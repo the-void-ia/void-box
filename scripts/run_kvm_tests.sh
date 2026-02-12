@@ -37,30 +37,13 @@ if [[ ! -e /dev/kvm ]]; then
   exit 1
 fi
 
-echo "[void-box] Building guest-agent (release)..."
-cargo build --release -p guest-agent
-
 ROOTFS_DIR="${ROOTFS_DIR:-/tmp/void-box-rootfs}"
 INITRAMFS="${INITRAMFS:-/tmp/void-box-rootfs.cpio.gz}"
+export OUT_DIR="$ROOTFS_DIR"
+export OUT_CPIO="$INITRAMFS"
 
-echo "[void-box] Preparing rootfs at: $ROOTFS_DIR"
-rm -rf "$ROOTFS_DIR"
-mkdir -p "$ROOTFS_DIR"/{bin,sbin,proc,sys,dev,tmp}
-
-echo "[void-box] Installing guest-agent into rootfs..."
-cp target/release/guest-agent "$ROOTFS_DIR"/sbin/guest-agent
-
-echo "[void-box] Writing /init script..."
-cat > "$ROOTFS_DIR"/init << 'EOF'
-#!/bin/sh
-exec /sbin/guest-agent
-EOF
-chmod +x "$ROOTFS_DIR"/init
-
-echo "[void-box] Creating initramfs at: $INITRAMFS"
-( cd "$ROOTFS_DIR" && find . | cpio -o -H newc | gzip ) > "$INITRAMFS"
-
-echo "[void-box] Initramfs created: $INITRAMFS"
+echo "[void-box] Building guest image (guest-agent + init + claude-code mock)..."
+"$ROOT_DIR/scripts/build_guest_image.sh"
 
 export VOID_BOX_KERNEL="$KERNEL"
 export VOID_BOX_INITRAMFS="$INITRAMFS"

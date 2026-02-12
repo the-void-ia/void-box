@@ -1,7 +1,7 @@
 //! vCPU configuration and execution
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use kvm_bindings::{kvm_regs, KVM_MAX_CPUID_ENTRIES};
@@ -10,6 +10,8 @@ use tracing::{debug, error, trace, warn};
 use vm_memory::Address;
 
 use crate::devices::serial::SerialDevice;
+use crate::devices::virtio_net::VirtioNetDevice;
+use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::vmm::kvm::Vm;
 use crate::{Error, Result};
 
@@ -51,6 +53,12 @@ impl VcpuHandle {
     }
 }
 
+/// MMIO device bundle passed into the vCPU run loop for dispatch
+pub struct MmioDevices {
+    pub virtio_net: Option<Arc<Mutex<VirtioNetDevice>>>,
+    pub virtio_vsock: Option<Arc<Mutex<VirtioVsockMmio>>>,
+}
+
 /// Create and start a vCPU
 pub fn create_vcpu(
     vm: Arc<Vm>,
@@ -58,6 +66,7 @@ pub fn create_vcpu(
     entry_point: u64,
     running: Arc<AtomicBool>,
     serial: SerialDevice,
+    mmio_devices: MmioDevices,
 ) -> Result<VcpuHandle> {
     let vcpu_fd = vm.create_vcpu(vcpu_id)?;
     debug!("Created vCPU {}", vcpu_id);
@@ -72,10 +81,11 @@ pub fn create_vcpu(
     configure_regs(&vcpu_fd, entry_point)?;
 
     // Start vCPU thread
+    let vm_clone = vm.clone();
     let thread = thread::Builder::new()
         .name(format!("vcpu-{}", vcpu_id))
         .spawn(move || {
-            vcpu_run_loop(vcpu_fd, vcpu_id, running, serial);
+            vcpu_run_loop(vcpu_fd, vcpu_id, running, serial, vm_clone, mmio_devices);
         })
         .map_err(|e| Error::Vcpu(format!("Failed to spawn vCPU thread: {}", e)))?;
 
@@ -195,10 +205,19 @@ fn vcpu_run_loop(
     vcpu_id: u64,
     running: Arc<AtomicBool>,
     mut serial: SerialDevice,
+    vm: Arc<Vm>,
+    mmio_devices: MmioDevices,
 ) {
     debug!("vCPU {} entering run loop", vcpu_id);
+    let guest_memory = vm.guest_memory();
 
     while running.load(Ordering::SeqCst) {
+        // Poll virtio-net RX: inject any frames from SLIRP into guest buffers
+        if let Some(ref dev) = mmio_devices.virtio_net {
+            let mut guard = dev.lock().unwrap();
+            let _ = guard.try_inject_rx(guest_memory);
+        }
+
         match vcpu_fd.run() {
             Ok(exit_reason) => {
                 trace!("vCPU {} exit: {:?}", vcpu_id, exit_reason);
@@ -211,12 +230,56 @@ fn vcpu_run_loop(
                         handle_io_in(port, data, &serial);
                     }
                     VcpuExit::MmioRead(addr, data) => {
-                        trace!("MMIO read: addr={:#x}, len={}", addr, data.len());
-                        // Fill with zeros for now
-                        data.iter_mut().for_each(|b| *b = 0);
+                        let handled = if let Some(ref dev) = mmio_devices.virtio_net {
+                            let guard = dev.lock().unwrap();
+                            if guard.handles_mmio(addr) {
+                                let offset = addr - guard.mmio_base();
+                                guard.mmio_read(offset, data);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !handled {
+                            if let Some(ref dev) = mmio_devices.virtio_vsock {
+                                let guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    guard.mmio_read(offset, data);
+                                } else {
+                                    data.iter_mut().for_each(|b| *b = 0);
+                                }
+                            } else {
+                                data.iter_mut().for_each(|b| *b = 0);
+                            }
+                        }
                     }
                     VcpuExit::MmioWrite(addr, data) => {
-                        trace!("MMIO write: addr={:#x}, data={:?}", addr, data);
+                        let handled = if let Some(ref dev) = mmio_devices.virtio_net {
+                            let mut guard = dev.lock().unwrap();
+                            if guard.handles_mmio(addr) {
+                                let offset = addr - guard.mmio_base();
+                                guard.mmio_write(offset, data, Some(guest_memory));
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !handled {
+                            if let Some(ref dev) = mmio_devices.virtio_vsock {
+                                let mut guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    if let Err(e) = guard.mmio_write(offset, data, guest_memory) {
+                                        warn!("virtio-vsock MMIO write error: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     VcpuExit::Hlt => {
                         debug!("vCPU {} halted", vcpu_id);

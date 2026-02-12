@@ -1,37 +1,40 @@
 //! virtio-vsock device for host-guest communication
 //!
 //! This module implements vsock (VM sockets) for communication between
-//! the host and guest. It uses the vhost-vsock kernel module for the
-//! data plane and communicates via a Context ID (CID).
+//! the host and guest. The host connects to the guest using AF_VSOCK
+//! with (guest_cid, port). Only one vhost-vsock backend per CID should
+//! exist (VirtioVsockMmio sets the CID and owns the backend); this device
+//! only performs the host-side connect using the same CID.
 
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::os::unix::io::RawFd;
+use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 use crate::guest::protocol::{ExecRequest, ExecResponse, Message, MessageType};
 use crate::{Error, Result};
 
+
 /// vsock port used by the guest agent
 pub const GUEST_AGENT_PORT: u32 = 1234;
 
-/// Reserved CIDs
+/// Reserved CIDs (see vsock(7))
 pub const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
 pub const VMADDR_CID_HYPERVISOR: u32 = 0;
 pub const VMADDR_CID_LOCAL: u32 = 1;
 pub const VMADDR_CID_HOST: u32 = 2;
 
-/// Vsock device for host-guest communication
+/// Vsock device for host-guest communication (host side only).
+/// Does not open /dev/vhost-vsock; the VirtioVsockMmio device is the single
+/// vhost-vsock backend for this VM's CID.
 pub struct VsockDevice {
-    /// Context ID for this VM
+    /// Context ID for this VM (guest CID; host uses CID 2)
     cid: u32,
-    /// vhost-vsock device fd (if using kernel vhost)
-    vhost_fd: Option<RawFd>,
 }
 
 impl VsockDevice {
-    /// Create a new vsock device with the given CID
+    /// Create a new vsock device with the given CID (guest CID).
     pub fn new(cid: u32) -> Result<Self> {
         if cid < 3 {
             return Err(Error::Config(format!(
@@ -40,53 +43,9 @@ impl VsockDevice {
             )));
         }
 
-        info!("Creating vsock device with CID {}", cid);
+        info!("Creating vsock device with CID {} (host connects to guest via AF_VSOCK)", cid);
 
-        // Try to open vhost-vsock device
-        let vhost_fd = match Self::setup_vhost_vsock(cid) {
-            Ok(fd) => {
-                debug!("Opened vhost-vsock device");
-                Some(fd)
-            }
-            Err(e) => {
-                debug!("vhost-vsock not available: {}, falling back to userspace", e);
-                None
-            }
-        };
-
-        Ok(Self { cid, vhost_fd })
-    }
-
-    /// Set up vhost-vsock kernel module
-    fn setup_vhost_vsock(cid: u32) -> Result<RawFd> {
-        use nix::fcntl::{open, OFlag};
-        use nix::sys::stat::Mode;
-
-        // Open /dev/vhost-vsock
-        let fd = open(
-            Path::new("/dev/vhost-vsock"),
-            OFlag::O_RDWR | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::Device(format!("Failed to open /dev/vhost-vsock: {}", e)))?;
-
-        // Set the CID using ioctl
-        // VHOST_VSOCK_SET_GUEST_CID = 0x4008AF60
-        const VHOST_VSOCK_SET_GUEST_CID: u64 = 0x4008AF60;
-
-        let cid_val: u64 = cid as u64;
-        let ret = unsafe {
-            libc::ioctl(fd.as_raw_fd(), VHOST_VSOCK_SET_GUEST_CID as libc::c_ulong, &cid_val)
-        };
-
-        if ret < 0 {
-            return Err(Error::Device(format!(
-                "Failed to set vsock CID: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        Ok(fd.as_raw_fd())
+        Ok(Self { cid })
     }
 
     /// Get the CID for this device
@@ -94,10 +53,85 @@ impl VsockDevice {
         self.cid
     }
 
-    /// Send an exec request to the guest agent and wait for response
+    /// Send an exec request to the guest agent and wait for response.
+    ///
+    /// Uses a VM0-style handshake: after connect, send Ping and wait for Pong
+    /// before sending the first request. This confirms the guest agent is ready
+    /// and avoids sending ExecRequest before the guest is in the read loop.
     pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
-        // Connect to guest agent via vsock
-        let mut stream = self.connect_to_guest(GUEST_AGENT_PORT)?;
+        // Give guest time to boot and virtio-vsock to be probed (vhost SET_OWNER after guest probe)
+        eprintln!("[vsock] waiting 15s for guest boot, then connect+handshake (max 40s)");
+        info!("vsock: waiting 15s for guest boot, then connect+handshake (max 40s)");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        let mut delay = Duration::from_millis(200);
+        let deadline = Instant::now() + Duration::from_secs(40);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+
+        let mut stream = loop {
+            if Instant::now() >= deadline {
+                eprintln!("[vsock] deadline reached after {} connect/handshake attempts", attempt);
+                warn!("vsock: deadline reached after {} connect/handshake attempts", attempt);
+                return Err(Error::Guest(
+                    "vsock: deadline reached (connect or handshake)".into(),
+                ));
+            }
+
+            attempt += 1;
+
+            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
+                Ok(stream) => {
+                    eprintln!("[vsock] attempt {} connect OK (cid={}, port={})", attempt, self.cid, GUEST_AGENT_PORT);
+                    info!("vsock: attempt {} connect OK (cid={}, port={})", attempt, self.cid, GUEST_AGENT_PORT);
+                    stream
+                }
+                Err(e) => {
+                    eprintln!("[vsock] attempt {} connect failed: {} (retry in {:?})", attempt, e, delay);
+                    warn!("vsock: attempt {} connect failed: {} (retry in {:?})", attempt, e, delay);
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            // VM0-style handshake: Ping -> Pong before first request
+            if let Err(e) = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+                warn!("vsock: attempt {} set_read_timeout failed: {}", attempt, e);
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                continue;
+            }
+            let ping_msg = Message {
+                msg_type: MessageType::Ping,
+                payload: vec![],
+            };
+            let ping_bytes = ping_msg.serialize();
+            if s.write_all(&ping_bytes).is_err() {
+                warn!("vsock: attempt {} handshake failed to send Ping", attempt);
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                continue;
+            }
+            info!("vsock: attempt {} Ping sent, waiting for Pong (timeout {:?})", attempt, HANDSHAKE_TIMEOUT);
+            match Message::read_from_sync(&mut s) {
+                Ok(msg) if msg.msg_type == MessageType::Pong => {
+                    info!("vsock: handshake OK (Pong received)");
+                    break s;
+                }
+                Ok(msg) => {
+                    warn!("vsock: attempt {} handshake unexpected message type {:?}", attempt, msg.msg_type);
+                }
+                Err(e) => {
+                    warn!("vsock: attempt {} handshake read Pong failed: {}", attempt, e);
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+        };
+
+        // Clear read timeout so ExecResponse can take as long as needed
+        let _ = stream.set_read_timeout(None);
 
         // Serialize and send request
         let message = Message {
@@ -110,8 +144,7 @@ impl VsockDevice {
             .write_all(&msg_bytes)
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        debug!("Sent exec request: {:?}", request);
-
+        info!("vsock: sent ExecRequest, waiting for ExecResponse");
         // Read response
         let response_msg = Message::read_from_sync(&mut stream)?;
 
@@ -123,7 +156,7 @@ impl VsockDevice {
         }
 
         let response: ExecResponse = serde_json::from_slice(&response_msg.payload)?;
-        debug!("Received exec response: exit_code={}", response.exit_code);
+        info!("vsock: ExecResponse received exit_code={}", response.exit_code);
 
         Ok(response)
     }
@@ -136,15 +169,6 @@ impl VsockDevice {
     }
 }
 
-impl Drop for VsockDevice {
-    fn drop(&mut self) {
-        if let Some(fd) = self.vhost_fd {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    }
-}
 
 /// Vsock stream wrapper
 pub struct VsockStream {
@@ -207,6 +231,34 @@ impl VsockStream {
         }
 
         Ok(Self { fd: socket_fd })
+    }
+
+    /// Set read timeout (e.g. for handshake). Pass `None` for blocking.
+    fn set_read_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
+        let tv = match duration {
+            None => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            Some(d) => libc::timeval {
+                tv_sec: d.as_secs() as i64,
+                tv_usec: d.subsec_micros() as i64,
+            },
+        };
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
 

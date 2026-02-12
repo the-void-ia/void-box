@@ -55,22 +55,52 @@ pub struct ExecResponse {
     pub duration_ms: Option<u64>,
 }
 
+/// Write a message to /dev/kmsg so it appears on the kernel serial console
+fn kmsg(msg: &str) {
+    // Write to both stderr and /dev/kmsg for maximum visibility
+    eprintln!("{}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        use std::io::Write;
+        let _ = writeln!(f, "guest-agent: {}", msg);
+    }
+}
+
 fn main() {
-    eprintln!("void-box guest agent starting...");
+    kmsg("void-box guest agent starting...");
 
     // Initialize the system if we're PID 1
     if std::process::id() == 1 {
         init_system();
     }
 
-    // Create vsock listener
-    let listener_fd = create_vsock_listener(LISTEN_PORT);
+    // Load kernel modules needed for vsock (virtio_mmio + vsock transport)
+    load_kernel_modules();
+
+    // Create vsock listener, retrying since module loading + device probe takes time
+    let listener_fd = {
+        let mut fd = -1i32;
+        for attempt in 0..30 {
+            fd = create_vsock_listener(LISTEN_PORT);
+            if fd >= 0 {
+                kmsg(&format!("vsock listener created on attempt {}", attempt + 1));
+                break;
+            }
+            let errno = std::io::Error::last_os_error();
+            kmsg(&format!("vsock listener attempt {} failed: {} retrying in 200ms...", attempt + 1, errno));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        fd
+    };
+
     if listener_fd < 0 {
-        eprintln!("Failed to create vsock listener");
-        return;
+        kmsg("Failed to create vsock listener after retries, entering idle loop (PID 1 must not exit)");
+        // PID 1 must never exit or the kernel panics
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
     }
 
-    eprintln!("Listening on vsock port {}", LISTEN_PORT);
+    kmsg(&format!("Listening on vsock port {}", LISTEN_PORT));
 
     // Accept connections and handle requests
     loop {
@@ -90,7 +120,7 @@ fn main() {
 
 /// Initialize the system when running as init (PID 1)
 fn init_system() {
-    eprintln!("Running as init, setting up system...");
+    kmsg("Running as init, setting up system...");
 
     // Mount proc filesystem
     let _ = std::fs::create_dir_all("/proc");
@@ -137,7 +167,127 @@ fn init_system() {
     // Create /tmp
     let _ = std::fs::create_dir_all("/tmp");
 
-    eprintln!("System initialization complete");
+    // Create /etc for resolv.conf
+    let _ = std::fs::create_dir_all("/etc");
+
+    // Set up networking (SLIRP uses 10.0.2.x network)
+    setup_network();
+
+    kmsg("System initialization complete");
+}
+
+/// Load kernel modules required for virtio-mmio and vsock.
+/// Modules are expected in /lib/modules/ as .ko.xz files.
+/// Uses the finit_module(2) syscall which handles compressed modules.
+fn load_kernel_modules() {
+    // Load order matters: dependencies must be loaded first.
+    // virtio_mmio needs explicit device= params since the cmdline params may not
+    // be forwarded when loading as a module.
+    let modules: &[(&str, &str)] = &[
+        ("virtio_mmio.ko", "device=512@0xd0000000:10 device=512@0xd0800000:11"),
+        ("vsock.ko", ""),
+        ("vmw_vsock_virtio_transport_common.ko", ""),
+        ("vmw_vsock_virtio_transport.ko", ""),
+    ];
+
+    for (module_name, params) in modules {
+        let path = format!("/lib/modules/{}", module_name);
+        match load_module_file(&path, params) {
+            Ok(()) => kmsg(&format!("Loaded module: {} (params='{}')", module_name, params)),
+            Err(e) => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
+        }
+    }
+
+    // Give the kernel a moment to probe devices after module loading
+    kmsg("Modules loaded, waiting 1s for device probe...");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+}
+
+/// Load a single kernel module using finit_module(2), with optional parameters.
+fn load_module_file(path: &str, params: &str) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("open {}: {}", path, e))?;
+
+    let fd = file.as_raw_fd();
+    let params_c = CString::new(params).unwrap();
+
+    // finit_module(fd, params, flags) - syscall 313 on x86_64
+    let ret = unsafe {
+        libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32)
+    };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        // EEXIST means module already loaded - that's fine
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        return Err(format!("finit_module: {}", err));
+    }
+    Ok(())
+}
+
+/// Set up network interface for SLIRP networking
+/// SLIRP network layout:
+/// - Guest IP:  10.0.2.15/24
+/// - Gateway:   10.0.2.2
+/// - DNS:       10.0.2.3
+fn setup_network() {
+    eprintln!("Setting up network...");
+
+    // Wait briefly for eth0 to appear (virtio-net driver initialization)
+    for i in 0..10 {
+        if std::path::Path::new("/sys/class/net/eth0").exists() {
+            eprintln!("eth0 detected after {} attempts", i + 1);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Check if eth0 exists
+    if !std::path::Path::new("/sys/class/net/eth0").exists() {
+        eprintln!("Warning: eth0 not found, networking may not be available");
+        return;
+    }
+
+    // Bring up loopback interface
+    run_cmd("ip", &["link", "set", "lo", "up"]);
+
+    // Bring up eth0
+    run_cmd("ip", &["link", "set", "eth0", "up"]);
+
+    // Configure IP address (SLIRP guest IP: 10.0.2.15/24)
+    run_cmd("ip", &["addr", "add", "10.0.2.15/24", "dev", "eth0"]);
+
+    // Add default route via SLIRP gateway (10.0.2.2)
+    run_cmd("ip", &["route", "add", "default", "via", "10.0.2.2"]);
+
+    // Configure DNS resolver (SLIRP DNS: 10.0.2.3)
+    let _ = std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 8.8.8.8\n");
+
+    eprintln!("Network configured: 10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3");
+}
+
+/// Run a command and log the result
+fn run_cmd(program: &str, args: &[&str]) {
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!(
+                    "Warning: {} {:?} failed: {}",
+                    program,
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to run {} {:?}: {}", program, args, e);
+        }
+    }
 }
 
 /// Create a vsock listener socket
@@ -194,46 +344,55 @@ fn create_vsock_listener(port: u32) -> RawFd {
     socket_fd
 }
 
-/// Handle a single connection
+/// Handle a connection – process messages in a loop until the peer disconnects
+/// or a terminal message (Shutdown) is received.
 fn handle_connection(fd: RawFd) -> Result<(), String> {
-    // Read message header (4 bytes length + 1 byte type)
-    let mut header = [0u8; 5];
-    read_exact(fd, &mut header)?;
+    loop {
+        // Read message header (4 bytes length + 1 byte type)
+        let mut header = [0u8; 5];
+        match read_exact(fd, &mut header) {
+            Ok(()) => {}
+            Err(_) => {
+                // Connection closed by peer (normal)
+                return Ok(());
+            }
+        }
 
-    let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    let msg_type = header[4];
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let msg_type = header[4];
 
-    // Read payload
-    let mut payload = vec![0u8; length];
-    if length > 0 {
-        read_exact(fd, &mut payload)?;
+        // Read payload
+        let mut payload = vec![0u8; length];
+        if length > 0 {
+            read_exact(fd, &mut payload)?;
+        }
+
+        // Handle message based on type
+        match msg_type {
+            1 => {
+                // ExecRequest
+                let request: ExecRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse request: {}", e))?;
+
+                let response = execute_command(&request);
+                send_response(fd, MessageType::ExecResponse, &response)?;
+            }
+            3 => {
+                // Ping
+                send_response(fd, MessageType::Pong, &())?;
+                // Continue loop - host will send ExecRequest on same connection
+            }
+            5 => {
+                // Shutdown
+                eprintln!("Shutdown requested");
+                unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32); }
+                return Ok(());
+            }
+            _ => {
+                eprintln!("Unknown message type: {}", msg_type);
+            }
+        }
     }
-
-    // Handle message based on type
-    match msg_type {
-        1 => {
-            // ExecRequest
-            let request: ExecRequest = serde_json::from_slice(&payload)
-                .map_err(|e| format!("Failed to parse request: {}", e))?;
-
-            let response = execute_command(&request);
-            send_response(fd, MessageType::ExecResponse, &response)?;
-        }
-        3 => {
-            // Ping
-            send_response(fd, MessageType::Pong, &())?;
-        }
-        5 => {
-            // Shutdown
-            eprintln!("Shutdown requested");
-            unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32); }
-        }
-        _ => {
-            eprintln!("Unknown message type: {}", msg_type);
-        }
-    }
-
-    Ok(())
 }
 
 /// Execute a command and return the response

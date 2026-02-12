@@ -187,6 +187,7 @@ impl Vm {
     pub fn create_vcpu(&self, id: u64) -> Result<kvm_ioctls::VcpuFd> {
         self.vm_fd.create_vcpu(id).map_err(|e| Error::Kvm(e))
     }
+
 }
 
 #[cfg(test)]

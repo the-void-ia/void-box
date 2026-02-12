@@ -340,6 +340,23 @@ impl MockSandbox {
                 // Simulate jq (pass through stdin for simplicity)
                 Ok(ExecOutput::new(stdin.to_vec(), Vec::new(), 0))
             }
+            "claude-code" => {
+                // Mock claude-code: plan emits one JSON-like line; apply reads stdin and echoes summary
+                let first = args.first().map(|s| *s).unwrap_or("");
+                if first == "plan" {
+                    let plan = r#"{"steps":[{"id":"1","action":"edit","path":"README.md"}]}"#;
+                    Ok(ExecOutput::new(format!("{}\n", plan).into_bytes(), Vec::new(), 0))
+                } else if first == "apply" {
+                    let lines = std::str::from_utf8(stdin).map(|s| s.lines().count()).unwrap_or(0);
+                    Ok(ExecOutput::new(
+                        format!("Mock applied {} plan line(s).\n", lines).into_bytes(),
+                        Vec::new(),
+                        0,
+                    ))
+                } else {
+                    Ok(ExecOutput::new(Vec::new(), b"usage: claude-code plan|apply [dir]\n".to_vec(), 1))
+                }
+            }
             _ => {
                 // Unknown command - simulate success with empty output
                 Ok(ExecOutput::new(Vec::new(), Vec::new(), 0))

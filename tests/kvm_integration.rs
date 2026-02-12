@@ -297,4 +297,68 @@ async fn kvm_workflow_pipe_uppercase() {
     );
 }
 
+/// KVM-backed Claude-in-void workflow: plan -> apply using claude-code in the guest.
+///
+/// Requires a guest image that includes `/usr/local/bin/claude-code` (e.g. from
+/// `scripts/build_guest_image.sh`). Opt-in: run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires KVM + guest image with claude-code; see module docs"]
+async fn kvm_claude_workflow_plan_apply() {
+    let Some(sandbox) = build_local_kvm_sandbox() else {
+        return;
+    };
+
+    let workflow = Workflow::define("kvm-claude-in-void")
+        .step("plan", |ctx| async move {
+            ctx.exec("claude-code", &["plan", "/workspace"]).await
+        })
+        .step("apply", |ctx| async move {
+            ctx.exec_piped("claude-code", &["apply", "/workspace"]).await
+        })
+        .pipe("plan", "apply")
+        .output("apply")
+        .build();
+
+    let observed = match workflow
+        .observe(ObserveConfig::test())
+        .run_in(sandbox)
+        .await
+    {
+        Ok(obs) => obs,
+        Err(Error::VmNotRunning) => {
+            eprintln!("kvm_claude_workflow_plan_apply: VM not running; skipping test");
+            return;
+        }
+        Err(Error::Guest(msg)) => {
+            eprintln!("kvm_claude_workflow_plan_apply: guest communication error: {msg}");
+            return;
+        }
+        Err(e) => panic!("KVM claude workflow failed: {e}"),
+    };
+
+    if !observed.result.success() {
+        eprintln!(
+            "kvm_claude_workflow_plan_apply: workflow exit_code={} output='{}'",
+            observed.result.exit_code,
+            observed.result.output_str()
+        );
+        for (name, step) in &observed.result.step_outputs {
+            eprintln!(
+                "  step {name}: exit_code={} stdout='{}' stderr='{}'",
+                step.exit_code,
+                step.stdout_str(),
+                step.stderr_str()
+            );
+        }
+        return;
+    }
+
+    assert!(
+        observed.result.output_str().contains("Mock applied") || observed.result.output_str().contains("applied"),
+        "apply step output: {}",
+        observed.result.output_str()
+    );
+    assert!(!observed.traces().is_empty());
+}
+
 

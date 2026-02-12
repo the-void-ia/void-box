@@ -125,12 +125,27 @@ impl VoidBoxConfig {
     pub fn kernel_cmdline(&self) -> String {
         let mut cmdline = vec![
             "console=ttyS0".to_string(),
+            "earlyprintk=serial,ttyS0,115200".to_string(),
             "reboot=k".to_string(),
             "panic=1".to_string(),
             "pci=off".to_string(),
-            "nomodules".to_string(),
+            "nokaslr".to_string(),
             "i8042.noaux".to_string(),
         ];
+
+        // Only add nomodules if vsock is NOT enabled (vsock needs modprobe)
+        if !self.enable_vsock {
+            cmdline.push("nomodules".to_string());
+        }
+
+        // Virtio MMIO devices so the guest kernel discovers them (no ACPI in minimal boot).
+        // Format: size@baseaddr:irq (see Linux virtio_mmio driver).
+        if self.network {
+            cmdline.push("virtio_mmio.device=512@0xd0000000:10".to_string());
+        }
+        if self.enable_vsock {
+            cmdline.push("virtio_mmio.device=512@0xd0800000:11".to_string());
+        }
 
         // Add root device if rootfs is specified
         if self.rootfs.is_some() {

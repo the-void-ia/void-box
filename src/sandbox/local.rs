@@ -95,7 +95,8 @@ impl LocalSandbox {
         let vm_lock = self.vm.lock().await;
         let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
 
-        vm.exec_with_stdin(program, args, stdin).await
+        let env: Vec<(String, String)> = self.config.env.clone();
+        vm.exec_with_env(program, args, stdin, &env, None).await
     }
 
     /// Simulate command execution (for testing without a real VM)

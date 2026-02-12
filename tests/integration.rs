@@ -215,6 +215,47 @@ fn test_observability_logs() {
 }
 
 // =============================================================================
+// CLAUDE-IN-VOID WORKFLOW (MOCK)
+// =============================================================================
+
+/// Reference workflow: plan -> apply using mock claude-code (no real API).
+#[tokio::test]
+async fn test_claude_workflow_plan_apply() {
+    let sandbox = Sandbox::mock().build().unwrap();
+
+    let workflow = Workflow::define("claude-in-void")
+        .step("plan", |ctx| async move {
+            ctx.exec("claude-code", &["plan", "/workspace"]).await
+        })
+        .step("apply", |ctx| async move {
+            ctx.exec_piped("claude-code", &["apply", "/workspace"]).await
+        })
+        .pipe("plan", "apply")
+        .output("apply")
+        .build();
+
+    let observed = workflow
+        .observe(ObserveConfig::test())
+        .run_in(sandbox)
+        .await
+        .unwrap();
+
+    assert!(observed.result.success());
+    assert!(observed.result.output_str().contains("Mock applied"));
+    assert!(observed.result.step_outputs.contains_key("plan"));
+    assert!(observed.result.step_outputs.contains_key("apply"));
+
+    let plan_stdout = String::from_utf8_lossy(
+        &observed.result.step_output("plan").unwrap().stdout,
+    );
+    assert!(plan_stdout.contains("steps") && plan_stdout.contains("edit"));
+
+    assert!(!observed.traces().is_empty());
+    assert!(observed.traces().iter().any(|s| s.name.contains("step:plan")));
+    assert!(observed.traces().iter().any(|s| s.name.contains("step:apply")));
+}
+
+// =============================================================================
 // REPRODUCIBILITY TESTS
 // =============================================================================
 

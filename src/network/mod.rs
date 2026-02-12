@@ -2,10 +2,15 @@
 //!
 //! This module handles network configuration for VMs, including:
 //! - TAP device setup
+//! - SLIRP user-mode networking (smoltcp-based)
 //! - virtio-net configuration
-//! - Network isolation
+//! - Network isolation and NAT
 
-use crate::Result;
+pub mod slirp;
+
+use std::ffi::CString;
+
+use crate::{Error, Result};
 
 /// Network configuration for a VM
 #[derive(Debug, Clone, Default)]
@@ -67,12 +72,61 @@ pub struct TapDevice {
 impl TapDevice {
     /// Create a new TAP device
     pub fn create(name: Option<&str>) -> Result<Self> {
-        // This is a placeholder - actual TAP creation requires root privileges
-        // and uses /dev/net/tun with TUNSETIFF ioctl
-        let name = name.unwrap_or("void-tap0").to_string();
+        // TAP creation requires /dev/net/tun and typically CAP_NET_ADMIN.
+        // We try to create the device and surface any OS error back to the caller.
+        let name = name.unwrap_or("void-tap0");
 
-        // For now, return a placeholder
-        Ok(Self { name, fd: -1 })
+        // Open /dev/net/tun
+        let fd = unsafe {
+            let path = b"/dev/net/tun\0";
+            libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CLOEXEC,
+            )
+        };
+
+        if fd < 0 {
+            return Err(Error::Device(format!(
+                "failed to open /dev/net/tun: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        // Prepare ifreq with interface name and flags (IFF_TAP | IFF_NO_PI).
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        let cname = CString::new(name).map_err(|e| {
+            Error::Device(format!("invalid TAP device name '{}': {}", name, e))
+        })?;
+
+        unsafe {
+            // Copy name into the ifreq name field
+            libc::strncpy(
+                ifr.ifr_name.as_mut_ptr(),
+                cname.as_ptr(),
+                libc::IFNAMSIZ as usize,
+            );
+
+            // Set flags to create a TAP device without extra packet info header.
+            ifr.ifr_ifru.ifru_flags =
+                (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+
+            // TUNSETIFF ioctl: from <linux/if_tun.h>
+            const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+            let ret = libc::ioctl(fd, TUNSETIFF, &ifr);
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(Error::Device(format!(
+                    "failed to create TAP device '{}': {}",
+                    name, err
+                )));
+            }
+        }
+
+        Ok(Self {
+            name: name.to_string(),
+            fd,
+        })
     }
 
     /// Get the device name
