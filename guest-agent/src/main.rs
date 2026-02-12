@@ -7,8 +7,7 @@
 //! - Process management
 
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
