@@ -67,6 +67,7 @@
 //! ```
 
 // Core modules
+pub mod artifacts;
 pub mod devices;
 pub mod error;
 pub mod guest;

@@ -248,6 +248,50 @@ impl SandboxBuilder {
         self
     }
 
+    /// Use pre-built artifacts from GitHub releases
+    ///
+    /// Downloads kernel and initramfs artifacts from the specified version.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use void_box::sandbox::Sandbox;
+    ///
+    /// let sandbox = Sandbox::local()
+    ///     .with_prebuilt_artifacts("v0.1.0")
+    ///     .unwrap()
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn with_prebuilt_artifacts(mut self, version: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let artifacts = crate::artifacts::download_prebuilt_artifacts(version)?;
+        self.config.kernel = Some(artifacts.kernel);
+        self.config.initramfs = Some(artifacts.initramfs);
+        Ok(self)
+    }
+
+    /// Load artifacts from environment variables
+    ///
+    /// Checks VOID_BOX_KERNEL and VOID_BOX_INITRAMFS environment variables.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use void_box::sandbox::Sandbox;
+    ///
+    /// let sandbox = Sandbox::local()
+    ///     .from_env()
+    ///     .unwrap()
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn from_env(mut self) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let artifacts = crate::artifacts::from_env()?;
+        self.config.kernel = Some(artifacts.kernel);
+        self.config.initramfs = Some(artifacts.initramfs);
+        Ok(self)
+    }
+
     /// Build the sandbox
     pub fn build(self) -> Result<Arc<Sandbox>> {
         let inner = match self.sandbox_type {

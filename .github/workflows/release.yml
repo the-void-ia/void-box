@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-artifacts:
+    name: Build Release Artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64]  # Add aarch64 when cross-compilation is set up
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cpio gzip xz-utils
+
+      - name: Build artifacts
+        run: |
+          ./scripts/build_release_artifacts.sh ${{ github.ref_name }} ${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-box-${{ github.ref_name }}-${{ matrix.arch }}
+          path: target/release-artifacts/${{ github.ref_name }}/*
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-artifacts/**/*
+          body: |
+            ## void-box ${{ github.ref_name }}
+
+            Pre-built artifacts for easy setup:
+
+            **Download:**
+            - Initramfs: `void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz`
+            - Guest agent: `guest-agent-x86_64`
+            - Checksums: `checksums-${{ github.ref_name }}-x86_64.txt`
+
+            **Quick start:**
+            ```bash
+            # Download artifacts
+            wget https://github.com/the-void-ia/void-box/releases/download/${{ github.ref_name }}/void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz
+
+            # Use with void-box
+            VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+            VOID_BOX_INITRAMFS=void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz \
+            cargo run --example claude_workflow
+            ```
+
+            See [Getting Started](https://github.com/the-void-ia/void-box#getting-started) for details.
+          draft: false
+          prerelease: false

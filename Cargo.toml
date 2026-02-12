@@ -2,11 +2,20 @@
 name = "void-box"
 version = "0.1.0"
 edition = "2021"
-description = "Composable workflow sandbox with native observability"
-license = "MIT"
+authors = ["Diego Parra <diegolparra@gmail.com>"]
+description = "Composable workflow sandbox with KVM micro-VMs and native observability"
+repository = "https://github.com/the-void-ia/void-box"
 readme = "README.md"
 keywords = ["sandbox", "workflow", "observability", "virtualization", "kvm"]
 categories = ["development-tools", "virtualization"]
+exclude = [
+    "target/*",
+    "artifacts/*",
+    "docs/vhs/*",
+    ".cursor/*",
+    "scripts/build_*",
+    "tmp/*",
+]
 
 [dependencies]
 # rust-vmm core
@@ -52,6 +61,10 @@ tokio-test = "0.4"
 default = []
 # Enable full OpenTelemetry integration
 opentelemetry = []
+
+[[bin]]
+name = "voidbox"
+path = "src/bin/voidbox.rs"
 
 [workspace]
 members = ["guest-agent"]
