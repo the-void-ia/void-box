@@ -193,6 +193,17 @@ fn init_system() {
     // Create /etc for resolv.conf
     let _ = std::fs::create_dir_all("/etc");
 
+    // Configure YAMA ptrace scope to allow same-UID ptrace
+    // ptrace_scope=0: classic ptrace permissions (same UID can ptrace)
+    // This allows ripgrep and debuggers to work in the sandbox
+    match std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0\n") {
+        Ok(()) => kmsg("Configured YAMA ptrace_scope=0"),
+        Err(e) => {
+            // Non-fatal: kernel may not have YAMA compiled in
+            kmsg(&format!("Note: Could not configure YAMA: {}", e));
+        }
+    }
+
     // Note: network setup is done after module loading in main(), not here,
     // because virtio_net.ko creates eth0 and must be loaded first.
 

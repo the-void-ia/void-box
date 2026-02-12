@@ -48,10 +48,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let choice = line.trim();
 
     if choice == "2" {
-        interactive_session(sandbox).await?;
+        interactive_session(sandbox.clone()).await?;
     } else {
-        demo_multi_turn(sandbox).await?;
+        demo_multi_turn(sandbox.clone()).await?;
     }
+
+    // Gracefully stop the sandbox VM
+    eprintln!("[claude-in-voidbox] Stopping sandbox...");
+    sandbox.stop().await?;
+    eprintln!("[claude-in-voidbox] Sandbox stopped cleanly.");
 
     println!("\nDone.");
     Ok(())

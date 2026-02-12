@@ -154,6 +154,14 @@ impl Sandbox {
     pub fn config(&self) -> &SandboxConfig {
         &self.config
     }
+
+    /// Stop the sandbox and cleanup resources gracefully
+    pub async fn stop(&self) -> Result<()> {
+        match &self.inner {
+            SandboxInner::Local(local) => local.stop().await,
+            SandboxInner::Mock(_) => Ok(()), // Mock sandbox has no cleanup needed
+        }
+    }
 }
 
 /// Types of sandboxes

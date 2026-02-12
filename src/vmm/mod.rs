@@ -56,6 +56,8 @@ pub struct VoidBox {
     command_tx: mpsc::Sender<VmCommand>,
     /// Handle to the VM event loop thread
     event_loop_handle: Option<JoinHandle<()>>,
+    /// Handle to the vsock IRQ handler thread (if vsock enabled)
+    vsock_irq_handle: Option<JoinHandle<()>>,
 }
 
 /// Commands that can be sent to the VM event loop
@@ -179,7 +181,7 @@ impl VoidBox {
         //   1. Set INTERRUPT_STATUS |= 1 on the virtio-mmio device (so the guest ISR sees it)
         //   2. Inject IRQ 11 into the guest via the in-kernel irqchip
         // KVM_IRQFD alone is NOT sufficient because virtio-mmio's ISR checks INTERRUPT_STATUS.
-        if let Some(ref vsock_mmio) = mmio_devices.virtio_vsock {
+        let vsock_irq_handle = if let Some(ref vsock_mmio) = mmio_devices.virtio_vsock {
             let call_fds: Vec<RawFd> = {
                 let guard = vsock_mmio.lock().unwrap();
                 guard.call_eventfds().iter().filter_map(|f| *f).collect()
@@ -188,15 +190,20 @@ impl VoidBox {
                 let vsock_mmio_clone = vsock_mmio.clone();
                 let vm_fd_raw = vm.vm_fd().as_raw_fd();
                 let running_irq = running.clone();
-                std::thread::Builder::new()
+                let handle = std::thread::Builder::new()
                     .name("vsock-irq".into())
                     .spawn(move || {
                         vsock_irq_thread(call_fds, vsock_mmio_clone, vm_fd_raw, running_irq);
                     })
                     .expect("Failed to spawn vsock-irq thread");
                 debug!("Spawned vsock-irq handler thread");
+                Some(handle)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Create command channel
         let (command_tx, mut command_rx) = mpsc::channel::<VmCommand>(32);
@@ -249,6 +256,7 @@ impl VoidBox {
             virtio_net: mmio_devices.virtio_net,
             command_tx,
             event_loop_handle: Some(event_loop_handle),
+            vsock_irq_handle,
         })
     }
 
@@ -352,6 +360,11 @@ impl VoidBox {
         // Wait for event loop to finish
         if let Some(handle) = self.event_loop_handle.take() {
             handle.join().map_err(|_| Error::Vcpu("Event loop panic".into()))?;
+        }
+
+        // Wait for vsock IRQ handler if present
+        if let Some(handle) = self.vsock_irq_handle.take() {
+            handle.join().map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
         }
 
         info!("VoidBox stopped");
