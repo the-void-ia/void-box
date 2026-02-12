@@ -74,7 +74,14 @@ fn main() {
     }
 
     // Load kernel modules needed for vsock (virtio_mmio + vsock transport)
+    // and virtio-net (for SLIRP networking). Must happen after init_system()
+    // so filesystems are mounted, but before network setup which needs the drivers.
     load_kernel_modules();
+
+    // Set up networking after modules are loaded (virtio_net.ko creates eth0)
+    if std::process::id() == 1 {
+        setup_network();
+    }
 
     // Create vsock listener, retrying since module loading + device probe takes time
     let listener_fd = {
@@ -120,6 +127,11 @@ fn main() {
 
 /// Initialize the system when running as init (PID 1)
 fn init_system() {
+    // Set PATH early - as PID 1, we inherit no environment
+    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin");
+    std::env::set_var("HOME", "/root");
+    std::env::set_var("TERM", "linux");
+
     kmsg("Running as init, setting up system...");
 
     // Mount proc filesystem
@@ -167,11 +179,22 @@ fn init_system() {
     // Create /tmp
     let _ = std::fs::create_dir_all("/tmp");
 
+    // Create /workspace for user projects and /home/sandbox for the sandbox user
+    let _ = std::fs::create_dir_all("/workspace");
+    let _ = std::fs::create_dir_all("/home/sandbox");
+    // Make them writable by uid 1000 (sandbox user)
+    unsafe {
+        let workspace = std::ffi::CString::new("/workspace").unwrap();
+        libc::chown(workspace.as_ptr(), 1000, 1000);
+        let home = std::ffi::CString::new("/home/sandbox").unwrap();
+        libc::chown(home.as_ptr(), 1000, 1000);
+    }
+
     // Create /etc for resolv.conf
     let _ = std::fs::create_dir_all("/etc");
 
-    // Set up networking (SLIRP uses 10.0.2.x network)
-    setup_network();
+    // Note: network setup is done after module loading in main(), not here,
+    // because virtio_net.ko creates eth0 and must be loaded first.
 
     kmsg("System initialization complete");
 }
@@ -185,9 +208,14 @@ fn load_kernel_modules() {
     // be forwarded when loading as a module.
     let modules: &[(&str, &str)] = &[
         ("virtio_mmio.ko", "device=512@0xd0000000:10 device=512@0xd0800000:11"),
+        // vsock modules
         ("vsock.ko", ""),
         ("vmw_vsock_virtio_transport_common.ko", ""),
         ("vmw_vsock_virtio_transport.ko", ""),
+        // Network modules (for SLIRP networking)
+        ("failover.ko", ""),
+        ("net_failover.ko", ""),
+        ("virtio_net.ko", ""),
     ];
 
     for (module_name, params) in modules {
@@ -266,9 +294,12 @@ fn setup_network() {
     run_cmd("ip", &["route", "add", "default", "via", "10.0.2.2"]);
 
     // Configure DNS resolver (SLIRP DNS: 10.0.2.3)
-    let _ = std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 8.8.8.8\n");
+    match std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 8.8.8.8\n") {
+        Ok(()) => kmsg("Wrote /etc/resolv.conf"),
+        Err(e) => kmsg(&format!("Failed to write /etc/resolv.conf: {}", e)),
+    }
 
-    eprintln!("Network configured: 10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3");
+    kmsg("Network configured: 10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3");
 }
 
 /// Run a command and log the result
@@ -402,7 +433,16 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
     let mut cmd = Command::new(&request.program);
     cmd.args(&request.args);
 
-    // Set environment variables
+    // Ensure PATH includes common binary locations
+    let path = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/sbin".to_string());
+    if !path.contains("/usr/local/bin") {
+        cmd.env("PATH", format!("/usr/local/bin:{}", path));
+    } else {
+        cmd.env("PATH", &path);
+    }
+
+    // Set environment variables from request (may override PATH above)
     for (key, value) in &request.env {
         cmd.env(key, value);
     }
@@ -421,6 +461,21 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // Drop privileges to sandbox user (uid=1000, gid=1000) for child processes.
+    // This is required because claude-code refuses --dangerously-skip-permissions as root.
+    // The guest-agent (PID 1) stays root, but child commands run as sandbox user.
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            // Set supplementary groups to empty
+            libc::setgroups(0, std::ptr::null());
+            // Drop to gid 1000, uid 1000
+            if libc::setgid(1000) != 0 { return Err(std::io::Error::last_os_error()); }
+            if libc::setuid(1000) != 0 { return Err(std::io::Error::last_os_error()); }
+            Ok(())
+        });
+    }
 
     // Spawn the process
     let child = match cmd.spawn() {

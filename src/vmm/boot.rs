@@ -35,7 +35,7 @@ pub fn load_kernel(
     // Read init_size from the kernel header BEFORE loading, so we know
     // where it's safe to place the initramfs (must be outside
     // [kernel_load, kernel_load + init_size)).
-    let init_size = read_bzimage_init_size(&mut kernel_file).unwrap_or(0);
+    let _init_size = read_bzimage_init_size(&mut kernel_file).unwrap_or(0);
 
     // Detect kernel format and load it
     let (kernel_load_addr, kernel_entry) = load_kernel_image(guest_memory, &mut kernel_file)?;

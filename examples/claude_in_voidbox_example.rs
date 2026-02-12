@@ -1,22 +1,20 @@
-//! Claude-in-voidbox example: multi-turn interaction with Claude-style CLI inside the sandbox.
+//! Claude-in-voidbox example: run the real Claude Code CLI inside a KVM micro-VM sandbox.
 //!
-//! Rust port of BoxLite's [claude_in_boxlite_example.py](https://github.com/boxlite-ai/boxlite/blob/main/examples/python/claude_in_boxlite_example.py).
-//! Uses void-box's `claude-code plan` / `claude-code apply` interface (mock in guest by default).
+//! Demonstrates multi-turn interaction with `claude-code` executing inside the
+//! guest VM, with SLIRP networking providing NAT-based API access.
 //!
-//! Usage:
+//! Usage (mock, no KVM required):
 //!   cargo run --example claude_in_voidbox_example
 //!
-//! Then choose:
-//!   1. Demo — automated plan then apply (multi-turn).
-//!   2. Interactive — type messages; "plan" runs plan, "apply" runs apply with previous plan as stdin.
+//! Usage (real KVM + real Claude API):
+//!   1. Build the guest initramfs:  scripts/build_claude_rootfs.sh
+//!   2. Run:
+//!      ANTHROPIC_API_KEY=sk-ant-xxx \
+//!      VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+//!      VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+//!      cargo run --example claude_in_voidbox_example
 //!
-//! For real Claude API:
-//!   1. Set ANTHROPIC_API_KEY environment variable
-//!   2. Build initramfs with: scripts/build-initramfs.sh
-//!   3. Set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS
-//!   4. Run: ANTHROPIC_API_KEY=sk-ant-xxx cargo run --example claude_in_voidbox_example
-//!
-//! The sandbox will have SLIRP networking enabled (10.0.2.15/24) for API access.
+//! The sandbox uses SLIRP networking (guest 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3).
 
 use std::error::Error;
 use std::io::{self, Write};
@@ -97,7 +95,7 @@ fn try_kvm_sandbox() -> Result<Option<Arc<Sandbox>>, Box<dyn Error>> {
     }
 
     let mut b = Sandbox::local()
-        .memory_mb(256)
+        .memory_mb(512)
         .vcpus(1)
         .kernel(&kernel)
         .network(true);  // Enable SLIRP networking for API access
@@ -124,38 +122,65 @@ fn try_kvm_sandbox() -> Result<Option<Arc<Sandbox>>, Box<dyn Error>> {
     }
 }
 
-/// Automated demo: run plan, then apply with plan output as stdin.
+/// Automated demo: run two turns with the real Claude CLI.
+///
+/// Turn 1: Ask Claude to create a plan (non-interactive via -p/--print).
+/// Turn 2: Feed the plan back and ask Claude to apply it.
 async fn demo_multi_turn(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>> {
     println!("\n=== Multi-turn Demo ===\n");
 
-    println!("Turn 1: plan");
+    // Step 0: Network diagnostic
+    println!("Step 0: Network diagnostic");
+    let diag = sandbox.exec("sh", &["-c",
+        "echo '--- interfaces ---'; ip addr 2>&1; echo '--- routes ---'; ip route 2>&1; echo '--- dns ---'; cat /etc/resolv.conf 2>&1; echo '--- dns test ---'; /bin/busybox nslookup api.anthropic.com 10.0.2.3 2>&1; echo dns_exit=$?"
+    ]).await?;
+    display_output("Network", &diag);
+
+    // Turn 1: ask Claude to create a plan
+    let plan_prompt = format!(
+        "Create a simple plan to add a hello-world Python script in {}. \
+         Output only the plan as a numbered list, nothing else.",
+        WORKSPACE
+    );
+    println!("Turn 1: plan\n  prompt: {}\n", plan_prompt);
     let plan_out = sandbox
-        .exec("claude-code", &["plan", WORKSPACE])
+        .exec("claude-code", &[
+            "-p", &plan_prompt,
+            "--output-format", "text",
+            "--dangerously-skip-permissions",
+        ])
         .await?;
     let plan_stdout = plan_out.stdout.clone();
     display_output("Claude (plan)", &plan_out);
 
-    println!("\nTurn 2: apply (with plan as stdin)");
+    // Turn 2: ask Claude to apply the plan
+    let apply_prompt = format!(
+        "Apply the following plan in {}. Execute each step.\n\n{}",
+        WORKSPACE,
+        String::from_utf8_lossy(&plan_stdout)
+    );
+    println!("\nTurn 2: apply\n  prompt: {} bytes\n", apply_prompt.len());
     let apply_out = sandbox
-        .exec_with_stdin("claude-code", &["apply", WORKSPACE], &plan_stdout)
+        .exec("claude-code", &[
+            "-p", &apply_prompt,
+            "--output-format", "text",
+            "--dangerously-skip-permissions",
+        ])
         .await?;
     display_output("Claude (apply)", &apply_out);
 
-    let ok = apply_out.success() && apply_out.stdout_str().contains("applied");
-    if ok {
+    if apply_out.success() {
         println!("\n✓ Demo completed.");
     } else {
-        println!("\n✗ Apply step did not report success.");
+        println!("\n✗ Apply step did not succeed (exit_code={}).", apply_out.exit_code);
     }
     Ok(())
 }
 
-/// Interactive: loop reading "plan" / "apply" / "quit"; run claude-code in the sandbox.
+/// Interactive: type a prompt, Claude responds. Type "quit" to exit.
 async fn interactive_session(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>> {
     println!("\n=== Interactive Session ===");
-    println!("Commands: plan | apply | quit\n");
-
-    let mut last_plan: Option<Vec<u8>> = None;
+    println!("Type a prompt for Claude (or 'quit' to exit).\n");
 
     loop {
         print!("You: ");
@@ -171,35 +196,17 @@ async fn interactive_session(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>
         }
         if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") || input == "q" {
             break;
+
         }
 
-        if input.eq_ignore_ascii_case("apply") {
-            let stdin = last_plan.as_deref().unwrap_or(&[]);
-            if stdin.is_empty() {
-                println!("Claude: (Run 'plan' first to have something to apply.)");
-                continue;
-            }
-            let out = sandbox
-                .exec_with_stdin("claude-code", &["apply", WORKSPACE], stdin)
-                .await?;
-            display_output("Claude", &out);
-            continue;
-        }
-
-        if input.eq_ignore_ascii_case("plan") || input.starts_with("plan") {
-            let out = sandbox
-                .exec("claude-code", &["plan", WORKSPACE])
-                .await?;
-            last_plan = Some(out.stdout.clone());
-            display_output("Claude", &out);
-            continue;
-        }
-
-        // Any other input: treat as "plan" request (user might type a prompt; we still run plan)
+        // Send the user's input as a prompt to the real Claude CLI
         let out = sandbox
-            .exec("claude-code", &["plan", WORKSPACE])
+            .exec("claude-code", &[
+                "-p", input,
+                "--output-format", "text",
+                "--dangerously-skip-permissions",
+            ])
             .await?;
-        last_plan = Some(out.stdout.clone());
         display_output("Claude", &out);
     }
 

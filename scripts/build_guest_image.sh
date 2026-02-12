@@ -37,8 +37,18 @@ chmod +x "$OUT_DIR"/init
 echo "[void-box] Installing guest-agent in /sbin..."
 cp "$GUEST_AGENT_BIN" "$OUT_DIR"/sbin/guest-agent
 
-# Claude-code mock (workflow demos and tests)
-if [[ -f "$ROOT_DIR/scripts/guest/claude-code-mock.sh" ]]; then
+# Claude-code binary for workflow demos and tests
+# Priority:
+#   1. If CLAUDE_CODE_BIN is set and points to an existing file on the host,
+#      copy that into the guest as /usr/local/bin/claude-code. This is the
+#      \"real\" claude-code CLI (can talk to Anthropic from inside the guest).
+#   2. Otherwise, fall back to the built-in shell mock script which simulates
+#      plan/apply behaviour without doing real network calls.
+if [[ -n "${CLAUDE_CODE_BIN:-}" && -f "$CLAUDE_CODE_BIN" ]]; then
+  echo "[void-box] Installing real claude-code from \$CLAUDE_CODE_BIN at /usr/local/bin/claude-code..."
+  cp "$CLAUDE_CODE_BIN" "$OUT_DIR/usr/local/bin/claude-code"
+  chmod +x "$OUT_DIR/usr/local/bin/claude-code"
+elif [[ -f "$ROOT_DIR/scripts/guest/claude-code-mock.sh" ]]; then
   echo "[void-box] Installing claude-code mock at /usr/local/bin/claude-code..."
   cp "$ROOT_DIR/scripts/guest/claude-code-mock.sh" "$OUT_DIR/usr/local/bin/claude-code"
   chmod +x "$OUT_DIR/usr/local/bin/claude-code"
@@ -51,7 +61,7 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
   chmod +x "$OUT_DIR/bin/busybox"
   ln -sf busybox "$OUT_DIR/bin/sh"
   # Optional links for common commands (so exec("echo", ...) works)
-  for cmd in echo cat tr test base64; do
+  for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env; do
     ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
   done
 else
@@ -64,13 +74,18 @@ MODDIR="/lib/modules/$KVER/kernel"
 DEST_MODDIR="$OUT_DIR/lib/modules"
 mkdir -p "$DEST_MODDIR"
 
-echo "[void-box] Adding kernel modules for virtio-mmio and vsock (kernel $KVER)..."
+echo "[void-box] Adding kernel modules for virtio-mmio, vsock, and networking (kernel $KVER)..."
 # virtio_mmio: virtio device on MMIO bus
+# vsock: VM socket communication
+# virtio_net + deps: network driver for SLIRP networking
 for mod_path in \
   "$MODDIR/drivers/virtio/virtio_mmio.ko.xz" \
   "$MODDIR/net/vmw_vsock/vsock.ko.xz" \
   "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.xz" \
   "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko.xz" \
+  "$MODDIR/net/core/failover.ko.xz" \
+  "$MODDIR/drivers/net/net_failover.ko.xz" \
+  "$MODDIR/drivers/net/virtio_net.ko.xz" \
   ; do
   if [[ -f "$mod_path" ]]; then
     base=$(basename "$mod_path")

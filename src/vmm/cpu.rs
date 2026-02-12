@@ -1,5 +1,6 @@
 //! vCPU configuration and execution
 
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -212,10 +213,22 @@ fn vcpu_run_loop(
     let guest_memory = vm.guest_memory();
 
     while running.load(Ordering::SeqCst) {
-        // Poll virtio-net RX: inject any frames from SLIRP into guest buffers
+        // Poll virtio-net RX: inject any frames from SLIRP into guest buffers,
+        // then inject IRQ 10 if the device has a pending interrupt.
         if let Some(ref dev) = mmio_devices.virtio_net {
             let mut guard = dev.lock().unwrap();
             let _ = guard.try_inject_rx(guest_memory);
+            if guard.has_pending_interrupt() {
+                // Inject IRQ 10 (virtio-net) into the guest via KVM_IRQ_LINE
+                #[repr(C)]
+                struct KvmIrqLevel { irq: u32, level: u32 }
+                const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+                let vm_fd = vm.vm_fd().as_raw_fd();
+                let assert = KvmIrqLevel { irq: 10, level: 1 };
+                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert); }
+                let deassert = KvmIrqLevel { irq: 10, level: 0 };
+                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert); }
+            }
         }
 
         match vcpu_fd.run() {

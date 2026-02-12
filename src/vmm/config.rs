@@ -142,6 +142,8 @@ impl VoidBoxConfig {
         // Format: size@baseaddr:irq (see Linux virtio_mmio driver).
         if self.network {
             cmdline.push("virtio_mmio.device=512@0xd0000000:10".to_string());
+            // Disable IPv6 - our SLIRP stack only supports IPv4
+            cmdline.push("ipv6.disable=1".to_string());
         }
         if self.enable_vsock {
             cmdline.push("virtio_mmio.device=512@0xd0800000:11".to_string());

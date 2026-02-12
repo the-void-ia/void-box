@@ -34,6 +34,8 @@ pub mod features {
     pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
     /// Control channel available
     pub const VIRTIO_NET_F_CTRL_VQ: u64 = 1 << 17;
+    /// Required for virtio-mmio version 2 devices
+    pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 }
 
 /// Virtio network header (prepended to frames)
@@ -183,7 +185,9 @@ impl VirtioNetDevice {
     pub fn new(slirp: Arc<Mutex<SlirpStack>>) -> Result<Self> {
         debug!("Creating virtio-net device with SLIRP backend");
 
-        let device_features = features::VIRTIO_NET_F_MAC | features::VIRTIO_NET_F_STATUS;
+        let device_features = features::VIRTIO_NET_F_MAC
+            | features::VIRTIO_NET_F_STATUS
+            | features::VIRTIO_F_VERSION_1;
 
         Ok(Self {
             slirp,
@@ -411,6 +415,7 @@ impl VirtioNetDevice {
             }
             1 => {
                 // TX queue - guest wants to send packets
+                debug!("virtio-net: TX queue notified");
                 if let Some(mem) = guest_memory {
                     if let Err(e) = self.process_tx_queue(mem) {
                         warn!("virtio-net: TX queue processing error: {}", e);
@@ -443,8 +448,8 @@ impl VirtioNetDevice {
         let avail_idx = u16::from_le_bytes(idx_buf);
 
         while self.tx_avail_idx != avail_idx {
-            // Ring entry: 2 bytes, at avail_addr + 4 + tx_avail_idx*2
-            let ring_offset = 4 + (self.tx_avail_idx as usize) * 2;
+            // Ring entry: 2 bytes, at avail_addr + 4 + (tx_avail_idx % queue_size)*2
+            let ring_offset = 4 + ((self.tx_avail_idx as usize) % queue_size) * 2;
             let mut desc_id_buf = [0u8; 2];
             mem.read(
                 &mut desc_id_buf,
@@ -484,8 +489,8 @@ impl VirtioNetDevice {
                 self.process_tx_frame(&packet)?;
             }
 
-            // Write used ring: used->ring[tx_used_idx] = { id: head_idx, len: 0 }
-            let used_ring_off = 4 + (self.tx_used_idx as usize) * 8;
+            // Write used ring: used->ring[tx_used_idx % queue_size] = { id: head_idx, len: 0 }
+            let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * 8;
             let used_elem = [
                 (head_idx as u32).to_le_bytes(),
                 0u32.to_le_bytes(), // len for TX typically 0
@@ -516,6 +521,10 @@ impl VirtioNetDevice {
 
         let q = &self.rx_queue;
         if !q.ready || q.num == 0 {
+            // Queue not ready - buffer frames for later
+            debug!("virtio-net: RX queue not ready (ready={}, num={}), buffering {} frames",
+                q.ready, q.num, frames.len());
+            self.rx_buffer.extend(frames);
             return Ok(());
         }
         let desc_addr = GuestAddress(q.desc_addr);
@@ -530,11 +539,14 @@ impl VirtioNetDevice {
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let avail_idx = u16::from_le_bytes(idx_buf);
             if self.rx_avail_idx == avail_idx {
+                debug!("virtio-net: RX no available buffers (avail_idx={}, our_idx={}), buffering frame ({} bytes)",
+                    avail_idx, self.rx_avail_idx, frame.len());
                 self.rx_buffer.push(frame);
                 continue;
             }
+            debug!("virtio-net: RX injecting frame ({} bytes), avail_idx={}", frame.len(), avail_idx);
 
-            let ring_offset = 4 + (self.rx_avail_idx as usize) * 2;
+            let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
             let mut desc_id_buf = [0u8; 2];
             mem.read(
                 &mut desc_id_buf,
@@ -575,7 +587,7 @@ impl VirtioNetDevice {
                 next = next_desc;
             }
 
-            let used_ring_off = 4 + (self.rx_used_idx as usize) * 8;
+            let used_ring_off = 4 + ((self.rx_used_idx as usize) % queue_size) * 8;
             let used_elem = [
                 (head_idx as u32).to_le_bytes(),
                 (written as u32).to_le_bytes(),
