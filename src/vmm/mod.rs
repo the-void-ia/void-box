@@ -25,7 +25,11 @@ use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::vmm::cpu::MmioDevices;
-use crate::guest::protocol::{ExecRequest, ExecResponse};
+use crate::guest::protocol::{
+    ExecRequest, ExecResponse,
+    WriteFileRequest, WriteFileResponse,
+    MkdirPRequest, MkdirPResponse,
+};
 use crate::network::slirp::SlirpStack;
 use crate::observe::telemetry::TelemetryAggregator;
 use crate::observe::Observer;
@@ -73,6 +77,16 @@ enum VmCommand {
     Exec {
         request: ExecRequest,
         response_tx: oneshot::Sender<Result<ExecResponse>>,
+    },
+    /// Write a file to the guest filesystem (native protocol, no shell)
+    WriteFile {
+        request: WriteFileRequest,
+        response_tx: oneshot::Sender<Result<WriteFileResponse>>,
+    },
+    /// Create directories in the guest filesystem (mkdir -p)
+    MkdirP {
+        request: MkdirPRequest,
+        response_tx: oneshot::Sender<Result<MkdirPResponse>>,
     },
     /// Start a telemetry subscription
     SubscribeTelemetry {
@@ -241,6 +255,22 @@ impl VoidBox {
                                     };
                                     let _ = response_tx.send(result);
                                 }
+                                VmCommand::WriteFile { request, response_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_write_file(&request.path, &request.content).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
+                                VmCommand::MkdirP { request, response_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_mkdir_p(&request.path).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
                                 VmCommand::SubscribeTelemetry { aggregator } => {
                                     if let Some(ref vsock) = vsock_clone {
                                         let vsock = vsock.clone();
@@ -356,6 +386,79 @@ impl VoidBox {
             response.stderr,
             response.exit_code,
         ))
+    }
+
+    /// Write a file to the guest filesystem using the native WriteFile protocol.
+    ///
+    /// This bypasses shell and base64 encoding -- the guest-agent writes the
+    /// file directly in Rust. Parent directories are created automatically.
+    pub async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::VmNotRunning);
+        }
+
+        let request = WriteFileRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            create_parents: true,
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(VmCommand::WriteFile {
+                request,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Error::Guest("Failed to send WriteFile command".into()))?;
+
+        let response = response_rx
+            .await
+            .map_err(|_| Error::Guest("Failed to receive WriteFile response".into()))??;
+
+        if response.success {
+            Ok(())
+        } else {
+            Err(Error::Guest(format!(
+                "Failed to write file: {}",
+                response.error.unwrap_or_default()
+            )))
+        }
+    }
+
+    /// Create directories in the guest filesystem (mkdir -p).
+    pub async fn mkdir_p(&self, path: &str) -> Result<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::VmNotRunning);
+        }
+
+        let request = MkdirPRequest {
+            path: path.to_string(),
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(VmCommand::MkdirP {
+                request,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Error::Guest("Failed to send MkdirP command".into()))?;
+
+        let response = response_rx
+            .await
+            .map_err(|_| Error::Guest("Failed to receive MkdirP response".into()))??;
+
+        if response.success {
+            Ok(())
+        } else {
+            Err(Error::Guest(format!(
+                "Failed to create directory: {}",
+                response.error.unwrap_or_default()
+            )))
+        }
     }
 
     /// Start a telemetry subscription from the guest.

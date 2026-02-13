@@ -98,6 +98,14 @@ pub enum MessageType {
     TelemetryAck = 9,
     /// Subscribe to telemetry stream
     SubscribeTelemetry = 10,
+    /// Write a file to the guest filesystem (native, no shell required)
+    WriteFile = 11,
+    /// Response to WriteFile
+    WriteFileResponse = 12,
+    /// Create directories (mkdir -p) in the guest filesystem
+    MkdirP = 13,
+    /// Response to MkdirP
+    MkdirPResponse = 14,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -115,6 +123,10 @@ impl TryFrom<u8> for MessageType {
             8 => Ok(MessageType::TelemetryData),
             9 => Ok(MessageType::TelemetryAck),
             10 => Ok(MessageType::SubscribeTelemetry),
+            11 => Ok(MessageType::WriteFile),
+            12 => Ok(MessageType::WriteFileResponse),
+            13 => Ok(MessageType::MkdirP),
+            14 => Ok(MessageType::MkdirPResponse),
             _ => Err(ProtocolError::UnknownMessageType(byte)),
         }
     }
@@ -244,6 +256,54 @@ impl ExecResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Data types: File operations (native, no shell required)
+// ---------------------------------------------------------------------------
+
+/// Request to write a file in the guest filesystem.
+///
+/// The guest-agent handles this directly (no shell/base64 needed).
+/// Parent directories are created automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileRequest {
+    /// Absolute path in the guest filesystem.
+    pub path: String,
+    /// File content (binary-safe via serde).
+    pub content: Vec<u8>,
+    /// If true, create parent directories automatically.
+    #[serde(default = "default_true")]
+    pub create_parents: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Response to a WriteFile request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileResponse {
+    /// Whether the write succeeded.
+    pub success: bool,
+    /// Error message if the write failed.
+    pub error: Option<String>,
+}
+
+/// Request to create directories in the guest filesystem (mkdir -p).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MkdirPRequest {
+    /// Absolute path to create.
+    pub path: String,
+}
+
+/// Response to a MkdirP request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MkdirPResponse {
+    /// Whether the mkdir succeeded.
+    pub success: bool,
+    /// Error message if the mkdir failed.
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Data types: Telemetry
 // ---------------------------------------------------------------------------
 
@@ -349,7 +409,7 @@ mod tests {
     #[test]
     fn message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
-        assert!(MessageType::try_from(11).is_err());
+        assert!(MessageType::try_from(15).is_err());
         assert!(MessageType::try_from(255).is_err());
     }
 

@@ -176,6 +176,38 @@ impl LocalSandbox {
         }
     }
 
+    /// Write a file to the guest filesystem using the native WriteFile protocol.
+    ///
+    /// This bypasses shell/base64 by sending a WriteFile message directly to
+    /// the guest-agent. Parent directories are created automatically.
+    /// In simulation mode (no kernel), this is a no-op success.
+    pub async fn write_file_native(&self, path: &str, content: &[u8]) -> Result<()> {
+        if self.config.kernel.is_none() {
+            // Simulation mode -- no-op
+            return Ok(());
+        }
+
+        self.ensure_started().await?;
+
+        let vm_lock = self.vm.lock().await;
+        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        vm.write_file(path, content).await
+    }
+
+    /// Create directories in the guest filesystem (mkdir -p).
+    /// In simulation mode (no kernel), this is a no-op success.
+    pub async fn mkdir_p(&self, path: &str) -> Result<()> {
+        if self.config.kernel.is_none() {
+            return Ok(());
+        }
+
+        self.ensure_started().await?;
+
+        let vm_lock = self.vm.lock().await;
+        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        vm.mkdir_p(path).await
+    }
+
     /// Internal helper for `exec_claude` -- runs claude-code with extra env.
     pub(crate) async fn exec_claude_internal(
         &self,

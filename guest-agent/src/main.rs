@@ -16,6 +16,8 @@ use serde::Serialize;
 use void_box_protocol::{
     ExecRequest, ExecResponse, MessageType,
     TelemetryBatch, SystemMetrics, ProcessMetrics,
+    WriteFileRequest, WriteFileResponse,
+    MkdirPRequest, MkdirPResponse,
 };
 
 /// vsock port we listen on
@@ -432,6 +434,20 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 telemetry_stream_loop(fd);
                 return Ok(());
             }
+            11 => {
+                // WriteFile - native file write (no shell/base64 needed)
+                let request: WriteFileRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse WriteFileRequest: {}", e))?;
+                let response = handle_write_file(&request);
+                send_response(fd, MessageType::WriteFileResponse, &response)?;
+            }
+            13 => {
+                // MkdirP - create directories
+                let request: MkdirPRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse MkdirPRequest: {}", e))?;
+                let response = handle_mkdir_p(&request);
+                send_response(fd, MessageType::MkdirPResponse, &response)?;
+            }
             _ => {
                 eprintln!("Unknown message type: {}", msg_type);
             }
@@ -584,6 +600,94 @@ fn send_response<T: Serialize>(fd: RawFd, msg_type: MessageType, payload: &T) ->
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Native file operations (no shell/base64 required)
+// ---------------------------------------------------------------------------
+
+/// Handle a WriteFile request: write content directly to the guest filesystem.
+/// Runs as root (no privilege drop) since this is host-initiated provisioning.
+/// After writing, the file and its parent directories are chowned to uid 1000
+/// so the sandbox user can read them (e.g., when claudio runs as uid 1000).
+fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
+    // Create parent directories if requested
+    if request.create_parents {
+        if let Some(parent) = std::path::Path::new(&request.path).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return WriteFileResponse {
+                    success: false,
+                    error: Some(format!("Failed to create parent dirs {}: {}", parent.display(), e)),
+                };
+            }
+            // Make parent directories readable by sandbox user (uid 1000)
+            chown_recursive(parent);
+        }
+    }
+
+    // Write the file content
+    match std::fs::write(&request.path, &request.content) {
+        Ok(()) => {
+            // Make the file readable by sandbox user (uid 1000)
+            let c_path = std::ffi::CString::new(request.path.as_str()).unwrap_or_default();
+            unsafe {
+                libc::chown(c_path.as_ptr(), 1000, 1000);
+                // Ensure file is world-readable
+                libc::chmod(c_path.as_ptr(), 0o644);
+            }
+            kmsg(&format!("Wrote {} bytes to {}", request.content.len(), request.path));
+            WriteFileResponse {
+                success: true,
+                error: None,
+            }
+        }
+        Err(e) => WriteFileResponse {
+            success: false,
+            error: Some(format!("Failed to write {}: {}", request.path, e)),
+        },
+    }
+}
+
+/// Recursively chown a path and its parents to uid 1000:1000.
+/// Only affects directories that are owned by root.
+fn chown_recursive(path: &std::path::Path) {
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(c_path) = std::ffi::CString::new(current.to_string_lossy().as_ref()) {
+            unsafe {
+                libc::chown(c_path.as_ptr(), 1000, 1000);
+                // Ensure directory is traversable
+                libc::chmod(c_path.as_ptr(), 0o755);
+            }
+        }
+        match current.parent() {
+            Some(p) if p != current && p.to_string_lossy() != "/" => {
+                current = p.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Handle a MkdirP request: create directories recursively.
+/// Runs as root (no privilege drop) since this is host-initiated provisioning.
+/// After creating, directories are chowned to uid 1000 so the sandbox user
+/// can access them.
+fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
+    match std::fs::create_dir_all(&request.path) {
+        Ok(()) => {
+            chown_recursive(std::path::Path::new(&request.path));
+            kmsg(&format!("Created directory {}", request.path));
+            MkdirPResponse {
+                success: true,
+                error: None,
+            }
+        }
+        Err(e) => MkdirPResponse {
+            success: false,
+            error: Some(format!("Failed to create directory {}: {}", request.path, e)),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

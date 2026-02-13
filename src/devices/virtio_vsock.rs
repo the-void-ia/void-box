@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crate::guest::protocol::{ExecRequest, ExecResponse, Message, MessageType, TelemetryBatch};
+use crate::guest::protocol::{
+    ExecRequest, ExecResponse, Message, MessageType, TelemetryBatch,
+    WriteFileRequest, WriteFileResponse,
+    MkdirPRequest, MkdirPResponse,
+};
 use crate::{Error, Result};
 
 
@@ -159,6 +163,135 @@ impl VsockDevice {
         info!("vsock: ExecResponse received exit_code={}", response.exit_code);
 
         Ok(response)
+    }
+
+    /// Write a file to the guest filesystem using the native WriteFile protocol.
+    ///
+    /// This sends a WriteFile message directly to the guest-agent, which writes
+    /// the file in Rust without needing `sh`, `echo`, or `base64`. Parent
+    /// directories are created automatically. The write runs as root in the
+    /// guest (appropriate for host-initiated provisioning like skill files).
+    pub async fn send_write_file(&self, path: &str, content: &[u8]) -> Result<WriteFileResponse> {
+        let request = WriteFileRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            create_parents: true,
+        };
+
+        let mut stream = self.connect_with_handshake().await?;
+
+        // Set generous read timeout
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+
+        let message = Message {
+            msg_type: MessageType::WriteFile,
+            payload: serde_json::to_vec(&request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send WriteFile: {}", e)))?;
+
+        let response_msg = Message::read_from_sync(&mut stream)?;
+        if response_msg.msg_type != MessageType::WriteFileResponse {
+            return Err(Error::Guest(format!(
+                "Unexpected response type for WriteFile: {:?}",
+                response_msg.msg_type
+            )));
+        }
+
+        let response: WriteFileResponse = serde_json::from_slice(&response_msg.payload)?;
+        Ok(response)
+    }
+
+    /// Create directories in the guest filesystem (mkdir -p).
+    pub async fn send_mkdir_p(&self, path: &str) -> Result<MkdirPResponse> {
+        let request = MkdirPRequest {
+            path: path.to_string(),
+        };
+
+        let mut stream = self.connect_with_handshake().await?;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+
+        let message = Message {
+            msg_type: MessageType::MkdirP,
+            payload: serde_json::to_vec(&request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send MkdirP: {}", e)))?;
+
+        let response_msg = Message::read_from_sync(&mut stream)?;
+        if response_msg.msg_type != MessageType::MkdirPResponse {
+            return Err(Error::Guest(format!(
+                "Unexpected response type for MkdirP: {:?}",
+                response_msg.msg_type
+            )));
+        }
+
+        let response: MkdirPResponse = serde_json::from_slice(&response_msg.payload)?;
+        Ok(response)
+    }
+
+    /// Connect to the guest agent and perform a Ping/Pong handshake.
+    /// Shared helper for send_write_file, send_mkdir_p, etc.
+    async fn connect_with_handshake(&self) -> Result<VsockStream> {
+        // Short initial wait for guest kernel to boot
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut delay = Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+        let mut attempt: u32 = 0;
+
+        loop {
+            if Instant::now() >= deadline {
+                eprintln!("[vsock] deadline reached after {} connect/handshake attempts", attempt);
+                return Err(Error::Guest(
+                    "vsock: deadline reached (connect or handshake)".into(),
+                ));
+            }
+
+            attempt += 1;
+
+            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
+                Ok(stream) => {
+                    eprintln!("[vsock] attempt {} connect OK (cid={}, port={})", attempt, self.cid, GUEST_AGENT_PORT);
+                    stream
+                }
+                Err(e) => {
+                    eprintln!("[vsock] attempt {} connect failed: {} (retry in {:?})", attempt, e, delay);
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            // Handshake: Ping -> Pong
+            if let Err(_e) = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                continue;
+            }
+            let ping_msg = Message {
+                msg_type: MessageType::Ping,
+                payload: vec![],
+            };
+            if s.write_all(&ping_msg.serialize()).is_err() {
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                continue;
+            }
+            match Message::read_from_sync(&mut s) {
+                Ok(msg) if msg.msg_type == MessageType::Pong => {
+                    return Ok(s);
+                }
+                _ => {
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                }
+            }
+        }
     }
 
     /// Open a persistent telemetry subscription to the guest agent.

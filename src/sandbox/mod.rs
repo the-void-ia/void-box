@@ -138,15 +138,26 @@ impl Sandbox {
         }
     }
 
-    /// Write a file in the sandbox
+    /// Write a file in the sandbox using the native WriteFile protocol.
+    ///
+    /// This sends the file content directly to the guest-agent via vsock,
+    /// which writes it in Rust without needing `sh`, `echo`, or `base64`.
+    /// Parent directories are created automatically.
     pub async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
-        // Use base64 encoding to handle binary data safely
-        let encoded = base64_encode(content);
-        let output = self.exec("sh", &["-c", &format!("echo -n '{}' | base64 -d > {}", encoded, path)]).await?;
-        if output.success() {
-            Ok(())
-        } else {
-            Err(Error::Guest(format!("Failed to write file: {}", output.stderr_str())))
+        match &self.inner {
+            SandboxInner::Local(local) => local.write_file_native(path, content).await,
+            SandboxInner::Mock(_mock) => {
+                // Mock: no-op success
+                Ok(())
+            }
+        }
+    }
+
+    /// Create directories in the guest filesystem (mkdir -p).
+    pub async fn mkdir_p(&self, path: &str) -> Result<()> {
+        match &self.inner {
+            SandboxInner::Local(local) => local.mkdir_p(path).await,
+            SandboxInner::Mock(_mock) => Ok(()),
         }
     }
 
@@ -465,7 +476,8 @@ impl MockSandbox {
     }
 }
 
-/// Simple base64 encoding (for write_file)
+/// Simple base64 encoding (kept for potential future use).
+#[allow(dead_code)]
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
