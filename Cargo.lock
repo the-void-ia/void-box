@@ -165,6 +165,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "void-box-protocol",
 ]
 
 [[package]]
@@ -896,6 +897,15 @@ dependencies = [
  "vm-memory 0.17.1",
  "vm-superio",
  "vmm-sys-util 0.12.1",
+ "void-box-protocol",
+]
+
+[[package]]
+name = "void-box-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

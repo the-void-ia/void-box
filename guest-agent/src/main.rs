@@ -6,52 +6,44 @@
 //! - File transfers
 //! - Process management
 
-use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::io::Write;
+use std::os::unix::io::RawFd;
 use std::process::{Command, Stdio};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+
+// Import shared wire-format types from the protocol crate (single source of truth).
+use void_box_protocol::{
+    ExecRequest, ExecResponse, MessageType,
+    TelemetryBatch, SystemMetrics, ProcessMetrics,
+};
 
 /// vsock port we listen on
 const LISTEN_PORT: u32 = 1234;
 
 /// Host CID
+#[allow(dead_code)]
 const HOST_CID: u32 = 2;
 
-/// Message types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum MessageType {
-    ExecRequest = 1,
-    ExecResponse = 2,
-    Ping = 3,
-    Pong = 4,
-    Shutdown = 5,
-    FileTransfer = 6,
-    FileTransferResponse = 7,
+/// CPU jiffies snapshot from /proc/stat
+struct CpuJiffies {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
 }
 
-/// Request to execute a command
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecRequest {
-    pub program: String,
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub stdin: Vec<u8>,
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-    pub working_dir: Option<String>,
-    pub timeout_secs: Option<u64>,
-}
+impl CpuJiffies {
+    fn total(&self) -> u64 {
+        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq
+    }
 
-/// Response from command execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResponse {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    pub error: Option<String>,
-    pub duration_ms: Option<u64>,
+    fn idle_total(&self) -> u64 {
+        self.idle + self.iowait
+    }
 }
 
 /// Write a message to /dev/kmsg so it appears on the kernel serial console
@@ -108,19 +100,24 @@ fn main() {
 
     kmsg(&format!("Listening on vsock port {}", LISTEN_PORT));
 
-    // Accept connections and handle requests
+    // Accept connections and handle requests (multi-threaded for concurrent telemetry + exec)
     loop {
         let client_fd = unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if client_fd < 0 {
             eprintln!("Accept failed");
             continue;
         }
-
-        if let Err(e) = handle_connection(client_fd) {
-            eprintln!("Connection error: {}", e);
+        if let Err(e) = std::thread::Builder::new()
+            .name("conn".into())
+            .spawn(move || {
+                if let Err(e) = handle_connection(client_fd) {
+                    eprintln!("Connection error: {}", e);
+                }
+                unsafe { libc::close(client_fd); }
+            })
+        {
+            eprintln!("Failed to spawn connection thread: {}", e);
         }
-
-        unsafe { libc::close(client_fd); }
     }
 }
 
@@ -429,6 +426,12 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32); }
                 return Ok(());
             }
+            10 => {
+                // SubscribeTelemetry - enter streaming mode
+                kmsg("Telemetry subscription started");
+                telemetry_stream_loop(fd);
+                return Ok(());
+            }
             _ => {
                 eprintln!("Unknown message type: {}", msg_type);
             }
@@ -581,4 +584,250 @@ fn send_response<T: Serialize>(fd: RawFd, msg_type: MessageType, payload: &T) ->
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry: procfs parsing and streaming
+// ---------------------------------------------------------------------------
+
+/// Stream telemetry data to the host until the connection drops.
+fn telemetry_stream_loop(fd: RawFd) {
+    let mut seq: u64 = 0;
+    let mut prev_cpu = read_cpu_jiffies();
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let curr_cpu = read_cpu_jiffies();
+        let cpu_percent = compute_cpu_percent(&prev_cpu, &curr_cpu);
+        prev_cpu = curr_cpu;
+
+        let (memory_used_bytes, memory_total_bytes) = read_meminfo();
+        let (net_rx_bytes, net_tx_bytes) = read_netdev();
+        let procs_running = read_procs_running();
+        let open_fds = read_open_fds();
+        let processes = collect_process_metrics();
+
+        let batch = TelemetryBatch {
+            seq,
+            timestamp_ms: unix_millis(),
+            system: Some(SystemMetrics {
+                cpu_percent,
+                memory_used_bytes,
+                memory_total_bytes,
+                net_rx_bytes,
+                net_tx_bytes,
+                procs_running,
+                open_fds,
+            }),
+            processes,
+            trace_context: None,
+        };
+
+        if send_response(fd, MessageType::TelemetryData, &batch).is_err() {
+            kmsg("Telemetry subscription ended (write error)");
+            return;
+        }
+
+        seq += 1;
+    }
+}
+
+/// Read aggregate CPU jiffies from the first line of /proc/stat.
+fn read_cpu_jiffies() -> CpuJiffies {
+    let default = CpuJiffies { user: 0, nice: 0, system: 0, idle: 0, iowait: 0, irq: 0, softirq: 0 };
+    let content = match std::fs::read_to_string("/proc/stat") {
+        Ok(c) => c,
+        Err(_) => return default,
+    };
+    // First line: "cpu  user nice system idle iowait irq softirq ..."
+    let line = match content.lines().next() {
+        Some(l) => l,
+        None => return default,
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 8 || fields[0] != "cpu" {
+        return default;
+    }
+    let parse = |i: usize| fields.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    CpuJiffies {
+        user: parse(1),
+        nice: parse(2),
+        system: parse(3),
+        idle: parse(4),
+        iowait: parse(5),
+        irq: parse(6),
+        softirq: parse(7),
+    }
+}
+
+/// Compute CPU usage percentage from two jiffies snapshots.
+fn compute_cpu_percent(prev: &CpuJiffies, curr: &CpuJiffies) -> f64 {
+    let total_delta = curr.total().saturating_sub(prev.total());
+    if total_delta == 0 {
+        return 0.0;
+    }
+    let idle_delta = curr.idle_total().saturating_sub(prev.idle_total());
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+    (busy_delta as f64 / total_delta as f64) * 100.0
+}
+
+/// Read memory info from /proc/meminfo. Returns (used_bytes, total_bytes).
+fn read_meminfo() -> (u64, u64) {
+    let content = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(c) => c,
+        Err(_) => return (0, 0),
+    };
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_available_kb: u64 = 0;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            mem_total_kb = parse_meminfo_value(rest);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            mem_available_kb = parse_meminfo_value(rest);
+        }
+    }
+    let total = mem_total_kb * 1024;
+    let used = total.saturating_sub(mem_available_kb * 1024);
+    (used, total)
+}
+
+/// Parse a /proc/meminfo value line like "    12345 kB" -> 12345
+fn parse_meminfo_value(s: &str) -> u64 {
+    s.split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Read network device stats from /proc/net/dev for eth0. Returns (rx_bytes, tx_bytes).
+fn read_netdev() -> (u64, u64) {
+    let content = match std::fs::read_to_string("/proc/net/dev") {
+        Ok(c) => c,
+        Err(_) => return (0, 0),
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("eth0:") {
+            let after_colon = &trimmed["eth0:".len()..];
+            let fields: Vec<&str> = after_colon.split_whitespace().collect();
+            let rx = fields.first().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            // tx_bytes is the 9th field (index 8) after the colon
+            let tx = fields.get(8).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            return (rx, tx);
+        }
+    }
+    (0, 0)
+}
+
+/// Read number of running processes from /proc/stat.
+fn read_procs_running() -> u32 {
+    let content = match std::fs::read_to_string("/proc/stat") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("procs_running ") {
+            return rest.trim().parse::<u32>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Read number of allocated file descriptors from /proc/sys/fs/file-nr.
+fn read_open_fds() -> u32 {
+    let content = match std::fs::read_to_string("/proc/sys/fs/file-nr") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    // Format: "allocated_fds  free_fds  max_fds"
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Collect per-process metrics by scanning /proc/[0-9]*/.
+fn collect_process_metrics() -> Vec<ProcessMetrics> {
+    let mut processes = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return processes,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only numeric directories (PIDs)
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let base = format!("/proc/{}", pid);
+
+        // Read comm
+        let comm = std::fs::read_to_string(format!("{}/comm", base))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if comm.is_empty() {
+            continue;
+        }
+
+        // Read RSS from statm (second field, in pages)
+        let rss_bytes = std::fs::read_to_string(format!("{}/statm", base))
+            .ok()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            * 4096; // page size
+
+        // Read state and cpu jiffies from stat
+        let (state, cpu_jiffies) = read_proc_stat_fields(&base);
+
+        processes.push(ProcessMetrics {
+            pid,
+            comm,
+            rss_bytes,
+            cpu_jiffies,
+            state,
+        });
+    }
+
+    processes
+}
+
+/// Read process state and CPU jiffies (utime + stime) from /proc/PID/stat.
+fn read_proc_stat_fields(base: &str) -> (char, u64) {
+    let content = match std::fs::read_to_string(format!("{}/stat", base)) {
+        Ok(c) => c,
+        Err(_) => return ('?', 0),
+    };
+    // /proc/PID/stat format: pid (comm) state ... utime(14) stime(15) ...
+    // Find the closing ')' to skip the comm field (which may contain spaces/parens)
+    let after_comm = match content.rfind(')') {
+        Some(pos) => &content[pos + 1..],
+        None => return ('?', 0),
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // fields[0] = state, fields[11] = utime, fields[12] = stime
+    let state = fields.first()
+        .and_then(|s| s.chars().next())
+        .unwrap_or('?');
+    let utime = fields.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let stime = fields.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    (state, utime + stime)
+}
+
+/// Get current time as Unix milliseconds.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crate::guest::protocol::{ExecRequest, ExecResponse, Message, MessageType};
+use crate::guest::protocol::{ExecRequest, ExecResponse, Message, MessageType, TelemetryBatch};
 use crate::{Error, Result};
 
 
@@ -159,6 +159,97 @@ impl VsockDevice {
         info!("vsock: ExecResponse received exit_code={}", response.exit_code);
 
         Ok(response)
+    }
+
+    /// Open a persistent telemetry subscription to the guest agent.
+    ///
+    /// Connects to the guest, performs a Ping/Pong handshake, sends a
+    /// SubscribeTelemetry message, then reads TelemetryData messages in a
+    /// loop, calling `on_batch` for each one. Returns when the connection drops.
+    pub async fn subscribe_telemetry<F>(&self, mut on_batch: F) -> Result<()>
+    where
+        F: FnMut(TelemetryBatch) + Send + 'static,
+    {
+        // Wait for guest boot (shorter than exec since the VM is already up by now)
+        let mut delay = Duration::from_millis(500);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let mut stream = loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Guest(
+                    "Telemetry subscription: deadline reached connecting to guest".into(),
+                ));
+            }
+
+            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
+                Ok(s) => s,
+                Err(_) => {
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            // Handshake: Ping -> Pong
+            if s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            let ping_msg = Message {
+                msg_type: MessageType::Ping,
+                payload: vec![],
+            };
+            if s.write_all(&ping_msg.serialize()).is_err() {
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            match Message::read_from_sync(&mut s) {
+                Ok(msg) if msg.msg_type == MessageType::Pong => break s,
+                _ => {
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                    continue;
+                }
+            }
+        };
+
+        // Send SubscribeTelemetry
+        let sub_msg = Message {
+            msg_type: MessageType::SubscribeTelemetry,
+            payload: vec![],
+        };
+        stream
+            .write_all(&sub_msg.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send SubscribeTelemetry: {}", e)))?;
+
+        info!("Telemetry subscription active (cid={})", self.cid);
+
+        // Clear read timeout - telemetry messages come every 2s
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+
+        // Read TelemetryData messages in a loop
+        loop {
+            let msg = match Message::read_from_sync(&mut stream) {
+                Ok(m) => m,
+                Err(e) => {
+                    info!("Telemetry subscription ended: {}", e);
+                    return Ok(());
+                }
+            };
+
+            if msg.msg_type != MessageType::TelemetryData {
+                warn!("Unexpected message type in telemetry stream: {:?}", msg.msg_type);
+                continue;
+            }
+
+            match serde_json::from_slice::<TelemetryBatch>(&msg.payload) {
+                Ok(batch) => on_batch(batch),
+                Err(e) => {
+                    warn!("Failed to parse TelemetryBatch: {}", e);
+                }
+            }
+        }
     }
 
     /// Connect to a port on the guest

@@ -9,9 +9,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 nix = { version = "0.29", features = ["fs", "mount", "process", "socket"] }
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
+void-box-protocol = { path = "../void-box-protocol" }

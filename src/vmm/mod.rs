@@ -27,6 +27,8 @@ use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::vmm::cpu::MmioDevices;
 use crate::guest::protocol::{ExecRequest, ExecResponse};
 use crate::network::slirp::SlirpStack;
+use crate::observe::telemetry::TelemetryAggregator;
+use crate::observe::Observer;
 use crate::{Error, ExecOutput, Result};
 
 use self::config::VoidBoxConfig;
@@ -58,6 +60,8 @@ pub struct VoidBox {
     event_loop_handle: Option<JoinHandle<()>>,
     /// Handle to the vsock IRQ handler thread (if vsock enabled)
     vsock_irq_handle: Option<JoinHandle<()>>,
+    /// Guest telemetry aggregator (if telemetry is active)
+    telemetry: Option<Arc<TelemetryAggregator>>,
 }
 
 /// Commands that can be sent to the VM event loop
@@ -66,6 +70,10 @@ enum VmCommand {
     Exec {
         request: ExecRequest,
         response_tx: oneshot::Sender<Result<ExecResponse>>,
+    },
+    /// Start a telemetry subscription
+    SubscribeTelemetry {
+        aggregator: Arc<TelemetryAggregator>,
     },
     /// Stop the VM
     Stop,
@@ -230,6 +238,19 @@ impl VoidBox {
                                     };
                                     let _ = response_tx.send(result);
                                 }
+                                VmCommand::SubscribeTelemetry { aggregator } => {
+                                    if let Some(ref vsock) = vsock_clone {
+                                        let vsock = vsock.clone();
+                                        let agg = aggregator.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = vsock.subscribe_telemetry(move |batch| {
+                                                agg.ingest(&batch);
+                                            }).await {
+                                                tracing::warn!("Telemetry subscription ended: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
                                 VmCommand::Stop => {
                                     running_clone.store(false, Ordering::SeqCst);
                                     break;
@@ -257,6 +278,7 @@ impl VoidBox {
             command_tx,
             event_loop_handle: Some(event_loop_handle),
             vsock_irq_handle,
+            telemetry: None,
         })
     }
 
@@ -317,6 +339,31 @@ impl VoidBox {
             response.stderr,
             response.exit_code,
         ))
+    }
+
+    /// Start a telemetry subscription from the guest.
+    ///
+    /// Creates a `TelemetryAggregator` that feeds guest metrics into the
+    /// provided `Observer`. The subscription runs in the background until
+    /// the VM stops or the guest connection drops.
+    pub async fn start_telemetry(&mut self, observer: Observer) -> Result<Arc<TelemetryAggregator>> {
+        let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
+        self.telemetry = Some(aggregator.clone());
+
+        self.command_tx
+            .send(VmCommand::SubscribeTelemetry {
+                aggregator: aggregator.clone(),
+            })
+            .await
+            .map_err(|_| Error::Guest("Failed to send telemetry subscribe command".into()))?;
+
+        info!("Telemetry subscription requested for CID {}", self.cid);
+        Ok(aggregator)
+    }
+
+    /// Get the telemetry aggregator, if telemetry has been started.
+    pub fn telemetry(&self) -> Option<&Arc<TelemetryAggregator>> {
+        self.telemetry.as_ref()
     }
 
     /// Get the vsock CID for this VM

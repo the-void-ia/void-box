@@ -79,4 +79,8 @@ pub enum Error {
     /// Observability errors
     #[error("Observability error: {0}")]
     Observe(String),
+
+    /// Protocol wire-format errors
+    #[error("Protocol error: {0}")]
+    Protocol(#[from] void_box_protocol::ProtocolError),
 }

@@ -5,4 +5,8 @@
 
 pub mod protocol;
 
-pub use protocol::{ExecRequest, ExecResponse, Message, MessageType};
+pub use protocol::{
+    ExecRequest, ExecResponse, Message, MessageType,
+    TelemetryBatch, SystemMetrics, ProcessMetrics,
+    read_message_async,
+};
