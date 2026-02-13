@@ -1,0 +1,8 @@
+[package]
+name = "claudio"
+version = "0.1.0"
+edition = "2021"
+description = "Claudio: configurable mock of claude-code CLI for void-box testing and playground"
+
+[dependencies]
+serde_json = "1"

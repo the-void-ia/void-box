@@ -59,14 +59,13 @@ impl VsockDevice {
     /// before sending the first request. This confirms the guest agent is ready
     /// and avoids sending ExecRequest before the guest is in the read loop.
     pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
-        // Give guest time to boot and virtio-vsock to be probed (vhost SET_OWNER after guest probe)
-        eprintln!("[vsock] waiting 15s for guest boot, then connect+handshake (max 40s)");
-        info!("vsock: waiting 15s for guest boot, then connect+handshake (max 40s)");
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Short initial wait for guest kernel to boot and virtio-vsock to be probed.
+        // The kernel typically boots in ~1.5s; the retry loop handles any remaining lag.
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let mut delay = Duration::from_millis(200);
-        let deadline = Instant::now() + Duration::from_secs(40);
-        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut delay = Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
         let mut attempt: u32 = 0;
 
         let mut stream = loop {
@@ -130,8 +129,9 @@ impl VsockDevice {
             delay = std::cmp::min(delay * 2, Duration::from_secs(2));
         };
 
-        // Clear read timeout so ExecResponse can take as long as needed
-        let _ = stream.set_read_timeout(None);
+        // Set a generous read timeout for the response (commands should finish
+        // within 60s; prevents hanging forever if the guest gets stuck).
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
 
         // Serialize and send request
         let message = Message {
