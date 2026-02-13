@@ -21,8 +21,10 @@
 //! // Traces, metrics, and logs are automatically captured during workflow execution
 //! ```
 
+pub mod claude;
 pub mod logs;
 pub mod metrics;
+pub mod otlp;
 pub mod telemetry;
 pub mod tracer;
 
@@ -64,6 +66,21 @@ impl ObserveConfig {
     /// Create a new observability configuration with defaults
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an observability configuration from environment variables.
+    ///
+    /// Reads `VOIDBOX_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`),
+    /// `VOIDBOX_SERVICE_NAME`, `VOIDBOX_OTLP_HEADERS`, and `VOIDBOX_OTEL_DEBUG`.
+    /// If an endpoint is found, configures the tracer for OTLP export.
+    pub fn from_env() -> Self {
+        let otlp = otlp::OtlpConfig::from_env();
+        let mut config = Self::default();
+        if let Some(ref endpoint) = otlp.endpoint {
+            config.tracer.otlp_endpoint = Some(endpoint.clone());
+            config.tracer.service_name = otlp.service_name.clone();
+        }
+        config
     }
 
     /// Configure for testing (in-memory collectors)

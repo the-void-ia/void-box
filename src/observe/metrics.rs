@@ -239,10 +239,13 @@ impl MetricsSnapshot {
     }
 }
 
-/// Metrics collector
+/// Metrics collector -- stores metrics in-memory and optionally exports via OTel.
 pub struct MetricsCollector {
     config: MetricsConfig,
     metrics: Mutex<HashMap<String, Metric>>,
+    /// OTel meter for OTLP export (feature-gated).
+    #[cfg(feature = "opentelemetry")]
+    otel_meter: Option<opentelemetry::metrics::Meter>,
 }
 
 impl MetricsCollector {
@@ -251,6 +254,18 @@ impl MetricsCollector {
         Self {
             config,
             metrics: Mutex::new(HashMap::new()),
+            #[cfg(feature = "opentelemetry")]
+            otel_meter: None,
+        }
+    }
+
+    /// Create a metrics collector with an OTel Meter for OTLP export.
+    #[cfg(feature = "opentelemetry")]
+    pub fn with_otel_meter(config: MetricsConfig, meter: opentelemetry::metrics::Meter) -> Self {
+        Self {
+            config,
+            metrics: Mutex::new(HashMap::new()),
+            otel_meter: Some(meter),
         }
     }
 
@@ -265,7 +280,7 @@ impl MetricsCollector {
 
         let mut metrics = self.metrics.lock().unwrap();
         let metric = metrics.entry(metric_name.clone()).or_insert_with(|| Metric {
-            name: metric_name,
+            name: metric_name.clone(),
             help: format!("Duration of {} in milliseconds", name),
             value: MetricValue::Histogram(HistogramValue::with_buckets(&[
                 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
@@ -275,6 +290,13 @@ impl MetricsCollector {
 
         if let MetricValue::Histogram(h) = &mut metric.value {
             h.observe(duration_ms);
+        }
+
+        // Also record via OTel histogram
+        #[cfg(feature = "opentelemetry")]
+        if let Some(ref meter) = self.otel_meter {
+            let histogram = meter.f64_histogram(metric_name).build();
+            histogram.record(duration_ms, &[]);
         }
     }
 
@@ -307,6 +329,18 @@ impl MetricsCollector {
         if let MetricValue::Counter(v) = &mut metric.value {
             *v += value;
         }
+
+        // Also record via OTel counter
+        #[cfg(feature = "opentelemetry")]
+        if let Some(ref meter) = self.otel_meter {
+            use opentelemetry::KeyValue;
+            let counter = meter.f64_counter(name.to_string()).build();
+            let otel_labels: Vec<KeyValue> = labels
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                .collect();
+            counter.add(value, &otel_labels);
+        }
     }
 
     /// Set a gauge value
@@ -332,6 +366,18 @@ impl MetricsCollector {
 
         if let MetricValue::Gauge(v) = &mut metric.value {
             *v = value;
+        }
+
+        // Also record via OTel gauge
+        #[cfg(feature = "opentelemetry")]
+        if let Some(ref meter) = self.otel_meter {
+            use opentelemetry::KeyValue;
+            let gauge = meter.f64_gauge(name.to_string()).build();
+            let otel_labels: Vec<KeyValue> = labels
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                .collect();
+            gauge.record(value, &otel_labels);
         }
     }
 

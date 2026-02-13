@@ -62,6 +62,9 @@ pub struct VoidBox {
     vsock_irq_handle: Option<JoinHandle<()>>,
     /// Guest telemetry aggregator (if telemetry is active)
     telemetry: Option<Arc<TelemetryAggregator>>,
+    /// Active span context for trace propagation into the guest.
+    /// When set, `exec_with_env` will inject a `TRACEPARENT` env var.
+    active_span_context: Option<crate::observe::tracer::SpanContext>,
 }
 
 /// Commands that can be sent to the VM event loop
@@ -279,6 +282,7 @@ impl VoidBox {
             event_loop_handle: Some(event_loop_handle),
             vsock_irq_handle,
             telemetry: None,
+            active_span_context: None,
         })
     }
 
@@ -299,6 +303,10 @@ impl VoidBox {
 
     /// Execute a command in the guest VM with stdin, environment, and working directory.
     /// Use this to pass e.g. ANTHROPIC_API_KEY or project-specific env into the guest.
+    ///
+    /// When the `opentelemetry` feature is enabled and there is an active trace context,
+    /// a `TRACEPARENT` environment variable is automatically injected so that the guest
+    /// process can participate in the distributed trace.
     pub async fn exec_with_env(
         &self,
         program: &str,
@@ -311,11 +319,20 @@ impl VoidBox {
             return Err(Error::VmNotRunning);
         }
 
+        // Build env with optional TRACEPARENT injection
+        let mut exec_env = env.to_vec();
+        if let Some(ref ctx) = self.active_span_context {
+            // Only inject if not already present
+            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
+                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
+            }
+        }
+
         let request = ExecRequest {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             stdin: stdin.to_vec(),
-            env: env.to_vec(),
+            env: exec_env,
             working_dir: working_dir.map(String::from),
             timeout_secs: None,
         };
@@ -364,6 +381,20 @@ impl VoidBox {
     /// Get the telemetry aggregator, if telemetry has been started.
     pub fn telemetry(&self) -> Option<&Arc<TelemetryAggregator>> {
         self.telemetry.as_ref()
+    }
+
+    /// Set the active span context for TRACEPARENT propagation.
+    ///
+    /// Any subsequent `exec_with_env` calls will inject this context as a
+    /// `TRACEPARENT` environment variable so guest processes participate
+    /// in the distributed trace.
+    pub fn set_span_context(&mut self, ctx: crate::observe::tracer::SpanContext) {
+        self.active_span_context = Some(ctx);
+    }
+
+    /// Clear the active span context.
+    pub fn clear_span_context(&mut self) {
+        self.active_span_context = None;
     }
 
     /// Get the vsock CID for this VM

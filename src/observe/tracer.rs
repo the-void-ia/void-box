@@ -227,14 +227,106 @@ pub struct Tracer {
     config: TracerConfig,
     /// In-memory span storage
     spans: Mutex<Vec<Span>>,
+    /// OTel SDK tracer (when feature enabled and endpoint configured)
+    #[cfg(feature = "opentelemetry")]
+    otel_tracer: Option<OtelBridge>,
+}
+
+/// Bridge to the OTel SDK tracer.
+#[cfg(feature = "opentelemetry")]
+struct OtelBridge {
+    tracer: opentelemetry::global::BoxedTracer,
+}
+
+#[cfg(feature = "opentelemetry")]
+impl OtelBridge {
+    fn export_span(&self, span: &Span) {
+        use opentelemetry::trace::{Tracer as OtelTracer, SpanKind, TraceContextExt};
+        use opentelemetry::{Context, KeyValue};
+
+        // Build parent context if this span has a parent
+        let parent_ctx = if let Some(ref parent_id) = span.context.parent_span_id {
+            // Create a remote parent context from the trace/span IDs
+            let trace_id = opentelemetry::trace::TraceId::from_hex(&span.context.trace_id)
+                .unwrap_or(opentelemetry::trace::TraceId::INVALID);
+            let parent_span_id = opentelemetry::trace::SpanId::from_hex(parent_id)
+                .unwrap_or(opentelemetry::trace::SpanId::INVALID);
+            let span_ctx = opentelemetry::trace::SpanContext::new(
+                trace_id,
+                parent_span_id,
+                opentelemetry::trace::TraceFlags::SAMPLED,
+                true, // remote
+                opentelemetry::trace::TraceState::default(),
+            );
+            Context::new().with_remote_span_context(span_ctx)
+        } else {
+            Context::new()
+        };
+
+        let mut otel_span = self.tracer.build_with_context(
+            opentelemetry::trace::SpanBuilder::from_name(span.name.clone())
+                .with_kind(SpanKind::Internal)
+                .with_start_time(span.start_time)
+                .with_attributes(
+                    span.attributes
+                        .iter()
+                        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+            &parent_ctx,
+        );
+
+        // Set status
+        use opentelemetry::trace::Span as OtelSpanTrait;
+        match &span.status {
+            SpanStatus::Ok => otel_span.set_status(opentelemetry::trace::Status::Ok),
+            SpanStatus::Error(msg) => {
+                otel_span.set_status(opentelemetry::trace::Status::error(msg.clone()));
+            }
+            SpanStatus::Unset => {}
+        }
+
+        // Add events
+        for event in &span.events {
+            let attrs: Vec<KeyValue> = event
+                .attributes
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                .collect();
+            otel_span.add_event_with_timestamp(
+                event.name.clone(),
+                event.timestamp,
+                attrs,
+            );
+        }
+
+        // End the span (with duration if set)
+        if let Some(duration) = span.duration {
+            let end_time = span.start_time + duration;
+            otel_span.end_with_timestamp(end_time);
+        } else {
+            otel_span.end();
+        }
+    }
 }
 
 impl Tracer {
     /// Create a new tracer
     pub fn new(config: TracerConfig) -> Self {
+        #[cfg(feature = "opentelemetry")]
+        let otel_tracer = if config.otlp_endpoint.is_some() {
+            Some(OtelBridge {
+                tracer: opentelemetry::global::tracer(config.service_name.clone()),
+            })
+        } else {
+            None
+        };
+
         Self {
             config,
             spans: Mutex::new(Vec::new()),
+            #[cfg(feature = "opentelemetry")]
+            otel_tracer,
         }
     }
 
@@ -252,6 +344,7 @@ impl Tracer {
     pub fn finish_span(&self, mut span: Span) {
         span.end();
 
+        // Always store in-memory when configured
         if self.config.in_memory {
             let mut spans = self.spans.lock().unwrap();
             if spans.len() >= self.config.max_spans {
@@ -260,10 +353,10 @@ impl Tracer {
             spans.push(span.clone());
         }
 
-        // In a real implementation, this would export to OTLP
-        if let Some(ref _endpoint) = self.config.otlp_endpoint {
-            // Export span to OTLP endpoint
-            // This would use opentelemetry-otlp crate in production
+        // Export to OTel SDK when available
+        #[cfg(feature = "opentelemetry")]
+        if let Some(ref bridge) = self.otel_tracer {
+            bridge.export_span(&span);
         }
     }
 
@@ -286,6 +379,44 @@ impl Tracer {
             .filter(|s| s.name.starts_with(prefix))
             .cloned()
             .collect()
+    }
+}
+
+impl SpanContext {
+    /// Format this context as a W3C Trace Context `traceparent` header value.
+    ///
+    /// Format: `00-{trace_id}-{span_id}-{trace_flags:02x}`
+    ///
+    /// See <https://www.w3.org/TR/trace-context/#traceparent-header>
+    pub fn to_traceparent(&self) -> String {
+        format!(
+            "00-{}-{}-{:02x}",
+            self.trace_id, self.span_id, self.trace_flags
+        )
+    }
+
+    /// Parse a W3C `traceparent` header value into a `SpanContext`.
+    ///
+    /// Returns `None` if the string is malformed.
+    pub fn from_traceparent(value: &str) -> Option<Self> {
+        let parts: Vec<&str> = value.split('-').collect();
+        if parts.len() != 4 || parts[0] != "00" {
+            return None;
+        }
+        let trace_id = parts[1].to_string();
+        let span_id = parts[2].to_string();
+        let trace_flags = u8::from_str_radix(parts[3], 16).ok()?;
+
+        if trace_id.len() != 32 || span_id.len() != 16 {
+            return None;
+        }
+
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            trace_flags,
+        })
     }
 }
 

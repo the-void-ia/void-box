@@ -176,6 +176,26 @@ impl LocalSandbox {
         }
     }
 
+    /// Internal helper for `exec_claude` -- runs claude-code with extra env.
+    pub(crate) async fn exec_claude_internal(
+        &self,
+        args: &[&str],
+        extra_env: &[(String, String)],
+    ) -> Result<ExecOutput> {
+        if self.config.kernel.is_none() {
+            return self.simulate_exec("claude-code", args, &[]);
+        }
+
+        self.ensure_started().await?;
+
+        let vm_lock = self.vm.lock().await;
+        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+
+        let mut env = self.config.env.clone();
+        env.extend(extra_env.iter().cloned());
+        vm.exec_with_env("claude-code", args, &[], &env, None).await
+    }
+
     /// Stop the sandbox
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;

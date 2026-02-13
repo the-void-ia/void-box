@@ -150,6 +150,54 @@ impl Sandbox {
         }
     }
 
+    /// Execute `claude-code` with `--output-format stream-json` and parse the result.
+    ///
+    /// This is a high-level wrapper that:
+    /// 1. Runs `claude-code -p <prompt> --output-format stream-json`
+    /// 2. Parses the JSONL stdout into structured `ClaudeExecResult`
+    /// 3. Returns both the text result and full telemetry (tokens, cost, tool calls)
+    ///
+    /// When the `opentelemetry` feature is enabled, OTel spans are created
+    /// for the execution and each tool call.
+    pub async fn exec_claude(
+        &self,
+        prompt: &str,
+        opts: crate::observe::claude::ClaudeExecOpts,
+    ) -> Result<crate::observe::claude::ClaudeExecResult> {
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+
+        if opts.dangerously_skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        for extra in &opts.extra_args {
+            args.push(extra.clone());
+        }
+
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        // Execute via the normal sandbox path
+        let output = match &self.inner {
+            SandboxInner::Local(local) => {
+                // For local sandbox, pass extra env through
+                local.exec_claude_internal(&args_refs, &opts.env).await?
+            }
+            SandboxInner::Mock(mock) => {
+                mock.exec_with_stdin("claude-code", &args_refs, &[]).await?
+            }
+        };
+
+        // Parse the stream-json output
+        let result = crate::observe::claude::parse_stream_json(&output.stdout);
+
+        Ok(result)
+    }
+
     /// Get sandbox configuration
     pub fn config(&self) -> &SandboxConfig {
         &self.config
