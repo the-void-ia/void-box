@@ -74,10 +74,15 @@ pub mod guest;
 pub mod network;
 pub mod vmm;
 
-// New modules for composable workflows
+// Composable workflows
 pub mod observe;
 pub mod sandbox;
 pub mod workflow;
+
+// Skill + Environment = Box
+pub mod skill;
+pub mod agent_box;
+pub mod pipeline;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
@@ -90,6 +95,9 @@ pub mod prelude {
     pub use crate::observe::{ObserveConfig, Observer};
     pub use crate::sandbox::{Sandbox, SandboxBuilder};
     pub use crate::workflow::{Workflow, WorkflowBuilder, WorkflowExt, WorkflowResult};
+    pub use crate::skill::Skill;
+    pub use crate::agent_box::AgentBox;
+    pub use crate::pipeline::Pipeline;
     pub use crate::ExecOutput;
 }
 
