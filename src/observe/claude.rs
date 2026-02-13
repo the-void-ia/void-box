@@ -271,15 +271,20 @@ fn extract_tool_result_text(block: &serde_json::Value) -> String {
 /// Create spans from a parsed `ClaudeExecResult`.
 ///
 /// Creates a root `claude.exec` span with child spans for each tool call,
-/// following OTel GenAI semantic conventions. Spans are recorded in the
-/// provided `Tracer`'s in-memory storage and, when the `opentelemetry`
-/// feature is enabled, also exported via the OTel SDK bridge.
+/// following the [OTel GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/).
+/// Attribute names come from the `opentelemetry-semantic-conventions` crate
+/// so they stay in sync with the spec automatically.
+///
+/// Spans are recorded in the provided `Tracer`'s in-memory storage and,
+/// when the `opentelemetry` feature is enabled, also exported via the
+/// OTel SDK bridge.
 pub fn create_otel_spans(
     result: &ClaudeExecResult,
     parent_context: Option<&crate::observe::tracer::SpanContext>,
     tracer: &crate::observe::tracer::Tracer,
 ) {
     use crate::observe::tracer::Span;
+    use opentelemetry_semantic_conventions::attribute as semconv;
 
     // Create the root claude.exec span
     let mut exec_span = if let Some(parent) = parent_context {
@@ -288,17 +293,38 @@ pub fn create_otel_spans(
         Span::new("claude.exec")
     };
 
-    // Set GenAI semantic convention attributes
-    exec_span.set_attribute("gen_ai.system", "anthropic");
-    exec_span.set_attribute("gen_ai.request.model", &result.model);
-    exec_span.set_attribute("gen_ai.usage.input_tokens", result.input_tokens.to_string());
-    exec_span.set_attribute("gen_ai.usage.output_tokens", result.output_tokens.to_string());
-    exec_span.set_attribute("claude.session_id", &result.session_id);
-    exec_span.set_attribute("claude.total_cost_usd", format!("{:.6}", result.total_cost_usd));
+    // --- OTel GenAI semconv: Required ---
+    exec_span.set_attribute(semconv::GEN_AI_OPERATION_NAME, "invoke_agent");
+    exec_span.set_attribute(semconv::GEN_AI_SYSTEM, "anthropic");
+
+    // --- OTel GenAI semconv: Conditionally Required ---
+    exec_span.set_attribute(semconv::GEN_AI_REQUEST_MODEL, &result.model);
+    exec_span.set_attribute(semconv::GEN_AI_CONVERSATION_ID, &result.session_id);
+
+    // --- OTel GenAI semconv: Recommended ---
+    exec_span.set_attribute(semconv::GEN_AI_RESPONSE_MODEL, &result.model);
+    exec_span.set_attribute(
+        semconv::GEN_AI_USAGE_INPUT_TOKENS,
+        result.input_tokens.to_string(),
+    );
+    exec_span.set_attribute(
+        semconv::GEN_AI_USAGE_OUTPUT_TOKENS,
+        result.output_tokens.to_string(),
+    );
+
+    // --- OTel semconv: error (Stable) ---
+    if result.is_error {
+        exec_span.set_attribute(semconv::ERROR_TYPE, "agent_error");
+    }
+
+    // --- Custom void-box extensions (no semconv equivalent) ---
+    exec_span.set_attribute(
+        "claude.total_cost_usd",
+        format!("{:.6}", result.total_cost_usd),
+    );
     exec_span.set_attribute("claude.num_turns", result.num_turns.to_string());
     exec_span.set_attribute("claude.duration_ms", result.duration_ms.to_string());
     exec_span.set_attribute("claude.duration_api_ms", result.duration_api_ms.to_string());
-    exec_span.set_attribute("claude.is_error", result.is_error.to_string());
     exec_span.set_attribute(
         "claude.tools_used",
         result
@@ -312,10 +338,6 @@ pub fn create_otel_spans(
     );
     exec_span.set_attribute("claude.tools_count", result.tool_calls.len().to_string());
 
-    if let Some(ref err) = result.error {
-        exec_span.set_attribute("error.message", err);
-    }
-
     let exec_ctx = exec_span.context.clone();
 
     // Set duration from the result
@@ -327,6 +349,12 @@ pub fn create_otel_spans(
     for tool in &result.tool_calls {
         let mut tool_span =
             Span::child(&format!("claude.tool.{}", tool.tool_name), &exec_ctx);
+
+        // OTel GenAI semconv on tool spans
+        tool_span.set_attribute(semconv::GEN_AI_OPERATION_NAME, "execute_tool");
+        tool_span.set_attribute(semconv::GEN_AI_SYSTEM, "anthropic");
+
+        // Custom tool attributes (no semconv equivalent yet)
         tool_span.set_attribute("tool.name", &tool.tool_name);
         tool_span.set_attribute("tool.use_id", &tool.tool_use_id);
 

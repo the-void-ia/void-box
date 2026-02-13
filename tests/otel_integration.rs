@@ -499,11 +499,19 @@ mod otel_sdk_tests {
         assert_eq!(spans.len(), 2, "expected 2 spans, got {:?}", spans.iter().map(|s| &s.name).collect::<Vec<_>>());
 
         let exec_span = spans.iter().find(|s| s.name == "claude.exec").expect("claude.exec span");
+        // OTel GenAI semconv: Required
+        assert_eq!(exec_span.attributes.get("gen_ai.operation.name").map(|s| s.as_str()), Some("invoke_agent"));
         assert_eq!(exec_span.attributes.get("gen_ai.system").map(|s| s.as_str()), Some("anthropic"));
+        // OTel GenAI semconv: Conditionally Required / Recommended
         assert_eq!(exec_span.attributes.get("gen_ai.request.model").map(|s| s.as_str()), Some("sonnet"));
+        assert_eq!(exec_span.attributes.get("gen_ai.response.model").map(|s| s.as_str()), Some("sonnet"));
+        assert_eq!(exec_span.attributes.get("gen_ai.conversation.id").map(|s| s.as_str()), Some("s"));
 
         let tool_span = spans.iter().find(|s| s.name == "claude.tool.Bash").expect("claude.tool.Bash span");
         assert_eq!(tool_span.attributes.get("tool.name").map(|s| s.as_str()), Some("Bash"));
+        // Tool child spans also carry GenAI semconv
+        assert_eq!(tool_span.attributes.get("gen_ai.operation.name").map(|s| s.as_str()), Some("execute_tool"));
+        assert_eq!(tool_span.attributes.get("gen_ai.system").map(|s| s.as_str()), Some("anthropic"));
     }
 
     #[test]

@@ -257,11 +257,16 @@ async fn test_default_scenario() {
     );
 
     let exec = &exec_spans[0];
+    // OTel GenAI semconv: Required
+    assert!(exec.attributes.contains_key("gen_ai.operation.name"));
     assert!(exec.attributes.contains_key("gen_ai.system"));
+    // OTel GenAI semconv: Conditionally Required / Recommended
     assert!(exec.attributes.contains_key("gen_ai.request.model"));
+    assert!(exec.attributes.contains_key("gen_ai.response.model"));
+    assert!(exec.attributes.contains_key("gen_ai.conversation.id"));
     assert!(exec.attributes.contains_key("gen_ai.usage.input_tokens"));
     assert!(exec.attributes.contains_key("gen_ai.usage.output_tokens"));
-    assert!(exec.attributes.contains_key("claude.session_id"));
+    // Custom void-box extensions
     assert!(exec.attributes.contains_key("claude.total_cost_usd"));
 
     for (i, tool_call) in result.tool_calls.iter().enumerate() {
@@ -445,10 +450,10 @@ async fn test_error_scenario() {
     let exec_spans: Vec<_> = spans.iter().filter(|s| s.name == "claude.exec").collect();
     assert_eq!(exec_spans.len(), 1);
     assert_eq!(
-        exec_spans[0].attributes.get("claude.is_error"),
-        Some(&"true".to_string()),
+        exec_spans[0].attributes.get("error.type"),
+        Some(&"agent_error".to_string()),
+        "error.type should be set on error spans (OTel semconv)"
     );
-    assert!(exec_spans[0].attributes.contains_key("error.message"));
 
     eprintln!("PASSED: test_error_scenario");
 }

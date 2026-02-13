@@ -42,6 +42,9 @@ opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics", "internal-logs"], optional = true }
 
+# OTel Semantic Conventions (typed constants for attribute names)
+opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"

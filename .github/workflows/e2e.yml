@@ -1,0 +1,91 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  e2e:
+    name: E2E KVM (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu x86_64
+            runner: ubuntu-latest
+            musl-target: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- KVM setup ----
+      - name: Enable KVM access
+        run: |
+          # Make /dev/kvm accessible to the runner user
+          sudo chmod a+rw /dev/kvm
+          # Load vhost-vsock module (needed for host<->guest vsock)
+          sudo modprobe vhost_vsock || true
+          # Verify
+          ls -la /dev/kvm
+          ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present (may be built-in)"
+
+      # ---- System dependencies ----
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools
+          # Ensure kernel modules are available for the running kernel
+          sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+
+      # ---- Rust toolchain ----
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.musl-target }}
+
+      # ---- Cargo cache ----
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-e2e-${{ matrix.musl-target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-${{ matrix.musl-target }}-
+
+      # ---- Build test initramfs ----
+      - name: Build test initramfs (guest-agent + claudio)
+        run: scripts/build_test_image.sh
+
+      # ---- Unit + integration tests ----
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --verbose
+
+      # ---- E2E KVM tests ----
+      - name: Run E2E KVM tests
+        env:
+          VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          # Detect kernel version at runtime (env context can't run commands)
+          export VOID_BOX_KERNEL="/boot/vmlinuz-$(uname -r)"
+          echo "Kernel: $VOID_BOX_KERNEL"
+          echo "Initramfs: $VOID_BOX_INITRAMFS"
+
+          # Verify artifacts exist
+          ls -la "$VOID_BOX_KERNEL"
+          ls -la "$VOID_BOX_INITRAMFS"
+
+          # Run E2E tests (--ignored to include KVM tests, sequential to avoid resource contention)
+          cargo test --test e2e_telemetry -- --ignored --test-threads=1
