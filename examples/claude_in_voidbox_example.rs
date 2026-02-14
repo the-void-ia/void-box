@@ -12,7 +12,7 @@
 //!   2. Run:
 //!      ANTHROPIC_API_KEY=sk-ant-xxx \
 //!      VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!      VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+//!      VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
 //!      cargo run --example claude_in_voidbox_example
 //!
 //! With OTel export (requires `--features opentelemetry`):

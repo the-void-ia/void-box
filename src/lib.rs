@@ -81,6 +81,7 @@ pub mod workflow;
 
 // Skill + Environment = Box
 pub mod skill;
+pub mod llm;
 pub mod agent_box;
 pub mod pipeline;
 
@@ -96,6 +97,7 @@ pub mod prelude {
     pub use crate::sandbox::{Sandbox, SandboxBuilder};
     pub use crate::workflow::{Workflow, WorkflowBuilder, WorkflowExt, WorkflowResult};
     pub use crate::skill::Skill;
+    pub use crate::llm::LlmProvider;
     pub use crate::agent_box::AgentBox;
     pub use crate::pipeline::Pipeline;
     pub use crate::ExecOutput;

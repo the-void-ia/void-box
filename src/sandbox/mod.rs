@@ -180,6 +180,7 @@ impl Sandbox {
             prompt.to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
+            "--verbose".to_string(),
         ];
 
         if opts.dangerously_skip_permissions {
@@ -195,13 +196,42 @@ impl Sandbox {
         // Execute via the normal sandbox path
         let output = match &self.inner {
             SandboxInner::Local(local) => {
-                // For local sandbox, pass extra env through
-                local.exec_claude_internal(&args_refs, &opts.env).await?
+                // For local sandbox, pass extra env and timeout through
+                local.exec_claude_internal(&args_refs, &opts.env, opts.timeout_secs).await?
             }
             SandboxInner::Mock(mock) => {
                 mock.exec_with_stdin("claude-code", &args_refs, &[]).await?
             }
         };
+
+        // Log raw output for debugging (always at debug, stderr at warn on failure)
+        {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stdout_preview = if stdout_str.len() > 500 {
+                format!("{}...", &stdout_str[..500])
+            } else {
+                stdout_str.to_string()
+            };
+
+            if output.exit_code != 0 {
+                tracing::warn!(
+                    exit_code = output.exit_code,
+                    "claude-code failed; stderr={}, stdout_head={}",
+                    if stderr_str.is_empty() { "(empty)" } else { stderr_str.trim() },
+                    stdout_preview,
+                );
+            } else {
+                tracing::debug!(
+                    exit_code = output.exit_code,
+                    stdout_len = output.stdout.len(),
+                    stderr_len = output.stderr.len(),
+                    "claude-code finished; stdout_head={}, stderr={}",
+                    stdout_preview,
+                    if stderr_str.is_empty() { "(empty)" } else { stderr_str.trim() },
+                );
+            }
+        }
 
         // Parse the stream-json output
         let result = crate::observe::claude::parse_stream_json(&output.stdout);

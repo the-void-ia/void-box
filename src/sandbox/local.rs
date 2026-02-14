@@ -208,11 +208,12 @@ impl LocalSandbox {
         vm.mkdir_p(path).await
     }
 
-    /// Internal helper for `exec_claude` -- runs claude-code with extra env.
+    /// Internal helper for `exec_claude` -- runs claude-code with extra env and optional timeout.
     pub(crate) async fn exec_claude_internal(
         &self,
         args: &[&str],
         extra_env: &[(String, String)],
+        timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
         if self.config.kernel.is_none() {
             return self.simulate_exec("claude-code", args, &[]);
@@ -225,7 +226,7 @@ impl LocalSandbox {
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
-        vm.exec_with_env("claude-code", args, &[], &env, None).await
+        vm.exec_with_env_timeout("claude-code", args, &[], &env, None, timeout_secs).await
     }
 
     /// Stop the sandbox

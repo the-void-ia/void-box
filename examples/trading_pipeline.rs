@@ -23,14 +23,32 @@
 //!   cargo run --example trading_pipeline
 //!
 //! KVM mode (requires kernel + initramfs):
-//!   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!   VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-//!   cargo run --example trading_pipeline
+//!   1. Build the guest initramfs:
+//!      ```
+//!      CLAUDE_CODE_BIN=$(which claude) BUSYBOX=/usr/bin/busybox \
+//!        scripts/build_guest_image.sh
+//!      ```
+//!   2. Run with Anthropic API:
+//!      ```
+//!      ANTHROPIC_API_KEY=sk-ant-xxx \
+//!      VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+//!      VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+//!      cargo run --example trading_pipeline
+//!      ```
+//!   3. Or run with Ollama (local LLM):
+//!      ```
+//!      ollama pull phi4-mini
+//!      OLLAMA_MODEL=phi4-mini \
+//!      VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+//!      VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+//!      cargo run --example trading_pipeline
+//!      ```
 
 use std::error::Error;
 use std::path::PathBuf;
 
 use void_box::agent_box::AgentBox;
+use void_box::llm::LlmProvider;
 use void_box::pipeline::Pipeline;
 use void_box::skill::Skill;
 
@@ -48,6 +66,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("║     Trading Analysis Pipeline: Skill + Environment = Box    ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
+
+    // ---- LLM Provider: Claude (default) or Ollama (opt-in) ----
+
+    let llm = detect_llm_provider();
+    println!("[llm] {}", llm);
 
     // ---- Skills: declared capabilities ----
 
@@ -79,14 +102,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Defining Boxes ---");
     println!();
 
-    let data_box = make_box("data_analyst", use_kvm)
+    let data_box = make_box("data_analyst", use_kvm, &llm)
         .skill(data_skill)
         .skill(reasoning.clone())
         .prompt(
-            "You are a financial data analyst. Generate realistic 30-day OHLCV data \
-             for AAPL, NVDA, MSFT, and GOOGL. Include mock news headlines for each symbol. \
-             Write a Python script to generate the data and run it. \
-             Follow the schema from your financial-data-analysis skill."
+            "You are a financial data analyst. Here is recent market data (Feb 2026):\n\n\
+             AAPL: price $227, P/E 34, RSI 62, 52w range $170-$243, EPS $2.40 beat est. $2.36, \
+             Services revenue missed ($23.1B vs $23.5B est.), iPhone revenue +4% YoY.\n\
+             NVDA: price $138, P/E 55, RSI 71, 52w range $78-$153, data center revenue +95% YoY, \
+             new Blackwell GPU ramping, China export restrictions tightening.\n\
+             MSFT: price $442, P/E 36, RSI 58, 52w range $385-$470, Azure grew +29%, \
+             Copilot revenue accelerating, gaming flat YoY.\n\
+             GOOGL: price $192, P/E 24, RSI 55, 52w range $152-$207, Search +12%, \
+             Cloud +28%, DOJ antitrust ruling pending.\n\n\
+             For each symbol, write a brief data summary with key metrics and recent catalysts.\n\
+             Do NOT write or run code. Do NOT output JSON or templates.\n\
+             Write plain text with clear sections per symbol."
         )
         .build()?;
 
@@ -94,14 +125,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Box 2: Quant Analyst ----
 
-    let quant_box = make_box("quant_analyst", use_kvm)
+    let quant_box = make_box("quant_analyst", use_kvm, &llm)
         .skill(quant_skill)
         .skill(reasoning.clone())
         .prompt(
-            "You are a quantitative analyst. Read the market data from /workspace/input.json. \
-             Compute technical indicators (SMA, RSI, MACD, Bollinger Bands) for each symbol. \
-             Generate composite trading signals. \
-             Follow the methodology from your quant-technical-analysis skill."
+            "You are a quantitative analyst. Read the data summary from /workspace/input.json.\n\n\
+             For each symbol (AAPL, NVDA, MSFT, GOOGL), provide:\n\
+             - RSI interpretation (overbought >70, neutral 30-70, oversold <30)\n\
+             - P/E relative to sector average (Tech sector avg ~28)\n\
+             - A composite signal: BULLISH, NEUTRAL, or BEARISH\n\n\
+             Write plain text. Do NOT output JSON or templates.\n\
+             Use the actual numbers from the input data."
         )
         .build()?;
 
@@ -109,13 +143,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Box 3: Research Analyst (pure reasoning, no special skills) ----
 
-    let sentiment_box = make_box("research_analyst", use_kvm)
+    let sentiment_box = make_box("research_analyst", use_kvm, &llm)
         .skill(reasoning.clone())
         .prompt(
-            "You are a research analyst. Read the technical signals from /workspace/input.json. \
-             For each symbol, assess the market sentiment considering the technical indicators, \
-             recent price action, and any news context. Score sentiment from -1.0 (very bearish) \
-             to +1.0 (very bullish). Provide brief reasoning for each score."
+            "You are a research analyst. Read the quant analysis from /workspace/input.json.\n\n\
+             For each symbol (AAPL, NVDA, MSFT, GOOGL):\n\
+             - Score sentiment from -1.0 (very bearish) to +1.0 (very bullish)\n\
+             - Write 2 sentences explaining your score\n\n\
+             Consider the technical signals, fundamentals, and catalysts from the input.\n\
+             Write plain text. Do NOT output JSON or templates.\n\
+             Example: AAPL: +0.3 (mildly bullish). The earnings beat suggests..."
         )
         .build()?;
 
@@ -123,16 +160,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Box 4: Portfolio Strategist ----
 
-    let strategy_box = make_box("portfolio_strategist", use_kvm)
+    let strategy_box = make_box("portfolio_strategist", use_kvm, &llm)
         .skill(risk_skill)
         .skill(reasoning.clone())
-        .memory_mb(512)
         .prompt(
-            "You are a portfolio strategist. Read the analysis from /workspace/input.json \
-             which contains technical signals and sentiment scores. \
-             Generate specific trade recommendations with position sizing, entry/exit prices, \
-             stop loss levels, and risk management. \
-             Follow the framework from your portfolio-risk-management skill."
+            "You are a portfolio strategist managing a $100,000 portfolio.\n\
+             Read the sentiment analysis from /workspace/input.json.\n\n\
+             For each symbol (AAPL, NVDA, MSFT, GOOGL) produce a trade recommendation:\n\
+             - ACTION: BUY, SELL, or HOLD\n\
+             - ALLOCATION: percentage of portfolio (must sum to <=100%)\n\
+             - ENTRY PRICE: target buy price\n\
+             - STOP LOSS: price to cut losses (set 5-10% below entry)\n\
+             - RATIONALE: one sentence\n\n\
+             Keep at least 20% in cash. Write plain text. Do NOT output JSON or templates.\n\
+             Use real numbers from the analysis, not placeholders."
         )
         .build()?;
 
@@ -180,8 +221,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             r.total_cost_usd,
         );
         if !r.result_text.is_empty() {
-            let preview = if r.result_text.len() > 120 {
-                format!("{}...", &r.result_text[..120])
+            let preview = if r.result_text.len() > 500 {
+                format!("{}...", &r.result_text[..500])
             } else {
                 r.result_text.clone()
             };
@@ -207,8 +248,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Create an AgentBox builder pre-configured for the current environment.
-fn make_box(name: &str, use_kvm: bool) -> AgentBox {
-    let mut ab = AgentBox::new(name);
+fn make_box(name: &str, use_kvm: bool, llm: &LlmProvider) -> AgentBox {
+    let mut ab = AgentBox::new(name).llm(llm.clone()).memory_mb(1024);
+
+    // Allow per-stage timeout override via STAGE_TIMEOUT_SECS env var
+    if let Ok(secs) = std::env::var("STAGE_TIMEOUT_SECS") {
+        if let Ok(s) = secs.parse::<u64>() {
+            ab = ab.timeout_secs(s);
+        }
+    }
 
     if use_kvm {
         if let Some(kernel) = kvm_kernel() {
@@ -222,6 +270,37 @@ fn make_box(name: &str, use_kvm: bool) -> AgentBox {
     }
 
     ab
+}
+
+/// Detect the LLM provider from environment variables.
+///
+/// - `OLLAMA_MODEL=qwen3-coder` -> Ollama with that model
+/// - `LLM_BASE_URL=...` -> Custom provider
+/// - Otherwise -> Claude (default)
+fn detect_llm_provider() -> LlmProvider {
+    // Check for Ollama
+    if let Ok(model) = std::env::var("OLLAMA_MODEL") {
+        if !model.is_empty() {
+            return LlmProvider::ollama(model);
+        }
+    }
+
+    // Check for custom endpoint
+    if let Ok(base_url) = std::env::var("LLM_BASE_URL") {
+        if !base_url.is_empty() {
+            let mut provider = LlmProvider::custom(base_url);
+            if let Ok(key) = std::env::var("LLM_API_KEY") {
+                provider = provider.api_key(key);
+            }
+            if let Ok(model) = std::env::var("LLM_MODEL") {
+                provider = provider.model(model);
+            }
+            return provider;
+        }
+    }
+
+    // Default: Claude
+    LlmProvider::Claude
 }
 
 /// Check if KVM artifacts are available.

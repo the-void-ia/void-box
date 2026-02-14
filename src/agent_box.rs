@@ -39,6 +39,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::llm::LlmProvider;
 use crate::observe::claude::ClaudeExecOpts;
 use crate::pipeline::StageResult;
 use crate::sandbox::Sandbox;
@@ -74,6 +75,11 @@ struct AgentBoxConfig {
     output_file: String,
     /// Whether to use mock sandbox
     mock: bool,
+    /// LLM provider (default: Claude)
+    llm: LlmProvider,
+    /// Per-stage timeout in seconds (overrides the default vsock read timeout).
+    /// `None` means use the system default (1200s / 20 minutes).
+    timeout_secs: Option<u64>,
 }
 
 impl Default for AgentBoxConfig {
@@ -87,6 +93,8 @@ impl Default for AgentBoxConfig {
             env: Vec::new(),
             output_file: "/workspace/output.json".to_string(),
             mock: false,
+            llm: LlmProvider::default(),
+            timeout_secs: None,
         }
     }
 }
@@ -160,6 +168,45 @@ impl AgentBox {
         self
     }
 
+    /// Set the LLM provider (default: Claude).
+    ///
+    /// When set to `Ollama` or `Custom`, the appropriate environment variables
+    /// are injected into the guest VM and networking is auto-enabled.
+    ///
+    /// ```no_run
+    /// use void_box::llm::LlmProvider;
+    /// use void_box::agent_box::AgentBox;
+    ///
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// let ab = AgentBox::new("local")
+    ///     .llm(LlmProvider::ollama("qwen3-coder"))
+    ///     .prompt("hello")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn llm(mut self, provider: LlmProvider) -> Self {
+        self.config.llm = provider;
+        self
+    }
+
+    /// Set a per-stage timeout in seconds.
+    ///
+    /// Overrides the system default (1200s / 20 min).  Useful when running
+    /// small local models that are slower or faster than the default.
+    ///
+    /// ```no_run
+    /// # use void_box::agent_box::AgentBox;
+    /// let ab = AgentBox::new("fast_box")
+    ///     .timeout_secs(300) // 5 minutes
+    ///     .prompt("Quick task")
+    ///     .build().unwrap();
+    /// ```
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        self.config.timeout_secs = Some(secs);
+        self
+    }
+
     /// Use a mock sandbox (for testing without KVM).
     pub fn mock(mut self) -> Self {
         self.config.mock = true;
@@ -181,16 +228,24 @@ impl AgentBox {
             Sandbox::local()
         };
 
+        // Auto-enable networking if the LLM provider needs it
+        let needs_network = self.config.network || self.config.llm.requires_network();
+
         builder = builder
             .memory_mb(self.config.memory_mb)
             .vcpus(self.config.vcpus)
-            .network(self.config.network);
+            .network(needs_network);
 
         if let Some(ref k) = self.config.kernel {
             builder = builder.kernel(k);
         }
         if let Some(ref i) = self.config.initramfs {
             builder = builder.initramfs(i);
+        }
+
+        // Inject LLM provider env vars first, then user overrides
+        for (k, v) in self.config.llm.env_vars() {
+            builder = builder.env(&k, &v);
         }
         for (k, v) in &self.config.env {
             builder = builder.env(k, v);
@@ -326,12 +381,24 @@ impl AgentBox {
             );
         }
 
-        // Build the full prompt
-        let full_prompt = if input.is_some() {
+        // Build the full prompt.
+        // We embed the previous stage's output directly in the prompt so models
+        // don't need to use file-reading tools (small local models often can't).
+        // The data is still written to /workspace/input.json for models that
+        // prefer tool-based file access.
+        let full_prompt = if let Some(data) = input {
+            let input_text = String::from_utf8_lossy(data);
+            // Truncate if very large to avoid blowing context window
+            let inline = if input_text.len() > 4000 {
+                format!("{}...\n(truncated; full data in /workspace/input.json)", &input_text[..4000])
+            } else {
+                input_text.to_string()
+            };
             format!(
-                "{}\n\nPrevious stage data is available at /workspace/input.json. \
+                "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
+                 The above data is also available at /workspace/input.json.\n\
                  Write your output to {}.",
-                self.prompt, self.config.output_file
+                self.prompt, inline, self.config.output_file
             )
         } else {
             format!(
@@ -340,7 +407,12 @@ impl AgentBox {
             )
         };
 
-        eprintln!("[box:{}] Running agent with prompt ({} chars)...", self.name, full_prompt.len());
+        eprintln!(
+            "[box:{}] Running agent with {} ({} chars)...",
+            self.name,
+            self.config.llm.description(),
+            full_prompt.len()
+        );
 
         // Execute the agent
         let claude_result = sandbox
@@ -348,6 +420,8 @@ impl AgentBox {
                 &full_prompt,
                 ClaudeExecOpts {
                     dangerously_skip_permissions: true,
+                    extra_args: self.config.llm.cli_args(),
+                    timeout_secs: self.config.timeout_secs,
                     ..Default::default()
                 },
             )

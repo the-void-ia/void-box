@@ -471,7 +471,13 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
         cmd.env("PATH", &path);
     }
 
-    // Set environment variables from request (may override PATH above)
+    // Child processes run as uid=1000 (sandbox user) but inherit HOME=/root
+    // from init. Since /root is not writable by uid=1000, set HOME to the
+    // sandbox user's home directory so tools like claude-code can write to
+    // $HOME/.claude/ for config and cache.
+    cmd.env("HOME", "/home/sandbox");
+
+    // Set environment variables from request (may override PATH and HOME above)
     for (key, value) in &request.env {
         cmd.env(key, value);
     }

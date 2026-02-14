@@ -288,7 +288,7 @@ fn vcpu_run_loop(
                                 if guard.handles_mmio(addr) {
                                     let offset = addr - guard.mmio_base();
                                     if let Err(e) = guard.mmio_write(offset, data, guest_memory) {
-                                        warn!("virtio-vsock MMIO write error: {}", e);
+                                        debug!("virtio-vsock MMIO write error: {}", e);
                                     }
                                 }
                             }

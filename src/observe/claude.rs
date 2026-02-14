@@ -65,6 +65,9 @@ pub struct ClaudeExecOpts {
     pub extra_args: Vec<String>,
     /// Additional environment variables.
     pub env: Vec<(String, String)>,
+    /// Per-request timeout in seconds.
+    /// `None` means use the system default (1200s).
+    pub timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

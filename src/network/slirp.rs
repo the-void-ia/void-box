@@ -399,11 +399,18 @@ impl SlirpStack {
             // Remove any stale entry with the same key
             self.tcp_nat.remove(&key);
 
-            // Create host TCP connection
-            let addr = SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            // Create host TCP connection.
+            // Map the SLIRP gateway IP (10.0.2.2) to localhost so the guest
+            // can reach host services (e.g. Ollama at localhost:11434).
+            let host_ip = if dst_ip == SLIRP_GATEWAY_IP {
+                std::net::Ipv4Addr::new(127, 0, 0, 1)
+            } else {
+                std::net::Ipv4Addr::new(
                     dst_ip.0[0], dst_ip.0[1], dst_ip.0[2], dst_ip.0[3],
-                )),
+                )
+            };
+            let addr = SocketAddr::new(
+                std::net::IpAddr::V4(host_ip),
                 dst_port,
             );
 

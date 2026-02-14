@@ -345,6 +345,20 @@ impl VoidBox {
         env: &[(String, String)],
         working_dir: Option<&str>,
     ) -> Result<ExecOutput> {
+        self.exec_with_env_timeout(program, args, stdin, env, working_dir, None).await
+    }
+
+    /// Like `exec_with_env` but with an optional per-request timeout that overrides
+    /// the default vsock read timeout.
+    pub async fn exec_with_env_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+        env: &[(String, String)],
+        working_dir: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecOutput> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(Error::VmNotRunning);
         }
@@ -364,7 +378,7 @@ impl VoidBox {
             stdin: stdin.to_vec(),
             env: exec_env,
             working_dir: working_dir.map(String::from),
-            timeout_secs: None,
+            timeout_secs,
         };
 
         let (response_tx, response_rx) = oneshot::channel();

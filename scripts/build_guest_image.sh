@@ -48,6 +48,36 @@ if [[ -n "${CLAUDE_CODE_BIN:-}" && -f "$CLAUDE_CODE_BIN" ]]; then
   echo "[void-box] Installing real claude-code from \$CLAUDE_CODE_BIN at /usr/local/bin/claude-code..."
   cp "$CLAUDE_CODE_BIN" "$OUT_DIR/usr/local/bin/claude-code"
   chmod +x "$OUT_DIR/usr/local/bin/claude-code"
+
+  # If the binary is dynamically linked, copy its shared libraries into the
+  # initramfs so the kernel's ELF loader can find them at runtime.
+  if file -L "$CLAUDE_CODE_BIN" | grep -q "dynamically linked"; then
+    echo "[void-box] Detected dynamically linked binary -- copying shared libraries..."
+    # Use ldd to discover required libraries and their host paths
+    ldd "$CLAUDE_CODE_BIN" 2>/dev/null | while read -r line; do
+      # Parse lines like:  libc.so.6 => /lib64/libc.so.6 (0x...)
+      #                or: /lib64/ld-linux-x86-64.so.2 (0x...)
+      lib_path=""
+      if echo "$line" | grep -q "=>"; then
+        lib_path=$(echo "$line" | awk '{print $3}')
+      elif echo "$line" | grep -q "^[[:space:]]*/"; then
+        lib_path=$(echo "$line" | awk '{print $1}')
+      fi
+
+      # Skip virtual libraries (linux-vdso) and empty paths
+      if [[ -z "$lib_path" || "$lib_path" == "linux-vdso"* || ! -f "$lib_path" ]]; then
+        continue
+      fi
+
+      # Preserve the original directory structure in the initramfs
+      lib_dir=$(dirname "$lib_path")
+      mkdir -p "$OUT_DIR$lib_dir"
+      if [[ ! -f "$OUT_DIR$lib_path" ]]; then
+        cp -L "$lib_path" "$OUT_DIR$lib_path"
+        echo "  -> $lib_path"
+      fi
+    done
+  fi
 elif [[ -f "$ROOT_DIR/scripts/guest/claude-code-mock.sh" ]]; then
   echo "[void-box] Installing claude-code mock at /usr/local/bin/claude-code..."
   cp "$ROOT_DIR/scripts/guest/claude-code-mock.sh" "$OUT_DIR/usr/local/bin/claude-code"
