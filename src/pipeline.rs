@@ -149,6 +149,23 @@ impl Pipeline {
                 stage_result.claude_result.total_cost_usd,
             );
 
+            if stage_result.claude_result.is_error {
+                if looks_like_login_error(&stage_result.claude_result) {
+                    eprintln!(
+                        "[pipeline] Stage '{}' failed due to agent authentication. \
+Run `claude-code /login` in the guest image (or configure OLLAMA_MODEL) and retry.",
+                        box_name
+                    );
+                } else {
+                    eprintln!(
+                        "[pipeline] Stage '{}' failed; stopping pipeline early.",
+                        box_name
+                    );
+                }
+                stages.push(stage_result);
+                break;
+            }
+
             stages.push(stage_result);
         }
 
@@ -165,6 +182,15 @@ impl Pipeline {
     }
 }
 
+fn looks_like_login_error(result: &ClaudeExecResult) -> bool {
+    let text = format!(
+        "{} {}",
+        result.result_text.to_ascii_lowercase(),
+        result.error.as_deref().unwrap_or("").to_ascii_lowercase()
+    );
+    text.contains("not logged in") || text.contains("/login")
+}
+
 // Can't move out of self.stages while iterating with index... let me fix the run method.
 // Actually the issue is that `self.stages` is consumed by `into_iter()` but we also
 // reference `agent_box.name` after moving it. Let me restructure.
@@ -178,5 +204,67 @@ impl Pipeline {
     /// Check if pipeline is empty.
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detects_login_error_from_result_text() {
+        let r = ClaudeExecResult {
+            result_text: "Not logged in · Please run /login".into(),
+            model: String::new(),
+            session_id: String::new(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            is_error: true,
+            error: None,
+            tool_calls: Vec::new(),
+        };
+        assert!(looks_like_login_error(&r));
+    }
+
+    #[test]
+    fn test_detects_login_error_from_error_field() {
+        let r = ClaudeExecResult {
+            result_text: String::new(),
+            model: String::new(),
+            session_id: String::new(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            is_error: true,
+            error: Some("Please run /login".into()),
+            tool_calls: Vec::new(),
+        };
+        assert!(looks_like_login_error(&r));
+    }
+
+    #[test]
+    fn test_non_login_error_is_not_detected() {
+        let r = ClaudeExecResult {
+            result_text: String::new(),
+            model: String::new(),
+            session_id: String::new(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            is_error: true,
+            error: Some("rate limit exceeded".into()),
+            tool_calls: Vec::new(),
+        };
+        assert!(!looks_like_login_error(&r));
     }
 }

@@ -8,17 +8,16 @@
 
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
 use crate::guest::protocol::{
-    ExecRequest, ExecResponse, Message, MessageType, TelemetryBatch,
+    ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest, MkdirPResponse, TelemetryBatch,
     WriteFileRequest, WriteFileResponse,
-    MkdirPRequest, MkdirPResponse,
 };
 use crate::{Error, Result};
-
 
 /// vsock port used by the guest agent
 pub const GUEST_AGENT_PORT: u32 = 1234;
@@ -35,6 +34,8 @@ pub const VMADDR_CID_HOST: u32 = 2;
 pub struct VsockDevice {
     /// Context ID for this VM (guest CID; host uses CID 2)
     cid: u32,
+    /// Tracks whether the cold-boot wait has already been applied.
+    boot_wait_done: AtomicBool,
 }
 
 impl VsockDevice {
@@ -47,9 +48,15 @@ impl VsockDevice {
             )));
         }
 
-        info!("Creating vsock device with CID {} (host connects to guest via AF_VSOCK)", cid);
+        info!(
+            "Creating vsock device with CID {} (host connects to guest via AF_VSOCK)",
+            cid
+        );
 
-        Ok(Self { cid })
+        Ok(Self {
+            cid,
+            boot_wait_done: AtomicBool::new(false),
+        })
     }
 
     /// Get the CID for this device
@@ -63,73 +70,9 @@ impl VsockDevice {
     /// before sending the first request. This confirms the guest agent is ready
     /// and avoids sending ExecRequest before the guest is in the read loop.
     pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
-        // Wait for guest kernel to boot, unpack initramfs, and probe virtio-vsock.
-        // With large initramfs (>70MB for production images with claude-code) the
-        // kernel needs ~3-4 seconds; the retry loop handles any remaining lag.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-
-        let mut delay = Duration::from_millis(100);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-        let mut attempt: u32 = 0;
-
-        let mut stream = loop {
-            if Instant::now() >= deadline {
-                warn!("vsock: deadline reached after {} connect/handshake attempts", attempt);
-                return Err(Error::Guest(
-                    "vsock: deadline reached (connect or handshake)".into(),
-                ));
-            }
-
-            attempt += 1;
-
-            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
-                Ok(stream) => {
-                    info!("vsock: attempt {} connect OK (cid={}, port={})", attempt, self.cid, GUEST_AGENT_PORT);
-                    stream
-                }
-                Err(e) => {
-                    debug!("vsock: attempt {} connect failed: {} (retry in {:?})", attempt, e, delay);
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                    continue;
-                }
-            };
-
-            // VM0-style handshake: Ping -> Pong before first request
-            if let Err(e) = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
-                debug!("vsock: attempt {} set_read_timeout failed: {}", attempt, e);
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-            let ping_msg = Message {
-                msg_type: MessageType::Ping,
-                payload: vec![],
-            };
-            let ping_bytes = ping_msg.serialize();
-            if s.write_all(&ping_bytes).is_err() {
-                debug!("vsock: attempt {} handshake failed to send Ping", attempt);
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-            info!("vsock: attempt {} Ping sent, waiting for Pong (timeout {:?})", attempt, HANDSHAKE_TIMEOUT);
-            match Message::read_from_sync(&mut s) {
-                Ok(msg) if msg.msg_type == MessageType::Pong => {
-                    info!("vsock: handshake OK (Pong received)");
-                    break s;
-                }
-                Ok(msg) => {
-                    debug!("vsock: attempt {} handshake unexpected message type {:?}", attempt, msg.msg_type);
-                }
-                Err(e) => {
-                    debug!("vsock: attempt {} handshake read Pong failed: {}", attempt, e);
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-        };
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "exec")
+            .await?;
 
         // Set the read timeout for the response.
         // Use the per-request timeout if provided, otherwise default to 20 minutes.
@@ -164,7 +107,10 @@ impl VsockDevice {
         }
 
         let response: ExecResponse = serde_json::from_slice(&response_msg.payload)?;
-        info!("vsock: ExecResponse received exit_code={}", response.exit_code);
+        info!(
+            "vsock: ExecResponse received exit_code={}",
+            response.exit_code
+        );
 
         Ok(response)
     }
@@ -182,7 +128,9 @@ impl VsockDevice {
             create_parents: true,
         };
 
-        let mut stream = self.connect_with_handshake().await?;
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "write-file")
+            .await?;
 
         // Set generous read timeout
         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
@@ -213,7 +161,9 @@ impl VsockDevice {
             path: path.to_string(),
         };
 
-        let mut stream = self.connect_with_handshake().await?;
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "mkdir-p")
+            .await?;
 
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
 
@@ -238,19 +188,32 @@ impl VsockDevice {
     }
 
     /// Connect to the guest agent and perform a Ping/Pong handshake.
-    /// Shared helper for send_write_file, send_mkdir_p, etc.
-    async fn connect_with_handshake(&self) -> Result<VsockStream> {
-        // Wait for guest kernel to boot (see send_exec_request for rationale)
-        tokio::time::sleep(Duration::from_secs(4)).await;
+    /// Shared helper for all request flows.
+    async fn connect_with_handshake(
+        &self,
+        handshake_timeout: Duration,
+        context: &str,
+    ) -> Result<VsockStream> {
+        // Wait for guest kernel boot once per VsockDevice lifetime.
+        // Later calls rely on retry/backoff without paying a fixed delay.
+        if self
+            .boot_wait_done
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
 
         let mut delay = Duration::from_millis(100);
         let deadline = Instant::now() + Duration::from_secs(30);
-        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
         let mut attempt: u32 = 0;
 
         loop {
             if Instant::now() >= deadline {
-                warn!("vsock: deadline reached after {} connect/handshake attempts (connect_with_handshake)", attempt);
+                warn!(
+                    "vsock[{context}]: deadline reached after {} connect/handshake attempts",
+                    attempt
+                );
                 return Err(Error::Guest(
                     "vsock: deadline reached (connect or handshake)".into(),
                 ));
@@ -260,11 +223,17 @@ impl VsockDevice {
 
             let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
                 Ok(stream) => {
-                    debug!("vsock: attempt {} connect OK (cid={}, port={})", attempt, self.cid, GUEST_AGENT_PORT);
+                    debug!(
+                        "vsock[{context}]: attempt {} connect OK (cid={}, port={})",
+                        attempt, self.cid, GUEST_AGENT_PORT
+                    );
                     stream
                 }
                 Err(e) => {
-                    debug!("vsock: attempt {} connect failed: {} (retry in {:?})", attempt, e, delay);
+                    debug!(
+                        "vsock[{context}]: attempt {} connect failed: {} (retry in {:?})",
+                        attempt, e, delay
+                    );
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                     continue;
@@ -272,7 +241,11 @@ impl VsockDevice {
             };
 
             // Handshake: Ping -> Pong
-            if let Err(_e) = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+            if let Err(e) = s.set_read_timeout(Some(handshake_timeout)) {
+                debug!(
+                    "vsock[{context}]: attempt {} set_read_timeout failed: {}",
+                    attempt, e
+                );
                 tokio::time::sleep(delay).await;
                 delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                 continue;
@@ -282,15 +255,29 @@ impl VsockDevice {
                 payload: vec![],
             };
             if s.write_all(&ping_msg.serialize()).is_err() {
+                debug!("vsock[{context}]: attempt {} failed to send Ping", attempt);
                 tokio::time::sleep(delay).await;
                 delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                 continue;
             }
             match Message::read_from_sync(&mut s) {
                 Ok(msg) if msg.msg_type == MessageType::Pong => {
+                    debug!("vsock[{context}]: handshake OK");
                     return Ok(s);
                 }
-                _ => {
+                Ok(msg) => {
+                    debug!(
+                        "vsock[{context}]: attempt {} unexpected handshake message: {:?}",
+                        attempt, msg.msg_type
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                }
+                Err(e) => {
+                    debug!(
+                        "vsock[{context}]: attempt {} handshake read failed: {}",
+                        attempt, e
+                    );
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                 }
@@ -307,49 +294,9 @@ impl VsockDevice {
     where
         F: FnMut(TelemetryBatch) + Send + 'static,
     {
-        // Wait for guest boot (shorter than exec since the VM is already up by now)
-        let mut delay = Duration::from_millis(500);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-
-        let mut stream = loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Guest(
-                    "Telemetry subscription: deadline reached connecting to guest".into(),
-                ));
-            }
-
-            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
-                Ok(s) => s,
-                Err(_) => {
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                    continue;
-                }
-            };
-
-            // Handshake: Ping -> Pong
-            if s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            let ping_msg = Message {
-                msg_type: MessageType::Ping,
-                payload: vec![],
-            };
-            if s.write_all(&ping_msg.serialize()).is_err() {
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            match Message::read_from_sync(&mut s) {
-                Ok(msg) if msg.msg_type == MessageType::Pong => break s,
-                _ => {
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                    continue;
-                }
-            }
-        };
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(5), "telemetry-subscribe")
+            .await?;
 
         // Send SubscribeTelemetry
         let sub_msg = Message {
@@ -376,7 +323,10 @@ impl VsockDevice {
             };
 
             if msg.msg_type != MessageType::TelemetryData {
-                warn!("Unexpected message type in telemetry stream: {:?}", msg.msg_type);
+                warn!(
+                    "Unexpected message type in telemetry stream: {:?}",
+                    msg.msg_type
+                );
                 continue;
             }
 
@@ -397,7 +347,6 @@ impl VsockDevice {
     }
 }
 
-
 /// Vsock stream wrapper
 pub struct VsockStream {
     fd: RawFd,
@@ -407,13 +356,8 @@ impl VsockStream {
     /// Connect to a vsock endpoint
     pub fn connect(cid: u32, port: u32) -> Result<Self> {
         // Try to create a vsock socket
-        let socket_fd = unsafe {
-            libc::socket(
-                libc::AF_VSOCK,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
 
         if socket_fd < 0 {
             return Err(Error::Guest(format!(
@@ -449,7 +393,9 @@ impl VsockStream {
         };
 
         if ret < 0 {
-            unsafe { libc::close(socket_fd); }
+            unsafe {
+                libc::close(socket_fd);
+            }
             return Err(Error::Guest(format!(
                 "Failed to connect to vsock {}:{}: {}",
                 cid,
@@ -492,9 +438,7 @@ impl VsockStream {
 
 impl Read for VsockStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -505,9 +449,7 @@ impl Read for VsockStream {
 
 impl Write for VsockStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = unsafe {
-            libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -522,10 +464,11 @@ impl Write for VsockStream {
 
 impl Drop for VsockStream {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

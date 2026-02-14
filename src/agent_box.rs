@@ -46,6 +46,8 @@ use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::Result;
 
+const CLAUDE_HOME: &str = "/home/sandbox/.claude";
+
 /// An agent Box: Skill + Environment.
 ///
 /// Constructed via the builder pattern with `AgentBox::new("name")`.
@@ -270,10 +272,7 @@ impl AgentBox {
                             e
                         ))
                     })?;
-                    let guest_path = format!(
-                        "/root/.claude/skills/{}.md",
-                        skill.name
-                    );
+                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
                     sandbox.write_file(&guest_path, &content).await?;
                     eprintln!(
                         "  [skill] Installed local skill '{}' -> {}",
@@ -281,10 +280,7 @@ impl AgentBox {
                     );
                 }
                 SkillKind::Remote { id } => {
-                    let guest_path = format!(
-                        "/root/.claude/skills/{}.md",
-                        skill.name
-                    );
+                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
                     match skill.fetch_remote_content().await {
                         Ok(content) => {
                             sandbox.write_file(&guest_path, content.as_bytes()).await?;
@@ -348,9 +344,9 @@ impl AgentBox {
             let config_str = serde_json::to_string_pretty(&mcp_config)
                 .map_err(|e| crate::Error::Config(format!("Failed to serialize MCP config: {}", e)))?;
             sandbox
-                .write_file("/root/.claude/mcp.json", config_str.as_bytes())
+                .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
                 .await?;
-            eprintln!("  [skill] Wrote MCP config to /root/.claude/mcp.json");
+            eprintln!("  [skill] Wrote MCP config to {}/mcp.json", CLAUDE_HOME);
         }
 
         Ok(())

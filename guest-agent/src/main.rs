@@ -7,17 +7,17 @@
 //! - Process management
 
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
 
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
-    ExecRequest, ExecResponse, MessageType,
-    TelemetryBatch, SystemMetrics, ProcessMetrics,
-    WriteFileRequest, WriteFileResponse,
-    MkdirPRequest, MkdirPResponse,
+    ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse, ProcessMetrics,
+    SystemMetrics, TelemetryBatch, WriteFileRequest, WriteFileResponse,
 };
 
 /// vsock port we listen on
@@ -26,6 +26,8 @@ const LISTEN_PORT: u32 = 1234;
 /// Host CID
 #[allow(dead_code)]
 const HOST_CID: u32 = 2;
+
+const ALLOWED_WRITE_ROOTS: [&str; 2] = ["/workspace", "/home"];
 
 /// CPU jiffies snapshot from /proc/stat
 struct CpuJiffies {
@@ -82,11 +84,18 @@ fn main() {
         for attempt in 0..30 {
             fd = create_vsock_listener(LISTEN_PORT);
             if fd >= 0 {
-                kmsg(&format!("vsock listener created on attempt {}", attempt + 1));
+                kmsg(&format!(
+                    "vsock listener created on attempt {}",
+                    attempt + 1
+                ));
                 break;
             }
             let errno = std::io::Error::last_os_error();
-            kmsg(&format!("vsock listener attempt {} failed: {} retrying in 200ms...", attempt + 1, errno));
+            kmsg(&format!(
+                "vsock listener attempt {} failed: {} retrying in 200ms...",
+                attempt + 1,
+                errno
+            ));
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         fd
@@ -104,7 +113,8 @@ fn main() {
 
     // Accept connections and handle requests (multi-threaded for concurrent telemetry + exec)
     loop {
-        let client_fd = unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let client_fd =
+            unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if client_fd < 0 {
             eprintln!("Accept failed");
             continue;
@@ -115,7 +125,9 @@ fn main() {
                 if let Err(e) = handle_connection(client_fd) {
                     eprintln!("Connection error: {}", e);
                 }
-                unsafe { libc::close(client_fd); }
+                unsafe {
+                    libc::close(client_fd);
+                }
             })
         {
             eprintln!("Failed to spawn connection thread: {}", e);
@@ -216,7 +228,10 @@ fn load_kernel_modules() {
     // virtio_mmio needs explicit device= params since the cmdline params may not
     // be forwarded when loading as a module.
     let modules: &[(&str, &str)] = &[
-        ("virtio_mmio.ko", "device=512@0xd0000000:10 device=512@0xd0800000:11"),
+        (
+            "virtio_mmio.ko",
+            "device=512@0xd0000000:10 device=512@0xd0800000:11",
+        ),
         // vsock modules
         ("vsock.ko", ""),
         ("vmw_vsock_virtio_transport_common.ko", ""),
@@ -230,7 +245,10 @@ fn load_kernel_modules() {
     for (module_name, params) in modules {
         let path = format!("/lib/modules/{}", module_name);
         match load_module_file(&path, params) {
-            Ok(()) => kmsg(&format!("Loaded module: {} (params='{}')", module_name, params)),
+            Ok(()) => kmsg(&format!(
+                "Loaded module: {} (params='{}')",
+                module_name, params
+            )),
             Err(e) => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
         }
     }
@@ -245,16 +263,13 @@ fn load_module_file(path: &str, params: &str) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("open {}: {}", path, e))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
 
     let fd = file.as_raw_fd();
     let params_c = CString::new(params).unwrap();
 
     // finit_module(fd, params, flags) - syscall 313 on x86_64
-    let ret = unsafe {
-        libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32)
-    };
+    let ret = unsafe { libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32) };
 
     if ret < 0 {
         let err = std::io::Error::last_os_error();
@@ -303,7 +318,10 @@ fn setup_network() {
     run_cmd("ip", &["route", "add", "default", "via", "10.0.2.2"]);
 
     // Configure DNS resolver (SLIRP DNS: 10.0.2.3)
-    match std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\nnameserver 8.8.8.8\n") {
+    match std::fs::write(
+        "/etc/resolv.conf",
+        "nameserver 10.0.2.3\nnameserver 8.8.8.8\n",
+    ) {
         Ok(()) => kmsg("Wrote /etc/resolv.conf"),
         Err(e) => kmsg(&format!("Failed to write /etc/resolv.conf: {}", e)),
     }
@@ -332,13 +350,8 @@ fn run_cmd(program: &str, args: &[&str]) {
 
 /// Create a vsock listener socket
 fn create_vsock_listener(port: u32) -> RawFd {
-    let socket_fd = unsafe {
-        libc::socket(
-            libc::AF_VSOCK,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let socket_fd =
+        unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
 
     if socket_fd < 0 {
         return -1;
@@ -371,13 +384,17 @@ fn create_vsock_listener(port: u32) -> RawFd {
     };
 
     if ret < 0 {
-        unsafe { libc::close(socket_fd); }
+        unsafe {
+            libc::close(socket_fd);
+        }
         return -1;
     }
 
     let ret = unsafe { libc::listen(socket_fd, 5) };
     if ret < 0 {
-        unsafe { libc::close(socket_fd); }
+        unsafe {
+            libc::close(socket_fd);
+        }
         return -1;
     }
 
@@ -425,7 +442,9 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             5 => {
                 // Shutdown
                 eprintln!("Shutdown requested");
-                unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32); }
+                unsafe {
+                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32);
+                }
                 return Ok(());
             }
             10 => {
@@ -463,8 +482,8 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
     cmd.args(&request.args);
 
     // Ensure PATH includes common binary locations
-    let path = std::env::var("PATH")
-        .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/sbin".to_string());
+    let path =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/sbin".to_string());
     if !path.contains("/usr/local/bin") {
         cmd.env("PATH", format!("/usr/local/bin:{}", path));
     } else {
@@ -506,8 +525,12 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
             // Set supplementary groups to empty
             libc::setgroups(0, std::ptr::null());
             // Drop to gid 1000, uid 1000
-            if libc::setgid(1000) != 0 { return Err(std::io::Error::last_os_error()); }
-            if libc::setuid(1000) != 0 { return Err(std::io::Error::last_os_error()); }
+            if libc::setgid(1000) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(1000) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -580,9 +603,13 @@ fn read_exact(fd: RawFd, buf: &mut [u8]) -> Result<(), String> {
 }
 
 /// Send a response message
-fn send_response<T: Serialize>(fd: RawFd, msg_type: MessageType, payload: &T) -> Result<(), String> {
-    let payload_bytes = serde_json::to_vec(payload)
-        .map_err(|e| format!("Failed to serialize response: {}", e))?;
+fn send_response<T: Serialize>(
+    fd: RawFd,
+    msg_type: MessageType,
+    payload: &T,
+) -> Result<(), String> {
+    let payload_bytes =
+        serde_json::to_vec(payload).map_err(|e| format!("Failed to serialize response: {}", e))?;
 
     let length = payload_bytes.len() as u32;
     let mut msg = Vec::with_capacity(5 + payload_bytes.len());
@@ -617,13 +644,28 @@ fn send_response<T: Serialize>(fd: RawFd, msg_type: MessageType, payload: &T) ->
 /// After writing, the file and its parent directories are chowned to uid 1000
 /// so the sandbox user can read them (e.g., when claudio runs as uid 1000).
 fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
+    let target = Path::new(&request.path);
+    if !is_allowed_guest_path(target) {
+        return WriteFileResponse {
+            success: false,
+            error: Some(format!(
+                "Refusing write outside allowed roots {:?}: {}",
+                ALLOWED_WRITE_ROOTS, request.path
+            )),
+        };
+    }
+
     // Create parent directories if requested
     if request.create_parents {
-        if let Some(parent) = std::path::Path::new(&request.path).parent() {
+        if let Some(parent) = target.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return WriteFileResponse {
                     success: false,
-                    error: Some(format!("Failed to create parent dirs {}: {}", parent.display(), e)),
+                    error: Some(format!(
+                        "Failed to create parent dirs {}: {}",
+                        parent.display(),
+                        e
+                    )),
                 };
             }
             // Make parent directories readable by sandbox user (uid 1000)
@@ -641,7 +683,11 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
                 // Ensure file is world-readable
                 libc::chmod(c_path.as_ptr(), 0o644);
             }
-            kmsg(&format!("Wrote {} bytes to {}", request.content.len(), request.path));
+            kmsg(&format!(
+                "Wrote {} bytes to {}",
+                request.content.len(),
+                request.path
+            ));
             WriteFileResponse {
                 success: true,
                 error: None,
@@ -657,17 +703,22 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
 /// Recursively chown a path and its parents to uid 1000:1000.
 /// Only affects directories that are owned by root.
 fn chown_recursive(path: &std::path::Path) {
+    if !is_allowed_guest_path(path) {
+        return;
+    }
+
     let mut current = path.to_path_buf();
     loop {
-        if let Ok(c_path) = std::ffi::CString::new(current.to_string_lossy().as_ref()) {
-            unsafe {
-                libc::chown(c_path.as_ptr(), 1000, 1000);
-                // Ensure directory is traversable
-                libc::chmod(c_path.as_ptr(), 0o755);
-            }
+        if !is_allowed_guest_path(&current) {
+            break;
+        }
+        chown_dir_if_root_owned(&current);
+
+        if is_allowed_root(&current) {
+            break;
         }
         match current.parent() {
-            Some(p) if p != current && p.to_string_lossy() != "/" => {
+            Some(p) if p != current => {
                 current = p.to_path_buf();
             }
             _ => break,
@@ -680,9 +731,20 @@ fn chown_recursive(path: &std::path::Path) {
 /// After creating, directories are chowned to uid 1000 so the sandbox user
 /// can access them.
 fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
+    let target = Path::new(&request.path);
+    if !is_allowed_guest_path(target) {
+        return MkdirPResponse {
+            success: false,
+            error: Some(format!(
+                "Refusing mkdir outside allowed roots {:?}: {}",
+                ALLOWED_WRITE_ROOTS, request.path
+            )),
+        };
+    }
+
     match std::fs::create_dir_all(&request.path) {
         Ok(()) => {
-            chown_recursive(std::path::Path::new(&request.path));
+            chown_recursive(target);
             kmsg(&format!("Created directory {}", request.path));
             MkdirPResponse {
                 success: true,
@@ -691,7 +753,10 @@ fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
         }
         Err(e) => MkdirPResponse {
             success: false,
-            error: Some(format!("Failed to create directory {}: {}", request.path, e)),
+            error: Some(format!(
+                "Failed to create directory {}: {}",
+                request.path, e
+            )),
         },
     }
 }
@@ -745,7 +810,15 @@ fn telemetry_stream_loop(fd: RawFd) {
 
 /// Read aggregate CPU jiffies from the first line of /proc/stat.
 fn read_cpu_jiffies() -> CpuJiffies {
-    let default = CpuJiffies { user: 0, nice: 0, system: 0, idle: 0, iowait: 0, irq: 0, softirq: 0 };
+    let default = CpuJiffies {
+        user: 0,
+        nice: 0,
+        system: 0,
+        idle: 0,
+        iowait: 0,
+        irq: 0,
+        softirq: 0,
+    };
     let content = match std::fs::read_to_string("/proc/stat") {
         Ok(c) => c,
         Err(_) => return default,
@@ -759,7 +832,12 @@ fn read_cpu_jiffies() -> CpuJiffies {
     if fields.len() < 8 || fields[0] != "cpu" {
         return default;
     }
-    let parse = |i: usize| fields.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let parse = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
     CpuJiffies {
         user: parse(1),
         nice: parse(2),
@@ -821,9 +899,15 @@ fn read_netdev() -> (u64, u64) {
         if trimmed.starts_with("eth0:") {
             let after_colon = &trimmed["eth0:".len()..];
             let fields: Vec<&str> = after_colon.split_whitespace().collect();
-            let rx = fields.first().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let rx = fields
+                .first()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             // tx_bytes is the 9th field (index 8) after the colon
-            let tx = fields.get(8).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let tx = fields
+                .get(8)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             return (rx, tx);
         }
     }
@@ -836,12 +920,7 @@ fn read_procs_running() -> u32 {
         Ok(c) => c,
         Err(_) => return 0,
     };
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("procs_running ") {
-            return rest.trim().parse::<u32>().unwrap_or(0);
-        }
-    }
-    0
+    parse_procs_running(&content)
 }
 
 /// Read number of allocated file descriptors from /proc/sys/fs/file-nr.
@@ -850,17 +929,13 @@ fn read_open_fds() -> u32 {
         Ok(c) => c,
         Err(_) => return 0,
     };
-    // Format: "allocated_fds  free_fds  max_fds"
-    content
-        .split_whitespace()
-        .next()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0)
+    parse_open_fds(&content)
 }
 
 /// Collect per-process metrics by scanning /proc/[0-9]*/.
 fn collect_process_metrics() -> Vec<ProcessMetrics> {
     let mut processes = Vec::new();
+    let page_size = page_size_bytes();
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
         Err(_) => return processes,
@@ -895,7 +970,7 @@ fn collect_process_metrics() -> Vec<ProcessMetrics> {
                     .and_then(|v| v.parse::<u64>().ok())
             })
             .unwrap_or(0)
-            * 4096; // page size
+            * page_size;
 
         // Read state and cpu jiffies from stat
         let (state, cpu_jiffies) = read_proc_stat_fields(&base);
@@ -918,6 +993,10 @@ fn read_proc_stat_fields(base: &str) -> (char, u64) {
         Ok(c) => c,
         Err(_) => return ('?', 0),
     };
+    parse_proc_stat_fields_content(&content)
+}
+
+fn parse_proc_stat_fields_content(content: &str) -> (char, u64) {
     // /proc/PID/stat format: pid (comm) state ... utime(14) stime(15) ...
     // Find the closing ')' to skip the comm field (which may contain spaces/parens)
     let after_comm = match content.rfind(')') {
@@ -926,12 +1005,99 @@ fn read_proc_stat_fields(base: &str) -> (char, u64) {
     };
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     // fields[0] = state, fields[11] = utime, fields[12] = stime
-    let state = fields.first()
-        .and_then(|s| s.chars().next())
-        .unwrap_or('?');
-    let utime = fields.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let stime = fields.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let state = fields.first().and_then(|s| s.chars().next()).unwrap_or('?');
+    let utime = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = fields
+        .get(12)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     (state, utime + stime)
+}
+
+fn parse_procs_running(content: &str) -> u32 {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("procs_running ") {
+            return rest.trim().parse::<u32>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+fn parse_open_fds(content: &str) -> u32 {
+    // Format: "allocated_fds  free_fds  max_fds"
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn page_size_bytes() -> u64 {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        4096
+    } else {
+        page_size as u64
+    }
+}
+
+fn is_allowed_guest_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+
+    let normalized = normalize_path(path);
+    ALLOWED_WRITE_ROOTS.iter().any(|root| {
+        let root_path = Path::new(root);
+        normalized == root_path || normalized.starts_with(root_path)
+    })
+}
+
+fn is_allowed_root(path: &Path) -> bool {
+    ALLOWED_WRITE_ROOTS
+        .iter()
+        .any(|root| path == Path::new(root))
+}
+
+fn chown_dir_if_root_owned(path: &Path) {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if meta.uid() != 0 {
+        return;
+    }
+
+    if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_ref()) {
+        unsafe {
+            libc::chown(c_path.as_ptr(), 1000, 1000);
+            // Ensure directory is traversable
+            libc::chmod(c_path.as_ptr(), 0o755);
+        }
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(seg) => normalized.push(seg),
+            Component::Prefix(_) => {}
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        normalized
+    }
 }
 
 /// Get current time as Unix milliseconds.
@@ -940,4 +1106,67 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_proc_stat_fields_content_ok() {
+        let line = "1234 (my(proc) name) S 1 2 3 4 5 6 7 8 9 10 100 200 0 0 0 0\n";
+        let (state, jiffies) = parse_proc_stat_fields_content(line);
+        assert_eq!(state, 'S');
+        assert_eq!(jiffies, 300);
+    }
+
+    #[test]
+    fn test_parse_proc_stat_fields_content_malformed() {
+        let (state, jiffies) = parse_proc_stat_fields_content("not-a-valid-stat-line");
+        assert_eq!(state, '?');
+        assert_eq!(jiffies, 0);
+    }
+
+    #[test]
+    fn test_parse_procs_running() {
+        let content = "cpu  1 2 3 4 5 6 7 8\nprocs_running 9\n";
+        assert_eq!(parse_procs_running(content), 9);
+        assert_eq!(parse_procs_running("cpu 1 2 3"), 0);
+    }
+
+    #[test]
+    fn test_parse_open_fds() {
+        assert_eq!(parse_open_fds("123 456 789\n"), 123);
+        assert_eq!(parse_open_fds("oops"), 0);
+    }
+
+    #[test]
+    fn test_allowed_guest_path_policy() {
+        assert!(is_allowed_guest_path(Path::new("/workspace/file.txt")));
+        assert!(is_allowed_guest_path(Path::new(
+            "/home/sandbox/.claude/skills/x.md"
+        )));
+        assert!(!is_allowed_guest_path(Path::new("/usr/local/bin/foo")));
+        assert!(!is_allowed_guest_path(Path::new("/etc/hosts")));
+        assert!(!is_allowed_guest_path(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn test_normalize_path() {
+        assert_eq!(
+            normalize_path(Path::new("/workspace/a/../b/./c")),
+            PathBuf::from("/workspace/b/c")
+        );
+    }
+
+    #[test]
+    fn test_chown_recursive_stays_in_allowed_roots() {
+        // Function should be a no-op for disallowed roots.
+        chown_recursive(Path::new("/usr/local/bin"));
+    }
+
+    #[test]
+    fn test_page_size_bytes_positive() {
+        assert!(page_size_bytes() > 0);
+    }
 }

@@ -5,8 +5,8 @@
 //! ## Skill & MCP awareness
 //!
 //! On startup, claudio scans the guest filesystem for provisioned skills and MCP config:
-//! - `/root/.claude/skills/*.md` -- SKILL.md files provisioned by AgentBox
-//! - `/root/.claude/mcp.json` -- MCP server configuration
+//! - `/home/sandbox/.claude/skills/*.md` -- SKILL.md files provisioned by AgentBox
+//! - `/home/sandbox/.claude/mcp.json` -- MCP server configuration
 //!
 //! Discovered skills and MCP servers are:
 //! 1. Reported in the system event (`"skills":[...],"mcp_servers":[...]`)
@@ -34,6 +34,8 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+
+const CLAUDE_HOME: &str = "/home/sandbox/.claude";
 
 fn main() {
     // Parse command line args to extract the prompt (mimic claude-code CLI)
@@ -72,11 +74,11 @@ fn extract_prompt(args: &[String]) -> String {
 
 /// Skills and MCP servers discovered in the guest filesystem.
 struct DiscoveredSkills {
-    /// Names of SKILL.md files found in /root/.claude/skills/
+    /// Names of SKILL.md files found in /home/sandbox/.claude/skills/
     skill_files: Vec<String>,
     /// First line (title) of each discovered SKILL.md
     skill_titles: Vec<String>,
-    /// Names of MCP servers found in /root/.claude/mcp.json
+    /// Names of MCP servers found in /home/sandbox/.claude/mcp.json
     mcp_servers: Vec<String>,
     /// MCP server commands (for simulating tool calls)
     mcp_commands: Vec<String>,
@@ -92,8 +94,9 @@ impl DiscoveredSkills {
             mcp_commands: Vec::new(),
         };
 
-        // Scan /root/.claude/skills/*.md
-        let skills_dir = Path::new("/root/.claude/skills");
+        // Scan /home/sandbox/.claude/skills/*.md
+        let skills_dir_path = format!("{}/skills", CLAUDE_HOME);
+        let skills_dir = Path::new(&skills_dir_path);
         if skills_dir.is_dir() {
             if let Ok(entries) = fs::read_dir(skills_dir) {
                 let mut files: Vec<_> = entries
@@ -125,8 +128,9 @@ impl DiscoveredSkills {
             }
         }
 
-        // Read /root/.claude/mcp.json
-        let mcp_path = Path::new("/root/.claude/mcp.json");
+        // Read /home/sandbox/.claude/mcp.json
+        let mcp_path_path = format!("{}/mcp.json", CLAUDE_HOME);
+        let mcp_path = Path::new(&mcp_path_path);
         if mcp_path.is_file() {
             if let Ok(content) = fs::read_to_string(mcp_path) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -514,7 +518,7 @@ fn tool_content(
             if !discovered.skill_files.is_empty() {
                 let skill_idx = index % discovered.skill_files.len();
                 let skill_name = &discovered.skill_files[skill_idx];
-                let skill_path = format!("/root/.claude/skills/{}.md", skill_name);
+                let skill_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill_name);
                 let input = serde_json::json!({
                     "file_path": &skill_path,
                 });
