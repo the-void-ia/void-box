@@ -258,6 +258,8 @@ impl AgentBox {
 
     /// Provision skills into the sandbox: write SKILL.md files and MCP config.
     async fn provision_skills(&self, sandbox: &Sandbox) -> Result<()> {
+        let tag = &self.name;
+
         // Collect MCP servers for mcp.json
         let mut mcp_servers = serde_json::Map::new();
 
@@ -275,24 +277,31 @@ impl AgentBox {
                     let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
                     sandbox.write_file(&guest_path, &content).await?;
                     eprintln!(
-                        "  [skill] Installed local skill '{}' -> {}",
-                        skill.name, guest_path
+                        "[vm:{}] Installing skill '{}' ({}) -> {}",
+                        tag,
+                        skill.name,
+                        skill.description_text.as_deref().unwrap_or("no description"),
+                        guest_path
                     );
                 }
                 SkillKind::Remote { id } => {
                     let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
+                    eprintln!(
+                        "[vm:{}] Fetching remote skill '{}' from skills.sh/{}",
+                        tag, skill.name, id
+                    );
                     match skill.fetch_remote_content().await {
                         Ok(content) => {
                             sandbox.write_file(&guest_path, content.as_bytes()).await?;
                             eprintln!(
-                                "  [skill] Fetched remote skill '{}' (skills.sh/{}) -> {}",
-                                skill.name, id, guest_path
+                                "[vm:{}] Installed remote skill '{}' -> {}",
+                                tag, skill.name, guest_path
                             );
                         }
                         Err(e) => {
                             eprintln!(
-                                "  [skill] WARN: Failed to fetch '{}': {}. Writing fallback.",
-                                skill.name, e
+                                "[vm:{}] WARN: Failed to fetch skill '{}': {}. Writing fallback.",
+                                tag, skill.name, e
                             );
                             let fallback = format!(
                                 "# Skill: {} (fetch failed)\n\n\
@@ -316,21 +325,21 @@ impl AgentBox {
                     }
                     mcp_servers.insert(skill.name.clone(), entry);
                     eprintln!(
-                        "  [skill] Registered MCP server '{}' ({})",
-                        skill.name, command
+                        "[vm:{}] Registering MCP server '{}' (cmd: {}, args: {:?})",
+                        tag, skill.name, command, args
                     );
                 }
                 SkillKind::Cli { command } => {
                     eprintln!(
-                        "  [skill] CLI tool '{}' available at {}",
-                        skill.name, command
+                        "[vm:{}] CLI tool '{}' available at {}",
+                        tag, skill.name, command
                     );
                     // CLI binaries are expected to be in the initramfs already
                 }
                 SkillKind::Agent { command } => {
                     eprintln!(
-                        "  [skill] Agent '{}' ({}) will be the reasoning engine",
-                        skill.name, command
+                        "[vm:{}] Reasoning engine: {} ({})",
+                        tag, skill.name, command
                     );
                 }
             }
@@ -347,7 +356,12 @@ impl AgentBox {
             sandbox
                 .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
                 .await?;
-            eprintln!("  [skill] Wrote MCP config to {}/mcp.json", CLAUDE_HOME);
+            eprintln!(
+                "[vm:{}] Wrote MCP config ({} servers) to {}/mcp.json",
+                tag,
+                mcp_servers.len(),
+                CLAUDE_HOME
+            );
         }
 
         Ok(())
@@ -365,12 +379,14 @@ impl AgentBox {
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
 
+        let tag = &self.name;
+
         // Write input data if provided
         if let Some(data) = input {
             sandbox.write_file("/workspace/input.json", data).await?;
             eprintln!(
-                "  [box:{}] Wrote {} bytes to /workspace/input.json",
-                self.name,
+                "[vm:{}] Writing input ({} bytes) to /workspace/input.json",
+                tag,
                 data.len()
             );
         }
@@ -405,8 +421,8 @@ impl AgentBox {
         };
 
         eprintln!(
-            "[box:{}] Running agent with {} ({} chars)...",
-            self.name,
+            "[vm:{}] Executing agent | llm={} | prompt_len={} chars",
+            tag,
             self.config.llm.description(),
             full_prompt.len()
         );
@@ -424,12 +440,27 @@ impl AgentBox {
             )
             .await?;
 
+        eprintln!(
+            "[vm:{}] Agent finished | tokens={}in/{}out | tools={} | cost=${:.4} | error={}",
+            tag,
+            claude_result.input_tokens,
+            claude_result.output_tokens,
+            claude_result.tool_calls.len(),
+            claude_result.total_cost_usd,
+            claude_result.is_error,
+        );
+
+        // Log tool calls if any
+        for tc in &claude_result.tool_calls {
+            eprintln!("[vm:{}]   tool: {}({})", tag, tc.tool_name, tc.tool_use_id);
+        }
+
         // Try to read the output file
         let file_output = match sandbox.read_file(&self.config.output_file).await {
             Ok(data) if !data.is_empty() => {
                 eprintln!(
-                    "  [box:{}] Read {} bytes from {}",
-                    self.name,
+                    "[vm:{}] Reading output ({} bytes) from {}",
+                    tag,
                     data.len(),
                     self.config.output_file
                 );

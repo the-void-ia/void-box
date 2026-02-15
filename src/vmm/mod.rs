@@ -25,7 +25,8 @@ use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::guest::protocol::{
-    ExecRequest, ExecResponse, MkdirPRequest, MkdirPResponse, WriteFileRequest, WriteFileResponse,
+    ExecOutputChunk, ExecRequest, ExecResponse, MkdirPRequest, MkdirPResponse, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::network::slirp::SlirpStack;
 use crate::observe::telemetry::TelemetryAggregator;
@@ -85,6 +86,12 @@ enum VmCommand {
     MkdirP {
         request: MkdirPRequest,
         response_tx: oneshot::Sender<Result<MkdirPResponse>>,
+    },
+    /// Execute a command with streaming output chunks
+    ExecStreaming {
+        request: ExecRequest,
+        response_tx: oneshot::Sender<Result<ExecResponse>>,
+        chunk_tx: mpsc::Sender<ExecOutputChunk>,
     },
     /// Start a telemetry subscription
     SubscribeTelemetry {
@@ -256,6 +263,16 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                                     };
                                     let _ = response_tx.send(result);
                                 }
+                                VmCommand::ExecStreaming { request, response_tx, chunk_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_exec_request_streaming(&request, |chunk| {
+                                            let _ = chunk_tx.try_send(chunk);
+                                        }).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
                                 VmCommand::WriteFile { request, response_tx } => {
                                     let result = if let Some(ref vsock) = vsock_clone {
                                         vsock.send_write_file(&request.path, &request.content).await
@@ -405,6 +422,54 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             response.stderr,
             response.exit_code,
         ))
+    }
+
+    /// Execute a command with streaming output.
+    ///
+    /// Returns a channel of `ExecOutputChunk` messages (stdout/stderr chunks as
+    /// they're produced) and a oneshot receiver for the final `ExecResponse`.
+    /// The final response still contains the complete accumulated output.
+    pub async fn exec_streaming(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(String, String)],
+        working_dir: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<(mpsc::Receiver<ExecOutputChunk>, oneshot::Receiver<Result<ExecResponse>>)> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::VmNotRunning);
+        }
+
+        let mut exec_env = env.to_vec();
+        if let Some(ref ctx) = self.active_span_context {
+            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
+                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
+            }
+        }
+
+        let request = ExecRequest {
+            program: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin: Vec::new(),
+            env: exec_env,
+            working_dir: working_dir.map(String::from),
+            timeout_secs,
+        };
+
+        let (chunk_tx, chunk_rx) = mpsc::channel(256);
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(VmCommand::ExecStreaming {
+                request,
+                response_tx,
+                chunk_tx,
+            })
+            .await
+            .map_err(|_| Error::Guest("Failed to send streaming command".into()))?;
+
+        Ok((chunk_rx, response_rx))
     }
 
     /// Write a file to the guest filesystem using the native WriteFile protocol.

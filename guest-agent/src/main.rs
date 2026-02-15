@@ -6,18 +6,19 @@
 //! - File transfers
 //! - Process management
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
-    ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse, ProcessMetrics,
-    SystemMetrics, TelemetryBatch, WriteFileRequest, WriteFileResponse,
+    ExecOutputChunk, ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse,
+    ProcessMetrics, SystemMetrics, TelemetryBatch, WriteFileRequest, WriteFileResponse,
 };
 
 /// vsock port we listen on
@@ -431,7 +432,7 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 let request: ExecRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse request: {}", e))?;
 
-                let response = execute_command(&request);
+                let response = execute_command(fd, &request);
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
             3 => {
@@ -474,8 +475,9 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
     }
 }
 
-/// Execute a command and return the response
-fn execute_command(request: &ExecRequest) -> ExecResponse {
+/// Execute a command, streaming stdout/stderr chunks via ExecOutputChunk
+/// messages, then return the final ExecResponse with full accumulated output.
+fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
 
     let mut cmd = Command::new(&request.program);
@@ -536,7 +538,7 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
     }
 
     // Spawn the process
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return ExecResponse {
@@ -549,38 +551,94 @@ fn execute_command(request: &ExecRequest) -> ExecResponse {
         }
     };
 
-    let mut child = child;
-
-    // Write stdin if provided
+    // Write stdin if provided, then close
     if !request.stdin.is_empty() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&request.stdin);
         }
     }
 
-    // Wait for completion
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
+    // Take stdout/stderr pipes for streaming
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Wrap fd in a Mutex so both streaming threads can send chunks safely
+    // without interleaving wire-format messages.
+    let fd_mutex = Arc::new(Mutex::new(fd));
+
+    let fd_for_stdout = fd_mutex.clone();
+    let stdout_handle = std::thread::spawn(move || stream_pipe(fd_for_stdout, stdout_pipe, "stdout"));
+
+    let fd_for_stderr = fd_mutex.clone();
+    let stderr_handle = std::thread::spawn(move || stream_pipe(fd_for_stderr, stderr_pipe, "stderr"));
+
+    // Wait for process to exit
+    let exit_code = match child.wait() {
+        Ok(status) => status.code().unwrap_or(-1),
         Err(e) => {
+            // Still join threads to get whatever output was collected
+            let stdout_bytes = stdout_handle.join().unwrap_or_default();
+            let stderr_bytes = stderr_handle.join().unwrap_or_default();
+            let duration_ms = start.elapsed().as_millis() as u64;
             return ExecResponse {
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
                 exit_code: -1,
                 error: Some(format!("Failed to wait for process: {}", e)),
-                duration_ms: None,
+                duration_ms: Some(duration_ms),
             };
         }
     };
 
+    // Collect accumulated output from streaming threads
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
     let duration_ms = start.elapsed().as_millis() as u64;
 
     ExecResponse {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        exit_code,
         error: None,
         duration_ms: Some(duration_ms),
     }
+}
+
+/// Read from a pipe and send ExecOutputChunk messages as data arrives.
+/// Returns the full accumulated output for the final ExecResponse.
+fn stream_pipe(
+    fd: Arc<Mutex<RawFd>>,
+    pipe: Option<impl Read>,
+    stream_name: &str,
+) -> Vec<u8> {
+    let mut accumulated = Vec::new();
+    let mut seq = 0u64;
+    let mut buf = [0u8; 4096];
+
+    if let Some(mut pipe) = pipe {
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    accumulated.extend_from_slice(&buf[..n]);
+                    let chunk = ExecOutputChunk {
+                        stream: stream_name.to_string(),
+                        data: buf[..n].to_vec(),
+                        seq,
+                    };
+                    // Best-effort: if send fails, we still accumulate for the
+                    // final ExecResponse so backward compat is preserved.
+                    if let Ok(locked_fd) = fd.lock() {
+                        let _ = send_response(*locked_fd, MessageType::ExecOutputChunk, &chunk);
+                    }
+                    seq += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    accumulated
 }
 
 /// Read exactly `buf.len()` bytes from the socket

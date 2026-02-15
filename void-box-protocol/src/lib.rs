@@ -106,6 +106,10 @@ pub enum MessageType {
     MkdirP = 13,
     /// Response to MkdirP
     MkdirPResponse = 14,
+    /// Incremental stdout/stderr chunk during execution
+    ExecOutputChunk = 15,
+    /// Ack from host (optional flow control)
+    ExecOutputAck = 16,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -127,6 +131,8 @@ impl TryFrom<u8> for MessageType {
             12 => Ok(MessageType::WriteFileResponse),
             13 => Ok(MessageType::MkdirP),
             14 => Ok(MessageType::MkdirPResponse),
+            15 => Ok(MessageType::ExecOutputChunk),
+            16 => Ok(MessageType::ExecOutputAck),
             _ => Err(ProtocolError::UnknownMessageType(byte)),
         }
     }
@@ -253,6 +259,22 @@ impl ExecResponse {
             duration_ms: None,
         }
     }
+}
+
+/// Incremental stdout/stderr chunk sent during command execution.
+///
+/// The guest-agent sends these as output is produced. The final
+/// [`ExecResponse`] still contains the complete output for backward
+/// compatibility — hosts that don't understand this message type can
+/// safely ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecOutputChunk {
+    /// Which stream: `"stdout"` or `"stderr"`.
+    pub stream: String,
+    /// The data chunk.
+    pub data: Vec<u8>,
+    /// Sequence number for ordering.
+    pub seq: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +431,7 @@ mod tests {
     #[test]
     fn message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
-        assert!(MessageType::try_from(15).is_err());
+        assert!(MessageType::try_from(17).is_err());
         assert!(MessageType::try_from(255).is_err());
     }
 
@@ -497,6 +519,26 @@ mod tests {
         let decoded = Message::read_from_sync(&mut cursor).unwrap();
         assert_eq!(decoded.msg_type, MessageType::ExecRequest);
         assert_eq!(decoded.payload, b"{\"program\":\"ls\"}");
+    }
+
+    #[test]
+    fn exec_output_chunk_json_round_trip() {
+        let chunk = ExecOutputChunk {
+            stream: "stdout".to_string(),
+            data: b"hello world\n".to_vec(),
+            seq: 42,
+        };
+        let json = serde_json::to_vec(&chunk).unwrap();
+        let decoded: ExecOutputChunk = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.stream, "stdout");
+        assert_eq!(decoded.data, b"hello world\n");
+        assert_eq!(decoded.seq, 42);
+    }
+
+    #[test]
+    fn exec_output_chunk_message_type() {
+        assert_eq!(MessageType::try_from(15).unwrap(), MessageType::ExecOutputChunk);
+        assert_eq!(MessageType::try_from(16).unwrap(), MessageType::ExecOutputAck);
     }
 
     #[test]

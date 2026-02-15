@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::guest::protocol::{
-    ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest, MkdirPResponse, TelemetryBatch,
-    WriteFileRequest, WriteFileResponse,
+    ExecOutputChunk, ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest,
+    MkdirPResponse, TelemetryBatch, WriteFileRequest, WriteFileResponse,
 };
 use crate::{Error, Result};
 
@@ -113,6 +113,65 @@ impl VsockDevice {
         );
 
         Ok(response)
+    }
+
+    /// Send an exec request and stream output chunks as they arrive.
+    ///
+    /// Calls `on_chunk` for each `ExecOutputChunk` the guest sends before the
+    /// final `ExecResponse`. The final response still contains full accumulated
+    /// stdout/stderr for backward compatibility.
+    pub async fn send_exec_request_streaming<F>(
+        &self,
+        request: &ExecRequest,
+        mut on_chunk: F,
+    ) -> Result<ExecResponse>
+    where
+        F: FnMut(ExecOutputChunk),
+    {
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "exec-streaming")
+            .await?;
+
+        let timeout = request
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(1200));
+        let _ = stream.set_read_timeout(Some(timeout));
+
+        let message = Message {
+            msg_type: MessageType::ExecRequest,
+            payload: serde_json::to_vec(request)?,
+        };
+
+        let msg_bytes = message.serialize();
+        stream
+            .write_all(&msg_bytes)
+            .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
+
+        info!("vsock: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
+
+        // Read messages in a loop until we get the final ExecResponse
+        loop {
+            let msg = Message::read_from_sync(&mut stream)?;
+            match msg.msg_type {
+                MessageType::ExecOutputChunk => {
+                    if let Ok(chunk) = serde_json::from_slice::<ExecOutputChunk>(&msg.payload) {
+                        on_chunk(chunk);
+                    }
+                }
+                MessageType::ExecResponse => {
+                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
+                    info!(
+                        "vsock: ExecResponse received (streaming) exit_code={}",
+                        response.exit_code
+                    );
+                    return Ok(response);
+                }
+                other => {
+                    warn!("Unexpected message type during streaming exec: {:?}", other);
+                }
+            }
+        }
     }
 
     /// Write a file to the guest filesystem using the native WriteFile protocol.
