@@ -436,7 +436,10 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         env: &[(String, String)],
         working_dir: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> Result<(mpsc::Receiver<ExecOutputChunk>, oneshot::Receiver<Result<ExecResponse>>)> {
+    ) -> Result<(
+        mpsc::Receiver<ExecOutputChunk>,
+        oneshot::Receiver<Result<ExecResponse>>,
+    )> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(Error::VmNotRunning);
         }

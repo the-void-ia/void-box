@@ -537,8 +537,14 @@ mod tests {
 
     #[test]
     fn exec_output_chunk_message_type() {
-        assert_eq!(MessageType::try_from(15).unwrap(), MessageType::ExecOutputChunk);
-        assert_eq!(MessageType::try_from(16).unwrap(), MessageType::ExecOutputAck);
+        assert_eq!(
+            MessageType::try_from(15).unwrap(),
+            MessageType::ExecOutputChunk
+        );
+        assert_eq!(
+            MessageType::try_from(16).unwrap(),
+            MessageType::ExecOutputAck
+        );
     }
 
     #[test]

@@ -195,9 +195,7 @@ impl Pipeline {
                     let mut join_set = tokio::task::JoinSet::new();
                     for agent_box in boxes {
                         let input = carry_data.clone();
-                        join_set.spawn(async move {
-                            agent_box.run(input.as_deref()).await
-                        });
+                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
                     }
 
                     let mut parallel_results: Vec<StageResult> = Vec::new();
@@ -215,10 +213,7 @@ impl Pipeline {
                         );
 
                         if stage_result.claude_result.is_error {
-                            log_stage_error(
-                                &stage_result.box_name,
-                                &stage_result.claude_result,
-                            );
+                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
                             had_error = true;
                         }
 
@@ -230,9 +225,7 @@ impl Pipeline {
                     stages.extend(parallel_results);
 
                     if had_error {
-                        eprintln!(
-                            "[pipeline] Fan-out stage had errors; stopping pipeline early."
-                        );
+                        eprintln!("[pipeline] Fan-out stage had errors; stopping pipeline early.");
                         break;
                     }
                 }
@@ -318,9 +311,7 @@ impl Pipeline {
                     let mut join_set = tokio::task::JoinSet::new();
                     for agent_box in boxes {
                         let input = carry_data.clone();
-                        join_set.spawn(async move {
-                            agent_box.run(input.as_deref()).await
-                        });
+                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
                     }
 
                     let mut parallel_results: Vec<StageResult> = Vec::new();
@@ -336,10 +327,7 @@ impl Pipeline {
                         );
 
                         if stage_result.claude_result.is_error {
-                            log_stage_error(
-                                &stage_result.box_name,
-                                &stage_result.claude_result,
-                            );
+                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
                             had_error = true;
                         }
 

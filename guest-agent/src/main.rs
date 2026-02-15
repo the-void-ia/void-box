@@ -567,10 +567,12 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let fd_mutex = Arc::new(Mutex::new(fd));
 
     let fd_for_stdout = fd_mutex.clone();
-    let stdout_handle = std::thread::spawn(move || stream_pipe(fd_for_stdout, stdout_pipe, "stdout"));
+    let stdout_handle =
+        std::thread::spawn(move || stream_pipe(fd_for_stdout, stdout_pipe, "stdout"));
 
     let fd_for_stderr = fd_mutex.clone();
-    let stderr_handle = std::thread::spawn(move || stream_pipe(fd_for_stderr, stderr_pipe, "stderr"));
+    let stderr_handle =
+        std::thread::spawn(move || stream_pipe(fd_for_stderr, stderr_pipe, "stderr"));
 
     // Wait for process to exit
     let exit_code = match child.wait() {
@@ -607,11 +609,7 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
 /// Read from a pipe and send ExecOutputChunk messages as data arrives.
 /// Returns the full accumulated output for the final ExecResponse.
-fn stream_pipe(
-    fd: Arc<Mutex<RawFd>>,
-    pipe: Option<impl Read>,
-    stream_name: &str,
-) -> Vec<u8> {
+fn stream_pipe(fd: Arc<Mutex<RawFd>>, pipe: Option<impl Read>, stream_name: &str) -> Vec<u8> {
     let mut accumulated = Vec::new();
     let mut seq = 0u64;
     let mut buf = [0u8; 4096];

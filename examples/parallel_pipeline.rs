@@ -174,7 +174,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .build()?;
 
-    println!("  [2b] {} (parallel) -- {}", sentiment_box.name, sentiment_llm);
+    println!(
+        "  [2b] {} (parallel) -- {}",
+        sentiment_box.name, sentiment_llm
+    );
 
     // ---- Box 3: Portfolio Strategist (sequential, can use different model) ----
 
@@ -190,7 +193,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .build()?;
 
-    println!("  [3]  {} (sequential) -- {}", strategy_box.name, strategy_llm);
+    println!(
+        "  [3]  {} (sequential) -- {}",
+        strategy_box.name, strategy_llm
+    );
 
     // ---- Compose: sequential -> fan_out -> sequential ----
 
@@ -202,7 +208,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let result = Pipeline::named("parallel_trading", data_box)
         .fan_out(vec![quant_box, sentiment_box]) // parallel: both get data_box output
-        .pipe(strategy_box)                       // sequential: gets merged JSON array
+        .pipe(strategy_box) // sequential: gets merged JSON array
         .run_streaming(|box_name, chunk| {
             // Show real-time output from each agent so users can see WTF is happening
             let text = String::from_utf8_lossy(&chunk.data);

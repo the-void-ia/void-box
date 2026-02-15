@@ -181,11 +181,10 @@ impl Scheduler {
                     join_set.spawn(async move {
                         let mut step_span = observer.start_step_span(&name, Some(&wf_ctx));
 
-                        let mut ctx_builder = StepContextBuilder::new(&name, sb)
-                            .with_outputs(outputs_snap.clone());
+                        let mut ctx_builder =
+                            StepContextBuilder::new(&name, sb).with_outputs(outputs_snap.clone());
 
-                        if let Some(input) =
-                            resolve_pipe_input(&name, &compositions, &outputs_snap)
+                        if let Some(input) = resolve_pipe_input(&name, &compositions, &outputs_snap)
                         {
                             ctx_builder = ctx_builder.with_input(input);
                         }
@@ -205,11 +204,9 @@ impl Scheduler {
                                     Err(e) => {
                                         last_error = Some(e);
                                         if attempt + 1 < retry_config.max_attempts {
-                                            tokio::time::sleep(
-                                                tokio::time::Duration::from_millis(
-                                                    100 * (attempt as u64 + 1),
-                                                ),
-                                            )
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                                100 * (attempt as u64 + 1),
+                                            ))
                                             .await;
                                         }
                                     }
@@ -233,10 +230,9 @@ impl Scheduler {
                                 let error_msg = e.to_string();
                                 step_span.record_stderr(error_msg.len());
                                 step_span.set_error(&error_msg);
-                                observer.logger().error(
-                                    &format!("Step {} failed: {}", name, error_msg),
-                                    &[],
-                                );
+                                observer
+                                    .logger()
+                                    .error(&format!("Step {} failed: {}", name, error_msg), &[]);
                                 StepOutput::new(Vec::new(), error_msg.as_bytes().to_vec(), 1)
                             }
                         };
@@ -247,8 +243,8 @@ impl Scheduler {
 
                 // Collect results from all parallel tasks
                 while let Some(result) = join_set.join_next().await {
-                    let (name, output) = result
-                        .map_err(|e| Error::Guest(format!("Join error: {}", e)))?;
+                    let (name, output) =
+                        result.map_err(|e| Error::Guest(format!("Join error: {}", e)))?;
                     step_outputs.write().await.insert(name, output);
                 }
             }

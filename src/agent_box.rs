@@ -280,7 +280,10 @@ impl AgentBox {
                         "[vm:{}] Installing skill '{}' ({}) -> {}",
                         tag,
                         skill.name,
-                        skill.description_text.as_deref().unwrap_or("no description"),
+                        skill
+                            .description_text
+                            .as_deref()
+                            .unwrap_or("no description"),
                         guest_path
                     );
                 }
