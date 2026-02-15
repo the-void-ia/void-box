@@ -77,13 +77,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let reasoning = Skill::agent("claude-code")
         .description("Autonomous reasoning and code execution");
 
-    let data_skill = Skill::file("skills/financial-data-analysis.md")
+    let data_skill = Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md")
         .description("Financial data collection and quality methodology");
 
-    let quant_skill = Skill::file("skills/quant-technical-analysis.md")
+    let quant_skill = Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md")
         .description("Technical indicator computation and signal generation");
 
-    let risk_skill = Skill::file("skills/portfolio-risk-management.md")
+    let risk_skill = Skill::file("examples/trading_pipeline/skills/portfolio-risk-management.md")
         .description("Portfolio risk management and position sizing");
 
     // ---- Detect environment: KVM or mock ----

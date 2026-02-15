@@ -4,7 +4,7 @@
 //! - Sandbox isolation
 //! - Workflow composition
 //! - Observability capture
-//! - Parity with BoxLite/VM0 examples
+//! - Command and workflow parity across sandbox modes
 
 use void_box::observe::{ObserveConfig, Observer};
 use void_box::sandbox::Sandbox;
@@ -288,13 +288,12 @@ async fn test_reproducibility() {
 }
 
 // =============================================================================
-// BOXLITE / VM0 PARITY TESTS
+// COMMAND / WORKFLOW PARITY TESTS
 // =============================================================================
 
-/// BoxLite example: Run simple echo command
-/// Their API: box.run("echo hello")
+/// Run simple echo command parity check.
 #[tokio::test]
-async fn test_boxlite_parity_echo() {
+async fn test_command_parity_echo() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let output = sandbox.exec("echo", &["hello", "world"]).await.unwrap();
@@ -302,12 +301,12 @@ async fn test_boxlite_parity_echo() {
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "hello world");
 
-    // void-box ADDS: we can attach observability
+    // Observability can be attached to the same execution flow.
 }
 
-/// BoxLite example: Command with exit code
+/// Command with exit code parity check.
 #[tokio::test]
-async fn test_boxlite_parity_exit_code() {
+async fn test_command_parity_exit_code() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let output = sandbox.exec("test", &["-e", "/nonexistent"]).await.unwrap();
@@ -316,13 +315,12 @@ async fn test_boxlite_parity_exit_code() {
     assert!(!output.success());
 }
 
-/// VM0 example: Workflow execution
-/// Their API uses natural language; void-box uses composable workflows
+/// Workflow execution parity check.
 #[tokio::test]
-async fn test_vm0_parity_workflow() {
+async fn test_workflow_parity_execution() {
     let sandbox = Sandbox::mock().build().unwrap();
 
-    // void-box uses composable workflows instead of natural language
+    // Use composable workflow steps with explicit piping.
     let workflow = Workflow::define("fetch-and-process")
         .step("fetch", |ctx| async move {
             ctx.exec("curl", &["-s", "https://httpbin.org/get"]).await
@@ -341,7 +339,7 @@ async fn test_vm0_parity_workflow() {
 
     assert!(result.result.success());
 
-    // void-box ADDS: trace the entire workflow
+    // Verify trace coverage across workflow and steps.
     let traces = result.traces();
     assert!(traces.iter().any(|t| t.name.contains("workflow:fetch-and-process")));
     assert!(traces.iter().any(|t| t.name.contains("step:fetch")));

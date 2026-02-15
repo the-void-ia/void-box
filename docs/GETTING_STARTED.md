@@ -1,267 +1,102 @@
-# Getting Started with void-box
+# Getting Started
 
-This guide will help you get started with void-box, from installation to running your first workflow.
+This guide covers local development, KVM execution, and e2e testing for `void-box`.
 
-## Choose Your Path
+## Prerequisites
 
-There are three main ways to use void-box, depending on your needs:
+- Linux host
+- Rust toolchain
+- `/dev/kvm` access for real VM runs
 
-### Path 1: Mock Sandbox (Quickest)
-
-**Best for:** Testing, development, CI/CD pipelines where isolation isn't critical
-
-No KVM required, works everywhere including macOS and Windows:
-
-```rust
-use void_box::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sandbox = Sandbox::mock().build()?;
-    let output = sandbox.exec("echo", &["hello"]).await?;
-    println!("{}", output.stdout_str());
-    Ok(())
-}
-```
-
-**Pros:**
-- Instant setup, no dependencies
-- Works on any platform
-- Perfect for testing workflow logic
-
-**Cons:**
-- No actual isolation
-- Limited to simulated commands
-
-### Path 2: KVM Sandbox (Real Isolation)
-
-**Best for:** Production use, security-critical workloads, running untrusted code
-
-Requires Linux + KVM + pre-built artifacts:
+## Build
 
 ```bash
-# 1. Download pre-built artifacts from GitHub releases
-wget https://github.com/the-void-ia/void-box/releases/download/v0.1.0/void-box-initramfs-v0.1.0-x86_64.cpio.gz
-
-# 2. Set environment variables
-export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=void-box-initramfs-v0.1.0-x86_64.cpio.gz
-
-# 3. Run your application
-cargo run --example claude_workflow
+cargo build
 ```
 
-Or in your code:
-
-```rust
-use void_box::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sandbox = Sandbox::local()
-        .from_env()? // Load kernel/initramfs from environment
-        .memory_mb(512)
-        .vcpus(2)
-        .network(true)
-        .build()?;
-
-    let output = sandbox.exec("echo", &["hello from KVM"]).await?;
-    println!("{}", output.stdout_str());
-
-    Ok(())
-}
-```
-
-**Pros:**
-- Real KVM-based isolation
-- Secure execution of untrusted code
-- Full Linux environment
-
-**Cons:**
-- Requires Linux with KVM support
-- Needs pre-built artifacts
-
-### Path 3: CLI Tool
-
-**Best for:** Quick testing, command-line workflows, scripting
-
-Install and use the command-line interface:
+## Run In Mock Mode
 
 ```bash
-# Install
-cargo install void-box
-
-# Run commands
-voidbox exec echo "hello"
-voidbox exec ls -la
-
-# Run workflows
-voidbox workflow plan /workspace
-voidbox workflow apply /workspace
+cargo run --example quick_demo
 ```
 
-With KVM mode:
+Mock mode is useful for fast iteration and CI where KVM is unavailable.
+
+## Run In KVM Mode
+
+Build runtime guest image:
 
 ```bash
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=void-box-initramfs-v0.1.0-x86_64.cpio.gz \
-voidbox exec echo "hello from KVM"
+scripts/build_guest_image.sh
 ```
 
-## Building Pre-built Artifacts Locally
-
-If you prefer to build artifacts yourself instead of downloading from releases:
-
-```bash
-# Clone the repository
-git clone https://github.com/the-void-ia/void-box
-cd void-box
-
-# Build the guest image
-./scripts/build_guest_image.sh
-
-# The artifacts will be in /tmp/
-# - Kernel: /boot/vmlinuz-$(uname -r) (use host kernel)
-# - Initramfs: /tmp/void-box-rootfs.cpio.gz
-```
-
-Then use them:
+Run:
 
 ```bash
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
-cargo run --example boot_diag
+cargo run --example quick_demo
 ```
 
-## Common Use Cases
+## Run With Ollama
 
-### 1. Simple Command Execution
-
-```rust
-use void_box::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sandbox = Sandbox::mock().build()?;
-
-    // Run a command
-    let output = sandbox.exec("echo", &["Hello, void-box!"]).await?;
-    println!("Output: {}", output.stdout_str());
-
-    // Check exit code
-    if output.success() {
-        println!("Command succeeded!");
-    }
-
-    Ok(())
-}
+```bash
+OLLAMA_MODEL=phi4-mini \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline
 ```
 
-### 2. Workflow with Multiple Steps
+If output shows `[llm] Claude (Anthropic API)`, your `OLLAMA_MODEL` env var did not reach the process.
 
-```rust
-use void_box::prelude::*;
+## E2E Tests
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Define a workflow
-    let workflow = Workflow::define("example")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["first"]).await
-        })
-        .step("step2", |ctx| async move {
-            ctx.exec("echo", &["second"]).await
-        })
-        .pipe("step1", "step2") // Pipe output from step1 to step2
-        .build();
+E2E uses a dedicated test image.
 
-    // Run in sandbox
-    let sandbox = Sandbox::mock().build()?;
-    let result = workflow
-        .observe(ObserveConfig::test())
-        .run_in(sandbox)
-        .await?;
+Build test image:
 
-    println!("Final output: {}", result.result.output_str());
-
-    Ok(())
-}
+```bash
+scripts/build_test_image.sh
 ```
 
-### 3. With Observability
+Run ignored e2e suites:
 
-```rust
-use void_box::prelude::*;
+```bash
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workflow = Workflow::define("observed-workflow")
-        .step("fetch", |ctx| async move {
-            ctx.exec("echo", &["data"]).await
-        })
-        .build();
-
-    let sandbox = Sandbox::mock().build()?;
-
-    // Enable observability
-    let observe_config = ObserveConfig::test()
-        .with_traces(true)
-        .with_metrics(true);
-
-    let result = workflow
-        .observe(observe_config)
-        .run_in(sandbox)
-        .await?;
-
-    // Access observability data
-    println!("Traces collected: {}", result.traces().len());
-    println!("Metrics: {:?}", result.metrics());
-
-    Ok(())
-}
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+cargo test --test e2e_telemetry -- --ignored --test-threads=1
 ```
 
-## Next Steps
+## Core Test Commands
 
-- **Explore Examples**: Check out the [`examples/`](../examples/) directory for more complex use cases
-- **Read the Architecture**: Understand how void-box works in [alignment.md](alignment.md)
-- **API Documentation**: View the full API docs with `cargo doc --open`
-- **Join the Community**: Star the repo and open issues for questions or feature requests
+```bash
+cargo test --lib
+cargo test --test integration
+cargo test --test skill_pipeline
+cargo test --test kvm_integration -- --ignored
+```
+
+## Skills Layout
+
+Local skill fixtures used by examples/tests live at:
+
+- `examples/trading_pipeline/skills/financial-data-analysis.md`
+- `examples/trading_pipeline/skills/quant-technical-analysis.md`
+- `examples/trading_pipeline/skills/portfolio-risk-management.md`
 
 ## Troubleshooting
 
-### "Permission denied" when accessing /dev/kvm
+### `Kvm(Error(13))`
 
-Make sure your user is in the `kvm` group:
+The process cannot access `/dev/kvm`.
 
-```bash
-sudo usermod -aG kvm $USER
-# Log out and log back in
-```
+### `No space left on device` or `Initramfs unpacking failed`
 
-### "Cannot find kernel"
+Ensure you are using the correct image for the suite:
 
-Make sure the kernel exists at the specified path:
-
-```bash
-ls -la /boot/vmlinuz-$(uname -r)
-```
-
-If not found, try:
-
-```bash
-# Find your kernel
-ls /boot/vmlinuz-*
-
-# Use the correct path
-export VOID_BOX_KERNEL=/boot/vmlinuz-6.x.x-xxx
-```
-
-### Mock sandbox not behaving as expected
-
-Remember that the mock sandbox simulates command execution. For actual isolation and real command execution, use KVM mode.
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/the-void-ia/void-box/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/the-void-ia/void-box/discussions)
+- Runtime examples: `/tmp/void-box-rootfs.cpio.gz`
+- E2E tests: `/tmp/void-box-test-rootfs.cpio.gz`

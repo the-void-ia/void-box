@@ -1,8 +1,7 @@
 //! void-box: Composable Workflow Sandbox with Native Observability
 //!
 //! A functional, composable workflow engine that runs in isolated sandbox
-//! environments with first-class observability - the key differentiator
-//! from BoxLite, VM0, and other sandbox solutions.
+//! environments with first-class observability for agent workflows.
 //!
 //! # Key Features
 //!

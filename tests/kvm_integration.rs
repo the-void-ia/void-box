@@ -174,7 +174,7 @@ async fn kvm_real_vm_exec_uname() {
     vm.stop().await.expect("failed to stop VM cleanly");
 }
 
-/// KVM-backed equivalent of `test_boxlite_parity_echo`:
+/// KVM-backed equivalent of the echo parity test:
 /// run `echo hello world` inside a real VM using `Sandbox::local()`.
 #[tokio::test]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
@@ -360,5 +360,4 @@ async fn kvm_claude_workflow_plan_apply() {
     );
     assert!(!observed.traces().is_empty());
 }
-
 

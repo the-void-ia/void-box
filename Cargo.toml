@@ -76,6 +76,14 @@ opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 name = "voidbox"
 path = "src/bin/voidbox.rs"
 
+[[test]]
+name = "e2e_skill_pipeline"
+path = "tests/e2e/skill_pipeline.rs"
+
+[[test]]
+name = "e2e_telemetry"
+path = "tests/e2e/telemetry.rs"
+
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio"]
 

@@ -66,7 +66,7 @@ impl VsockDevice {
 
     /// Send an exec request to the guest agent and wait for response.
     ///
-    /// Uses a VM0-style handshake: after connect, send Ping and wait for Pong
+    /// Uses a connect handshake: after connect, send Ping and wait for Pong
     /// before sending the first request. This confirms the guest agent is ready
     /// and avoids sending ExecRequest before the guest is in the read loop.
     pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {

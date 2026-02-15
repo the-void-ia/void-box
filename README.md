@@ -1,208 +1,115 @@
 # void-box
 
-> Composable workflow sandbox with KVM micro-VMs and native observability
+Composable sandbox runtime for agent workflows with KVM micro-VMs, vsock command execution, skill provisioning, and observability.
 
-[![CI](https://github.com/the-void-ia/void-box/workflows/CI/badge.svg)](https://github.com/the-void-ia/void-box/actions?query=workflow%3ACI)
-[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://docs.rs/void-box)
-[![Rust Version](https://img.shields.io/badge/rust-1.70%2B-blue.svg)](https://www.rust-lang.org)
+## What It Provides
 
-void-box provides isolated execution environments for AI agents and workflows with first-class observability.
+- `Sandbox`: mock and KVM-backed execution
+- `AgentBox`: skill + prompt + isolated runtime unit
+- `Pipeline`: multi-stage box composition
+- `observe`: traces, metrics, and structured logs
 
-## Features
+## Repository Layout
 
-- 🔒 **Isolated Execution**: KVM micro-VMs or mock sandboxes
-- 🔄 **Workflow Composition**: Functional-style workflow DAGs with piping
-- 📊 **Native Observability**: OpenTelemetry traces, metrics, and logs
-- 🚀 **Fast Boot**: Minimal VMs with < 100ms startup
-- 🌐 **Networking**: SLIRP user-mode networking (no root required)
-- 🛠️ **Flexible**: Library, CLI, or future REST API
+- `src/`: core runtime
+- `examples/`: runnable demos
+- `examples/trading_pipeline/skills/`: local skill files used by trading examples/tests
+- `tests/`: integration and e2e suites
+- `tests/e2e/`: ignored KVM e2e suites
+- `scripts/`: image builders and helpers
 
-## Quick Start
+## Quickstart
 
-### Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-void-box = "0.1"
-```
-
-Or via cargo:
+### 1. Mock mode (no KVM required)
 
 ```bash
-cargo add void-box
+cargo run --example quick_demo
 ```
 
-### Basic Usage (Mock Sandbox)
+### 2. KVM mode with runtime guest image
 
-```rust
-use void_box::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sandbox = Sandbox::mock().build()?;
-
-    let output = sandbox.exec("echo", &["hello"]).await?;
-    println!("{}", output.stdout_str());
-
-    Ok(())
-}
-```
-
-### Workflow Composition
-
-```rust
-use void_box::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workflow = Workflow::define("data-pipeline")
-        .step("fetch", |ctx| async move {
-            ctx.exec("curl", &["https://api.example.com/data"]).await
-        })
-        .step("process", |ctx| async move {
-            ctx.exec_piped("jq", &[".results[]"]).await
-        })
-        .pipe("fetch", "process")
-        .build();
-
-    let sandbox = Sandbox::mock().build()?;
-    let result = workflow
-        .observe(ObserveConfig::test())
-        .run_in(sandbox)
-        .await?;
-
-    println!("Output: {}", result.result.output_str());
-    println!("Traces: {}", result.traces().len());
-
-    Ok(())
-}
-```
-
-### KVM Mode (Real Isolation)
-
-#### Download Pre-built Artifacts
+Build runtime initramfs:
 
 ```bash
-# Download from GitHub releases
-wget https://github.com/the-void-ia/void-box/releases/download/v0.1.0/void-box-initramfs-v0.1.0-x86_64.cpio.gz
+scripts/build_guest_image.sh
+```
 
-# Run with KVM
+Run an example in KVM mode:
+
+```bash
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=void-box-initramfs-v0.1.0-x86_64.cpio.gz \
-cargo run --example claude_workflow
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example quick_demo
 ```
 
-Or use the CLI:
+### 3. KVM mode with Ollama provider
 
 ```bash
-cargo install void-box
+OLLAMA_MODEL=phi4-mini \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline
+```
 
-# Run commands
-voidbox exec echo "hello from KVM"
-voidbox workflow plan /workspace
+## E2E Tests
+
+E2E tests require the **test initramfs**, not the runtime one.
+
+Build test initramfs:
+
+```bash
+scripts/build_test_image.sh
+```
+
+Run e2e suites:
+
+```bash
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+cargo test --test e2e_telemetry -- --ignored --test-threads=1
 ```
 
 ## Examples
 
-See [`examples/`](examples/) directory:
+- `boot_diag`: VM boot diagnostics
+- `quick_demo`: two-stage analyst/strategist pipeline
+- `trading_pipeline`: four-stage financial pipeline with local skills
+- `ollama_local`: single box configured for Ollama
+- `remote_skills`: pulls skills from remote repositories
+- `claude_workflow`: workflow plan/apply pattern in sandbox
+- `claude_in_voidbox_example`: interactive Claude-style session
 
-- `boot_diag.rs` - Basic VM boot and diagnostics
-- `claude_workflow.rs` - Claude-style plan → apply workflow
-- `claude_in_voidbox_example.rs` - Full Claude integration demo
-
-Run examples:
-
-```bash
-# Mock mode (no KVM)
-cargo run --example claude_workflow
-
-# KVM mode (real isolation)
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example claude_in_voidbox_example
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│  Your Application (Rust/Python/Node)   │
-├─────────────────────────────────────────┤
-│  void-box Library / REST API            │
-├─────────────────────────────────────────┤
-│  Sandbox Abstraction                    │
-│  ├─ Mock (in-process)                   │
-│  └─ Local (KVM micro-VM)                │
-├─────────────────────────────────────────┤
-│  Observability Layer                    │
-│  ├─ Traces (OpenTelemetry)              │
-│  ├─ Metrics (counters, gauges)          │
-│  └─ Logs (structured)                   │
-└─────────────────────────────────────────┘
-```
-
-## Comparison
-
-| Feature | void-box | BoxLite | Firecracker | Docker |
-|---------|----------|---------|-------------|--------|
-| Isolation | KVM VMs | Containers | KVM VMs | Containers |
-| Startup | ~100ms | ~50ms | ~125ms | ~1s |
-| Observability | Native | Basic | None | Basic |
-| Workflows | Built-in | None | None | Compose |
-| Language | Rust (+API) | Python/Node/Rust | Any (REST) | Any (CLI) |
-
-## Documentation
-
-- [Getting Started Guide](docs/GETTING_STARTED.md)
-- [Examples](examples/)
-- [Architecture](docs/alignment.md)
+See `examples/README.md` for per-example notes.
 
 ## Development
 
-### Build from Source
+Run core test suites:
 
 ```bash
-# Clone repository
-git clone https://github.com/the-void-ia/void-box
-cd void-box
-
-# Run tests
-cargo test --workspace
-
-# Build guest image
-./scripts/build_guest_image.sh
-
-# Run with KVM
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example boot_diag
+cargo test --lib
+cargo test --test skill_pipeline
+cargo test --test integration
 ```
 
-### Build Release Artifacts
+## Documentation
 
-```bash
-# Build artifacts for distribution
-./scripts/build_release_artifacts.sh v0.1.0 x86_64
+- `docs/GETTING_STARTED.md`
+- `docs/workflows.md`
+- `docs/observability.md`
+- `docs/guest_image.md`
+- `docs/sandbox_capabilities.md`
 
-# Artifacts will be in target/release-artifacts/v0.1.0/
-```
+## Troubleshooting
 
-## Contributing
+### `/dev/kvm` permission denied
 
-Contributions welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on:
+Ensure your user can access `/dev/kvm` (often via `kvm` group) and re-login.
 
-- Development setup and workflow
-- Code quality standards
-- Testing requirements
-- Pull request process
-- Areas looking for contributions
+### Stage fails with `Not logged in · Please run /login`
 
-See also:
-- [Changelog](CHANGELOG.md) - Notable changes between versions
-- [Issue Templates](.github/ISSUE_TEMPLATE/) - Bug reports and feature requests
-
-## Acknowledgments
-
-Built with [rust-vmm](https://github.com/rust-vmm) components.
+This indicates the guest-side `claude-code` auth flow is not configured for the selected provider.
+Use `OLLAMA_MODEL=...` or configure Claude auth/API key for your guest image.

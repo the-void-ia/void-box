@@ -97,7 +97,7 @@ fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<AgentBo
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_agent_box_with_local_skill() {
     let skills = vec![
-        Skill::file("skills/financial-data-analysis.md")
+        Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md")
             .description("Financial data methodology"),
         Skill::agent("claude-code"),
     ];
@@ -143,8 +143,8 @@ async fn test_agent_box_with_local_skill() {
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_agent_box_with_multiple_skills() {
     let skills = vec![
-        Skill::file("skills/financial-data-analysis.md"),
-        Skill::file("skills/quant-technical-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md"),
         Skill::agent("claude-code"),
     ];
 
@@ -230,7 +230,7 @@ async fn test_agent_box_with_mcp_skill() {
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_agent_box_mixed_skills() {
     let skills = vec![
-        Skill::file("skills/financial-data-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md"),
         Skill::mcp("market-data-mcp").args(&["--mock"]),
         Skill::agent("claude-code"),
     ];
@@ -270,11 +270,11 @@ async fn test_agent_box_mixed_skills() {
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_pipeline_two_stages_kvm() {
     let box1_skills = vec![
-        Skill::file("skills/financial-data-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md"),
         Skill::agent("claude-code"),
     ];
     let box2_skills = vec![
-        Skill::file("skills/quant-technical-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md"),
         Skill::agent("claude-code"),
     ];
 
@@ -328,7 +328,7 @@ async fn test_pipeline_two_stages_kvm() {
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_agent_box_with_input_data_kvm() {
     let skills = vec![
-        Skill::file("skills/quant-technical-analysis.md"),
+        Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md"),
         Skill::agent("claude-code"),
     ];
 

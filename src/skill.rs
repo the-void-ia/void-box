@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_skill_file() {
-        let s = Skill::file("skills/financial-data-analysis.md");
+        let s = Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md");
         assert_eq!(s.name, "financial-data-analysis");
     }
 

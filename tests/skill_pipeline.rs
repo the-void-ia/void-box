@@ -16,7 +16,7 @@ use void_box::skill::Skill;
 
 #[tokio::test]
 async fn test_provision_local_skill_file() {
-    let skill = Skill::file("skills/financial-data-analysis.md")
+    let skill = Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md")
         .description("Financial data methodology");
     let reasoning = Skill::agent("claude-code");
 
@@ -82,7 +82,7 @@ async fn test_provision_cli_skill() {
 async fn test_provision_mixed_skills() {
     // All 5 skill types in one Box
     let agent = Skill::agent("claude-code");
-    let file = Skill::file("skills/quant-technical-analysis.md");
+    let file = Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md");
     let mcp = Skill::mcp("data-server").args(&["--port", "8080"]);
     let cli = Skill::cli("python3");
     // Remote will hit fallback (nonexistent repo) -- should not fail
@@ -279,7 +279,7 @@ async fn test_trading_pipeline_mock() {
     let reasoning = Skill::agent("claude-code");
 
     let data_box = AgentBox::new("data_analyst")
-        .skill(Skill::file("skills/financial-data-analysis.md"))
+        .skill(Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md"))
         .skill(reasoning.clone())
         .prompt("Fetch 30 days of OHLCV data for AAPL, NVDA, MSFT, GOOGL")
         .mock()
@@ -287,7 +287,7 @@ async fn test_trading_pipeline_mock() {
         .unwrap();
 
     let quant_box = AgentBox::new("quant_analyst")
-        .skill(Skill::file("skills/quant-technical-analysis.md"))
+        .skill(Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md"))
         .skill(reasoning.clone())
         .prompt("Compute technical indicators for each symbol")
         .mock()
@@ -302,7 +302,7 @@ async fn test_trading_pipeline_mock() {
         .unwrap();
 
     let strategy_box = AgentBox::new("portfolio_strategist")
-        .skill(Skill::file("skills/portfolio-risk-management.md"))
+        .skill(Skill::file("examples/trading_pipeline/skills/portfolio-risk-management.md"))
         .skill(reasoning.clone())
         .memory_mb(512)
         .prompt("Generate trade recommendations with risk management")

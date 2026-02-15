@@ -1,30 +1,66 @@
-# void-box examples
+# Examples
 
-## codebox_example (real code execution)
+## boot_diag
 
-BoxLite-style example: run commands inside a sandbox and print stdout/stderr/exit code.
+Boot diagnostics for VM bring-up.
 
-- `cargo run --example codebox_example`
+```bash
+cargo run --example boot_diag
+```
 
-**Modes**
+## quick_demo
 
-| Mode | How | When |
-|------|-----|------|
-| Mock | No env, or omit `VOID_BOX_KERNEL` | Default. Execution is simulated in-process; always works. |
-| KVM | Set `VOID_BOX_KERNEL` (+ optional `VOID_BOX_INITRAMFS`) | Real micro-VM. Requires virtio-vsock to be wired in the VMM (see [docs/sandbox_capabilities.md](../docs/sandbox_capabilities.md)). |
+Two-stage pipeline (`analyst -> strategist`) with mock or KVM.
 
-The example does **not** fall back to mock if KVM fails; it exits with an error so the execution mode is explicit.
+```bash
+cargo run --example quick_demo
+```
 
-## claude_in_voidbox_example (Claude in the box)
+## trading_pipeline
 
-Rust port of [BoxLite’s claude_in_boxlite_example.py](https://github.com/boxlite-ai/boxlite/blob/main/examples/python/claude_in_boxlite_example.py): run a Claude-style CLI inside the sandbox and interact via plan/apply (void-box uses `claude-code plan` / `claude-code apply`; the guest image includes a mock by default).
+Four-stage trading pipeline using local skills under `examples/trading_pipeline/skills/`.
 
-- `cargo run --example claude_in_voidbox_example` — then choose demo (automated multi-turn) or interactive (type messages, type `apply` to run apply step).
+```bash
+cargo run --example trading_pipeline
+```
 
-For real Claude API you would set `ANTHROPIC_API_KEY` in the sandbox env and use a guest image with the real Claude Code CLI.
+With Ollama:
+
+```bash
+OLLAMA_MODEL=phi4-mini \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline
+```
+
+## ollama_local
+
+Single AgentBox configured to use Ollama.
+
+```bash
+cargo run --example ollama_local
+```
+
+## remote_skills
+
+Fetch and preview remote skills from public repositories.
+
+```bash
+cargo run --example remote_skills
+```
 
 ## claude_workflow
 
-Canonical plan → apply workflow using the mock sandbox (and optional KVM when vsock is available). See [docs/workflows.md](../docs/workflows.md).
+Plan/apply workflow-style example in sandbox.
 
-- `cargo run --example claude_workflow`
+```bash
+cargo run --example claude_workflow
+```
+
+## claude_in_voidbox_example
+
+Interactive/demo style Claude-compatible session.
+
+```bash
+cargo run --example claude_in_voidbox_example
+```

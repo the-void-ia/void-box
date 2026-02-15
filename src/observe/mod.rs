@@ -5,7 +5,7 @@
 //! - Prometheus-compatible metrics
 //! - Structured logging with correlation IDs
 //!
-//! This is the KEY DIFFERENTIATOR from BoxLite, VM0, and other sandbox solutions.
+//! These capabilities are built in and available for every observed workflow run.
 //!
 //! # Example
 //!
