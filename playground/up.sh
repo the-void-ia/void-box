@@ -158,19 +158,30 @@ configure_kvm_artifacts
 
 export VOIDBOX_OTLP_ENDPOINT="${VOIDBOX_OTLP_ENDPOINT:-http://localhost:4317}"
 export VOIDBOX_SERVICE_NAME="${VOIDBOX_SERVICE_NAME:-void-box-playground}"
+export PLAYGROUND_GRAFANA_URL="${PLAYGROUND_GRAFANA_URL:-http://localhost:3000}"
+export PLAYGROUND_LOG_PATH="${PLAYGROUND_LOG_PATH:-/tmp/void-box-playground-last.log}"
 print_run_summary
 
 echo "[playground] running pipeline example..."
 (
   cd "$ROOT_DIR"
-  cargo run --example playground_pipeline --features opentelemetry
+  cargo run --example playground_pipeline --features opentelemetry 2>&1 | tee "$PLAYGROUND_LOG_PATH"
 )
+
+TRACES_URL="$(grep -E '^Traces URL:' "$PLAYGROUND_LOG_PATH" | tail -n1 | sed -E 's/^Traces URL:[[:space:]]*//')"
+METRICS_URL="$(grep -E '^Metrics URL:' "$PLAYGROUND_LOG_PATH" | tail -n1 | sed -E 's/^Metrics URL:[[:space:]]*//')"
 
 echo
 echo "[playground] wow, it's live"
-echo "  Grafana: http://localhost:3000"
+echo "  Grafana: $PLAYGROUND_GRAFANA_URL"
 echo "  Login: admin/admin"
 echo "  Service filter: service.name=$VOIDBOX_SERVICE_NAME"
 echo "  Provider: $PLAYGROUND_PROVIDER"
+echo "  Logs (local): $PLAYGROUND_LOG_PATH"
+echo
+echo "[playground] direct links"
+echo "  Traces: ${TRACES_URL:-<not emitted>}"
+echo "  Metrics: ${METRICS_URL:-<not emitted>}"
+echo "  Logs: $PLAYGROUND_LOG_PATH"
 echo
 echo "Tip: run '$0 --down' to stop the stack."

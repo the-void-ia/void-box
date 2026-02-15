@@ -85,6 +85,10 @@ This uses the OTLP-enabled example:
 cargo run --example playground_pipeline --features opentelemetry
 ```
 
+At the end of the run, the script prints:
+- direct Trace and Metrics Explore URLs
+- local log path (`/tmp/void-box-playground-last.log` by default)
+
 ## Core Test Commands
 
 ```bash

@@ -30,6 +30,8 @@ pub mod tracer;
 
 use std::sync::Arc;
 #[cfg(feature = "opentelemetry")]
+use std::sync::Mutex;
+#[cfg(feature = "opentelemetry")]
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -137,9 +139,68 @@ pub struct Observer {
     logger: Arc<StructuredLogger>,
 }
 
+#[cfg(feature = "opentelemetry")]
+#[derive(Default)]
+struct OtlpProviderState {
+    tracer: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    meter: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+}
+
+/// Force-flush globally configured OTLP providers.
+///
+/// This is primarily useful in short-lived binaries (examples/CLI tools) so
+/// traces and metrics are exported before process exit.
+#[cfg(feature = "opentelemetry")]
+pub fn flush_global_otel() -> crate::Result<()> {
+    let Some(state) = otlp_provider_state().get() else {
+        return Ok(());
+    };
+
+    let mut state = state
+        .lock()
+        .map_err(|e| crate::Error::Guest(format!("OTLP provider mutex poisoned: {e}")))?;
+    let tracer = state.tracer.take();
+    let meter = state.meter.take();
+    drop(state);
+
+    let mut errors = Vec::new();
+
+    if let Some(tracer) = tracer {
+        if let Err(e) = tracer.force_flush() {
+            errors.push(format!("Failed to flush OTLP tracer: {e}"));
+        }
+        if let Err(e) = tracer.shutdown() {
+            errors.push(format!("Failed to shutdown OTLP tracer: {e}"));
+        }
+    }
+
+    if let Some(meter) = meter {
+        if let Err(e) = meter.force_flush() {
+            errors.push(format!("Failed to flush OTLP metrics: {e}"));
+        }
+        if let Err(e) = meter.shutdown() {
+            errors.push(format!("Failed to shutdown OTLP metrics: {e}"));
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(crate::Error::Guest(errors.join("; ")));
+    }
+
+    Ok(())
+}
+
+/// No-op when OpenTelemetry feature is disabled.
+#[cfg(not(feature = "opentelemetry"))]
+pub fn flush_global_otel() -> crate::Result<()> {
+    Ok(())
+}
+
 impl Observer {
     /// Create a new observer with the given configuration
     pub fn new(config: ObserveConfig) -> Self {
+        #[cfg(feature = "opentelemetry")]
+        maybe_init_global_otel(&config);
         let tracer = Arc::new(Tracer::new(config.tracer.clone()));
         let metrics = Arc::new(build_metrics_collector(&config));
         let logger = Arc::new(StructuredLogger::new(config.logs.clone()));
@@ -255,13 +316,31 @@ fn maybe_init_global_otel(config: &ObserveConfig) {
             debug: false,
         };
 
-        if let Err(e) = crate::observe::otlp::init_otlp_tracer(&otlp_config) {
-            eprintln!("[observe] WARN: failed to initialize OTLP tracer export: {e}");
+        let mut state = OtlpProviderState::default();
+
+        match crate::observe::otlp::init_otlp_tracer(&otlp_config) {
+            Ok(provider) => state.tracer = Some(provider),
+            Err(e) => eprintln!("[observe] WARN: failed to initialize OTLP tracer export: {e}"),
         }
-        if let Err(e) = crate::observe::otlp::init_otlp_metrics(&otlp_config) {
-            eprintln!("[observe] WARN: failed to initialize OTLP metrics export: {e}");
+        match crate::observe::otlp::init_otlp_metrics(&otlp_config) {
+            Ok(provider) => state.meter = Some(provider),
+            Err(e) => eprintln!("[observe] WARN: failed to initialize OTLP metrics export: {e}"),
+        }
+
+        if state.tracer.is_some() || state.meter.is_some() {
+            let lock =
+                otlp_provider_state().get_or_init(|| Mutex::new(OtlpProviderState::default()));
+            if let Ok(mut slot) = lock.lock() {
+                *slot = state;
+            }
         }
     });
+}
+
+#[cfg(feature = "opentelemetry")]
+fn otlp_provider_state() -> &'static OnceLock<Mutex<OtlpProviderState>> {
+    static OTLP_PROVIDER_STATE: OnceLock<Mutex<OtlpProviderState>> = OnceLock::new();
+    &OTLP_PROVIDER_STATE
 }
 
 /// RAII guard for spans that records metrics on drop

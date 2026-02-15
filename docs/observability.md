@@ -12,6 +12,7 @@
 ## OTLP Export
 
 When configured, traces and metrics are exported via OTLP.
+Structured logs remain local in the current playground flow.
 
 Required:
 
@@ -41,7 +42,8 @@ This will:
 
 1. Start Grafana LGTM via Docker Compose
 2. Run `playground_pipeline` with OTLP enabled
-3. Print Grafana URL and service filter hints
+3. Print direct Grafana Explore links for traces and metrics
+4. Write full run logs to `/tmp/void-box-playground-last.log` (default)
 
 Stop stack:
 

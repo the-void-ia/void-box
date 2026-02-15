@@ -87,7 +87,8 @@ The script starts Docker Compose services, runs:
 cargo run --example playground_pipeline --features opentelemetry
 ```
 
-Then prints Grafana URL and service filter hints.
+Then prints direct Grafana Explore links for traces and metrics.
+Playground logs are also written locally to `/tmp/void-box-playground-last.log` by default.
 It also asks for provider mode (`Anthropic`, `Ollama`, `Mock`) and prepares initramfs automatically:
 - `Mock` -> `scripts/build_test_image.sh` (`/tmp/void-box-test-rootfs.cpio.gz`, claudio mock)
 - `Anthropic` / `Ollama` -> `scripts/build_guest_image.sh` (`/tmp/void-box-rootfs.cpio.gz`)
