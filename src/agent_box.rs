@@ -341,8 +341,9 @@ impl AgentBox {
             let mcp_config = serde_json::json!({
                 "mcpServers": mcp_servers
             });
-            let config_str = serde_json::to_string_pretty(&mcp_config)
-                .map_err(|e| crate::Error::Config(format!("Failed to serialize MCP config: {}", e)))?;
+            let config_str = serde_json::to_string_pretty(&mcp_config).map_err(|e| {
+                crate::Error::Config(format!("Failed to serialize MCP config: {}", e))
+            })?;
             sandbox
                 .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
                 .await?;
@@ -357,19 +358,16 @@ impl AgentBox {
     /// If `input` is provided, it's written to `/workspace/input.json` before
     /// the agent runs, and the prompt is augmented to reference it.
     pub async fn run(self, input: Option<&[u8]>) -> Result<StageResult> {
-        let sandbox = self
-            .sandbox
-            .as_ref()
-            .ok_or_else(|| crate::Error::Config("AgentBox not built -- call .build() first".into()))?;
+        let sandbox = self.sandbox.as_ref().ok_or_else(|| {
+            crate::Error::Config("AgentBox not built -- call .build() first".into())
+        })?;
 
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
 
         // Write input data if provided
         if let Some(data) = input {
-            sandbox
-                .write_file("/workspace/input.json", data)
-                .await?;
+            sandbox.write_file("/workspace/input.json", data).await?;
             eprintln!(
                 "  [box:{}] Wrote {} bytes to /workspace/input.json",
                 self.name,
@@ -386,7 +384,10 @@ impl AgentBox {
             let input_text = String::from_utf8_lossy(data);
             // Truncate if very large to avoid blowing context window
             let inline = if input_text.len() > 4000 {
-                format!("{}...\n(truncated; full data in /workspace/input.json)", &input_text[..4000])
+                format!(
+                    "{}...\n(truncated; full data in /workspace/input.json)",
+                    &input_text[..4000]
+                )
             } else {
                 input_text.to_string()
             };
@@ -452,11 +453,9 @@ mod tests {
 
     #[test]
     fn test_agent_box_builder() {
-        let reasoning = Skill::agent("claude-code")
-            .description("Autonomous reasoning");
+        let reasoning = Skill::agent("claude-code").description("Autonomous reasoning");
 
-        let market_data = Skill::mcp("market-data-mcp")
-            .description("Market data provider");
+        let market_data = Skill::mcp("market-data-mcp").description("Market data provider");
 
         let ab = AgentBox::new("data_analyst")
             .skill(market_data)

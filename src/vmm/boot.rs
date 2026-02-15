@@ -5,8 +5,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use linux_loader::bootparam::boot_params;
-use linux_loader::loader::elf::Elf as ElfLoader;
 use linux_loader::loader::bzimage::BzImage;
+use linux_loader::loader::elf::Elf as ElfLoader;
 use linux_loader::loader::KernelLoader;
 use tracing::{debug, info};
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryMmap};
@@ -63,13 +63,23 @@ pub fn load_kernel(
 
     // Load initramfs if provided
     let initramfs_info = if let Some(initramfs) = initramfs_path {
-        Some(load_initramfs(guest_memory, initramfs, GuestAddress(safe_initramfs_addr))?)
+        Some(load_initramfs(
+            guest_memory,
+            initramfs,
+            GuestAddress(safe_initramfs_addr),
+        )?)
     } else {
         None
     };
 
     // Set up boot parameters (reads setup header from kernel file)
-    setup_boot_params(guest_memory, &mut kernel_file, cmdline, initramfs_info, memory_size)?;
+    setup_boot_params(
+        guest_memory,
+        &mut kernel_file,
+        cmdline,
+        initramfs_info,
+        memory_size,
+    )?;
 
     // Set up initial page tables for 64-bit mode
     setup_page_tables(guest_memory)?;
@@ -99,10 +109,7 @@ fn read_bzimage_init_size(kernel_file: &mut File) -> Result<u32> {
 }
 
 /// Load kernel image (supports bzImage and ELF formats)
-fn load_kernel_image(
-    guest_memory: &GuestMemoryMmap,
-    kernel_file: &mut File,
-) -> Result<(u64, u64)> {
+fn load_kernel_image(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Result<(u64, u64)> {
     // Check if it's a bzImage
     if is_bzimage(kernel_file)? {
         debug!("Loading bzImage kernel");
@@ -115,24 +122,24 @@ fn load_kernel_image(
 
 /// Check if kernel is bzImage format
 fn is_bzimage(kernel_file: &mut File) -> Result<bool> {
-    kernel_file.seek(SeekFrom::Start(0x202))
+    kernel_file
+        .seek(SeekFrom::Start(0x202))
         .map_err(|e| Error::Boot(format!("Failed to seek kernel: {}", e)))?;
 
     let mut magic = [0u8; 4];
-    kernel_file.read_exact(&mut magic)
+    kernel_file
+        .read_exact(&mut magic)
         .map_err(|e| Error::Boot(format!("Failed to read kernel magic: {}", e)))?;
 
-    kernel_file.seek(SeekFrom::Start(0))
+    kernel_file
+        .seek(SeekFrom::Start(0))
         .map_err(|e| Error::Boot(format!("Failed to seek kernel: {}", e)))?;
 
     Ok(u32::from_le_bytes(magic) == BZIMAGE_MAGIC)
 }
 
 /// Load bzImage format kernel
-fn load_bzimage(
-    guest_memory: &GuestMemoryMmap,
-    kernel_file: &mut File,
-) -> Result<(u64, u64)> {
+fn load_bzimage(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Result<(u64, u64)> {
     let kernel_load = BzImage::load(
         guest_memory,
         None, // Use default kernel offset
@@ -150,10 +157,7 @@ fn load_bzimage(
 }
 
 /// Load ELF format kernel
-fn load_elf_kernel(
-    guest_memory: &GuestMemoryMmap,
-    kernel_file: &mut File,
-) -> Result<(u64, u64)> {
+fn load_elf_kernel(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Result<(u64, u64)> {
     let kernel_load = ElfLoader::load(
         guest_memory,
         None, // Use default kernel offset
@@ -236,12 +240,8 @@ fn setup_boot_params(
         .map_err(|e| Error::Boot(format!("Failed to seek to setup header: {}", e)))?;
 
     // SAFETY: setup_header is a plain-old-data #[repr(C)] struct from linux-loader.
-    let hdr_slice = unsafe {
-        std::slice::from_raw_parts_mut(
-            &mut params.hdr as *mut _ as *mut u8,
-            hdr_size,
-        )
-    };
+    let hdr_slice =
+        unsafe { std::slice::from_raw_parts_mut(&mut params.hdr as *mut _ as *mut u8, hdr_size) };
     kernel_file
         .read_exact(hdr_slice)
         .map_err(|e| Error::Boot(format!("Failed to read setup header: {}", e)))?;
@@ -277,7 +277,7 @@ fn setup_boot_params(
     params.e820_table[e820_idx as usize] = boot_e820_entry {
         addr: 0,
         size: 0x9FC00, // 639KB (standard PC low memory)
-        type_: 1, // E820_RAM
+        type_: 1,      // E820_RAM
     };
     e820_idx += 1;
 
@@ -285,7 +285,7 @@ fn setup_boot_params(
     params.e820_table[e820_idx as usize] = boot_e820_entry {
         addr: 0x9FC00,
         size: 0x100000 - 0x9FC00, // ~384KB reserved
-        type_: 2, // E820_RESERVED
+        type_: 2,                 // E820_RESERVED
     };
     e820_idx += 1;
 

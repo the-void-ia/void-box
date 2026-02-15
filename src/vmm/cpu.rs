@@ -90,7 +90,10 @@ pub fn create_vcpu(
         })
         .map_err(|e| Error::Vcpu(format!("Failed to spawn vCPU thread: {}", e)))?;
 
-    Ok(VcpuHandle { thread, id: vcpu_id })
+    Ok(VcpuHandle {
+        thread,
+        id: vcpu_id,
+    })
 }
 
 /// Configure CPUID for the vCPU
@@ -186,7 +189,10 @@ fn configure_regs(vcpu_fd: &VcpuFd, entry_point: u64) -> Result<()> {
     regs.rflags = 0x2;
 
     vcpu_fd.set_regs(&regs).map_err(|e| Error::Kvm(e))?;
-    debug!("Configured registers: RIP={:#x}, RSI={:#x}", regs.rip, regs.rsi);
+    debug!(
+        "Configured registers: RIP={:#x}, RSI={:#x}",
+        regs.rip, regs.rsi
+    );
 
     Ok(())
 }
@@ -221,13 +227,20 @@ fn vcpu_run_loop(
             if guard.has_pending_interrupt() {
                 // Inject IRQ 10 (virtio-net) into the guest via KVM_IRQ_LINE
                 #[repr(C)]
-                struct KvmIrqLevel { irq: u32, level: u32 }
+                struct KvmIrqLevel {
+                    irq: u32,
+                    level: u32,
+                }
                 const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
                 let vm_fd = vm.vm_fd().as_raw_fd();
                 let assert = KvmIrqLevel { irq: 10, level: 1 };
-                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert); }
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
+                }
                 let deassert = KvmIrqLevel { irq: 10, level: 0 };
-                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert); }
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+                }
             }
         }
 

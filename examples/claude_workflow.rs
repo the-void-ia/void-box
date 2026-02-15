@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .step("apply", |ctx| async move {
             // Pipe plan output into claude-code apply
-            ctx.exec_piped("claude-code", &["apply", "/workspace"]).await
+            ctx.exec_piped("claude-code", &["apply", "/workspace"])
+                .await
         })
         .pipe("plan", "apply")
         .output("apply")
@@ -37,15 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Step outputs ===");
     for (name, out) in &observed.result.step_outputs {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        println!("  {}: exit={} stdout_len={}", name, out.exit_code, stdout.len());
+        println!(
+            "  {}: exit={} stdout_len={}",
+            name,
+            out.exit_code,
+            stdout.len()
+        );
         if !stdout.is_empty() && stdout.len() <= 200 {
             println!("    -> {}", stdout.trim());
         }
     }
 
-    println!("\n=== Observability ({} traces, {} logs) ===",
+    println!(
+        "\n=== Observability ({} traces, {} logs) ===",
         observed.traces().len(),
-        observed.logs().len());
+        observed.logs().len()
+    );
     for span in observed.traces() {
         println!("  span: {} status={:?}", span.name, span.status);
     }

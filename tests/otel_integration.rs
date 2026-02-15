@@ -53,17 +53,26 @@ mod otlp_config_tests {
         assert_eq!(config.endpoint.as_deref(), Some("http://collector:4317"));
     }
 
-    struct TempEnv { key: String, prev: Option<String> }
+    struct TempEnv {
+        key: String,
+        prev: Option<String>,
+    }
     impl TempEnv {
         fn set(k: &str, v: &str) -> Self {
             let prev = std::env::var(k).ok();
             std::env::set_var(k, v);
-            Self { key: k.to_string(), prev }
+            Self {
+                key: k.to_string(),
+                prev,
+            }
         }
         fn remove(k: &str) -> Self {
             let prev = std::env::var(k).ok();
             std::env::remove_var(k);
-            Self { key: k.to_string(), prev }
+            Self {
+                key: k.to_string(),
+                prev,
+            }
         }
     }
     impl Drop for TempEnv {
@@ -86,13 +95,20 @@ mod claude_parser_tests {
 
     fn sample_session() -> &'static str {
         concat!(
-            r#"{"type":"system","subtype":"init","session_id":"sess_01","model":"sonnet","tools":["Bash","Read","Write"],"cwd":"/workspace"}"#, "\n",
-            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Creating script."}],"usage":{"input_tokens":120,"output_tokens":45}}}"#, "\n",
-            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/workspace/hello.py","content":"print('hello')"}}],"usage":{"input_tokens":30,"output_tokens":20}}}"#, "\n",
-            r#"{"type":"user","session_id":"sess_01","message":{"id":"msg_3","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"File written"}]}}"#, "\n",
-            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_4","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"python hello.py"}}],"usage":{"input_tokens":40,"output_tokens":15}}}"#, "\n",
-            r#"{"type":"user","session_id":"sess_01","message":{"id":"msg_5","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"hello\n"}]}}"#, "\n",
-            r#"{"type":"result","subtype":"success","session_id":"sess_01","total_cost_usd":0.0042,"is_error":false,"duration_ms":8500,"duration_api_ms":7200,"num_turns":3,"result":"Done.","usage":{"input_tokens":190,"output_tokens":80}}"#, "\n",
+            r#"{"type":"system","subtype":"init","session_id":"sess_01","model":"sonnet","tools":["Bash","Read","Write"],"cwd":"/workspace"}"#,
+            "\n",
+            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Creating script."}],"usage":{"input_tokens":120,"output_tokens":45}}}"#,
+            "\n",
+            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/workspace/hello.py","content":"print('hello')"}}],"usage":{"input_tokens":30,"output_tokens":20}}}"#,
+            "\n",
+            r#"{"type":"user","session_id":"sess_01","message":{"id":"msg_3","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"File written"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","session_id":"sess_01","message":{"id":"msg_4","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"python hello.py"}}],"usage":{"input_tokens":40,"output_tokens":15}}}"#,
+            "\n",
+            r#"{"type":"user","session_id":"sess_01","message":{"id":"msg_5","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"hello\n"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess_01","total_cost_usd":0.0042,"is_error":false,"duration_ms":8500,"duration_api_ms":7200,"num_turns":3,"result":"Done.","usage":{"input_tokens":190,"output_tokens":80}}"#,
+            "\n",
         )
     }
 
@@ -158,8 +174,10 @@ mod claude_parser_tests {
     #[test]
     fn test_parse_tool_result_array_content() {
         let jsonl = concat!(
-            r#"{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#, "\n",
-            r#"{"type":"user","session_id":"s","message":{"id":"m2","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a.txt"},{"type":"text","text":"\nb.txt"}]}]}}"#, "\n",
+            r#"{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "\n",
+            r#"{"type":"user","session_id":"s","message":{"id":"m2","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a.txt"},{"type":"text","text":"\nb.txt"}]}]}}"#,
+            "\n",
         );
         let r = parse_stream_json(jsonl.as_bytes());
         assert_eq!(r.tool_calls[0].output.as_deref(), Some("a.txt\nb.txt"));
@@ -184,7 +202,10 @@ mod traceparent_tests {
         };
 
         let tp = ctx.to_traceparent();
-        assert_eq!(tp, "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+        assert_eq!(
+            tp,
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
 
         // Verify it matches the W3C regex
         let re = regex_lite::Regex::new(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$").unwrap();
@@ -223,7 +244,11 @@ mod traceparent_tests {
 
         // Should be valid W3C format
         let parsed = SpanContext::from_traceparent(&tp);
-        assert!(parsed.is_some(), "generated traceparent should be parseable: {}", tp);
+        assert!(
+            parsed.is_some(),
+            "generated traceparent should be parseable: {}",
+            tp
+        );
     }
 }
 
@@ -234,17 +259,15 @@ mod traceparent_tests {
 #[cfg(all(test, feature = "opentelemetry"))]
 mod otel_sdk_tests {
     use opentelemetry::metrics::MeterProvider;
-    use opentelemetry_sdk::trace::{
-        SdkTracerProvider, SimpleSpanProcessor,
-        in_memory_exporter::InMemorySpanExporter,
-    };
     use opentelemetry_sdk::metrics::{
-        SdkMeterProvider, PeriodicReader,
-        in_memory_exporter::InMemoryMetricExporter,
+        in_memory_exporter::InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+    };
+    use opentelemetry_sdk::trace::{
+        in_memory_exporter::InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor,
     };
 
-    use void_box::observe::tracer::{Tracer, TracerConfig, SpanStatus};
     use void_box::observe::metrics::{MetricsCollector, MetricsConfig};
+    use void_box::observe::tracer::{SpanStatus, Tracer, TracerConfig};
 
     fn test_tracer_provider() -> (SdkTracerProvider, InMemorySpanExporter) {
         let exporter = InMemorySpanExporter::default();
@@ -257,9 +280,7 @@ mod otel_sdk_tests {
     fn test_meter_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
-        let provider = SdkMeterProvider::builder()
-            .with_reader(reader)
-            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
         (provider, exporter)
     }
 
@@ -285,7 +306,10 @@ mod otel_sdk_tests {
         let spans = tracer.get_spans();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "test.span");
-        assert_eq!(spans[0].attributes.get("key1").map(|s| s.as_str()), Some("value1"));
+        assert_eq!(
+            spans[0].attributes.get("key1").map(|s| s.as_str()),
+            Some("value1")
+        );
     }
 
     #[test]
@@ -302,7 +326,10 @@ mod otel_sdk_tests {
 
         // Child should share trace_id and have parent as parent_span_id
         assert_eq!(child.context.trace_id, parent.context.trace_id);
-        assert_eq!(child.context.parent_span_id.as_ref(), Some(&parent.context.span_id));
+        assert_eq!(
+            child.context.parent_span_id.as_ref(),
+            Some(&parent.context.span_id)
+        );
 
         tracer.finish_span(child);
         tracer.finish_span(parent);
@@ -398,7 +425,10 @@ mod otel_sdk_tests {
         let _ = meter_provider.force_flush();
 
         let metrics = metric_exporter.get_finished_metrics().unwrap();
-        assert!(!metrics.is_empty(), "should have exported histogram metrics");
+        assert!(
+            !metrics.is_empty(),
+            "should have exported histogram metrics"
+        );
 
         // Also verify in-memory
         let snap = collector.snapshot();
@@ -410,9 +440,9 @@ mod otel_sdk_tests {
 
     #[test]
     fn test_guest_cpu_metric_via_aggregator() {
-        use void_box::observe::Observer;
+        use void_box::guest::protocol::{SystemMetrics, TelemetryBatch};
         use void_box::observe::telemetry::TelemetryAggregator;
-        use void_box::guest::protocol::{TelemetryBatch, SystemMetrics};
+        use void_box::observe::Observer;
 
         let observer = Observer::test();
         let aggregator = TelemetryAggregator::new(observer.clone(), 42);
@@ -439,14 +469,17 @@ mod otel_sdk_tests {
         // CPU should be recorded
         assert!(snap.metrics.values().any(|m| m.name == "cpu_usage_percent"));
         // Memory should be recorded
-        assert!(snap.metrics.values().any(|m| m.name == "memory_usage_bytes"));
+        assert!(snap
+            .metrics
+            .values()
+            .any(|m| m.name == "memory_usage_bytes"));
     }
 
     #[test]
     fn test_guest_process_metrics_via_aggregator() {
-        use void_box::observe::Observer;
+        use void_box::guest::protocol::{ProcessMetrics, TelemetryBatch};
         use void_box::observe::telemetry::TelemetryAggregator;
-        use void_box::guest::protocol::{TelemetryBatch, ProcessMetrics};
+        use void_box::observe::Observer;
 
         let observer = Observer::test();
         let aggregator = TelemetryAggregator::new(observer.clone(), 42);
@@ -468,22 +501,32 @@ mod otel_sdk_tests {
         aggregator.ingest(&batch);
 
         let snap = observer.get_metrics();
-        assert!(snap.metrics.values().any(|m| m.name == "guest.process.rss_bytes"));
-        assert!(snap.metrics.values().any(|m| m.name == "guest.process.cpu_jiffies"));
+        assert!(snap
+            .metrics
+            .values()
+            .any(|m| m.name == "guest.process.rss_bytes"));
+        assert!(snap
+            .metrics
+            .values()
+            .any(|m| m.name == "guest.process.cpu_jiffies"));
     }
 
     // -- Claude parser OTel span tests --
 
     #[test]
     fn test_claude_tool_spans_created() {
-        use void_box::observe::claude::{parse_stream_json, create_otel_spans};
+        use void_box::observe::claude::{create_otel_spans, parse_stream_json};
         use void_box::observe::tracer::{Tracer, TracerConfig};
 
         let jsonl = concat!(
-            r#"{"type":"system","session_id":"s","model":"sonnet","tools":["Bash"]}"#, "\n",
-            r#"{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"output_tokens":5}}}"#, "\n",
-            r#"{"type":"user","session_id":"s","message":{"id":"m2","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"files\n"}]}}"#, "\n",
-            r#"{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.001,"is_error":false,"duration_ms":1000,"duration_api_ms":800,"num_turns":1,"result":"Done.","usage":{"input_tokens":10,"output_tokens":5}}"#, "\n",
+            r#"{"type":"system","session_id":"s","model":"sonnet","tools":["Bash"]}"#,
+            "\n",
+            r#"{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "\n",
+            r#"{"type":"user","session_id":"s","message":{"id":"m2","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"files\n"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.001,"is_error":false,"duration_ms":1000,"duration_api_ms":800,"num_turns":1,"result":"Done.","usage":{"input_tokens":10,"output_tokens":5}}"#,
+            "\n",
         );
 
         let result = parse_stream_json(jsonl.as_bytes());
@@ -496,27 +539,83 @@ mod otel_sdk_tests {
 
         let spans = tracer.get_spans();
         // Should have: claude.exec + claude.tool.Bash = 2 spans
-        assert_eq!(spans.len(), 2, "expected 2 spans, got {:?}", spans.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert_eq!(
+            spans.len(),
+            2,
+            "expected 2 spans, got {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
 
-        let exec_span = spans.iter().find(|s| s.name == "claude.exec").expect("claude.exec span");
+        let exec_span = spans
+            .iter()
+            .find(|s| s.name == "claude.exec")
+            .expect("claude.exec span");
         // OTel GenAI semconv: Required
-        assert_eq!(exec_span.attributes.get("gen_ai.operation.name").map(|s| s.as_str()), Some("invoke_agent"));
-        assert_eq!(exec_span.attributes.get("gen_ai.system").map(|s| s.as_str()), Some("anthropic"));
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.operation.name")
+                .map(|s| s.as_str()),
+            Some("invoke_agent")
+        );
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.system")
+                .map(|s| s.as_str()),
+            Some("anthropic")
+        );
         // OTel GenAI semconv: Conditionally Required / Recommended
-        assert_eq!(exec_span.attributes.get("gen_ai.request.model").map(|s| s.as_str()), Some("sonnet"));
-        assert_eq!(exec_span.attributes.get("gen_ai.response.model").map(|s| s.as_str()), Some("sonnet"));
-        assert_eq!(exec_span.attributes.get("gen_ai.conversation.id").map(|s| s.as_str()), Some("s"));
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.request.model")
+                .map(|s| s.as_str()),
+            Some("sonnet")
+        );
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.response.model")
+                .map(|s| s.as_str()),
+            Some("sonnet")
+        );
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.conversation.id")
+                .map(|s| s.as_str()),
+            Some("s")
+        );
 
-        let tool_span = spans.iter().find(|s| s.name == "claude.tool.Bash").expect("claude.tool.Bash span");
-        assert_eq!(tool_span.attributes.get("tool.name").map(|s| s.as_str()), Some("Bash"));
+        let tool_span = spans
+            .iter()
+            .find(|s| s.name == "claude.tool.Bash")
+            .expect("claude.tool.Bash span");
+        assert_eq!(
+            tool_span.attributes.get("tool.name").map(|s| s.as_str()),
+            Some("Bash")
+        );
         // Tool child spans also carry GenAI semconv
-        assert_eq!(tool_span.attributes.get("gen_ai.operation.name").map(|s| s.as_str()), Some("execute_tool"));
-        assert_eq!(tool_span.attributes.get("gen_ai.system").map(|s| s.as_str()), Some("anthropic"));
+        assert_eq!(
+            tool_span
+                .attributes
+                .get("gen_ai.operation.name")
+                .map(|s| s.as_str()),
+            Some("execute_tool")
+        );
+        assert_eq!(
+            tool_span
+                .attributes
+                .get("gen_ai.system")
+                .map(|s| s.as_str()),
+            Some("anthropic")
+        );
     }
 
     #[test]
     fn test_token_usage_attributes() {
-        use void_box::observe::claude::{parse_stream_json, create_otel_spans};
+        use void_box::observe::claude::{create_otel_spans, parse_stream_json};
         use void_box::observe::tracer::{Tracer, TracerConfig};
 
         let jsonl = r#"{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.05,"is_error":false,"duration_ms":5000,"duration_api_ms":4000,"num_turns":2,"result":"ok","usage":{"input_tokens":1000,"output_tokens":500}}"#;
@@ -527,10 +626,31 @@ mod otel_sdk_tests {
         create_otel_spans(&result, None, &tracer);
 
         let spans = tracer.get_spans();
-        let exec_span = spans.iter().find(|s| s.name == "claude.exec").expect("claude.exec");
-        assert_eq!(exec_span.attributes.get("gen_ai.usage.input_tokens").map(|s| s.as_str()), Some("1000"));
-        assert_eq!(exec_span.attributes.get("gen_ai.usage.output_tokens").map(|s| s.as_str()), Some("500"));
-        assert_eq!(exec_span.attributes.get("claude.total_cost_usd").map(|s| s.as_str()), Some("0.050000"));
+        let exec_span = spans
+            .iter()
+            .find(|s| s.name == "claude.exec")
+            .expect("claude.exec");
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.usage.input_tokens")
+                .map(|s| s.as_str()),
+            Some("1000")
+        );
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("gen_ai.usage.output_tokens")
+                .map(|s| s.as_str()),
+            Some("500")
+        );
+        assert_eq!(
+            exec_span
+                .attributes
+                .get("claude.total_cost_usd")
+                .map(|s| s.as_str()),
+            Some("0.050000")
+        );
     }
 }
 

@@ -125,7 +125,7 @@ impl VoidBoxConfig {
     pub fn kernel_cmdline(&self) -> String {
         let mut cmdline = vec![
             "console=ttyS0".to_string(),
-            "loglevel=4".to_string(),  // Suppress INFO messages (keeps warnings/errors)
+            "loglevel=4".to_string(), // Suppress INFO messages (keeps warnings/errors)
             "earlyprintk=serial,ttyS0,115200".to_string(),
             "reboot=k".to_string(),
             "panic=1".to_string(),
@@ -268,17 +268,13 @@ mod tests {
 
     #[test]
     fn test_validation_memory() {
-        let config = VoidBoxConfig::new()
-            .memory_mb(8)
-            .kernel("/tmp/nonexistent");
+        let config = VoidBoxConfig::new().memory_mb(8).kernel("/tmp/nonexistent");
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validation_vcpus() {
-        let config = VoidBoxConfig::new()
-            .vcpus(0)
-            .kernel("/tmp/nonexistent");
+        let config = VoidBoxConfig::new().vcpus(0).kernel("/tmp/nonexistent");
         assert!(config.validate().is_err());
     }
 }

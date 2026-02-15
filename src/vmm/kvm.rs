@@ -96,7 +96,9 @@ impl Vm {
             flags: KVM_PIT_SPEAKER_DUMMY,
             ..Default::default()
         };
-        vm.vm_fd.create_pit2(pit_config).map_err(|e| Error::Kvm(e))?;
+        vm.vm_fd
+            .create_pit2(pit_config)
+            .map_err(|e| Error::Kvm(e))?;
         debug!("Created PIT");
 
         Ok(vm)
@@ -106,10 +108,7 @@ impl Vm {
     fn check_extensions(kvm: &Kvm) -> Result<()> {
         use kvm_ioctls::Cap;
 
-        let required_caps = [
-            (Cap::Irqchip, "IRQCHIP"),
-            (Cap::UserMemory, "USER_MEMORY"),
-        ];
+        let required_caps = [(Cap::Irqchip, "IRQCHIP"), (Cap::UserMemory, "USER_MEMORY")];
 
         for (cap, name) in required_caps {
             if !kvm.check_extension(cap) {
@@ -140,7 +139,10 @@ impl Vm {
                 slot: index as u32,
                 guest_phys_addr: region.start_addr().raw_value(),
                 memory_size: region.len(),
-                userspace_addr: self.guest_memory.get_host_address(region.start_addr()).unwrap() as u64,
+                userspace_addr: self
+                    .guest_memory
+                    .get_host_address(region.start_addr())
+                    .unwrap() as u64,
                 flags: 0,
             };
 
@@ -187,7 +189,6 @@ impl Vm {
     pub fn create_vcpu(&self, id: u64) -> Result<kvm_ioctls::VcpuFd> {
         self.vm_fd.create_vcpu(id).map_err(|e| Error::Kvm(e))
     }
-
 }
 
 #[cfg(test)]

@@ -79,10 +79,10 @@ pub mod sandbox;
 pub mod workflow;
 
 // Skill + Environment = Box
-pub mod skill;
-pub mod llm;
 pub mod agent_box;
+pub mod llm;
 pub mod pipeline;
+pub mod skill;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
@@ -91,14 +91,14 @@ pub use vmm::VoidBox;
 
 // Prelude for common imports
 pub mod prelude {
-    pub use crate::error::{Error, Result};
-    pub use crate::observe::{ObserveConfig, Observer};
-    pub use crate::sandbox::{Sandbox, SandboxBuilder};
-    pub use crate::workflow::{Workflow, WorkflowBuilder, WorkflowExt, WorkflowResult};
-    pub use crate::skill::Skill;
-    pub use crate::llm::LlmProvider;
     pub use crate::agent_box::AgentBox;
+    pub use crate::error::{Error, Result};
+    pub use crate::llm::LlmProvider;
+    pub use crate::observe::{ObserveConfig, Observer};
     pub use crate::pipeline::Pipeline;
+    pub use crate::sandbox::{Sandbox, SandboxBuilder};
+    pub use crate::skill::Skill;
+    pub use crate::workflow::{Workflow, WorkflowBuilder, WorkflowExt, WorkflowResult};
     pub use crate::ExecOutput;
 }
 

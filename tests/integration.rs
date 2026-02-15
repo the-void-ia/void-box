@@ -56,9 +56,10 @@ async fn test_workflow_pipe() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("pipe-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["hello"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["hello"]).await },
+        )
         .step("step2", |ctx| async move {
             // This step receives output from step1 via pipe
             ctx.exec_piped("tr", &["a-z", "A-Z"]).await
@@ -83,15 +84,9 @@ async fn test_workflow_multiple_steps() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("multi-step")
-        .step("a", |ctx| async move {
-            ctx.exec("echo", &["a"]).await
-        })
-        .step("b", |ctx| async move {
-            ctx.exec("echo", &["b"]).await
-        })
-        .step("c", |ctx| async move {
-            ctx.exec("echo", &["c"]).await
-        })
+        .step("a", |ctx| async move { ctx.exec("echo", &["a"]).await })
+        .step("b", |ctx| async move { ctx.exec("echo", &["b"]).await })
+        .step("c", |ctx| async move { ctx.exec("echo", &["c"]).await })
         .output("c")
         .build();
 
@@ -139,9 +134,10 @@ async fn test_observability_traces() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("trace-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["hello"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["hello"]).await },
+        )
         .build();
 
     let result = workflow
@@ -153,7 +149,9 @@ async fn test_observability_traces() {
     // Should have workflow and step traces
     let traces = result.traces();
     assert!(!traces.is_empty());
-    assert!(traces.iter().any(|t| t.name.contains("workflow:trace-test")));
+    assert!(traces
+        .iter()
+        .any(|t| t.name.contains("workflow:trace-test")));
     assert!(traces.iter().any(|t| t.name.contains("step:step1")));
 }
 
@@ -163,9 +161,10 @@ async fn test_observability_metrics() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("metrics-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["hello"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["hello"]).await },
+        )
         .build();
 
     let result = workflow
@@ -205,7 +204,9 @@ fn test_observer_spans() {
 fn test_observability_logs() {
     let observer = Observer::test();
 
-    observer.logger().info("Test info message", &[("key", "value")]);
+    observer
+        .logger()
+        .info("Test info message", &[("key", "value")]);
     observer.logger().error("Test error message", &[]);
 
     let logs = observer.get_logs();
@@ -228,7 +229,8 @@ async fn test_claude_workflow_plan_apply() {
             ctx.exec("claude-code", &["plan", "/workspace"]).await
         })
         .step("apply", |ctx| async move {
-            ctx.exec_piped("claude-code", &["apply", "/workspace"]).await
+            ctx.exec_piped("claude-code", &["apply", "/workspace"])
+                .await
         })
         .pipe("plan", "apply")
         .output("apply")
@@ -245,14 +247,18 @@ async fn test_claude_workflow_plan_apply() {
     assert!(observed.result.step_outputs.contains_key("plan"));
     assert!(observed.result.step_outputs.contains_key("apply"));
 
-    let plan_stdout = String::from_utf8_lossy(
-        &observed.result.step_output("plan").unwrap().stdout,
-    );
+    let plan_stdout = String::from_utf8_lossy(&observed.result.step_output("plan").unwrap().stdout);
     assert!(plan_stdout.contains("steps") && plan_stdout.contains("edit"));
 
     assert!(!observed.traces().is_empty());
-    assert!(observed.traces().iter().any(|s| s.name.contains("step:plan")));
-    assert!(observed.traces().iter().any(|s| s.name.contains("step:apply")));
+    assert!(observed
+        .traces()
+        .iter()
+        .any(|s| s.name.contains("step:plan")));
+    assert!(observed
+        .traces()
+        .iter()
+        .any(|s| s.name.contains("step:apply")));
 }
 
 // =============================================================================
@@ -341,7 +347,9 @@ async fn test_workflow_parity_execution() {
 
     // Verify trace coverage across workflow and steps.
     let traces = result.traces();
-    assert!(traces.iter().any(|t| t.name.contains("workflow:fetch-and-process")));
+    assert!(traces
+        .iter()
+        .any(|t| t.name.contains("workflow:fetch-and-process")));
     assert!(traces.iter().any(|t| t.name.contains("step:fetch")));
     assert!(traces.iter().any(|t| t.name.contains("step:parse")));
 }
@@ -400,9 +408,10 @@ async fn test_workflow_result_access() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("result-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["output"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["output"]).await },
+        )
         .build();
 
     let result = workflow
@@ -428,9 +437,10 @@ async fn test_observed_result_structure() {
     let sandbox = Sandbox::mock().build().unwrap();
 
     let workflow = Workflow::define("observed-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["test"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["test"]).await },
+        )
         .build();
 
     let observed = workflow

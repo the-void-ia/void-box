@@ -5,15 +5,14 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use crate::{Error, Result};
 
 /// Write data to guest memory at the specified address
-pub fn write_to_guest(
-    memory: &GuestMemoryMmap,
-    addr: GuestAddress,
-    data: &[u8],
-) -> Result<()> {
-    memory
-        .write(data, addr)
-        .map(|_| ())
-        .map_err(|e| Error::Memory(format!("Failed to write to guest memory at {:#x}: {}", addr.raw_value(), e)))
+pub fn write_to_guest(memory: &GuestMemoryMmap, addr: GuestAddress, data: &[u8]) -> Result<()> {
+    memory.write(data, addr).map(|_| ()).map_err(|e| {
+        Error::Memory(format!(
+            "Failed to write to guest memory at {:#x}: {}",
+            addr.raw_value(),
+            e
+        ))
+    })
 }
 
 /// Read data from guest memory at the specified address
@@ -23,9 +22,13 @@ pub fn read_from_guest(
     size: usize,
 ) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; size];
-    memory
-        .read(&mut buf, addr)
-        .map_err(|e| Error::Memory(format!("Failed to read from guest memory at {:#x}: {}", addr.raw_value(), e)))?;
+    memory.read(&mut buf, addr).map_err(|e| {
+        Error::Memory(format!(
+            "Failed to read from guest memory at {:#x}: {}",
+            addr.raw_value(),
+            e
+        ))
+    })?;
     Ok(buf)
 }
 
@@ -40,11 +43,7 @@ pub fn write_slice_to_guest(
 }
 
 /// Zero out a region of guest memory
-pub fn zero_guest_memory(
-    memory: &GuestMemoryMmap,
-    addr: GuestAddress,
-    size: usize,
-) -> Result<()> {
+pub fn zero_guest_memory(memory: &GuestMemoryMmap, addr: GuestAddress, size: usize) -> Result<()> {
     let zeros = vec![0u8; size];
     write_to_guest(memory, addr, &zeros)
 }

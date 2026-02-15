@@ -2,8 +2,8 @@
 //!
 //! Provides utilities to download and manage pre-built kernel and initramfs artifacts.
 
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// GitHub releases base URL
 const GITHUB_RELEASES_URL: &str = "https://github.com/the-void-ia/void-box/releases/download";
@@ -29,7 +29,9 @@ pub struct ArtifactPaths {
 /// println!("Initramfs: {:?}", artifacts.initramfs);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn download_prebuilt_artifacts(version: &str) -> Result<ArtifactPaths, Box<dyn std::error::Error>> {
+pub fn download_prebuilt_artifacts(
+    version: &str,
+) -> Result<ArtifactPaths, Box<dyn std::error::Error>> {
     let cache_dir = artifact_cache_dir()?;
 
     let arch = std::env::consts::ARCH;
@@ -40,7 +42,9 @@ pub fn download_prebuilt_artifacts(version: &str) -> Result<ArtifactPaths, Box<d
     // Download if not cached
     if !initramfs_path.exists() {
         eprintln!("Downloading initramfs from {}", initramfs_url);
-        return Err("Download not implemented yet - use curl/wget to manually download artifacts".into());
+        return Err(
+            "Download not implemented yet - use curl/wget to manually download artifacts".into(),
+        );
     }
 
     Ok(ArtifactPaths {
@@ -101,17 +105,13 @@ fn detect_host_kernel() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// Get the running kernel version
 fn get_kernel_version() -> Result<String, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("uname")
-        .arg("-r")
-        .output()?;
+    let output = std::process::Command::new("uname").arg("-r").output()?;
 
     if !output.status.success() {
         return Err("Failed to get kernel version".into());
     }
 
-    let version = String::from_utf8(output.stdout)?
-        .trim()
-        .to_string();
+    let version = String::from_utf8(output.stdout)?.trim().to_string();
 
     Ok(version)
 }

@@ -73,6 +73,25 @@ VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 ```
 
+## Observability Playground
+
+One command boots Grafana LGTM and runs a pipeline that exports traces and metrics over OTLP.
+
+```bash
+playground/up.sh
+```
+
+The script starts Docker Compose services, runs:
+
+```bash
+cargo run --example playground_pipeline --features opentelemetry
+```
+
+Then prints Grafana URL and service filter hints.
+It also asks for provider mode (`Anthropic`, `Ollama`, `Mock`) and prepares initramfs automatically:
+- `Mock` -> `scripts/build_test_image.sh` (`/tmp/void-box-test-rootfs.cpio.gz`, claudio mock)
+- `Anthropic` / `Ollama` -> `scripts/build_guest_image.sh` (`/tmp/void-box-rootfs.cpio.gz`)
+
 ## Examples
 
 - `boot_diag`: VM boot diagnostics
@@ -82,6 +101,7 @@ cargo test --test e2e_telemetry -- --ignored --test-threads=1
 - `remote_skills`: pulls skills from remote repositories
 - `claude_workflow`: workflow plan/apply pattern in sandbox
 - `claude_in_voidbox_example`: interactive Claude-style session
+- `playground_pipeline`: observability-first pipeline demo for Grafana
 
 See `examples/README.md` for per-example notes.
 

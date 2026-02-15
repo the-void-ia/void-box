@@ -188,7 +188,13 @@ impl LogEntry {
             let attrs: Vec<_> = self
                 .attributes
                 .iter()
-                .map(|(k, v)| format!(r#""{}":"{}""#, k, v.replace('\\', "\\\\").replace('"', "\\\"")))
+                .map(|(k, v)| {
+                    format!(
+                        r#""{}":"{}""#,
+                        k,
+                        v.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                })
                 .collect();
             json.push_str(&attrs.join(","));
             json.push('}');
@@ -286,7 +292,9 @@ impl StructuredLogger {
 
         for line in output.lines() {
             let mut entry = LogEntry::new(LogLevel::Debug, line).with_source("stdout");
-            entry.attributes.insert("step".to_string(), step_name.to_string());
+            entry
+                .attributes
+                .insert("step".to_string(), step_name.to_string());
             self.record_entry(entry);
         }
     }
@@ -299,7 +307,9 @@ impl StructuredLogger {
 
         for line in output.lines() {
             let mut entry = LogEntry::new(LogLevel::Warn, line).with_source("stderr");
-            entry.attributes.insert("step".to_string(), step_name.to_string());
+            entry
+                .attributes
+                .insert("step".to_string(), step_name.to_string());
             self.record_entry(entry);
         }
     }

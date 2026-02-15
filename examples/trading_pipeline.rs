@@ -74,8 +74,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Skills: declared capabilities ----
 
-    let reasoning = Skill::agent("claude-code")
-        .description("Autonomous reasoning and code execution");
+    let reasoning =
+        Skill::agent("claude-code").description("Autonomous reasoning and code execution");
 
     let data_skill = Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md")
         .description("Financial data collection and quality methodology");
@@ -117,11 +117,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
              Cloud +28%, DOJ antitrust ruling pending.\n\n\
              For each symbol, write a brief data summary with key metrics and recent catalysts.\n\
              Do NOT write or run code. Do NOT output JSON or templates.\n\
-             Write plain text with clear sections per symbol."
+             Write plain text with clear sections per symbol.",
         )
         .build()?;
 
-    println!("  [1] {} -- {} skills", data_box.name, data_box.skills.len());
+    println!(
+        "  [1] {} -- {} skills",
+        data_box.name,
+        data_box.skills.len()
+    );
 
     // ---- Box 2: Quant Analyst ----
 
@@ -135,11 +139,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
              - P/E relative to sector average (Tech sector avg ~28)\n\
              - A composite signal: BULLISH, NEUTRAL, or BEARISH\n\n\
              Write plain text. Do NOT output JSON or templates.\n\
-             Use the actual numbers from the input data."
+             Use the actual numbers from the input data.",
         )
         .build()?;
 
-    println!("  [2] {} -- {} skills", quant_box.name, quant_box.skills.len());
+    println!(
+        "  [2] {} -- {} skills",
+        quant_box.name,
+        quant_box.skills.len()
+    );
 
     // ---- Box 3: Research Analyst (pure reasoning, no special skills) ----
 
@@ -152,11 +160,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
              - Write 2 sentences explaining your score\n\n\
              Consider the technical signals, fundamentals, and catalysts from the input.\n\
              Write plain text. Do NOT output JSON or templates.\n\
-             Example: AAPL: +0.3 (mildly bullish). The earnings beat suggests..."
+             Example: AAPL: +0.3 (mildly bullish). The earnings beat suggests...",
         )
         .build()?;
 
-    println!("  [3] {} -- {} skills (pure reasoning)", sentiment_box.name, sentiment_box.skills.len());
+    println!(
+        "  [3] {} -- {} skills (pure reasoning)",
+        sentiment_box.name,
+        sentiment_box.skills.len()
+    );
 
     // ---- Box 4: Portfolio Strategist ----
 
@@ -173,11 +185,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
              - STOP LOSS: price to cut losses (set 5-10% below entry)\n\
              - RATIONALE: one sentence\n\n\
              Keep at least 20% in cash. Write plain text. Do NOT output JSON or templates.\n\
-             Use real numbers from the analysis, not placeholders."
+             Use real numbers from the analysis, not placeholders.",
         )
         .build()?;
 
-    println!("  [4] {} -- {} skills", strategy_box.name, strategy_box.skills.len());
+    println!(
+        "  [4] {} -- {} skills",
+        strategy_box.name,
+        strategy_box.skills.len()
+    );
 
     // ---- Compose the pipeline ----
 
@@ -201,10 +217,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!();
     println!("  Pipeline:       {}", result.name);
     println!("  Stages:         {}", result.stages.len());
-    println!("  Success:        {}", if result.success() { "YES" } else { "NO" });
+    println!(
+        "  Success:        {}",
+        if result.success() { "YES" } else { "NO" }
+    );
     println!("  Total cost:     ${:.6}", result.total_cost_usd());
-    println!("  Total tokens:   {} in / {} out",
-        result.total_input_tokens(), result.total_output_tokens());
+    println!(
+        "  Total tokens:   {} in / {} out",
+        result.total_input_tokens(),
+        result.total_output_tokens()
+    );
     println!("  Total tools:    {}", result.total_tool_calls());
     println!();
 
@@ -306,7 +328,9 @@ fn detect_llm_provider() -> LlmProvider {
 /// Check if KVM artifacts are available.
 fn is_kvm_available() -> bool {
     std::path::Path::new("/dev/kvm").exists()
-        && std::env::var("VOID_BOX_KERNEL").map(|v| !v.is_empty()).unwrap_or(false)
+        && std::env::var("VOID_BOX_KERNEL")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
 }
 
 /// Get the kernel path from environment.

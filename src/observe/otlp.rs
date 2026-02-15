@@ -68,8 +68,8 @@ impl OtlpConfig {
             })
             .collect();
 
-        let service_name = std::env::var("VOIDBOX_SERVICE_NAME")
-            .unwrap_or_else(|_| "void-box".to_string());
+        let service_name =
+            std::env::var("VOIDBOX_SERVICE_NAME").unwrap_or_else(|_| "void-box".to_string());
 
         let debug = std::env::var("VOIDBOX_OTEL_DEBUG").is_ok();
 
@@ -95,10 +95,10 @@ impl OtlpConfig {
 mod otel_init {
     use super::OtlpConfig;
     use opentelemetry::KeyValue;
-    use opentelemetry_sdk::trace::{SdkTracerProvider, BatchSpanProcessor};
-    use opentelemetry_sdk::metrics::{SdkMeterProvider, PeriodicReader};
-    use opentelemetry_sdk::Resource;
     use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
+    use opentelemetry_sdk::Resource;
 
     /// Initialize an OTel `TracerProvider` that exports spans via OTLP/gRPC.
     ///
@@ -121,9 +121,7 @@ mod otel_init {
         let exporter = exporter_builder.build()?;
 
         let resource = Resource::builder()
-            .with_attributes([
-                KeyValue::new("service.name", config.service_name.clone()),
-            ])
+            .with_attributes([KeyValue::new("service.name", config.service_name.clone())])
             .build();
 
         let provider = SdkTracerProvider::builder()
@@ -152,9 +150,7 @@ mod otel_init {
             .build()?;
 
         let resource = Resource::builder()
-            .with_attributes([
-                KeyValue::new("service.name", config.service_name.clone()),
-            ])
+            .with_attributes([KeyValue::new("service.name", config.service_name.clone())])
             .build();
 
         let reader = PeriodicReader::builder(exporter).build();
@@ -188,7 +184,7 @@ mod otel_init {
 }
 
 #[cfg(feature = "opentelemetry")]
-pub use otel_init::{init_otlp_tracer, init_otlp_metrics, shutdown_otlp};
+pub use otel_init::{init_otlp_metrics, init_otlp_tracer, shutdown_otlp};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -219,7 +215,10 @@ mod tests {
         let _guard0 = TempEnv::remove("OTEL_EXPORTER_OTLP_ENDPOINT");
         let _guard1 = TempEnv::set("VOIDBOX_OTLP_ENDPOINT", "http://localhost:4317");
         let _guard2 = TempEnv::set("VOIDBOX_SERVICE_NAME", "my-service");
-        let _guard3 = TempEnv::set("VOIDBOX_OTLP_HEADERS", "authorization=Bearer token123,x-custom=value");
+        let _guard3 = TempEnv::set(
+            "VOIDBOX_OTLP_HEADERS",
+            "authorization=Bearer token123,x-custom=value",
+        );
         let _guard4 = TempEnv::set("VOIDBOX_OTEL_DEBUG", "1");
 
         let config = OtlpConfig::from_env();
@@ -228,8 +227,14 @@ mod tests {
         assert_eq!(config.service_name, "my-service");
         assert!(config.debug);
         assert_eq!(config.headers.len(), 2);
-        assert_eq!(config.headers[0], ("authorization".to_string(), "Bearer token123".to_string()));
-        assert_eq!(config.headers[1], ("x-custom".to_string(), "value".to_string()));
+        assert_eq!(
+            config.headers[0],
+            ("authorization".to_string(), "Bearer token123".to_string())
+        );
+        assert_eq!(
+            config.headers[1],
+            ("x-custom".to_string(), "value".to_string())
+        );
     }
 
     #[test]
@@ -265,13 +270,19 @@ mod tests {
         fn set(key: &str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key: key.to_string(), previous }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
         }
 
         fn remove(key: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_string(), previous }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
         }
     }
 

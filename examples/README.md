@@ -64,3 +64,11 @@ Interactive/demo style Claude-compatible session.
 ```bash
 cargo run --example claude_in_voidbox_example
 ```
+
+## playground_pipeline
+
+Observability-first pipeline for Grafana LGTM with OTLP export.
+
+```bash
+cargo run --example playground_pipeline --features opentelemetry
+```

@@ -76,6 +76,11 @@ opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 name = "voidbox"
 path = "src/bin/voidbox.rs"
 
+
+[[example]]
+name = "playground_pipeline"
+path = "playground/playground_pipeline.rs"
+
 [[test]]
 name = "e2e_skill_pipeline"
 path = "tests/e2e/skill_pipeline.rs"

@@ -58,22 +58,34 @@ impl PipelineResult {
 
     /// Total cost across all stages.
     pub fn total_cost_usd(&self) -> f64 {
-        self.stages.iter().map(|s| s.claude_result.total_cost_usd).sum()
+        self.stages
+            .iter()
+            .map(|s| s.claude_result.total_cost_usd)
+            .sum()
     }
 
     /// Total input tokens across all stages.
     pub fn total_input_tokens(&self) -> u64 {
-        self.stages.iter().map(|s| s.claude_result.input_tokens).sum()
+        self.stages
+            .iter()
+            .map(|s| s.claude_result.input_tokens)
+            .sum()
     }
 
     /// Total output tokens across all stages.
     pub fn total_output_tokens(&self) -> u64 {
-        self.stages.iter().map(|s| s.claude_result.output_tokens).sum()
+        self.stages
+            .iter()
+            .map(|s| s.claude_result.output_tokens)
+            .sum()
     }
 
     /// Total tool calls across all stages.
     pub fn total_tool_calls(&self) -> usize {
-        self.stages.iter().map(|s| s.claude_result.tool_calls.len()).sum()
+        self.stages
+            .iter()
+            .map(|s| s.claude_result.tool_calls.len())
+            .sum()
     }
 }
 

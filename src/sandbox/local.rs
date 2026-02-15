@@ -46,9 +46,11 @@ impl LocalSandbox {
         }
 
         // Build VM config
-        let kernel = self.config.kernel.clone().ok_or_else(|| {
-            Error::Config("Kernel path required for local sandbox".into())
-        })?;
+        let kernel = self
+            .config
+            .kernel
+            .clone()
+            .ok_or_else(|| Error::Config("Kernel path required for local sandbox".into()))?;
 
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(self.config.memory_mb)
@@ -83,7 +85,12 @@ impl LocalSandbox {
     }
 
     /// Execute a command with stdin input
-    pub async fn exec_with_stdin(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<ExecOutput> {
+    pub async fn exec_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<ExecOutput> {
         // For now, if VM is not configured, return a simulated response
         // This allows testing without a real VM
         if self.config.kernel.is_none() {
@@ -109,7 +116,11 @@ impl LocalSandbox {
             "cat" => {
                 if stdin.is_empty() {
                     // Reading file - simulate not found
-                    Ok(ExecOutput::new(Vec::new(), b"cat: file not found\n".to_vec(), 1))
+                    Ok(ExecOutput::new(
+                        Vec::new(),
+                        b"cat: file not found\n".to_vec(),
+                        1,
+                    ))
                 } else {
                     // cat with stdin - echo it back
                     Ok(ExecOutput::new(stdin.to_vec(), Vec::new(), 0))
@@ -143,7 +154,11 @@ impl LocalSandbox {
                     let cmd = args[1];
                     if cmd.starts_with("echo") {
                         let msg = cmd.strip_prefix("echo ").unwrap_or("");
-                        Ok(ExecOutput::new(format!("{}\n", msg).into_bytes(), Vec::new(), 0))
+                        Ok(ExecOutput::new(
+                            format!("{}\n", msg).into_bytes(),
+                            Vec::new(),
+                            0,
+                        ))
                     } else {
                         Ok(ExecOutput::new(Vec::new(), Vec::new(), 0))
                     }
@@ -226,7 +241,8 @@ impl LocalSandbox {
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
-        vm.exec_with_env_timeout("claude-code", args, &[], &env, None, timeout_secs).await
+        vm.exec_with_env_timeout("claude-code", args, &[], &env, None, timeout_secs)
+            .await
     }
 
     /// Stop the sandbox
@@ -268,7 +284,10 @@ mod tests {
         let config = SandboxConfig::default();
         let sandbox = LocalSandbox::new(config).unwrap();
 
-        let output = sandbox.exec_with_stdin("cat", &[], b"test input").await.unwrap();
+        let output = sandbox
+            .exec_with_stdin("cat", &[], b"test input")
+            .await
+            .unwrap();
         assert!(output.success());
         assert_eq!(output.stdout, b"test input");
     }
@@ -291,7 +310,10 @@ mod tests {
         let config = SandboxConfig::default();
         let sandbox = LocalSandbox::new(config).unwrap();
 
-        let output = sandbox.exec("curl", &["-s", "https://example.com"]).await.unwrap();
+        let output = sandbox
+            .exec("curl", &["-s", "https://example.com"])
+            .await
+            .unwrap();
         assert!(output.success());
     }
 }

@@ -90,15 +90,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Building AgentBox with remote skills ---");
     println!();
 
-    let reasoning = Skill::agent("claude-code")
-        .description("Autonomous reasoning and code execution");
+    let reasoning =
+        Skill::agent("claude-code").description("Autonomous reasoning and code execution");
 
     let mut builder = AgentBox::new("developer")
         .skill(reasoning)
         .prompt(
             "You are a senior developer. Use your brainstorming, debugging, and TDD skills \
              to plan a new CLI tool that converts Markdown to HTML. First brainstorm the design, \
-             then write tests, then implement."
+             then write tests, then implement.",
         )
         .mock();
 
@@ -139,11 +139,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Result ---");
     println!("  Box:     {}", result.box_name);
     println!("  Error:   {}", result.claude_result.is_error);
-    println!("  Tokens:  {} in / {} out",
-        result.claude_result.input_tokens,
-        result.claude_result.output_tokens);
+    println!(
+        "  Tokens:  {} in / {} out",
+        result.claude_result.input_tokens, result.claude_result.output_tokens
+    );
     println!();
-    println!("Done. All {} remote skills were fetched and provisioned.", fetched_count);
+    println!(
+        "Done. All {} remote skills were fetched and provisioned.",
+        fetched_count
+    );
 
     Ok(())
 }

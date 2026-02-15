@@ -71,6 +71,20 @@ VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 ```
 
+## Grafana Playground
+
+To bring up Grafana + traces + metrics in one command:
+
+```bash
+playground/up.sh
+```
+
+This uses the OTLP-enabled example:
+
+```bash
+cargo run --example playground_pipeline --features opentelemetry
+```
+
 ## Core Test Commands
 
 ```bash

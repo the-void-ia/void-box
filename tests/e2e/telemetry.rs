@@ -106,10 +106,7 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
         return None;
     }
 
-    let mut builder = Sandbox::local()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel);
+    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
 
     if let Some(ref p) = initramfs {
         if !p.exists() {
@@ -142,10 +139,7 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
         return None;
     }
 
-    let mut builder = Sandbox::local()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel);
+    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
 
     if let Some(ref p) = initramfs {
         if !p.exists() {
@@ -249,7 +243,11 @@ async fn test_default_scenario() {
         .filter(|s| s.name.starts_with("claude.tool."))
         .collect();
 
-    assert_eq!(exec_spans.len(), 1, "should have exactly 1 claude.exec span");
+    assert_eq!(
+        exec_spans.len(),
+        1,
+        "should have exactly 1 claude.exec span"
+    );
     assert_eq!(
         tool_spans.len(),
         result.tool_calls.len(),
@@ -285,8 +283,14 @@ async fn test_default_scenario() {
         .await
         .expect("exec_claude failed");
     assert!(!result2.is_error, "exec_claude should not error");
-    assert!(!result2.session_id.is_empty(), "exec_claude should have session_id");
-    assert!(!result2.tool_calls.is_empty(), "exec_claude should have tool calls");
+    assert!(
+        !result2.session_id.is_empty(),
+        "exec_claude should have session_id"
+    );
+    assert!(
+        !result2.tool_calls.is_empty(),
+        "exec_claude should have tool calls"
+    );
     eprintln!("  [C] exec_claude() works correctly");
 
     // Note: we don't call sandbox.stop() -- vCPU threads are blocked in KVM_RUN
@@ -363,7 +367,10 @@ async fn test_telemetry_aggregator() {
 
     // Warmup: ensure VM is ready
     let _warmup = vm
-        .exec("claude-code", &["-p", "warmup", "--output-format", "stream-json"])
+        .exec(
+            "claude-code",
+            &["-p", "warmup", "--output-format", "stream-json"],
+        )
         .await;
 
     let observer = void_box::observe::Observer::test();
@@ -388,7 +395,10 @@ async fn test_telemetry_aggregator() {
     );
 
     let batch = latest.unwrap();
-    assert!(batch.system.is_some(), "batch should contain system metrics");
+    assert!(
+        batch.system.is_some(),
+        "batch should contain system metrics"
+    );
 
     if let Some(ref sys) = batch.system {
         assert!(
@@ -396,7 +406,10 @@ async fn test_telemetry_aggregator() {
             "cpu_percent should be 0-100, got: {}",
             sys.cpu_percent
         );
-        assert!(sys.memory_total_bytes > 0, "memory_total_bytes should be > 0");
+        assert!(
+            sys.memory_total_bytes > 0,
+            "memory_total_bytes should be > 0"
+        );
     }
 
     let snapshot = observer.get_metrics();
@@ -431,7 +444,10 @@ async fn test_error_scenario() {
 
     let result = parse_stream_json(&output.stdout);
 
-    assert!(result.is_error, "error scenario should produce is_error=true");
+    assert!(
+        result.is_error,
+        "error scenario should produce is_error=true"
+    );
     assert!(result.error.is_some(), "should have error message");
     assert!(
         result.error.as_ref().unwrap().contains("Permission denied"),
@@ -475,8 +491,11 @@ async fn test_heavy_scenario() {
         "heavy: expected 20+ tool calls, got: {}",
         result.tool_calls.len()
     );
-    let tool_names: std::collections::HashSet<_> =
-        result.tool_calls.iter().map(|t| t.tool_name.as_str()).collect();
+    let tool_names: std::collections::HashSet<_> = result
+        .tool_calls
+        .iter()
+        .map(|t| t.tool_name.as_str())
+        .collect();
     assert!(
         tool_names.len() >= 3,
         "heavy: expected 3+ tool types, got: {:?}",
@@ -493,7 +512,10 @@ async fn test_heavy_scenario() {
         .count();
     assert_eq!(tool_span_count, result.tool_calls.len());
 
-    eprintln!("PASSED: test_heavy_scenario ({} tool calls)", result.tool_calls.len());
+    eprintln!(
+        "PASSED: test_heavy_scenario ({} tool calls)",
+        result.tool_calls.len()
+    );
 }
 
 /// Multi-tool scenario: Read, Write, Bash, Read, Write in order.
@@ -508,8 +530,16 @@ async fn test_multi_tool_scenario() {
     let result = run_claudio(&sandbox, "refactor the code").await;
 
     assert!(!result.is_error);
-    assert_eq!(result.tool_calls.len(), 5, "multi_tool should have 5 tool calls");
-    let names: Vec<&str> = result.tool_calls.iter().map(|t| t.tool_name.as_str()).collect();
+    assert_eq!(
+        result.tool_calls.len(),
+        5,
+        "multi_tool should have 5 tool calls"
+    );
+    let names: Vec<&str> = result
+        .tool_calls
+        .iter()
+        .map(|t| t.tool_name.as_str())
+        .collect();
     assert_eq!(names, vec!["Read", "Write", "Bash", "Read", "Write"]);
     assert_eq!(result.num_turns, 3);
 
@@ -528,7 +558,10 @@ async fn test_configurable_env_overrides() {
         ("MOCK_CLAUDE_INPUT_TOKENS", "1234"),
         ("MOCK_CLAUDE_OUTPUT_TOKENS", "567"),
         ("MOCK_CLAUDE_COST", "0.042"),
-        ("TRACEPARENT", "00-abcd1234abcd1234abcd1234abcd1234-1234567890abcdef-01"),
+        (
+            "TRACEPARENT",
+            "00-abcd1234abcd1234abcd1234abcd1234-1234567890abcdef-01",
+        ),
     ]) {
         Some(sb) => sb,
         None => return,
@@ -545,8 +578,14 @@ async fn test_configurable_env_overrides() {
     let result = parse_stream_json(&output.stdout);
 
     // --- Token / cost overrides ---
-    assert_eq!(result.input_tokens, 1234, "input tokens should be overridden");
-    assert_eq!(result.output_tokens, 567, "output tokens should be overridden");
+    assert_eq!(
+        result.input_tokens, 1234,
+        "input tokens should be overridden"
+    );
+    assert_eq!(
+        result.output_tokens, 567,
+        "output tokens should be overridden"
+    );
     assert!(
         (result.total_cost_usd - 0.042).abs() < 0.0001,
         "cost should be 0.042, got: {}",

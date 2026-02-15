@@ -14,10 +14,7 @@ use super::context::StepOutput;
 #[derive(Debug, Clone)]
 pub enum CompositionOp {
     /// Pipe output from one step to another
-    Pipe {
-        from: String,
-        to: String,
-    },
+    Pipe { from: String, to: String },
     /// Map/transform output using a function
     Map {
         step: String,
@@ -29,9 +26,7 @@ pub enum CompositionOp {
         condition_name: String,
     },
     /// Parallel execution of multiple steps
-    Parallel {
-        steps: Vec<String>,
-    },
+    Parallel { steps: Vec<String> },
     /// Conditional branching
     Branch {
         condition_step: String,
@@ -39,10 +34,7 @@ pub enum CompositionOp {
         false_branch: String,
     },
     /// Merge multiple step outputs
-    Merge {
-        steps: Vec<String>,
-        into: String,
-    },
+    Merge { steps: Vec<String>, into: String },
 }
 
 /// A pipeline of steps with composition operations
@@ -196,10 +188,7 @@ pub fn get_parallel_steps(step_name: &str, operations: &[CompositionOp]) -> Vec<
     for op in operations {
         if let CompositionOp::Parallel { steps } = op {
             if steps.contains(&step_name.to_string()) {
-                return steps.iter()
-                    .filter(|s| *s != step_name)
-                    .cloned()
-                    .collect();
+                return steps.iter().filter(|s| *s != step_name).cloned().collect();
             }
         }
     }
@@ -237,12 +226,10 @@ mod tests {
 
     #[test]
     fn test_resolve_pipe_input() {
-        let operations = vec![
-            CompositionOp::Pipe {
-                from: "step1".to_string(),
-                to: "step2".to_string(),
-            },
-        ];
+        let operations = vec![CompositionOp::Pipe {
+            from: "step1".to_string(),
+            to: "step2".to_string(),
+        }];
 
         let mut outputs = HashMap::new();
         outputs.insert(
@@ -259,11 +246,9 @@ mod tests {
 
     #[test]
     fn test_parallel_steps() {
-        let operations = vec![
-            CompositionOp::Parallel {
-                steps: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            },
-        ];
+        let operations = vec![CompositionOp::Parallel {
+            steps: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        }];
 
         let parallel = get_parallel_steps("a", &operations);
         assert_eq!(parallel, vec!["b".to_string(), "c".to_string()]);

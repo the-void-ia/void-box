@@ -81,8 +81,7 @@ fn telemetry_batch_in_message_frame() {
     assert_eq!(decoded_msg.msg_type, MessageType::TelemetryData);
     assert_eq!(decoded_msg.payload, payload);
 
-    let decoded_batch: TelemetryBatch =
-        serde_json::from_slice(&decoded_msg.payload).unwrap();
+    let decoded_batch: TelemetryBatch = serde_json::from_slice(&decoded_msg.payload).unwrap();
     assert_eq!(decoded_batch.seq, 1);
 }
 
@@ -115,8 +114,7 @@ fn telemetry_message_read_from_sync() {
     let decoded = Message::read_from_sync(&mut cursor).unwrap();
 
     assert_eq!(decoded.msg_type, MessageType::TelemetryData);
-    let decoded_batch: TelemetryBatch =
-        serde_json::from_slice(&decoded.payload).unwrap();
+    let decoded_batch: TelemetryBatch = serde_json::from_slice(&decoded.payload).unwrap();
     assert_eq!(decoded_batch.seq, 42);
 }
 
@@ -200,14 +198,15 @@ fn telemetry_batch_with_trace_context() {
         timestamp_ms: 1700000000000,
         system: None,
         processes: vec![],
-        trace_context: Some(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
-        ),
+        trace_context: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string()),
     };
 
     let json = serde_json::to_vec(&batch).unwrap();
     let decoded: TelemetryBatch = serde_json::from_slice(&json).unwrap();
-    assert_eq!(decoded.trace_context.as_deref(), batch.trace_context.as_deref());
+    assert_eq!(
+        decoded.trace_context.as_deref(),
+        batch.trace_context.as_deref()
+    );
 }
 
 /// Verify ExecResponse helpers still work (smoke test for shared types).
@@ -236,11 +235,17 @@ fn aggregator_ingest_system_metrics() {
 
     let snapshot = observer.get_metrics();
     assert!(
-        snapshot.metrics.values().any(|m| m.name == "cpu_usage_percent"),
+        snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "cpu_usage_percent"),
         "expected cpu_usage_percent metric after ingest"
     );
     assert!(
-        snapshot.metrics.values().any(|m| m.name == "memory_usage_bytes"),
+        snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "memory_usage_bytes"),
         "expected memory_usage_bytes metric after ingest"
     );
 }
@@ -255,11 +260,17 @@ fn aggregator_ingest_process_metrics() {
 
     let snapshot = observer.get_metrics();
     assert!(
-        snapshot.metrics.values().any(|m| m.name == "guest.process.rss_bytes"),
+        snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "guest.process.rss_bytes"),
         "expected guest.process.rss_bytes gauge after ingest"
     );
     assert!(
-        snapshot.metrics.values().any(|m| m.name == "guest.process.cpu_jiffies"),
+        snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "guest.process.cpu_jiffies"),
         "expected guest.process.cpu_jiffies gauge after ingest"
     );
 }
@@ -310,7 +321,10 @@ fn aggregator_sequential_ingest() {
 
     // Metrics should exist (exact values depend on MetricsCollector semantics)
     let snapshot = observer.get_metrics();
-    assert!(snapshot.metrics.values().any(|m| m.name == "cpu_usage_percent"));
+    assert!(snapshot
+        .metrics
+        .values()
+        .any(|m| m.name == "cpu_usage_percent"));
 }
 
 /// Ingest a batch with no system metrics (only processes).
@@ -337,7 +351,10 @@ fn aggregator_ingest_no_system_metrics() {
 
     let snapshot = observer.get_metrics();
     // Should still record process metrics even without system metrics
-    assert!(snapshot.metrics.values().any(|m| m.name == "guest.process.rss_bytes"));
+    assert!(snapshot
+        .metrics
+        .values()
+        .any(|m| m.name == "guest.process.rss_bytes"));
     // Should NOT have cpu_usage_percent since system was None
     // (depends on implementation -- if set_gauge records 0 or skips)
 }
@@ -392,7 +409,10 @@ fn aggregator_concurrent_ingest() {
 
     // Observer should have metrics
     let snapshot = observer.get_metrics();
-    assert!(snapshot.metrics.values().any(|m| m.name == "cpu_usage_percent"));
+    assert!(snapshot
+        .metrics
+        .values()
+        .any(|m| m.name == "cpu_usage_percent"));
 }
 
 /// Verify that metrics labels include the VM CID.
@@ -480,8 +500,14 @@ fn observer_integration_telemetry_plus_spans() {
 
     // Both span-based and telemetry-based metrics should be present
     let snapshot = observer.get_metrics();
-    let has_duration = snapshot.metrics.values().any(|m| m.name.contains("duration"));
-    let has_cpu = snapshot.metrics.values().any(|m| m.name == "cpu_usage_percent");
+    let has_duration = snapshot
+        .metrics
+        .values()
+        .any(|m| m.name.contains("duration"));
+    let has_cpu = snapshot
+        .metrics
+        .values()
+        .any(|m| m.name == "cpu_usage_percent");
 
     assert!(has_duration, "expected workflow duration metric");
     assert!(has_cpu, "expected telemetry cpu_usage_percent metric");
@@ -538,11 +564,7 @@ async fn kvm_telemetry_end_to_end() {
     // Verify the VM boots by running a trivial command first
     match vm.exec("echo", &["telemetry-test"]).await {
         Ok(output) => {
-            assert!(
-                output.success(),
-                "echo failed: {}",
-                output.stderr_str()
-            );
+            assert!(output.success(), "echo failed: {}", output.stderr_str());
         }
         Err(e) => {
             eprintln!("kvm_telemetry_end_to_end: exec failed, skipping: {e}");

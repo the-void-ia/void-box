@@ -1,0 +1,18 @@
+services:
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: void-box-lgtm
+    ports:
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - lgtm-data:/data
+
+volumes:
+  lgtm-data:

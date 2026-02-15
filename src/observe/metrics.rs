@@ -230,7 +230,10 @@ impl MetricsSnapshot {
                         ));
                     }
                     output.push_str(&format!("{}_sum{} {}\n", metric.name, labels_str, h.sum));
-                    output.push_str(&format!("{}_count{} {}\n", metric.name, labels_str, h.count));
+                    output.push_str(&format!(
+                        "{}_count{} {}\n",
+                        metric.name, labels_str, h.count
+                    ));
                 }
             }
         }
@@ -279,14 +282,16 @@ impl MetricsCollector {
         let duration_ms = duration.as_secs_f64() * 1000.0;
 
         let mut metrics = self.metrics.lock().unwrap();
-        let metric = metrics.entry(metric_name.clone()).or_insert_with(|| Metric {
-            name: metric_name.clone(),
-            help: format!("Duration of {} in milliseconds", name),
-            value: MetricValue::Histogram(HistogramValue::with_buckets(&[
-                1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
-            ])),
-            labels: HashMap::new(),
-        });
+        let metric = metrics
+            .entry(metric_name.clone())
+            .or_insert_with(|| Metric {
+                name: metric_name.clone(),
+                help: format!("Duration of {} in milliseconds", name),
+                value: MetricValue::Histogram(HistogramValue::with_buckets(&[
+                    1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
+                ])),
+                labels: HashMap::new(),
+            });
 
         if let MetricValue::Histogram(h) = &mut metric.value {
             h.observe(duration_ms);

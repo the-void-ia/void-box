@@ -123,7 +123,10 @@ async fn test_agent_box_with_local_skill() {
 
     // Verify claudio discovered the provisioned skill
     assert!(
-        result.claude_result.result_text.contains("financial-data-analysis"),
+        result
+            .claude_result
+            .result_text
+            .contains("financial-data-analysis"),
         "result should mention the provisioned skill name, got: {}",
         result.claude_result.result_text
     );
@@ -159,12 +162,18 @@ async fn test_agent_box_with_multiple_skills() {
 
     // Both skills should be discovered by claudio
     assert!(
-        result.claude_result.result_text.contains("financial-data-analysis"),
+        result
+            .claude_result
+            .result_text
+            .contains("financial-data-analysis"),
         "should discover financial-data-analysis skill, got: {}",
         result.claude_result.result_text
     );
     assert!(
-        result.claude_result.result_text.contains("quant-technical-analysis"),
+        result
+            .claude_result
+            .result_text
+            .contains("quant-technical-analysis"),
         "should discover quant-technical-analysis skill, got: {}",
         result.claude_result.result_text
     );
@@ -214,7 +223,12 @@ async fn test_agent_box_with_mcp_skill() {
     assert!(
         !mcp_tools.is_empty(),
         "should have at least one MCP tool call, tools: {:?}",
-        result.claude_result.tool_calls.iter().map(|t| &t.tool_name).collect::<Vec<_>>()
+        result
+            .claude_result
+            .tool_calls
+            .iter()
+            .map(|t| &t.tool_name)
+            .collect::<Vec<_>>()
     );
 
     eprintln!("PASSED: test_agent_box_with_mcp_skill");
@@ -301,12 +315,18 @@ async fn test_pipeline_two_stages_kvm() {
 
     // Verify each stage discovered its skill
     assert!(
-        result.stages[0].claude_result.result_text.contains("financial-data-analysis"),
+        result.stages[0]
+            .claude_result
+            .result_text
+            .contains("financial-data-analysis"),
         "stage 1 should have financial skill: {}",
         result.stages[0].claude_result.result_text
     );
     assert!(
-        result.stages[1].claude_result.result_text.contains("quant-technical-analysis"),
+        result.stages[1]
+            .claude_result
+            .result_text
+            .contains("quant-technical-analysis"),
         "stage 2 should have quant skill: {}",
         result.stages[1].claude_result.result_text
     );

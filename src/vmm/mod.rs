@@ -24,15 +24,13 @@ use crate::devices::serial::SerialDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
-use crate::vmm::cpu::MmioDevices;
 use crate::guest::protocol::{
-    ExecRequest, ExecResponse,
-    WriteFileRequest, WriteFileResponse,
-    MkdirPRequest, MkdirPResponse,
+    ExecRequest, ExecResponse, MkdirPRequest, MkdirPResponse, WriteFileRequest, WriteFileResponse,
 };
 use crate::network::slirp::SlirpStack;
 use crate::observe::telemetry::TelemetryAggregator;
 use crate::observe::Observer;
+use crate::vmm::cpu::MmioDevices;
 use crate::{Error, ExecOutput, Result};
 
 use self::config::VoidBoxConfig;
@@ -298,7 +296,10 @@ impl VoidBox {
             });
         });
 
-        info!("VoidBox started with CID {}, network={}", cid, config.network);
+        info!(
+            "VoidBox started with CID {}, network={}",
+            cid, config.network
+        );
 
         Ok(Self {
             vm,
@@ -345,7 +346,8 @@ impl VoidBox {
         env: &[(String, String)],
         working_dir: Option<&str>,
     ) -> Result<ExecOutput> {
-        self.exec_with_env_timeout(program, args, stdin, env, working_dir, None).await
+        self.exec_with_env_timeout(program, args, stdin, env, working_dir, None)
+            .await
     }
 
     /// Like `exec_with_env` but with an optional per-request timeout that overrides
@@ -480,7 +482,10 @@ impl VoidBox {
     /// Creates a `TelemetryAggregator` that feeds guest metrics into the
     /// provided `Observer`. The subscription runs in the background until
     /// the VM stops or the guest connection drops.
-    pub async fn start_telemetry(&mut self, observer: Observer) -> Result<Arc<TelemetryAggregator>> {
+    pub async fn start_telemetry(
+        &mut self,
+        observer: Observer,
+    ) -> Result<Arc<TelemetryAggregator>> {
         let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
         self.telemetry = Some(aggregator.clone());
 
@@ -554,12 +559,16 @@ impl VoidBox {
 
         // Wait for event loop to finish
         if let Some(handle) = self.event_loop_handle.take() {
-            handle.join().map_err(|_| Error::Vcpu("Event loop panic".into()))?;
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
         }
 
         // Wait for vsock IRQ handler if present
         if let Some(handle) = self.vsock_irq_handle.take() {
-            handle.join().map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
         }
 
         info!("VoidBox stopped");
@@ -587,19 +596,31 @@ fn vsock_irq_thread(
     vm_fd: RawFd,
     running: Arc<AtomicBool>,
 ) {
-    use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLLIN};
+    use libc::{
+        epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
+    };
 
     let epfd = unsafe { epoll_create1(EPOLL_CLOEXEC) };
     if epfd < 0 {
-        error!("vsock-irq: epoll_create1 failed: {}", std::io::Error::last_os_error());
+        error!(
+            "vsock-irq: epoll_create1 failed: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
 
     for (i, &fd) in call_fds.iter().enumerate() {
-        let mut ev = epoll_event { events: EPOLLIN as u32, u64: i as u64 };
+        let mut ev = epoll_event {
+            events: EPOLLIN as u32,
+            u64: i as u64,
+        };
         let ret = unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev) };
         if ret < 0 {
-            error!("vsock-irq: epoll_ctl ADD fd={} failed: {}", fd, std::io::Error::last_os_error());
+            error!(
+                "vsock-irq: epoll_ctl ADD fd={} failed: {}",
+                fd,
+                std::io::Error::last_os_error()
+            );
         }
     }
 
@@ -617,7 +638,9 @@ fn vsock_irq_thread(
         let nfds = unsafe { epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, 200) };
         if nfds < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) { continue; }
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             error!("vsock-irq: epoll_wait failed: {}", e);
             break;
         }
@@ -627,7 +650,8 @@ fn vsock_irq_thread(
             if idx < call_fds.len() {
                 // Consume the eventfd signal
                 let mut buf = [0u8; 8];
-                let _ = unsafe { libc::read(call_fds[idx], buf.as_mut_ptr() as *mut libc::c_void, 8) };
+                let _ =
+                    unsafe { libc::read(call_fds[idx], buf.as_mut_ptr() as *mut libc::c_void, 8) };
 
                 // Set INTERRUPT_STATUS so the guest ISR sees a used-buffer notification
                 if let Ok(mut dev) = vsock_mmio.lock() {
@@ -636,14 +660,20 @@ fn vsock_irq_thread(
 
                 // Assert IRQ 11 (level high) then deassert (level low) for edge behavior
                 let assert_irq = KvmIrqLevel { irq: 11, level: 1 };
-                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert_irq); }
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert_irq);
+                }
                 let deassert_irq = KvmIrqLevel { irq: 11, level: 0 };
-                unsafe { libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert_irq); }
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert_irq);
+                }
             }
         }
     }
 
-    unsafe { libc::close(epfd); }
+    unsafe {
+        libc::close(epfd);
+    }
     debug!("vsock-irq thread exiting");
 }
 

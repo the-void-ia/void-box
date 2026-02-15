@@ -139,7 +139,12 @@ impl StepContext {
     }
 
     /// Execute a command with stdin
-    pub async fn exec_with_stdin(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
+    pub async fn exec_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<Vec<u8>> {
         let output = self.sandbox.exec_with_stdin(program, args, stdin).await?;
         if output.success() {
             Ok(output.stdout)
@@ -164,7 +169,12 @@ impl StepContext {
     }
 
     /// Execute a raw command with stdin
-    pub async fn exec_raw_with_stdin(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<ExecOutput> {
+    pub async fn exec_raw_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<ExecOutput> {
         self.sandbox.exec_with_stdin(program, args, stdin).await
     }
 

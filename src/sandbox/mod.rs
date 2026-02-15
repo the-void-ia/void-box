@@ -115,7 +115,12 @@ impl Sandbox {
     }
 
     /// Execute a command with stdin input
-    pub async fn exec_with_stdin(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<ExecOutput> {
+    pub async fn exec_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<ExecOutput> {
         match &self.inner {
             SandboxInner::Local(local) => local.exec_with_stdin(program, args, stdin).await,
             SandboxInner::Mock(mock) => mock.exec_with_stdin(program, args, stdin).await,
@@ -134,7 +139,10 @@ impl Sandbox {
         if output.success() {
             Ok(output.stdout)
         } else {
-            Err(Error::Guest(format!("Failed to read file: {}", output.stderr_str())))
+            Err(Error::Guest(format!(
+                "Failed to read file: {}",
+                output.stderr_str()
+            )))
         }
     }
 
@@ -197,7 +205,9 @@ impl Sandbox {
         let output = match &self.inner {
             SandboxInner::Local(local) => {
                 // For local sandbox, pass extra env and timeout through
-                local.exec_claude_internal(&args_refs, &opts.env, opts.timeout_secs).await?
+                local
+                    .exec_claude_internal(&args_refs, &opts.env, opts.timeout_secs)
+                    .await?
             }
             SandboxInner::Mock(mock) => {
                 mock.exec_with_stdin("claude-code", &args_refs, &[]).await?
@@ -218,7 +228,11 @@ impl Sandbox {
                 tracing::warn!(
                     exit_code = output.exit_code,
                     "claude-code failed; stderr={}, stdout_head={}",
-                    if stderr_str.is_empty() { "(empty)" } else { stderr_str.trim() },
+                    if stderr_str.is_empty() {
+                        "(empty)"
+                    } else {
+                        stderr_str.trim()
+                    },
                     stdout_preview,
                 );
             } else {
@@ -228,7 +242,11 @@ impl Sandbox {
                     stderr_len = output.stderr.len(),
                     "claude-code finished; stdout_head={}, stderr={}",
                     stdout_preview,
-                    if stderr_str.is_empty() { "(empty)" } else { stderr_str.trim() },
+                    if stderr_str.is_empty() {
+                        "(empty)"
+                    } else {
+                        stderr_str.trim()
+                    },
                 );
             }
         }
@@ -352,7 +370,10 @@ impl SandboxBuilder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    pub fn with_prebuilt_artifacts(mut self, version: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    pub fn with_prebuilt_artifacts(
+        mut self,
+        version: &str,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let artifacts = crate::artifacts::download_prebuilt_artifacts(version)?;
         self.config.kernel = Some(artifacts.kernel);
         self.config.initramfs = Some(artifacts.initramfs);
@@ -423,7 +444,12 @@ impl MockSandbox {
     }
 
     /// Execute a command (returns queued response or default)
-    pub async fn exec_with_stdin(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<ExecOutput> {
+    pub async fn exec_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<ExecOutput> {
         let mut responses = self.responses.lock().unwrap();
         if let Some(response) = responses.pop() {
             return Ok(response);
@@ -439,7 +465,11 @@ impl MockSandbox {
             "cat" => {
                 if stdin.is_empty() && !args.is_empty() {
                     // Reading file - simulate not found
-                    Ok(ExecOutput::new(Vec::new(), b"cat: file not found\n".to_vec(), 1))
+                    Ok(ExecOutput::new(
+                        Vec::new(),
+                        b"cat: file not found\n".to_vec(),
+                        1,
+                    ))
                 } else {
                     // cat with stdin - echo it back
                     Ok(ExecOutput::new(stdin.to_vec(), Vec::new(), 0))
@@ -486,16 +516,26 @@ impl MockSandbox {
                 let first = args.first().map(|s| *s).unwrap_or("");
                 if first == "plan" {
                     let plan = r#"{"steps":[{"id":"1","action":"edit","path":"README.md"}]}"#;
-                    Ok(ExecOutput::new(format!("{}\n", plan).into_bytes(), Vec::new(), 0))
+                    Ok(ExecOutput::new(
+                        format!("{}\n", plan).into_bytes(),
+                        Vec::new(),
+                        0,
+                    ))
                 } else if first == "apply" {
-                    let lines = std::str::from_utf8(stdin).map(|s| s.lines().count()).unwrap_or(0);
+                    let lines = std::str::from_utf8(stdin)
+                        .map(|s| s.lines().count())
+                        .unwrap_or(0);
                     Ok(ExecOutput::new(
                         format!("Mock applied {} plan line(s).\n", lines).into_bytes(),
                         Vec::new(),
                         0,
                     ))
                 } else {
-                    Ok(ExecOutput::new(Vec::new(), b"usage: claude-code plan|apply [dir]\n".to_vec(), 1))
+                    Ok(ExecOutput::new(
+                        Vec::new(),
+                        b"usage: claude-code plan|apply [dir]\n".to_vec(),
+                        1,
+                    ))
                 }
             }
             _ => {
@@ -573,11 +613,7 @@ mod tests {
 
         // Queue a custom response
         if let SandboxInner::Mock(mock) = &sandbox.inner {
-            mock.queue_response(ExecOutput::new(
-                b"custom output".to_vec(),
-                Vec::new(),
-                0,
-            ));
+            mock.queue_response(ExecOutput::new(b"custom output".to_vec(), Vec::new(), 0));
         }
 
         let output = sandbox.exec("anything", &[]).await.unwrap();

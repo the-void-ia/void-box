@@ -50,7 +50,11 @@ impl Scheduler {
     }
 
     /// Execute a workflow in a sandbox
-    pub async fn execute(&self, workflow: &Workflow, sandbox: Arc<Sandbox>) -> Result<WorkflowResult> {
+    pub async fn execute(
+        &self,
+        workflow: &Workflow,
+        sandbox: Arc<Sandbox>,
+    ) -> Result<WorkflowResult> {
         let start_time = Instant::now();
 
         // Start workflow span
@@ -70,14 +74,18 @@ impl Scheduler {
             })?;
 
             // Start step span
-            let mut step_span = self.observer.start_step_span(step_name, Some(&workflow_ctx));
+            let mut step_span = self
+                .observer
+                .start_step_span(step_name, Some(&workflow_ctx));
 
             // Build step context
             let mut ctx_builder = StepContextBuilder::new(step_name, sandbox.clone())
                 .with_outputs(step_outputs.clone());
 
             // Resolve pipe input if applicable
-            if let Some(input) = resolve_pipe_input(step_name, &workflow.compositions, &step_outputs) {
+            if let Some(input) =
+                resolve_pipe_input(step_name, &workflow.compositions, &step_outputs)
+            {
                 ctx_builder = ctx_builder.with_input(input);
             }
 
@@ -86,7 +94,8 @@ impl Scheduler {
             // Execute step with retry if configured
             let func = step.func.clone();
             let result = if let Some(ref retry_config) = step.retry {
-                self.execute_with_retry(func.clone(), ctx.clone(), retry_config.max_attempts).await
+                self.execute_with_retry(func.clone(), ctx.clone(), retry_config.max_attempts)
+                    .await
             } else {
                 func(ctx).await
             };
@@ -106,7 +115,9 @@ impl Scheduler {
                     step_span.set_error(&error_msg);
 
                     // Log error but continue for now
-                    self.observer.logger().error(&format!("Step {} failed: {}", step_name, error_msg), &[]);
+                    self.observer
+                        .logger()
+                        .error(&format!("Step {} failed: {}", step_name, error_msg), &[]);
                 }
             }
         }
@@ -156,14 +167,22 @@ impl Scheduler {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     self.observer.logger().warn(
-                        &format!("Step {} attempt {} failed: {}", ctx.step_name, attempt + 1, e),
+                        &format!(
+                            "Step {} attempt {} failed: {}",
+                            ctx.step_name,
+                            attempt + 1,
+                            e
+                        ),
                         &[("attempt", &(attempt + 1).to_string())],
                     );
                     last_error = Some(e);
 
                     // Wait before retry (exponential backoff could be added here)
                     if attempt + 1 < max_attempts {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            100 * (attempt as u64 + 1),
+                        ))
+                        .await;
                     }
                 }
             }
@@ -180,9 +199,10 @@ pub async fn execute_step(
     sandbox: Arc<Sandbox>,
     inputs: HashMap<String, StepOutput>,
 ) -> Result<StepOutput> {
-    let step = workflow.steps.get(step_name).ok_or_else(|| {
-        Error::Config(format!("Step '{}' not found", step_name))
-    })?;
+    let step = workflow
+        .steps
+        .get(step_name)
+        .ok_or_else(|| Error::Config(format!("Step '{}' not found", step_name)))?;
 
     let mut ctx_builder = StepContextBuilder::new(step_name, sandbox).with_outputs(inputs.clone());
 

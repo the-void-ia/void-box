@@ -109,7 +109,7 @@ fn try_kvm_sandbox() -> Result<Option<Arc<Sandbox>>, Box<dyn Error>> {
         .memory_mb(512)
         .vcpus(1)
         .kernel(&kernel)
-        .network(true);  // Enable SLIRP networking for API access
+        .network(true); // Enable SLIRP networking for API access
 
     if let Some(ref p) = initramfs {
         b = b.initramfs(p);
@@ -134,16 +134,18 @@ fn try_kvm_sandbox() -> Result<Option<Arc<Sandbox>>, Box<dyn Error>> {
 }
 
 /// Run claude-code with stream-json output and parse the result.
-async fn run_claude(
-    sandbox: &Sandbox,
-    prompt: &str,
-) -> Result<ClaudeExecResult, Box<dyn Error>> {
+async fn run_claude(sandbox: &Sandbox, prompt: &str) -> Result<ClaudeExecResult, Box<dyn Error>> {
     let out = sandbox
-        .exec("claude-code", &[
-            "-p", prompt,
-            "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
-        ])
+        .exec(
+            "claude-code",
+            &[
+                "-p",
+                prompt,
+                "--output-format",
+                "stream-json",
+                "--dangerously-skip-permissions",
+            ],
+        )
         .await?;
 
     if !out.stderr.is_empty() {
@@ -160,10 +162,19 @@ fn print_telemetry(label: &str, result: &ClaudeExecResult) {
     println!("  Session:     {}", result.session_id);
     println!("  Model:       {}", result.model);
     println!("  Turns:       {}", result.num_turns);
-    println!("  Tokens:      {} in / {} out", result.input_tokens, result.output_tokens);
+    println!(
+        "  Tokens:      {} in / {} out",
+        result.input_tokens, result.output_tokens
+    );
     println!("  Cost:        ${:.6}", result.total_cost_usd);
-    println!("  Duration:    {}ms (API: {}ms)", result.duration_ms, result.duration_api_ms);
-    println!("  Error:       {}", if result.is_error { "YES" } else { "no" });
+    println!(
+        "  Duration:    {}ms (API: {}ms)",
+        result.duration_ms, result.duration_api_ms
+    );
+    println!(
+        "  Error:       {}",
+        if result.is_error { "YES" } else { "no" }
+    );
 
     if !result.tool_calls.is_empty() {
         println!("  Tool calls:  {}", result.tool_calls.len());
@@ -174,7 +185,13 @@ fn print_telemetry(label: &str, result: &ClaudeExecResult) {
             } else {
                 output_preview.to_string()
             };
-            println!("    [{}] {} (id={}) -> {}", i + 1, tc.tool_name, tc.tool_use_id, output_short);
+            println!(
+                "    [{}] {} (id={}) -> {}",
+                i + 1,
+                tc.tool_name,
+                tc.tool_use_id,
+                output_short
+            );
         }
     }
 
@@ -202,7 +219,7 @@ fn maybe_create_otel_spans(result: &ClaudeExecResult) {
 
     if otlp_configured {
         let tracer = void_box::observe::tracer::Tracer::new(
-            void_box::observe::tracer::TracerConfig::in_memory()
+            void_box::observe::tracer::TracerConfig::in_memory(),
         );
         void_box::observe::claude::create_otel_spans(result, None, &tracer);
         eprintln!(
@@ -247,8 +264,7 @@ async fn demo_multi_turn(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>> {
     // Turn 2: ask Claude to apply the plan
     let apply_prompt = format!(
         "Apply the following plan in {}. Execute each step.\n\n{}",
-        WORKSPACE,
-        plan_result.result_text,
+        WORKSPACE, plan_result.result_text,
     );
     println!("\nTurn 2: apply\n  prompt: {} bytes\n", apply_prompt.len());
 
@@ -264,7 +280,10 @@ async fn demo_multi_turn(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>> {
 
     println!("\n=== Session Summary ===");
     println!("  Total cost:   ${:.6}", total_cost);
-    println!("  Total tokens: {} in / {} out", total_tokens_in, total_tokens_out);
+    println!(
+        "  Total tokens: {} in / {} out",
+        total_tokens_in, total_tokens_out
+    );
     println!("  Total tools:  {}", total_tools);
 
     if !apply_result.is_error {
@@ -297,7 +316,8 @@ async fn interactive_session(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>
         if input.is_empty() {
             continue;
         }
-        if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") || input == "q" {
+        if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") || input == "q"
+        {
             break;
         }
 
@@ -324,7 +344,10 @@ async fn interactive_session(sandbox: Arc<Sandbox>) -> Result<(), Box<dyn Error>
     if turn_count > 0 {
         println!("\n=== Session Summary ({} turns) ===", turn_count);
         println!("  Total cost:   ${:.6}", total_cost);
-        println!("  Total tokens: {} in / {} out", total_tokens_in, total_tokens_out);
+        println!(
+            "  Total tokens: {} in / {} out",
+            total_tokens_in, total_tokens_out
+        );
     }
 
     Ok(())

@@ -12,9 +12,8 @@ use super::context::StepContext;
 use crate::{Error, Result};
 
 /// Type alias for step functions
-pub type StepFn = Arc<
-    dyn Fn(StepContext) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>> + Send + Sync,
->;
+pub type StepFn =
+    Arc<dyn Fn(StepContext) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>> + Send + Sync>;
 
 /// A single step in a workflow
 #[derive(Clone)]
@@ -119,7 +118,10 @@ impl Workflow {
         order: &mut Vec<String>,
     ) -> Result<()> {
         if temp_visited.get(name).copied().unwrap_or(false) {
-            return Err(Error::Config(format!("Circular dependency detected at step '{}'", name)));
+            return Err(Error::Config(format!(
+                "Circular dependency detected at step '{}'",
+                name
+            )));
         }
 
         if visited.get(name).copied().unwrap_or(false) {
@@ -198,7 +200,12 @@ impl WorkflowBuilder {
     }
 
     /// Add a step with dependencies
-    pub fn step_depends<F, Fut>(mut self, name: impl Into<String>, depends_on: &[&str], func: F) -> Self
+    pub fn step_depends<F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        depends_on: &[&str],
+        func: F,
+    ) -> Self
     where
         F: Fn(StepContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
@@ -235,10 +242,7 @@ impl WorkflowBuilder {
             }
         }
 
-        self.compositions.push(CompositionOp::Pipe {
-            from,
-            to,
-        });
+        self.compositions.push(CompositionOp::Pipe { from, to });
 
         self
     }

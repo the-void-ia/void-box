@@ -60,8 +60,7 @@ async fn test_provision_mcp_skill() {
 
 #[tokio::test]
 async fn test_provision_cli_skill() {
-    let cli = Skill::cli("jq")
-        .description("JSON processor");
+    let cli = Skill::cli("jq").description("JSON processor");
     let reasoning = Skill::agent("claude-code");
 
     let ab = AgentBox::new("cli_box")
@@ -133,8 +132,8 @@ async fn test_provision_remote_skill_fallback() {
 #[tokio::test]
 #[ignore] // Requires network access
 async fn test_remote_skill_provision_live() {
-    let brainstorm = Skill::remote("obra/superpowers/brainstorming")
-        .description("Brainstorming methodology");
+    let brainstorm =
+        Skill::remote("obra/superpowers/brainstorming").description("Brainstorming methodology");
     let reasoning = Skill::agent("claude-code");
 
     let ab = AgentBox::new("live_fetch_box")
@@ -279,7 +278,9 @@ async fn test_trading_pipeline_mock() {
     let reasoning = Skill::agent("claude-code");
 
     let data_box = AgentBox::new("data_analyst")
-        .skill(Skill::file("examples/trading_pipeline/skills/financial-data-analysis.md"))
+        .skill(Skill::file(
+            "examples/trading_pipeline/skills/financial-data-analysis.md",
+        ))
         .skill(reasoning.clone())
         .prompt("Fetch 30 days of OHLCV data for AAPL, NVDA, MSFT, GOOGL")
         .mock()
@@ -287,7 +288,9 @@ async fn test_trading_pipeline_mock() {
         .unwrap();
 
     let quant_box = AgentBox::new("quant_analyst")
-        .skill(Skill::file("examples/trading_pipeline/skills/quant-technical-analysis.md"))
+        .skill(Skill::file(
+            "examples/trading_pipeline/skills/quant-technical-analysis.md",
+        ))
         .skill(reasoning.clone())
         .prompt("Compute technical indicators for each symbol")
         .mock()
@@ -302,7 +305,9 @@ async fn test_trading_pipeline_mock() {
         .unwrap();
 
     let strategy_box = AgentBox::new("portfolio_strategist")
-        .skill(Skill::file("examples/trading_pipeline/skills/portfolio-risk-management.md"))
+        .skill(Skill::file(
+            "examples/trading_pipeline/skills/portfolio-risk-management.md",
+        ))
         .skill(reasoning.clone())
         .memory_mb(512)
         .prompt("Generate trade recommendations with risk management")
@@ -380,9 +385,12 @@ fn test_skill_remote_url_one_part_returns_none() {
 
 #[test]
 fn test_skill_descriptions() {
-    let s = Skill::remote("obra/superpowers/brainstorming")
-        .description("Brainstorming methodology");
-    assert_eq!(s.description_text.as_deref(), Some("Brainstorming methodology"));
+    let s =
+        Skill::remote("obra/superpowers/brainstorming").description("Brainstorming methodology");
+    assert_eq!(
+        s.description_text.as_deref(),
+        Some("Brainstorming methodology")
+    );
 
     let s2 = Skill::agent("claude-code");
     assert!(s2.description_text.is_none());

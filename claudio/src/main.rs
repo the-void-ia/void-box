@@ -101,12 +101,7 @@ impl DiscoveredSkills {
             if let Ok(entries) = fs::read_dir(skills_dir) {
                 let mut files: Vec<_> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext == "md")
-                            .unwrap_or(false)
-                    })
+                    .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
                     .collect();
                 files.sort_by_key(|e| e.file_name());
 
@@ -121,7 +116,12 @@ impl DiscoveredSkills {
                     // Read first non-empty, non-frontmatter line as title
                     let title = read_skill_title(&path);
 
-                    eprintln!("claudio: discovered skill '{}' ({}) -> {}", name, title, path.display());
+                    eprintln!(
+                        "claudio: discovered skill '{}' ({}) -> {}",
+                        name,
+                        title,
+                        path.display()
+                    );
                     result.skill_files.push(name);
                     result.skill_titles.push(title);
                 }
@@ -162,7 +162,6 @@ impl DiscoveredSkills {
 
         result
     }
-
 }
 
 /// Read the first meaningful line from a SKILL.md (skip frontmatter).
@@ -249,9 +248,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             session_id: format!("mock_sess_{}", std::process::id()),
-            traceparent: env::var("TRACEPARENT")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            traceparent: env::var("TRACEPARENT").ok().filter(|s| !s.is_empty()),
         }
     }
 

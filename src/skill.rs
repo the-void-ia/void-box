@@ -127,11 +127,7 @@ impl Skill {
     /// The `id` should be in the format "owner/repo/skill-name".
     pub fn remote(id: impl Into<String>) -> Self {
         let id = id.into();
-        let name = id
-            .rsplit('/')
-            .next()
-            .unwrap_or(&id)
-            .to_string();
+        let name = id.rsplit('/').next().unwrap_or(&id).to_string();
         Self {
             kind: SkillKind::Remote { id },
             name,
@@ -187,10 +183,7 @@ impl Skill {
 
     /// Add an environment variable (MCP skills only).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        if let SkillKind::Mcp {
-            env: ref mut e, ..
-        } = self.kind
-        {
+        if let SkillKind::Mcp { env: ref mut e, .. } = self.kind {
             e.insert(key.into(), value.into());
         }
         self
@@ -292,8 +285,7 @@ mod tests {
 
     #[test]
     fn test_skill_agent() {
-        let s = Skill::agent("claude-code")
-            .description("Autonomous reasoning");
+        let s = Skill::agent("claude-code").description("Autonomous reasoning");
         assert_eq!(s.name, "claude-code");
         assert!(matches!(s.kind, SkillKind::Agent { .. }));
     }
@@ -316,8 +308,7 @@ mod tests {
 
     #[test]
     fn test_skill_cli() {
-        let s = Skill::cli("quant-tools")
-            .description("Technical indicator calculator");
+        let s = Skill::cli("quant-tools").description("Technical indicator calculator");
         assert_eq!(s.name, "quant-tools");
         assert!(matches!(s.kind, SkillKind::Cli { .. }));
     }
@@ -343,7 +334,10 @@ mod tests {
     async fn test_fetch_remote_skill_live() {
         let s = Skill::remote("vercel-labs/skills/find-skills");
         let content = s.fetch_remote_content().await.unwrap();
-        assert!(content.contains("# Find Skills"), "Expected '# Find Skills' in fetched SKILL.md");
+        assert!(
+            content.contains("# Find Skills"),
+            "Expected '# Find Skills' in fetched SKILL.md"
+        );
         assert!(content.len() > 100, "Content should be substantial");
     }
 
@@ -354,6 +348,10 @@ mod tests {
         let result = s.fetch_remote_content().await;
         assert!(result.is_err(), "Should fail for nonexistent skill");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("404"), "Error should mention 404: {}", err_msg);
+        assert!(
+            err_msg.contains("404"),
+            "Error should mention 404: {}",
+            err_msg
+        );
     }
 }

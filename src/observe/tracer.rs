@@ -191,7 +191,11 @@ impl Span {
     }
 
     /// Add an event with attributes
-    pub fn add_event_with_attrs(&mut self, name: impl Into<String>, attrs: HashMap<String, String>) {
+    pub fn add_event_with_attrs(
+        &mut self,
+        name: impl Into<String>,
+        attrs: HashMap<String, String>,
+    ) {
         self.events.push(SpanEvent {
             name: name.into(),
             timestamp: SystemTime::now(),
@@ -241,7 +245,7 @@ struct OtelBridge {
 #[cfg(feature = "opentelemetry")]
 impl OtelBridge {
     fn export_span(&self, span: &Span) {
-        use opentelemetry::trace::{Tracer as OtelTracer, SpanKind, TraceContextExt};
+        use opentelemetry::trace::{SpanKind, TraceContextExt, Tracer as OtelTracer};
         use opentelemetry::{Context, KeyValue};
 
         // Build parent context if this span has a parent
@@ -293,11 +297,7 @@ impl OtelBridge {
                 .iter()
                 .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
                 .collect();
-            otel_span.add_event_with_timestamp(
-                event.name.clone(),
-                event.timestamp,
-                attrs,
-            );
+            otel_span.add_event_with_timestamp(event.name.clone(), event.timestamp, attrs);
         }
 
         // End the span (with duration if set)
@@ -486,7 +486,10 @@ mod tests {
         let child = Span::child("child", &parent.context);
 
         assert_eq!(child.context.trace_id, parent.context.trace_id);
-        assert_eq!(child.context.parent_span_id, Some(parent.context.span_id.clone()));
+        assert_eq!(
+            child.context.parent_span_id,
+            Some(parent.context.span_id.clone())
+        );
         assert_ne!(child.context.span_id, parent.context.span_id);
     }
 

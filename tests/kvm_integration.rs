@@ -84,10 +84,7 @@ fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
         }
     }
 
-    let mut builder = Sandbox::local()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel);
+    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
 
     if let Some(ref initramfs_path) = initramfs {
         builder = builder.initramfs(initramfs_path);
@@ -146,9 +143,7 @@ async fn kvm_real_vm_exec_uname() {
         Err(Error::VmNotRunning) => {
             let serial_bytes = vm.read_serial_output();
             let console = String::from_utf8_lossy(&serial_bytes);
-            eprintln!(
-                "kvm_real_vm_exec_uname: VM not running, guest console:\n{console}"
-            );
+            eprintln!("kvm_real_vm_exec_uname: VM not running, guest console:\n{console}");
             return;
         }
         Err(Error::Guest(msg)) => {
@@ -242,9 +237,10 @@ async fn kvm_workflow_pipe_uppercase() {
     };
 
     let workflow = Workflow::define("kvm-pipe-test")
-        .step("step1", |ctx| async move {
-            ctx.exec("echo", &["hello"]).await
-        })
+        .step(
+            "step1",
+            |ctx| async move { ctx.exec("echo", &["hello"]).await },
+        )
         .step("step2", |ctx| async move {
             ctx.exec_piped("tr", &["a-z", "A-Z"]).await
         })
@@ -313,7 +309,8 @@ async fn kvm_claude_workflow_plan_apply() {
             ctx.exec("claude-code", &["plan", "/workspace"]).await
         })
         .step("apply", |ctx| async move {
-            ctx.exec_piped("claude-code", &["apply", "/workspace"]).await
+            ctx.exec_piped("claude-code", &["apply", "/workspace"])
+                .await
         })
         .pipe("plan", "apply")
         .output("apply")
@@ -354,10 +351,10 @@ async fn kvm_claude_workflow_plan_apply() {
     }
 
     assert!(
-        observed.result.output_str().contains("Mock applied") || observed.result.output_str().contains("applied"),
+        observed.result.output_str().contains("Mock applied")
+            || observed.result.output_str().contains("applied"),
         "apply step output: {}",
         observed.result.output_str()
     );
     assert!(!observed.traces().is_empty());
 }
-

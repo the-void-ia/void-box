@@ -94,9 +94,8 @@ impl TapDevice {
 
         // Prepare ifreq with interface name and flags (IFF_TAP | IFF_NO_PI).
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        let cname = CString::new(name).map_err(|e| {
-            Error::Device(format!("invalid TAP device name '{}': {}", name, e))
-        })?;
+        let cname = CString::new(name)
+            .map_err(|e| Error::Device(format!("invalid TAP device name '{}': {}", name, e)))?;
 
         unsafe {
             // Copy name into the ifreq name field
@@ -107,8 +106,7 @@ impl TapDevice {
             );
 
             // Set flags to create a TAP device without extra packet info header.
-            ifr.ifr_ifru.ifru_flags =
-                (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+            ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
 
             // TUNSETIFF ioctl: from <linux/if_tun.h>
             const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
@@ -168,7 +166,10 @@ pub fn generate_mac_address() -> String {
     let b4 = (seed >> 8) as u8;
     let b5 = seed as u8;
 
-    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b0, b1, b2, b3, b4, b5)
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b0, b1, b2, b3, b4, b5
+    )
 }
 
 #[cfg(test)]

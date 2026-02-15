@@ -102,7 +102,10 @@ impl VirtioVsockMmio {
 
     pub fn new_with_require_vhost(cid: u32, require_vhost: bool) -> Result<Self> {
         if cid < 3 {
-            return Err(Error::Config(format!("Invalid vsock CID {}: must be >= 3", cid)));
+            return Err(Error::Config(format!(
+                "Invalid vsock CID {}: must be >= 3",
+                cid
+            )));
         }
 
         let (vhost_fd, kick_eventfds, call_eventfds) = Self::setup_vhost(cid, require_vhost)?;
@@ -119,26 +122,43 @@ impl VirtioVsockMmio {
             status: 0,
             interrupt_status: 0,
             config_generation: 0,
-            rx_queue: QueueState { num_max: 256, ..Default::default() },
-            tx_queue: QueueState { num_max: 256, ..Default::default() },
-            event_queue: QueueState { num_max: 256, ..Default::default() },
+            rx_queue: QueueState {
+                num_max: 256,
+                ..Default::default()
+            },
+            tx_queue: QueueState {
+                num_max: 256,
+                ..Default::default()
+            },
+            event_queue: QueueState {
+                num_max: 256,
+                ..Default::default()
+            },
             mmio_base: 0,
             mmio_size: 0x200,
             vhost_attached: false,
         })
     }
 
-    fn setup_vhost(cid: u32, require_vhost: bool) -> Result<(Option<RawFd>, [Option<RawFd>; 3], [Option<RawFd>; 3])> {
+    fn setup_vhost(
+        cid: u32,
+        require_vhost: bool,
+    ) -> Result<(Option<RawFd>, [Option<RawFd>; 3], [Option<RawFd>; 3])> {
         use nix::fcntl::{open, OFlag};
-        use nix::sys::eventfd::{EventFd, EfdFlags};
+        use nix::sys::eventfd::{EfdFlags, EventFd};
         use nix::sys::stat::Mode;
 
-        let fd = match open(Path::new("/dev/vhost-vsock"), OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()) {
+        let fd = match open(
+            Path::new("/dev/vhost-vsock"),
+            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
             Ok(f) => f,
             Err(e) => {
                 if require_vhost {
                     return Err(Error::Device(format!(
-                        "vsock enabled but /dev/vhost-vsock unavailable: {}", e
+                        "vsock enabled but /dev/vhost-vsock unavailable: {}",
+                        e
                     )));
                 }
                 debug!("vhost-vsock not available: {}", e);
@@ -151,30 +171,66 @@ impl VirtioVsockMmio {
         // SET_GUEST_CID
         const VHOST_VSOCK_SET_GUEST_CID: u64 = 0x4008AF60;
         let cid_val: u64 = cid as u64;
-        let ret = unsafe { libc::ioctl(raw_fd, VHOST_VSOCK_SET_GUEST_CID as libc::c_ulong, &cid_val) };
+        let ret =
+            unsafe { libc::ioctl(raw_fd, VHOST_VSOCK_SET_GUEST_CID as libc::c_ulong, &cid_val) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            unsafe { libc::close(raw_fd); }
-            return Err(Error::Device(format!("VHOST_VSOCK_SET_GUEST_CID failed: {}", e)));
+            unsafe {
+                libc::close(raw_fd);
+            }
+            return Err(Error::Device(format!(
+                "VHOST_VSOCK_SET_GUEST_CID failed: {}",
+                e
+            )));
         }
 
         let mut kick = [None, None, None];
         let mut call = [None, None, None];
         for i in 0..3 {
             match EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC) {
-                Ok(k) => { let f = k.as_raw_fd(); std::mem::forget(k); kick[i] = Some(f); }
+                Ok(k) => {
+                    let f = k.as_raw_fd();
+                    std::mem::forget(k);
+                    kick[i] = Some(f);
+                }
                 Err(e) => {
-                    for j in 0..i { if let Some(f) = kick[j] { unsafe { libc::close(f); } } }
-                    unsafe { libc::close(raw_fd); }
+                    for j in 0..i {
+                        if let Some(f) = kick[j] {
+                            unsafe {
+                                libc::close(f);
+                            }
+                        }
+                    }
+                    unsafe {
+                        libc::close(raw_fd);
+                    }
                     return Err(Error::Device(format!("eventfd: {}", e)));
                 }
             }
             match EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC) {
-                Ok(c) => { let f = c.as_raw_fd(); std::mem::forget(c); call[i] = Some(f); }
+                Ok(c) => {
+                    let f = c.as_raw_fd();
+                    std::mem::forget(c);
+                    call[i] = Some(f);
+                }
                 Err(e) => {
-                    for j in 0..=i { if let Some(f) = kick[j] { unsafe { libc::close(f); } } }
-                    for j in 0..i { if let Some(f) = call[j] { unsafe { libc::close(f); } } }
-                    unsafe { libc::close(raw_fd); }
+                    for j in 0..=i {
+                        if let Some(f) = kick[j] {
+                            unsafe {
+                                libc::close(f);
+                            }
+                        }
+                    }
+                    for j in 0..i {
+                        if let Some(f) = call[j] {
+                            unsafe {
+                                libc::close(f);
+                            }
+                        }
+                    }
+                    unsafe {
+                        libc::close(raw_fd);
+                    }
                     return Err(Error::Device(format!("eventfd: {}", e)));
                 }
             }
@@ -191,8 +247,12 @@ impl VirtioVsockMmio {
         debug!("virtio-vsock MMIO base set to {:#x}", base);
     }
 
-    pub fn mmio_base(&self) -> u64 { self.mmio_base }
-    pub fn mmio_size(&self) -> u64 { self.mmio_size }
+    pub fn mmio_base(&self) -> u64 {
+        self.mmio_base
+    }
+    pub fn mmio_size(&self) -> u64 {
+        self.mmio_size
+    }
 
     /// Return the raw FDs for the call eventfds (used for IRQ injection).
     /// Index 0 = rx, 1 = tx; index 2 (event) may not be used by vhost-vsock.
@@ -211,28 +271,50 @@ impl VirtioVsockMmio {
     }
 
     fn current_queue(&self) -> &QueueState {
-        match self.queue_sel { 0 => &self.rx_queue, 1 => &self.tx_queue, 2 => &self.event_queue, _ => &self.rx_queue }
+        match self.queue_sel {
+            0 => &self.rx_queue,
+            1 => &self.tx_queue,
+            2 => &self.event_queue,
+            _ => &self.rx_queue,
+        }
     }
     fn current_queue_mut(&mut self) -> &mut QueueState {
-        match self.queue_sel { 0 => &mut self.rx_queue, 1 => &mut self.tx_queue, 2 => &mut self.event_queue, _ => &mut self.rx_queue }
+        match self.queue_sel {
+            0 => &mut self.rx_queue,
+            1 => &mut self.tx_queue,
+            2 => &mut self.event_queue,
+            _ => &mut self.rx_queue,
+        }
     }
 
     fn set_vhost_running(&self, running: bool) -> Result<()> {
-        let fd = match self.vhost_fd { Some(f) => f, None => return Ok(()) };
+        let fd = match self.vhost_fd {
+            Some(f) => f,
+            None => return Ok(()),
+        };
         let val: std::ffi::c_int = if running { 1 } else { 0 };
         const VHOST_VSOCK_SET_RUNNING: u64 = 0x4004AF61;
         let ret = unsafe { libc::ioctl(fd, VHOST_VSOCK_SET_RUNNING as libc::c_ulong, &val) };
 
         if ret < 0 {
-            return Err(Error::Device(format!("VHOST_VSOCK_SET_RUNNING({}): {}", running, std::io::Error::last_os_error())));
+            return Err(Error::Device(format!(
+                "VHOST_VSOCK_SET_RUNNING({}): {}",
+                running,
+                std::io::Error::last_os_error()
+            )));
         }
         debug!("vhost-vsock SET_RUNNING({})", running);
         Ok(())
     }
 
     fn attach_vhost(&mut self, guest_memory: &vm_memory::GuestMemoryMmap) -> Result<()> {
-        let fd = match self.vhost_fd { Some(f) => f, None => return Ok(()) };
-        if self.vhost_attached { return Ok(()); }
+        let fd = match self.vhost_fd {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        if self.vhost_attached {
+            return Ok(());
+        }
 
         let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_OWNER as libc::c_ulong) };
         if ret < 0 {
@@ -247,10 +329,13 @@ impl VirtioVsockMmio {
         let size = 8 + nregions as usize * std::mem::size_of::<VhostMemoryRegion>();
         let mut buf = vec![0u8; size];
         let hdr = buf.as_mut_ptr() as *mut u32;
-        unsafe { *hdr = nregions; }
+        unsafe {
+            *hdr = nregions;
+        }
         let regions_ptr = unsafe { buf.as_mut_ptr().add(8) as *mut VhostMemoryRegion };
         for (i, region) in guest_memory.iter().enumerate() {
-            let host_addr = guest_memory.get_host_address(region.start_addr())
+            let host_addr = guest_memory
+                .get_host_address(region.start_addr())
                 .map_err(|e| Error::Device(format!("get_host_address: {}", e)))?;
             let reg = unsafe { &mut *regions_ptr.add(i) };
             reg.guest_phys_addr = region.start_addr().raw_value();
@@ -258,9 +343,18 @@ impl VirtioVsockMmio {
             reg.userspace_addr = host_addr as u64;
         }
 
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_MEM_TABLE as libc::c_ulong, buf.as_ptr()) };
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_MEM_TABLE as libc::c_ulong,
+                buf.as_ptr(),
+            )
+        };
         if ret < 0 {
-            return Err(Error::Device(format!("VHOST_SET_MEM_TABLE: {}", std::io::Error::last_os_error())));
+            return Err(Error::Device(format!(
+                "VHOST_SET_MEM_TABLE: {}",
+                std::io::Error::last_os_error()
+            )));
         }
 
         self.vhost_attached = true;
@@ -270,39 +364,120 @@ impl VirtioVsockMmio {
     }
 
     fn set_vring(
-        &self, index: u32, num: u32, desc: u64, avail: u64, used: u64,
-        guest_memory: &vm_memory::GuestMemoryMmap, kick_fd: RawFd, call_fd: RawFd,
+        &self,
+        index: u32,
+        num: u32,
+        desc: u64,
+        avail: u64,
+        used: u64,
+        guest_memory: &vm_memory::GuestMemoryMmap,
+        kick_fd: RawFd,
+        call_fd: RawFd,
     ) -> Result<()> {
-        let fd = match self.vhost_fd { Some(f) => f, None => return Ok(()) };
+        let fd = match self.vhost_fd {
+            Some(f) => f,
+            None => return Ok(()),
+        };
 
-        let desc_host = guest_memory.get_host_address(GuestAddress(desc))
-            .map_err(|e| Error::Device(format!("desc host addr: {}", e)))? as u64;
-        let avail_host = guest_memory.get_host_address(GuestAddress(avail))
-            .map_err(|e| Error::Device(format!("avail host addr: {}", e)))? as u64;
-        let used_host = guest_memory.get_host_address(GuestAddress(used))
-            .map_err(|e| Error::Device(format!("used host addr: {}", e)))? as u64;
+        let desc_host = guest_memory
+            .get_host_address(GuestAddress(desc))
+            .map_err(|e| Error::Device(format!("desc host addr: {}", e)))?
+            as u64;
+        let avail_host = guest_memory
+            .get_host_address(GuestAddress(avail))
+            .map_err(|e| Error::Device(format!("avail host addr: {}", e)))?
+            as u64;
+        let used_host = guest_memory
+            .get_host_address(GuestAddress(used))
+            .map_err(|e| Error::Device(format!("used host addr: {}", e)))?
+            as u64;
 
         let state = VhostVringState { index, num };
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_NUM as libc::c_ulong, &state) };
-        if ret < 0 { return Err(Error::Device(format!("VHOST_SET_VRING_NUM: {}", std::io::Error::last_os_error()))); }
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_VRING_NUM as libc::c_ulong,
+                &state,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::Device(format!(
+                "VHOST_SET_VRING_NUM: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
-        let addr = VhostVringAddr { index, flags: 0, desc_user_addr: desc_host, used_user_addr: used_host, avail_user_addr: avail_host, log_guest_addr: 0 };
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_ADDR as libc::c_ulong, &addr) };
-        if ret < 0 { return Err(Error::Device(format!("VHOST_SET_VRING_ADDR: {}", std::io::Error::last_os_error()))); }
+        let addr = VhostVringAddr {
+            index,
+            flags: 0,
+            desc_user_addr: desc_host,
+            used_user_addr: used_host,
+            avail_user_addr: avail_host,
+            log_guest_addr: 0,
+        };
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_VRING_ADDR as libc::c_ulong,
+                &addr,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::Device(format!(
+                "VHOST_SET_VRING_ADDR: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
         let base_state = VhostVringState { index, num: 0 };
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_BASE as libc::c_ulong, &base_state) };
-        if ret < 0 { return Err(Error::Device(format!("VHOST_SET_VRING_BASE: {}", std::io::Error::last_os_error()))); }
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_VRING_BASE as libc::c_ulong,
+                &base_state,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::Device(format!(
+                "VHOST_SET_VRING_BASE: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
         #[repr(C)]
-        struct VhostVringFile { index: u32, fd: i32 }
+        struct VhostVringFile {
+            index: u32,
+            fd: i32,
+        }
         let kick_file = VhostVringFile { index, fd: kick_fd };
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_KICK as libc::c_ulong, &kick_file) };
-        if ret < 0 { return Err(Error::Device(format!("VHOST_SET_VRING_KICK: {}", std::io::Error::last_os_error()))); }
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_VRING_KICK as libc::c_ulong,
+                &kick_file,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::Device(format!(
+                "VHOST_SET_VRING_KICK: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
         let call_file = VhostVringFile { index, fd: call_fd };
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_CALL as libc::c_ulong, &call_file) };
-        if ret < 0 { return Err(Error::Device(format!("VHOST_SET_VRING_CALL: {}", std::io::Error::last_os_error()))); }
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                vhost_ioctl::VHOST_SET_VRING_CALL as libc::c_ulong,
+                &call_file,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::Device(format!(
+                "VHOST_SET_VRING_CALL: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
         debug!("vhost vring {} programmed (num={})", index, num);
         Ok(())
@@ -315,8 +490,11 @@ impl VirtioVsockMmio {
             mmio::DEVICE_ID => VIRTIO_VSOCK_DEVICE_TYPE,
             mmio::VENDOR_ID => 0x554d4551,
             mmio::DEVICE_FEATURES => {
-                if self.features_sel == 0 { self.device_features as u32 }
-                else { (self.device_features >> 32) as u32 }
+                if self.features_sel == 0 {
+                    self.device_features as u32
+                } else {
+                    (self.device_features >> 32) as u32
+                }
             }
             mmio::QUEUE_NUM_MAX => self.current_queue().num_max as u32,
             mmio::QUEUE_READY => self.current_queue().ready as u32,
@@ -326,17 +504,31 @@ impl VirtioVsockMmio {
             o if o >= mmio::CONFIG && o < mmio::CONFIG + 8 => {
                 let off = (o - mmio::CONFIG) as usize;
                 let cid64 = self.cid as u64;
-                if off == 0 { (cid64 & 0xFFFF_FFFF) as u32 } else { (cid64 >> 32) as u32 }
+                if off == 0 {
+                    (cid64 & 0xFFFF_FFFF) as u32
+                } else {
+                    (cid64 >> 32) as u32
+                }
             }
-            _ => { trace!("virtio-vsock: unhandled MMIO read offset {:#x}", offset); 0 }
+            _ => {
+                trace!("virtio-vsock: unhandled MMIO read offset {:#x}", offset);
+                0
+            }
         };
         let bytes = value.to_le_bytes();
         let len = data.len().min(4);
         data[..len].copy_from_slice(&bytes[..len]);
     }
 
-    pub fn mmio_write(&mut self, offset: u64, data: &[u8], guest_memory: &vm_memory::GuestMemoryMmap) -> Result<()> {
-        if data.is_empty() { return Ok(()); }
+    pub fn mmio_write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        guest_memory: &vm_memory::GuestMemoryMmap,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let mut bytes = [0u8; 4];
         let len = data.len().min(4);
         bytes[..len].copy_from_slice(&data[..len]);
@@ -346,30 +538,48 @@ impl VirtioVsockMmio {
             mmio::DEVICE_FEATURES_SEL => self.features_sel = value,
             mmio::DRIVER_FEATURES => {
                 if self.features_sel == 0 {
-                    self.driver_features = (self.driver_features & 0xFFFF_FFFF_0000_0000) | (value as u64);
+                    self.driver_features =
+                        (self.driver_features & 0xFFFF_FFFF_0000_0000) | (value as u64);
                 } else {
-                    self.driver_features = (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
+                    self.driver_features =
+                        (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
                 }
             }
             mmio::DRIVER_FEATURES_SEL => self.features_sel = value,
             mmio::QUEUE_SEL => self.queue_sel = value,
-            mmio::QUEUE_NUM => { self.current_queue_mut().num = value as u16; }
+            mmio::QUEUE_NUM => {
+                self.current_queue_mut().num = value as u16;
+            }
             mmio::QUEUE_READY => {
                 let idx = self.queue_sel;
                 let q = self.current_queue_mut();
                 q.ready = value != 0;
                 if q.ready {
-                    let (num, desc, driver, device) = (q.num as u32, q.desc_addr, q.driver_addr, q.device_addr);
+                    let (num, desc, driver, device) =
+                        (q.num as u32, q.desc_addr, q.driver_addr, q.device_addr);
 
                     if !self.vhost_attached {
                         self.attach_vhost(guest_memory)?;
                     }
-                    let kick_fd = self.kick_eventfds[idx as usize].ok_or_else(|| Error::Device("no kick eventfd".into()))?;
-                    let call_fd = self._call_eventfds[idx as usize].ok_or_else(|| Error::Device("no call eventfd".into()))?;
-                    self.set_vring(idx, num, desc, driver, device, guest_memory, kick_fd, call_fd)?;
+                    let kick_fd = self.kick_eventfds[idx as usize]
+                        .ok_or_else(|| Error::Device("no kick eventfd".into()))?;
+                    let call_fd = self._call_eventfds[idx as usize]
+                        .ok_or_else(|| Error::Device("no call eventfd".into()))?;
+                    self.set_vring(
+                        idx,
+                        num,
+                        desc,
+                        driver,
+                        device,
+                        guest_memory,
+                        kick_fd,
+                        call_fd,
+                    )?;
                 }
             }
-            mmio::QUEUE_NOTIFY => { self.notify_queue(value); }
+            mmio::QUEUE_NOTIFY => {
+                self.notify_queue(value);
+            }
             mmio::INTERRUPT_ACK => self.interrupt_status &= !value,
             mmio::STATUS => {
                 self.status = value;
@@ -382,24 +592,39 @@ impl VirtioVsockMmio {
                 }
             }
             mmio::QUEUE_DESC_LOW => {
-                self.current_queue_mut().desc_addr = (self.current_queue().desc_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
+                self.current_queue_mut().desc_addr =
+                    (self.current_queue().desc_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
             }
             mmio::QUEUE_DESC_HIGH => {
-                self.current_queue_mut().desc_addr = (self.current_queue().desc_addr & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
+                self.current_queue_mut().desc_addr = (self.current_queue().desc_addr
+                    & 0x0000_0000_FFFF_FFFF)
+                    | ((value as u64) << 32);
             }
             mmio::QUEUE_DRIVER_LOW => {
-                self.current_queue_mut().driver_addr = (self.current_queue().driver_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
+                self.current_queue_mut().driver_addr =
+                    (self.current_queue().driver_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
             }
             mmio::QUEUE_DRIVER_HIGH => {
-                self.current_queue_mut().driver_addr = (self.current_queue().driver_addr & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
+                self.current_queue_mut().driver_addr = (self.current_queue().driver_addr
+                    & 0x0000_0000_FFFF_FFFF)
+                    | ((value as u64) << 32);
             }
             mmio::QUEUE_DEVICE_LOW => {
-                self.current_queue_mut().device_addr = (self.current_queue().device_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
+                self.current_queue_mut().device_addr =
+                    (self.current_queue().device_addr & 0xFFFF_FFFF_0000_0000) | (value as u64);
             }
             mmio::QUEUE_DEVICE_HIGH => {
-                self.current_queue_mut().device_addr = (self.current_queue().device_addr & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
+                self.current_queue_mut().device_addr = (self.current_queue().device_addr
+                    & 0x0000_0000_FFFF_FFFF)
+                    | ((value as u64) << 32);
             }
-            _ => { trace!("virtio-vsock: unhandled MMIO write offset {:#x} value={:#x}", offset, value); }
+            _ => {
+                trace!(
+                    "virtio-vsock: unhandled MMIO write offset {:#x} value={:#x}",
+                    offset,
+                    value
+                );
+            }
         }
         Ok(())
     }
@@ -409,17 +634,34 @@ impl VirtioVsockMmio {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
-        self.rx_queue = QueueState { num_max: 256, ..Default::default() };
-        self.tx_queue = QueueState { num_max: 256, ..Default::default() };
-        self.event_queue = QueueState { num_max: 256, ..Default::default() };
+        self.rx_queue = QueueState {
+            num_max: 256,
+            ..Default::default()
+        };
+        self.tx_queue = QueueState {
+            num_max: 256,
+            ..Default::default()
+        };
+        self.event_queue = QueueState {
+            num_max: 256,
+            ..Default::default()
+        };
     }
 
     pub fn notify_queue(&mut self, queue_index: u32) {
         if queue_index < 3 {
             if let Some(fd) = self.kick_eventfds[queue_index as usize] {
                 let val: u64 = 1;
-                let ret = unsafe { libc::write(fd, &val as *const _ as *const libc::c_void, std::mem::size_of::<u64>()) };
-                if ret < 0 { trace!("virtio-vsock: kick write failed for queue {}", queue_index); }
+                let ret = unsafe {
+                    libc::write(
+                        fd,
+                        &val as *const _ as *const libc::c_void,
+                        std::mem::size_of::<u64>(),
+                    )
+                };
+                if ret < 0 {
+                    trace!("virtio-vsock: kick write failed for queue {}", queue_index);
+                }
             }
         } else {
             warn!("virtio-vsock: invalid queue notify {}", queue_index);
@@ -429,8 +671,24 @@ impl VirtioVsockMmio {
 
 impl Drop for VirtioVsockMmio {
     fn drop(&mut self) {
-        if let Some(fd) = self.vhost_fd { unsafe { libc::close(fd); } }
-        for fd in &self.kick_eventfds { if let Some(f) = fd { unsafe { libc::close(*f); } } }
-        for fd in &self._call_eventfds { if let Some(f) = fd { unsafe { libc::close(*f); } } }
+        if let Some(fd) = self.vhost_fd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        for fd in &self.kick_eventfds {
+            if let Some(f) = fd {
+                unsafe {
+                    libc::close(*f);
+                }
+            }
+        }
+        for fd in &self._call_eventfds {
+            if let Some(f) = fd {
+                unsafe {
+                    libc::close(*f);
+                }
+            }
+        }
     }
 }

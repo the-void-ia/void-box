@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use super::Observer;
-use crate::guest::protocol::{TelemetryBatch, SystemMetrics};
+use crate::guest::protocol::{SystemMetrics, TelemetryBatch};
 
 /// Aggregates telemetry data from a guest VM into the Observer's metrics.
 pub struct TelemetryAggregator {
@@ -66,7 +66,11 @@ impl TelemetryAggregator {
         metrics.record_cpu_usage(sys.cpu_percent, labels);
         metrics.record_memory_usage(sys.memory_used_bytes, labels);
         metrics.record_network_io(sys.net_rx_bytes, sys.net_tx_bytes, labels);
-        metrics.set_gauge("guest.memory_total_bytes", sys.memory_total_bytes as f64, labels);
+        metrics.set_gauge(
+            "guest.memory_total_bytes",
+            sys.memory_total_bytes as f64,
+            labels,
+        );
         metrics.set_gauge("guest.procs_running", sys.procs_running as f64, labels);
         metrics.set_gauge("guest.open_fds", sys.open_fds as f64, labels);
     }
@@ -112,8 +116,14 @@ mod tests {
 
         let snapshot = observer.get_metrics();
         // CPU and memory gauges should be recorded
-        assert!(snapshot.metrics.values().any(|m| m.name == "cpu_usage_percent"));
-        assert!(snapshot.metrics.values().any(|m| m.name == "memory_usage_bytes"));
+        assert!(snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "cpu_usage_percent"));
+        assert!(snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "memory_usage_bytes"));
     }
 
     #[test]
@@ -138,7 +148,10 @@ mod tests {
         aggregator.ingest(&batch);
 
         let snapshot = observer.get_metrics();
-        assert!(snapshot.metrics.values().any(|m| m.name == "guest.process.rss_bytes"));
+        assert!(snapshot
+            .metrics
+            .values()
+            .any(|m| m.name == "guest.process.rss_bytes"));
     }
 
     #[test]

@@ -214,10 +214,8 @@ pub fn parse_stream_json(stdout: &[u8]) -> ClaudeExecResult {
                     .get("duration_api_ms")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                result.num_turns = event
-                    .get("num_turns")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
+                result.num_turns =
+                    event.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 result.is_error = event
                     .get("is_error")
                     .and_then(|v| v.as_bool())
@@ -350,8 +348,7 @@ pub fn create_otel_spans(
 
     // Create child spans for each tool call
     for tool in &result.tool_calls {
-        let mut tool_span =
-            Span::child(&format!("claude.tool.{}", tool.tool_name), &exec_ctx);
+        let mut tool_span = Span::child(&format!("claude.tool.{}", tool.tool_name), &exec_ctx);
 
         // OTel GenAI semconv on tool spans
         tool_span.set_attribute(semconv::GEN_AI_OPERATION_NAME, "execute_tool");
@@ -386,7 +383,6 @@ pub fn create_otel_spans(
     exec_span.end();
     tracer.finish_span(exec_span);
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

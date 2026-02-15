@@ -307,8 +307,8 @@ impl VirtioNetDevice {
             }
             mmio::DRIVER_FEATURES => {
                 if self.features_sel == 0 {
-                    self.driver_features = (self.driver_features & 0xFFFF_FFFF_0000_0000)
-                        | (value as u64);
+                    self.driver_features =
+                        (self.driver_features & 0xFFFF_FFFF_0000_0000) | (value as u64);
                 } else {
                     self.driver_features =
                         (self.driver_features & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
@@ -522,8 +522,12 @@ impl VirtioNetDevice {
         let q = &self.rx_queue;
         if !q.ready || q.num == 0 {
             // Queue not ready - buffer frames for later
-            debug!("virtio-net: RX queue not ready (ready={}, num={}), buffering {} frames",
-                q.ready, q.num, frames.len());
+            debug!(
+                "virtio-net: RX queue not ready (ready={}, num={}), buffering {} frames",
+                q.ready,
+                q.num,
+                frames.len()
+            );
             self.rx_buffer.extend(frames);
             return Ok(());
         }
@@ -544,7 +548,11 @@ impl VirtioNetDevice {
                 self.rx_buffer.push(frame);
                 continue;
             }
-            debug!("virtio-net: RX injecting frame ({} bytes), avail_idx={}", frame.len(), avail_idx);
+            debug!(
+                "virtio-net: RX injecting frame ({} bytes), avail_idx={}",
+                frame.len(),
+                avail_idx
+            );
 
             let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
             let mut desc_id_buf = [0u8; 2];
@@ -552,7 +560,7 @@ impl VirtioNetDevice {
                 &mut desc_id_buf,
                 avail_addr.unchecked_add(ring_offset as u64),
             )
-                .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             let mut next = head_idx;

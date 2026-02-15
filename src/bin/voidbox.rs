@@ -50,7 +50,9 @@ async fn cmd_exec(args: &[String]) -> std::result::Result<(), Box<dyn std::error
             s
         }
         None => {
-            eprintln!("[voidbox] Using mock sandbox (set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS for KVM)");
+            eprintln!(
+                "[voidbox] Using mock sandbox (set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS for KVM)"
+            );
             Sandbox::mock().build()?
         }
     };
@@ -73,11 +75,10 @@ async fn cmd_workflow(args: &[String]) -> std::result::Result<(), Box<dyn std::e
     let action = &args[0];
     let workspace = args.get(1).map(|s| s.as_str()).unwrap_or("/workspace");
 
-    let sandbox = try_kvm_sandbox()
-        .unwrap_or_else(|| {
-            eprintln!("[voidbox] Using mock sandbox");
-            Sandbox::mock().build().unwrap()
-        });
+    let sandbox = try_kvm_sandbox().unwrap_or_else(|| {
+        eprintln!("[voidbox] Using mock sandbox");
+        Sandbox::mock().build().unwrap()
+    });
 
     match action.as_str() {
         "plan" => {

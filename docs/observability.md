@@ -1,28 +1,50 @@
-# Observability for Claude-in-void runs
+# Observability
 
-## User-facing summary
+`void-box` captures traces, metrics, and structured logs for workflow runs.
 
-Each workflow run returns an **`ObservedResult<WorkflowResult>`**:
+## What You Get Per Run
 
-- **`result`**: `WorkflowResult` with `output`, `exit_code`, `step_outputs` (per-step stdout/stderr/exit_code), and `duration_ms`.
-- **`traces()`**: Spans for the workflow and each step (name, status, duration, attributes such as `stdout_bytes` / `stderr_bytes`).
-- **`metrics()`**: `MetricsSnapshot` with step durations (e.g. for dashboards or alerting).
-- **`logs()`**: Structured log entries (workflow/step start and finish, errors).
+- `ObservedResult.result`: workflow output, step outputs, exit code, duration
+- `ObservedResult.traces()`: workflow + step spans
+- `ObservedResult.metrics()`: in-memory metrics snapshot
+- `ObservedResult.logs()`: structured run logs
 
-Use this to present a clear picture of each run: success/failure, which step failed, how long each step took, and optional export to OTLP for traces.
+## OTLP Export
 
-## What is captured
+When configured, traces and metrics are exported via OTLP.
 
-- **Per-step spans**: Created by the scheduler for each step. On success, the span records `stdout_bytes`; on failure, `stderr_bytes` and error status. Duration is always recorded and sent to the metrics collector.
-- **Workflow span**: Parent of all step spans; total duration.
-- **Logs**: Info at workflow start, debug at step start/finish, error when a step fails.
-- **Metrics**: Step duration (and any custom counters if added). Use `ObserveConfig::test()` for in-memory capture in tests; use `ObserveConfig::default()` and `.otlp_endpoint(...)` for production trace export.
+Required:
 
-## Recording the executed command
+- build/run with feature flag: `--features opentelemetry`
+- set endpoint env var:
+  - `VOIDBOX_OTLP_ENDPOINT=http://localhost:4317`
+- optional service name:
+  - `VOIDBOX_SERVICE_NAME=void-box-playground`
 
-`SpanGuard::record_exec(program, args)` exists to record the exact command (e.g. `claude-code plan /workspace`) on a step span. The scheduler does not call it because it does not see the program/args inside the step closure. To have the exec command on spans, either:
+Example:
 
-- Thread the observer into `StepContext` and have `ctx.exec` / `ctx.exec_piped` record the command on the current step span, or
-- Have step code set a custom attribute via a future API.
+```bash
+VOIDBOX_OTLP_ENDPOINT=http://localhost:4317 \
+VOIDBOX_SERVICE_NAME=void-box-playground \
+cargo run --example playground_pipeline --features opentelemetry
+```
 
-For now, step spans still give you step name, duration, and output sizes for debugging.
+## Fastest Grafana Path
+
+Use the one-command playground script:
+
+```bash
+playground/up.sh
+```
+
+This will:
+
+1. Start Grafana LGTM via Docker Compose
+2. Run `playground_pipeline` with OTLP enabled
+3. Print Grafana URL and service filter hints
+
+Stop stack:
+
+```bash
+playground/up.sh --down
+```

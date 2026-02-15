@@ -29,6 +29,8 @@ pub mod telemetry;
 pub mod tracer;
 
 use std::sync::Arc;
+#[cfg(feature = "opentelemetry")]
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub use logs::{LogConfig, LogEntry, LogLevel, StructuredLogger};
@@ -139,7 +141,7 @@ impl Observer {
     /// Create a new observer with the given configuration
     pub fn new(config: ObserveConfig) -> Self {
         let tracer = Arc::new(Tracer::new(config.tracer.clone()));
-        let metrics = Arc::new(MetricsCollector::new(config.metrics.clone()));
+        let metrics = Arc::new(build_metrics_collector(&config));
         let logger = Arc::new(StructuredLogger::new(config.logs.clone()));
 
         Self {
@@ -173,7 +175,8 @@ impl Observer {
     /// Start a new span for a workflow
     pub fn start_workflow_span(&self, name: &str) -> SpanGuard {
         let span = self.tracer.start_span(&format!("workflow:{}", name));
-        self.logger.info(&format!("Starting workflow: {}", name), &[]);
+        self.logger
+            .info(&format!("Starting workflow: {}", name), &[]);
         SpanGuard {
             span,
             tracer: self.tracer.clone(),
@@ -187,7 +190,8 @@ impl Observer {
     /// Start a new span for a workflow step
     pub fn start_step_span(&self, name: &str, parent: Option<&SpanContext>) -> SpanGuard {
         let span = if let Some(parent) = parent {
-            self.tracer.start_span_with_parent(&format!("step:{}", name), parent)
+            self.tracer
+                .start_span_with_parent(&format!("step:{}", name), parent)
         } else {
             self.tracer.start_span(&format!("step:{}", name))
         };
@@ -223,6 +227,43 @@ impl Observer {
     }
 }
 
+fn build_metrics_collector(config: &ObserveConfig) -> MetricsCollector {
+    #[cfg(feature = "opentelemetry")]
+    {
+        maybe_init_global_otel(config);
+        if config.tracer.otlp_endpoint.is_some() {
+            let meter = opentelemetry::global::meter("void-box");
+            return MetricsCollector::with_otel_meter(config.metrics.clone(), meter);
+        }
+    }
+
+    MetricsCollector::new(config.metrics.clone())
+}
+
+#[cfg(feature = "opentelemetry")]
+fn maybe_init_global_otel(config: &ObserveConfig) {
+    static OTEL_INIT: OnceLock<()> = OnceLock::new();
+    OTEL_INIT.get_or_init(|| {
+        let Some(endpoint) = config.tracer.otlp_endpoint.clone() else {
+            return;
+        };
+
+        let otlp_config = crate::observe::otlp::OtlpConfig {
+            endpoint: Some(endpoint),
+            headers: Vec::new(),
+            service_name: config.tracer.service_name.clone(),
+            debug: false,
+        };
+
+        if let Err(e) = crate::observe::otlp::init_otlp_tracer(&otlp_config) {
+            eprintln!("[observe] WARN: failed to initialize OTLP tracer export: {e}");
+        }
+        if let Err(e) = crate::observe::otlp::init_otlp_metrics(&otlp_config) {
+            eprintln!("[observe] WARN: failed to initialize OTLP metrics export: {e}");
+        }
+    });
+}
+
 /// RAII guard for spans that records metrics on drop
 pub struct SpanGuard {
     span: Span,
@@ -248,7 +289,8 @@ impl SpanGuard {
     /// Mark the span as failed with an error message
     pub fn set_error(mut self, message: &str) {
         self.span.status = SpanStatus::Error(message.to_string());
-        self.logger.error(&format!("Step {} failed: {}", self.name, message), &[]);
+        self.logger
+            .error(&format!("Step {} failed: {}", self.name, message), &[]);
         self.finish();
     }
 
@@ -259,12 +301,16 @@ impl SpanGuard {
 
     /// Record stdout output
     pub fn record_stdout(&mut self, size: usize) {
-        self.span.attributes.insert("stdout_bytes".to_string(), size.to_string());
+        self.span
+            .attributes
+            .insert("stdout_bytes".to_string(), size.to_string());
     }
 
     /// Record stderr output
     pub fn record_stderr(&mut self, size: usize) {
-        self.span.attributes.insert("stderr_bytes".to_string(), size.to_string());
+        self.span
+            .attributes
+            .insert("stderr_bytes".to_string(), size.to_string());
     }
 
     /// Record the command that was executed
@@ -370,7 +416,10 @@ mod tests {
             .enable_metrics(true)
             .log_level(LogLevel::Debug);
 
-        assert_eq!(config.tracer.otlp_endpoint, Some("http://localhost:4317".to_string()));
+        assert_eq!(
+            config.tracer.otlp_endpoint,
+            Some("http://localhost:4317".to_string())
+        );
         assert!(config.metrics.enabled);
         assert_eq!(config.logs.level, LogLevel::Debug);
     }

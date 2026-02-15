@@ -27,9 +27,9 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress,
-    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
-    TcpPacket, TcpRepr, TcpControl, TcpSeqNumber, UdpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, IpAddress,
+    IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
+    TcpSeqNumber, UdpPacket,
 };
 
 use tracing::{debug, trace, warn};
@@ -101,11 +101,20 @@ struct PacketQueue {
     tx_queue: Vec<Vec<u8>>,
 }
 impl PacketQueue {
-    fn new() -> Self { Self { rx_queue: Vec::new(), tx_queue: Vec::new() } }
+    fn new() -> Self {
+        Self {
+            rx_queue: Vec::new(),
+            tx_queue: Vec::new(),
+        }
+    }
 }
-struct VirtualDevice { queue: Arc<Mutex<PacketQueue>> }
+struct VirtualDevice {
+    queue: Arc<Mutex<PacketQueue>>,
+}
 impl VirtualDevice {
-    fn new(q: Arc<Mutex<PacketQueue>>) -> Self { Self { queue: q } }
+    fn new(q: Arc<Mutex<PacketQueue>>) -> Self {
+        Self { queue: q }
+    }
 }
 impl Device for VirtualDevice {
     type RxToken<'a> = VRx;
@@ -119,25 +128,42 @@ impl Device for VirtualDevice {
     }
     fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut q = self.queue.lock().unwrap();
-        if q.rx_queue.is_empty() { return None; }
+        if q.rx_queue.is_empty() {
+            return None;
+        }
         let pkt = q.rx_queue.remove(0);
-        Some((VRx { buffer: pkt }, VTx { queue: self.queue.clone() }))
+        Some((
+            VRx { buffer: pkt },
+            VTx {
+                queue: self.queue.clone(),
+            },
+        ))
     }
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(VTx { queue: self.queue.clone() })
+        Some(VTx {
+            queue: self.queue.clone(),
+        })
     }
 }
-struct VRx { buffer: Vec<u8> }
-impl RxToken for VRx {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R { f(&mut self.buffer) }
+struct VRx {
+    buffer: Vec<u8>,
 }
-struct VTx { queue: Arc<Mutex<PacketQueue>> }
+impl RxToken for VRx {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R {
+        f(&mut self.buffer)
+    }
+}
+struct VTx {
+    queue: Arc<Mutex<PacketQueue>>,
+}
 impl TxToken for VTx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
         let mut q = self.queue.lock().unwrap();
-        if q.tx_queue.len() < MAX_QUEUE_SIZE { q.tx_queue.push(buf); }
+        if q.tx_queue.len() < MAX_QUEUE_SIZE {
+            q.tx_queue.push(buf);
+        }
         r
     }
 }
@@ -164,15 +190,27 @@ impl SlirpStack {
         let device = VirtualDevice::new(queue.clone());
 
         let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
-        let mut iface = Interface::new(config, &mut VirtualDevice::new(queue.clone()), smol_instant_now());
+        let mut iface = Interface::new(
+            config,
+            &mut VirtualDevice::new(queue.clone()),
+            smol_instant_now(),
+        );
 
         iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 2), SLIRP_NETMASK)).unwrap();
+            addrs
+                .push(IpCidr::new(IpAddress::v4(10, 0, 2, 2), SLIRP_NETMASK))
+                .unwrap();
         });
-        iface.routes_mut().add_default_ipv4_route(SLIRP_GATEWAY_IP).unwrap();
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(SLIRP_GATEWAY_IP)
+            .unwrap();
 
         let sockets = SocketSet::new(vec![]);
-        debug!("SLIRP stack created - Gateway: {}, DNS: {}", SLIRP_GATEWAY_IP, SLIRP_DNS_IP);
+        debug!(
+            "SLIRP stack created - Gateway: {}, DNS: {}",
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP
+        );
 
         Ok(Self {
             queue,
@@ -188,7 +226,9 @@ impl SlirpStack {
 
     /// Process an ethernet frame from the guest
     pub fn process_guest_frame(&mut self, frame: &[u8]) -> Result<()> {
-        if frame.len() < 14 { return Ok(()); }
+        if frame.len() < 14 {
+            return Ok(());
+        }
 
         let eth = match EthernetFrame::new_checked(frame) {
             Ok(f) => f,
@@ -230,8 +270,13 @@ impl SlirpStack {
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
-                debug!("SLIRP poll: rx_in={}, tx_out={}, changed={}, inject={}",
-                    rx_count, q.tx_queue.len(), changed, self.inject_to_guest.len());
+                debug!(
+                    "SLIRP poll: rx_in={}, tx_out={}, changed={}, inject={}",
+                    rx_count,
+                    q.tx_queue.len(),
+                    changed,
+                    self.inject_to_guest.len()
+                );
             }
             frames.append(&mut q.tx_queue);
         }
@@ -260,7 +305,9 @@ impl SlirpStack {
 
     fn handle_arp_frame(&mut self, frame: &[u8]) -> Result<()> {
         // ARP: Ethernet(14) + ARP(28)
-        if frame.len() < 42 { return Ok(()); }
+        if frame.len() < 42 {
+            return Ok(());
+        }
 
         let arp = &frame[14..];
         let hw_type = u16::from_be_bytes([arp[0], arp[1]]);
@@ -276,9 +323,17 @@ impl SlirpStack {
         let sender_ip = &arp[14..18];
         let target_ip = &arp[24..28];
 
-        debug!("SLIRP ARP: who has {}.{}.{}.{}, tell {}.{}.{}.{}",
-            target_ip[0], target_ip[1], target_ip[2], target_ip[3],
-            sender_ip[0], sender_ip[1], sender_ip[2], sender_ip[3]);
+        debug!(
+            "SLIRP ARP: who has {}.{}.{}.{}, tell {}.{}.{}.{}",
+            target_ip[0],
+            target_ip[1],
+            target_ip[2],
+            target_ip[3],
+            sender_ip[0],
+            sender_ip[1],
+            sender_ip[2],
+            sender_ip[3]
+        );
 
         // Reply for any IP in our subnet (10.0.2.x) except the guest's own IP
         let target = Ipv4Address::from_bytes(target_ip);
@@ -289,24 +344,32 @@ impl SlirpStack {
         // Build ARP reply: Ethernet(14) + ARP(28) = 42 bytes
         let mut reply = vec![0u8; 42];
         // Ethernet header
-        reply[0..6].copy_from_slice(sender_mac);    // dst = original sender
-        reply[6..12].copy_from_slice(&GATEWAY_MAC);  // src = gateway
-        reply[12] = 0x08; reply[13] = 0x06;          // EtherType = ARP
+        reply[0..6].copy_from_slice(sender_mac); // dst = original sender
+        reply[6..12].copy_from_slice(&GATEWAY_MAC); // src = gateway
+        reply[12] = 0x08;
+        reply[13] = 0x06; // EtherType = ARP
 
         // ARP payload (28 bytes starting at offset 14)
-        reply[14..16].copy_from_slice(&1u16.to_be_bytes());      // hw type = Ethernet
+        reply[14..16].copy_from_slice(&1u16.to_be_bytes()); // hw type = Ethernet
         reply[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // proto = IPv4
-        reply[18] = 6;  // hw addr len
-        reply[19] = 4;  // proto addr len
-        reply[20..22].copy_from_slice(&2u16.to_be_bytes());      // opcode = reply
-        reply[22..28].copy_from_slice(&GATEWAY_MAC);              // sender hw addr = gateway
-        reply[28..32].copy_from_slice(target_ip);                 // sender proto addr = requested IP
-        reply[32..38].copy_from_slice(sender_mac);                // target hw addr = original sender
-        reply[38..42].copy_from_slice(sender_ip);                 // target proto addr = original sender IP
+        reply[18] = 6; // hw addr len
+        reply[19] = 4; // proto addr len
+        reply[20..22].copy_from_slice(&2u16.to_be_bytes()); // opcode = reply
+        reply[22..28].copy_from_slice(&GATEWAY_MAC); // sender hw addr = gateway
+        reply[28..32].copy_from_slice(target_ip); // sender proto addr = requested IP
+        reply[32..38].copy_from_slice(sender_mac); // target hw addr = original sender
+        reply[38..42].copy_from_slice(sender_ip); // target proto addr = original sender IP
 
-        debug!("SLIRP ARP: reply {} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            target, GATEWAY_MAC[0], GATEWAY_MAC[1], GATEWAY_MAC[2],
-            GATEWAY_MAC[3], GATEWAY_MAC[4], GATEWAY_MAC[5]);
+        debug!(
+            "SLIRP ARP: reply {} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            target,
+            GATEWAY_MAC[0],
+            GATEWAY_MAC[1],
+            GATEWAY_MAC[2],
+            GATEWAY_MAC[3],
+            GATEWAY_MAC[4],
+            GATEWAY_MAC[5]
+        );
 
         self.inject_to_guest.push(reply);
         Ok(())
@@ -315,7 +378,8 @@ impl SlirpStack {
     // ── IPv4 handling ────────────────────────────────────────────────
 
     fn handle_ipv4_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let eth = EthernetFrame::new_checked(frame).map_err(|e| crate::Error::Network(e.to_string()))?;
+        let eth =
+            EthernetFrame::new_checked(frame).map_err(|e| crate::Error::Network(e.to_string()))?;
         let ipv4 = match Ipv4Packet::new_checked(eth.payload()) {
             Ok(p) => p,
             Err(_) => return Ok(()),
@@ -352,7 +416,11 @@ impl SlirpStack {
         let src_port = udp.src_port();
         let query = udp.payload();
 
-        debug!("SLIRP DNS: query from guest port {} ({} bytes)", src_port, query.len());
+        debug!(
+            "SLIRP DNS: query from guest port {} ({} bytes)",
+            src_port,
+            query.len()
+        );
 
         // Forward to host DNS
         if let Some(response) = self.forward_dns_query(query) {
@@ -394,7 +462,10 @@ impl SlirpStack {
 
         // SYN (new connection)
         if tcp.syn() && !tcp.ack() {
-            debug!("SLIRP TCP: SYN {}:{} -> {}:{}", src_ip, src_port, dst_ip, dst_port);
+            debug!(
+                "SLIRP TCP: SYN {}:{} -> {}:{}",
+                src_ip, src_port, dst_ip, dst_port
+            );
 
             // Remove any stale entry with the same key
             self.tcp_nat.remove(&key);
@@ -405,14 +476,9 @@ impl SlirpStack {
             let host_ip = if dst_ip == SLIRP_GATEWAY_IP {
                 std::net::Ipv4Addr::new(127, 0, 0, 1)
             } else {
-                std::net::Ipv4Addr::new(
-                    dst_ip.0[0], dst_ip.0[1], dst_ip.0[2], dst_ip.0[3],
-                )
+                std::net::Ipv4Addr::new(dst_ip.0[0], dst_ip.0[1], dst_ip.0[2], dst_ip.0[3])
             };
-            let addr = SocketAddr::new(
-                std::net::IpAddr::V4(host_ip),
-                dst_port,
-            );
+            let addr = SocketAddr::new(std::net::IpAddr::V4(host_ip), dst_port);
 
             match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
                 Ok(stream) => {
@@ -430,9 +496,12 @@ impl SlirpStack {
 
                     // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
-                        dst_ip, SLIRP_GUEST_IP,
-                        dst_port, src_port,
-                        our_seq, seq + 1,
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        our_seq,
+                        seq + 1,
                         TcpControl::Syn,
                         &[],
                     );
@@ -440,13 +509,20 @@ impl SlirpStack {
                     debug!("SLIRP TCP: SYN-ACK sent for {}:{}", dst_ip, dst_port);
                 }
                 Err(e) => {
-                    warn!("SLIRP TCP: connect to {}:{} failed: {}", dst_ip, dst_port, e);
+                    warn!(
+                        "SLIRP TCP: connect to {}:{} failed: {}",
+                        dst_ip, dst_port, e
+                    );
                     // Send RST to guest
                     let rst = build_tcp_packet_static(
-                        dst_ip, SLIRP_GUEST_IP,
-                        dst_port, src_port,
-                        0, seq + 1,
-                        TcpControl::Rst, &[],
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        0,
+                        seq + 1,
+                        TcpControl::Rst,
+                        &[],
                     );
                     self.inject_to_guest.push(rst);
                 }
@@ -458,7 +534,13 @@ impl SlirpStack {
         let entry = match self.tcp_nat.get_mut(&key) {
             Some(e) => e,
             None => {
-                trace!("SLIRP TCP: no NAT entry for {}:{} -> {}:{}", src_ip, src_port, dst_ip, dst_port);
+                trace!(
+                    "SLIRP TCP: no NAT entry for {}:{} -> {}:{}",
+                    src_ip,
+                    src_port,
+                    dst_ip,
+                    dst_port
+                );
                 return Ok(());
             }
         };
@@ -470,7 +552,10 @@ impl SlirpStack {
             entry.state = TcpNatState::Established;
             // our_seq was the SYN-ACK seq, so now it's +1
             entry.our_seq += 1;
-            debug!("SLIRP TCP: connection established for {}:{}", dst_ip, dst_port);
+            debug!(
+                "SLIRP TCP: connection established for {}:{}",
+                dst_ip, dst_port
+            );
         }
 
         // Data payload
@@ -481,10 +566,14 @@ impl SlirpStack {
                 Ok(()) => {
                     entry.guest_ack = seq.wrapping_add(payload.len() as u32);
                     let ack_frame = build_tcp_packet_static(
-                        dst_ip, SLIRP_GUEST_IP,
-                        dst_port, src_port,
-                        entry.our_seq, entry.guest_ack,
-                        TcpControl::None, &[],
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        entry.our_seq,
+                        entry.guest_ack,
+                        TcpControl::None,
+                        &[],
                     );
                     self.inject_to_guest.push(ack_frame);
                 }
@@ -500,10 +589,14 @@ impl SlirpStack {
             debug!("SLIRP TCP: FIN from guest for {}:{}", dst_ip, dst_port);
             entry.guest_ack = seq.wrapping_add(1);
             let fin_ack_frame = build_tcp_packet_static(
-                dst_ip, SLIRP_GUEST_IP,
-                dst_port, src_port,
-                entry.our_seq, entry.guest_ack,
-                TcpControl::Fin, &[],
+                dst_ip,
+                SLIRP_GUEST_IP,
+                dst_port,
+                src_port,
+                entry.our_seq,
+                entry.guest_ack,
+                TcpControl::Fin,
+                &[],
             );
             self.inject_to_guest.push(fin_ack_frame);
             entry.our_seq = entry.our_seq.wrapping_add(1);
@@ -562,9 +655,12 @@ impl SlirpStack {
                 let chunk_size = entry.to_guest.len().min(MTU - 54);
                 let chunk: Vec<u8> = entry.to_guest.drain(..chunk_size).collect();
                 let frame = build_tcp_packet_static(
-                    key.dst_ip, SLIRP_GUEST_IP,
-                    key.dst_port, key.guest_src_port,
-                    entry.our_seq, entry.guest_ack,
+                    key.dst_ip,
+                    SLIRP_GUEST_IP,
+                    key.dst_port,
+                    key.guest_src_port,
+                    entry.our_seq,
+                    entry.guest_ack,
                     TcpControl::None,
                     &chunk,
                 );
@@ -575,9 +671,12 @@ impl SlirpStack {
             // FIN if host closed
             if entry.state == TcpNatState::Closed {
                 let fin = build_tcp_packet_static(
-                    key.dst_ip, SLIRP_GUEST_IP,
-                    key.dst_port, key.guest_src_port,
-                    entry.our_seq, entry.guest_ack,
+                    key.dst_ip,
+                    SLIRP_GUEST_IP,
+                    key.dst_port,
+                    key.guest_src_port,
+                    entry.our_seq,
+                    entry.guest_ack,
                     TcpControl::Fin,
                     &[],
                 );
@@ -611,10 +710,11 @@ impl SlirpStack {
         // Ethernet header
         buf[0..6].copy_from_slice(&GUEST_MAC);
         buf[6..12].copy_from_slice(&GATEWAY_MAC);
-        buf[12] = 0x08; buf[13] = 0x00; // IPv4
+        buf[12] = 0x08;
+        buf[13] = 0x00; // IPv4
 
         // IPv4 header
-        let ip = &mut buf[14..14+20];
+        let ip = &mut buf[14..14 + 20];
         ip[0] = 0x45; // version=4, IHL=5
         let ip_total = ip_len as u16;
         ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
@@ -629,15 +729,15 @@ impl SlirpStack {
 
         // UDP header
         let udp_offset = 34;
-        buf[udp_offset..udp_offset+2].copy_from_slice(&src_port.to_be_bytes());
-        buf[udp_offset+2..udp_offset+4].copy_from_slice(&dst_port.to_be_bytes());
+        buf[udp_offset..udp_offset + 2].copy_from_slice(&src_port.to_be_bytes());
+        buf[udp_offset + 2..udp_offset + 4].copy_from_slice(&dst_port.to_be_bytes());
         let udp_length = udp_len as u16;
-        buf[udp_offset+4..udp_offset+6].copy_from_slice(&udp_length.to_be_bytes());
+        buf[udp_offset + 4..udp_offset + 6].copy_from_slice(&udp_length.to_be_bytes());
         // UDP checksum = 0 (optional for IPv4)
-        buf[udp_offset+6..udp_offset+8].copy_from_slice(&[0, 0]);
+        buf[udp_offset + 6..udp_offset + 8].copy_from_slice(&[0, 0]);
 
         // Payload
-        buf[udp_offset+8..].copy_from_slice(payload);
+        buf[udp_offset + 8..].copy_from_slice(payload);
 
         buf
     }
@@ -662,7 +762,11 @@ fn build_tcp_packet_static(
         window_len: TCP_WINDOW,
         window_scale: None,
         control,
-        max_seg_size: if control == TcpControl::Syn { Some(MTU as u16 - 40) } else { None },
+        max_seg_size: if control == TcpControl::Syn {
+            Some(MTU as u16 - 40)
+        } else {
+            None
+        },
         sack_permitted: false,
         sack_ranges: [None; 3],
         payload,
@@ -683,7 +787,8 @@ fn build_tcp_packet_static(
     };
 
     let checksums = ChecksumCapabilities::default();
-    let total_len = eth_repr.buffer_len() + ip_repr.buffer_len() + tcp_repr.header_len() + payload.len();
+    let total_len =
+        eth_repr.buffer_len() + ip_repr.buffer_len() + tcp_repr.header_len() + payload.len();
     let mut buf = vec![0u8; total_len];
 
     let mut eth_frame = EthernetFrame::new_unchecked(&mut buf);
@@ -691,7 +796,12 @@ fn build_tcp_packet_static(
     let mut ip_packet = Ipv4Packet::new_unchecked(eth_frame.payload_mut());
     ip_repr.emit(&mut ip_packet, &checksums);
     let mut tcp_packet = TcpPacket::new_unchecked(ip_packet.payload_mut());
-    tcp_repr.emit(&mut tcp_packet, &IpAddress::Ipv4(src_ip), &IpAddress::Ipv4(dst_ip), &checksums);
+    tcp_repr.emit(
+        &mut tcp_packet,
+        &IpAddress::Ipv4(src_ip),
+        &IpAddress::Ipv4(dst_ip),
+        &checksums,
+    );
 
     buf
 }
@@ -712,7 +822,9 @@ fn rand_id() -> u16 {
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for i in (0..header.len()).step_by(2) {
-        if i == 10 { continue; } // skip checksum field
+        if i == 10 {
+            continue;
+        } // skip checksum field
         let word = if i + 1 < header.len() {
             ((header[i] as u32) << 8) | (header[i + 1] as u32)
         } else {
