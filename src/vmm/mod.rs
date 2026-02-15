@@ -139,7 +139,10 @@ impl VoidBox {
 
         // Vsock device for host->guest exec (connect to guest agent)
         let vsock = if config.enable_vsock {
-            Some(Arc::new(VsockDevice::new(cid)?))
+            Some(Arc::new(VsockDevice::with_secret(
+                cid,
+                config.security.session_secret,
+            )?))
         } else {
             None
         };
@@ -167,7 +170,11 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         // Virtio-net with SLIRP backend if networking is enabled
         let virtio_net = if config.network {
             debug!("Setting up SLIRP networking");
-            let slirp = Arc::new(Mutex::new(SlirpStack::new()?));
+            let slirp = Arc::new(Mutex::new(SlirpStack::with_security(
+                config.security.max_concurrent_connections,
+                config.security.max_connections_per_second,
+                &config.security.network_deny_list,
+            )?));
             let mut net_device = VirtioNetDevice::new(slirp)?;
             net_device.set_mmio_base(0xd000_0000);
             info!(
@@ -244,7 +251,17 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         // Start VM event loop
         let running_clone = running.clone();
         let vsock_clone = vsock.clone();
+        let enable_seccomp = config.security.seccomp;
         let event_loop_handle = std::thread::spawn(move || {
+            // Install seccomp-BPF filter after all setup is done.
+            // This restricts the VMM process to only the syscalls needed for
+            // KVM operation, limiting blast radius of a hypothetical KVM escape.
+            if enable_seccomp {
+                if let Err(e) = install_seccomp_filter() {
+                    error!("Failed to install seccomp filter: {} (continuing without seccomp)", e);
+                }
+            }
+
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -315,6 +332,14 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                 }
             });
         });
+
+        // Drop all capabilities after VM setup is complete.
+        // This limits what a compromised VMM process can do.
+        // PR_SET_NO_NEW_PRIVS prevents gaining new privileges via execve.
+        unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        }
+        debug!("Set PR_SET_NO_NEW_PRIVS");
 
         info!(
             "VoidBox started with CID {}, network={}",
@@ -654,6 +679,101 @@ impl Drop for VoidBox {
             error!("VoidBox dropped while still running - forcing stop");
         }
     }
+}
+
+/// Install a seccomp-bpf filter that restricts the VMM process to the minimum
+/// set of syscalls needed for KVM operation, vsock, and networking.
+///
+/// Uses `SECCOMP_RET_KILL_PROCESS` for any disallowed syscall, terminating
+/// the entire VMM if an attacker gains code execution (e.g., via KVM escape).
+fn install_seccomp_filter() -> Result<()> {
+    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule};
+    use std::convert::TryInto;
+
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        std::collections::BTreeMap::new();
+
+    // Allowlisted syscalls for KVM VMM operation
+    let allowed_syscalls: &[i64] = &[
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_ioctl,       // KVM ioctls
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_create1,
+        libc::SYS_socket,      // AF_VSOCK, AF_INET
+        libc::SYS_connect,
+        libc::SYS_close,
+        libc::SYS_clock_gettime,
+        libc::SYS_nanosleep,
+        libc::SYS_futex,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mprotect,
+        libc::SYS_exit_group,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_recvfrom,
+        libc::SYS_sendto,
+        libc::SYS_accept,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_clone,       // thread creation
+        libc::SYS_clone3,
+        libc::SYS_set_robust_list,
+        libc::SYS_rseq,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_sigaltstack,
+        libc::SYS_getrandom,
+        libc::SYS_poll,
+        libc::SYS_ppoll,
+        libc::SYS_eventfd2,
+        libc::SYS_openat,      // for /dev/kvm, etc.
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_fcntl,
+        libc::SYS_prctl,
+        libc::SYS_seccomp,     // to install this filter itself
+        libc::SYS_getpid,
+        libc::SYS_gettid,
+        libc::SYS_tgkill,
+        libc::SYS_sched_yield,
+        libc::SYS_madvise,
+        libc::SYS_lseek,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_writev,
+        libc::SYS_readv,
+        libc::SYS_sched_getaffinity,
+    ];
+
+    for &syscall in allowed_syscalls {
+        rules.insert(syscall, vec![SeccompRule::new(vec![]).unwrap()]);
+    }
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::KillProcess,    // Default: kill for unlisted syscalls
+        SeccompAction::Allow,          // Matched rules: allow
+        std::env::consts::ARCH.try_into().map_err(|_| {
+            Error::Config("Unsupported architecture for seccomp".into())
+        })?,
+    )
+    .map_err(|e| Error::Config(format!("Failed to create seccomp filter: {:?}", e)))?;
+
+    let bpf_prog: seccompiler::BpfProgram = filter
+        .try_into()
+        .map_err(|e| Error::Config(format!("Failed to compile seccomp filter: {:?}", e)))?;
+
+    seccompiler::apply_filter(&bpf_prog)
+        .map_err(|e| Error::Config(format!("Failed to apply seccomp filter: {:?}", e)))?;
+
+    info!("Seccomp-BPF filter installed ({} syscalls allowed)", allowed_syscalls.len());
+    Ok(())
 }
 
 /// Background thread that bridges vhost-vsock call eventfds to virtio-mmio interrupts.

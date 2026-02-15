@@ -19,6 +19,7 @@ use serde::Serialize;
 use void_box_protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse,
     ProcessMetrics, SystemMetrics, TelemetryBatch, WriteFileRequest, WriteFileResponse,
+    MAX_MESSAGE_SIZE,
 };
 
 /// vsock port we listen on
@@ -29,6 +30,41 @@ const LISTEN_PORT: u32 = 1234;
 const HOST_CID: u32 = 2;
 
 const ALLOWED_WRITE_ROOTS: [&str; 2] = ["/workspace", "/home"];
+
+/// Parsed session secret from kernel cmdline (set once at startup).
+static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+// Whether the current connection has been authenticated.
+// Each connection thread gets its own copy.
+thread_local! {
+    static AUTHENTICATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Resource limits applied to child processes via setrlimit.
+#[derive(Clone, serde::Deserialize)]
+struct ResourceLimits {
+    max_virtual_memory: u64,
+    max_open_files: u64,
+    max_processes: u64,
+    max_file_size: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_virtual_memory: 512 * 1024 * 1024, // 512 MB
+            max_open_files: 1024,
+            max_processes: 64,
+            max_file_size: 100 * 1024 * 1024, // 100 MB
+        }
+    }
+}
+
+/// Loaded resource limits (parsed from /etc/voidbox/resource_limits.json or defaults).
+static RESOURCE_LIMITS: std::sync::OnceLock<ResourceLimits> = std::sync::OnceLock::new();
+
+/// Loaded command allowlist (parsed from /etc/voidbox/allowed_commands.json or empty = allow all).
+static COMMAND_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// CPU jiffies snapshot from /proc/stat
 struct CpuJiffies {
@@ -61,6 +97,34 @@ fn kmsg(msg: &str) {
     }
 }
 
+/// Parse the session secret from /proc/cmdline (voidbox.secret=<hex>).
+fn parse_session_secret() -> Option<[u8; 32]> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    for param in cmdline.split_whitespace() {
+        if let Some(hex_str) = param.strip_prefix("voidbox.secret=") {
+            if hex_str.len() != 64 {
+                kmsg(&format!(
+                    "WARNING: voidbox.secret has wrong length: {} (expected 64 hex chars)",
+                    hex_str.len()
+                ));
+                return None;
+            }
+            let mut secret = [0u8; 32];
+            for i in 0..32 {
+                match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => secret[i] = b,
+                    Err(_) => {
+                        kmsg("WARNING: voidbox.secret contains invalid hex");
+                        return None;
+                    }
+                }
+            }
+            return Some(secret);
+        }
+    }
+    None
+}
+
 fn main() {
     kmsg("void-box guest agent starting...");
 
@@ -77,6 +141,58 @@ fn main() {
     // Set up networking after modules are loaded (virtio_net.ko creates eth0)
     if std::process::id() == 1 {
         setup_network();
+    }
+
+    // Parse session secret from kernel cmdline for vsock authentication.
+    match parse_session_secret() {
+        Some(secret) => {
+            let _ = SESSION_SECRET.set(secret);
+            kmsg("Session secret loaded from kernel cmdline");
+        }
+        None => {
+            kmsg("WARNING: No session secret found in kernel cmdline -- all connections will be rejected");
+        }
+    }
+
+    // Load resource limits from config file (written by host during provisioning).
+    let limits = match std::fs::read_to_string("/etc/voidbox/resource_limits.json") {
+        Ok(content) => match serde_json::from_str::<ResourceLimits>(&content) {
+            Ok(limits) => {
+                kmsg(&format!(
+                    "Loaded resource limits: AS={}MB, NOFILE={}, NPROC={}, FSIZE={}MB",
+                    limits.max_virtual_memory / (1024 * 1024),
+                    limits.max_open_files,
+                    limits.max_processes,
+                    limits.max_file_size / (1024 * 1024),
+                ));
+                limits
+            }
+            Err(e) => {
+                kmsg(&format!("WARNING: Failed to parse resource_limits.json: {}, using defaults", e));
+                ResourceLimits::default()
+            }
+        },
+        Err(_) => {
+            kmsg("Using default resource limits (no /etc/voidbox/resource_limits.json)");
+            ResourceLimits::default()
+        }
+    };
+    let _ = RESOURCE_LIMITS.set(limits);
+
+    // Load command allowlist from config file (written by host during provisioning).
+    match std::fs::read_to_string("/etc/voidbox/allowed_commands.json") {
+        Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+            Ok(allowlist) => {
+                kmsg(&format!("Loaded command allowlist: {} commands", allowlist.len()));
+                let _ = COMMAND_ALLOWLIST.set(allowlist);
+            }
+            Err(e) => {
+                kmsg(&format!("WARNING: Failed to parse allowed_commands.json: {}", e));
+            }
+        },
+        Err(_) => {
+            kmsg("No command allowlist loaded (no /etc/voidbox/allowed_commands.json)");
+        }
     }
 
     // Create vsock listener, retrying since module loading + device probe takes time
@@ -419,10 +535,28 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
         let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let msg_type = header[4];
 
+        // Reject oversized messages before allocating
+        if length > MAX_MESSAGE_SIZE {
+            eprintln!(
+                "Rejecting oversized message: {} bytes (max {})",
+                length, MAX_MESSAGE_SIZE
+            );
+            return Err(format!(
+                "Payload too large: {} bytes (max {})",
+                length, MAX_MESSAGE_SIZE
+            ));
+        }
+
         // Read payload
         let mut payload = vec![0u8; length];
         if length > 0 {
             read_exact(fd, &mut payload)?;
+        }
+
+        // Require authentication for all message types except Ping (which IS the auth).
+        if msg_type != 3 && !AUTHENTICATED.with(|a| a.get()) {
+            eprintln!("Rejecting unauthenticated message type {}", msg_type);
+            return Err("Connection not authenticated -- send Ping with session secret first".into());
         }
 
         // Handle message based on type
@@ -436,8 +570,21 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
             3 => {
-                // Ping
-                send_response(fd, MessageType::Pong, &())?;
+                // Ping -- payload must carry the 32-byte session secret.
+                match SESSION_SECRET.get() {
+                    Some(secret) if payload.len() == 32 && payload[..] == secret[..] => {
+                        AUTHENTICATED.with(|a| a.set(true));
+                        send_response(fd, MessageType::Pong, &())?;
+                    }
+                    Some(_) => {
+                        eprintln!("Authentication failed: invalid secret");
+                        return Err("Authentication failed: invalid session secret".into());
+                    }
+                    None => {
+                        eprintln!("Authentication failed: no secret configured");
+                        return Err("Authentication failed: no session secret configured".into());
+                    }
+                }
                 // Continue loop - host will send ExecRequest on same connection
             }
             5 => {
@@ -475,10 +622,40 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
     }
 }
 
+/// Check if a program is allowed by the command allowlist.
+/// Returns the resolved program name (basename) for allowlist matching.
+fn is_command_allowed(program: &str) -> bool {
+    match COMMAND_ALLOWLIST.get() {
+        None => true, // No allowlist loaded = allow all
+        Some(list) if list.is_empty() => true,
+        Some(list) => {
+            // Match against basename of the program path
+            let basename = Path::new(program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(program);
+            list.iter().any(|allowed| allowed == basename)
+        }
+    }
+}
+
 /// Execute a command, streaming stdout/stderr chunks via ExecOutputChunk
 /// messages, then return the final ExecResponse with full accumulated output.
 fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
+
+    // Check command allowlist before spawning
+    if !is_command_allowed(&request.program) {
+        eprintln!("Command not allowed: {}", request.program);
+        return ExecResponse {
+            stdout: Vec::new(),
+            stderr: format!("Command '{}' is not in the allowed commands list", request.program)
+                .into_bytes(),
+            exit_code: -1,
+            error: Some(format!("Command '{}' is not allowed", request.program)),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+    }
 
     let mut cmd = Command::new(&request.program);
     cmd.args(&request.args);
@@ -521,6 +698,8 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     // Drop privileges to sandbox user (uid=1000, gid=1000) for child processes.
     // This is required because claude-code refuses --dangerously-skip-permissions as root.
     // The guest-agent (PID 1) stays root, but child commands run as sandbox user.
+    //
+    // Also apply resource limits (setrlimit) to prevent fork bombs, OOM, and disk filling.
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| {
@@ -533,6 +712,41 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
             if libc::setuid(1000) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+
+            // Apply resource limits
+            if let Some(limits) = RESOURCE_LIMITS.get() {
+                // RLIMIT_AS: virtual memory
+                let rlim_as = libc::rlimit {
+                    rlim_cur: limits.max_virtual_memory,
+                    rlim_max: limits.max_virtual_memory,
+                };
+                libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
+
+                // RLIMIT_NOFILE: open file descriptors
+                let rlim_nofile = libc::rlimit {
+                    rlim_cur: limits.max_open_files,
+                    rlim_max: limits.max_open_files,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile);
+
+                // RLIMIT_NPROC: max processes (anti-fork-bomb)
+                let rlim_nproc = libc::rlimit {
+                    rlim_cur: limits.max_processes,
+                    rlim_max: limits.max_processes,
+                };
+                libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
+
+                // RLIMIT_FSIZE: max file size
+                let rlim_fsize = libc::rlimit {
+                    rlim_cur: limits.max_file_size,
+                    rlim_max: limits.max_file_size,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+
+                // Create a new process group so the watchdog can killpg()
+                libc::setpgid(0, 0);
+            }
+
             Ok(())
         });
     }
@@ -557,6 +771,34 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
             let _ = stdin.write_all(&request.stdin);
         }
     }
+
+    // Spawn a watchdog thread that will SIGKILL the child's process group
+    // if it exceeds the timeout. The child PID is captured before we move
+    // ownership to the wait logic.
+    let child_pid = child.id() as i32;
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog_handle = if let Some(timeout_secs) = request.timeout_secs {
+        let timed_out_flag = timed_out.clone();
+        Some(std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+                eprintln!(
+                    "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
+                    timeout_secs, child_pid
+                );
+                timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Kill the entire process group (negative PID)
+                unsafe {
+                    libc::kill(-child_pid, libc::SIGKILL);
+                    // Also kill the specific process in case setpgid wasn't called
+                    libc::kill(child_pid, libc::SIGKILL);
+                }
+            })
+            .ok())
+    } else {
+        None
+    };
 
     // Take stdout/stderr pipes for streaming
     let stdout_pipe = child.stdout.take();
@@ -598,11 +840,24 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // The watchdog thread is a daemon -- it will exit when the process dies.
+    // We don't join it because it may still be sleeping.
+    let _ = watchdog_handle;
+
+    let was_timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
+
     ExecResponse {
         stdout: stdout_bytes,
         stderr: stderr_bytes,
         exit_code,
-        error: None,
+        error: if was_timed_out {
+            Some(format!(
+                "Process killed after {}s timeout",
+                request.timeout_secs.unwrap_or(0)
+            ))
+        } else {
+            None
+        },
         duration_ms: Some(duration_ms),
     }
 }

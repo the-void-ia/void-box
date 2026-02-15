@@ -2,7 +2,83 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result};
+
+/// Default command allowlist for guest execution.
+pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
+    "sh", "bash", "claude-code", "node", "npm", "npx", "python3", "pip", "git", "curl", "wget",
+    "cat", "ls", "mkdir", "cp", "mv", "rm", "chmod", "find", "grep", "sed", "awk", "tr", "head",
+    "tail", "wc", "sort", "uniq", "env", "echo", "printf", "date", "touch", "tar", "gzip", "ip",
+    "test",
+];
+
+/// Per-process resource limits applied in the guest via `setrlimit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    /// Maximum virtual memory per process in bytes (RLIMIT_AS).
+    pub max_virtual_memory: u64,
+    /// Maximum number of open file descriptors (RLIMIT_NOFILE).
+    pub max_open_files: u64,
+    /// Maximum number of processes per user (RLIMIT_NPROC).
+    pub max_processes: u64,
+    /// Maximum file size in bytes (RLIMIT_FSIZE).
+    pub max_file_size: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_virtual_memory: 512 * 1024 * 1024, // 512 MB
+            max_open_files: 1024,
+            max_processes: 64,
+            max_file_size: 100 * 1024 * 1024, // 100 MB
+        }
+    }
+}
+
+/// Security configuration for VoidBox VMs.
+///
+/// All security features are mandatory by default. No opt-out toggles
+/// unless there's a concrete development need.
+#[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    /// 32-byte session secret for vsock authentication.
+    /// Auto-generated via `getrandom` in `Default`.
+    pub session_secret: [u8; 32],
+    /// Allowlist of commands that may be executed in the guest.
+    pub command_allowlist: Vec<String>,
+    /// Per-process resource limits for the guest.
+    pub resource_limits: ResourceLimits,
+    /// Network deny list in CIDR notation.
+    pub network_deny_list: Vec<String>,
+    /// Maximum new TCP connections per second from the guest.
+    pub max_connections_per_second: u32,
+    /// Maximum concurrent TCP connections from the guest.
+    pub max_concurrent_connections: usize,
+    /// Whether to install seccomp-bpf filter on the VMM process.
+    pub seccomp: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).expect("Failed to generate session secret");
+        Self {
+            session_secret: secret,
+            command_allowlist: DEFAULT_COMMAND_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            resource_limits: ResourceLimits::default(),
+            network_deny_list: vec!["169.254.0.0/16".to_string()],
+            max_connections_per_second: 10,
+            max_concurrent_connections: 64,
+            seccomp: true,
+        }
+    }
+}
 
 /// Configuration for creating a new VoidBox VM
 #[derive(Debug, Clone)]
@@ -29,6 +105,8 @@ pub struct VoidBoxConfig {
     pub cid: Option<u32>,
     /// Additional kernel command line arguments
     pub extra_cmdline: Vec<String>,
+    /// Security configuration (auth, allowlists, limits, seccomp).
+    pub security: SecurityConfig,
 }
 
 impl Default for VoidBoxConfig {
@@ -45,6 +123,7 @@ impl Default for VoidBoxConfig {
             enable_vsock: true,
             cid: None,
             extra_cmdline: Vec::new(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -156,6 +235,15 @@ impl VoidBoxConfig {
             cmdline.push("rootfstype=ext4".to_string());
             cmdline.push("rw".to_string());
         }
+
+        // Inject session secret for vsock authentication
+        let secret_hex: String = self
+            .security
+            .session_secret
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        cmdline.push(format!("voidbox.secret={}", secret_hex));
 
         // Add extra arguments
         cmdline.extend(self.extra_cmdline.clone());

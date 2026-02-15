@@ -36,6 +36,8 @@ pub enum ProtocolError {
     Io(std::io::Error),
     /// JSON (de)serialization failed.
     Json(serde_json::Error),
+    /// Payload exceeds [`MAX_MESSAGE_SIZE`].
+    PayloadTooLarge { size: usize, max: usize },
 }
 
 impl fmt::Display for ProtocolError {
@@ -45,6 +47,9 @@ impl fmt::Display for ProtocolError {
             ProtocolError::UnknownMessageType(b) => write!(f, "Unknown message type: {}", b),
             ProtocolError::Io(e) => write!(f, "IO error: {}", e),
             ProtocolError::Json(e) => write!(f, "JSON error: {}", e),
+            ProtocolError::PayloadTooLarge { size, max } => {
+                write!(f, "Payload too large: {} bytes (max {})", size, max)
+            }
         }
     }
 }
@@ -69,6 +74,12 @@ impl From<serde_json::Error> for ProtocolError {
 
 /// Header size in bytes: 4 (length) + 1 (type).
 pub const HEADER_SIZE: usize = 5;
+
+/// Maximum allowed message payload size (64 MB).
+///
+/// Prevents OOM from an untrusted length field: without this limit an attacker
+/// can send `0xFFFFFFFF` as the length and force a 4 GB allocation.
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // MessageType
@@ -172,6 +183,14 @@ impl Message {
         }
 
         let length = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+        if length > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::PayloadTooLarge {
+                size: length,
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
+
         let msg_type = MessageType::try_from(data[4])?;
 
         if data.len() < HEADER_SIZE + length {
@@ -188,6 +207,14 @@ impl Message {
         reader.read_exact(&mut header)?;
 
         let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+
+        if length > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::PayloadTooLarge {
+                size: length,
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
+
         let msg_type = MessageType::try_from(header[4])?;
 
         let mut payload = vec![0u8; length];
@@ -204,7 +231,7 @@ impl Message {
 // ---------------------------------------------------------------------------
 
 /// Request to execute a command in the guest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
     /// Program to execute.
     pub program: String,
@@ -220,6 +247,42 @@ pub struct ExecRequest {
     pub working_dir: Option<String>,
     /// Timeout in seconds (optional).
     pub timeout_secs: Option<u64>,
+}
+
+/// Patterns that indicate a sensitive environment variable key.
+const SENSITIVE_KEY_PATTERNS: &[&str] = &["KEY", "SECRET", "TOKEN", "PASSWORD"];
+
+/// Returns true if the environment variable key looks like it holds a secret.
+fn is_sensitive_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    SENSITIVE_KEY_PATTERNS
+        .iter()
+        .any(|pattern| upper.contains(pattern))
+}
+
+impl fmt::Debug for ExecRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_env: Vec<(String, String)> = self
+            .env
+            .iter()
+            .map(|(k, v)| {
+                if is_sensitive_env_key(k) {
+                    (k.clone(), "[REDACTED]".to_string())
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+
+        f.debug_struct("ExecRequest")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("stdin", &format!("[{} bytes]", self.stdin.len()))
+            .field("env", &redacted_env)
+            .field("working_dir", &self.working_dir)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 /// Response from command execution.
@@ -545,6 +608,59 @@ mod tests {
             MessageType::try_from(16).unwrap(),
             MessageType::ExecOutputAck
         );
+    }
+
+    #[test]
+    fn message_payload_too_large_deserialize() {
+        // Header says payload is larger than MAX_MESSAGE_SIZE
+        let huge_len = (MAX_MESSAGE_SIZE + 1) as u32;
+        let mut data = vec![0u8; HEADER_SIZE];
+        data[0..4].copy_from_slice(&huge_len.to_le_bytes());
+        data[4] = 1; // ExecRequest
+        let err = Message::deserialize(&data).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::PayloadTooLarge { .. }),
+            "expected PayloadTooLarge, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn message_payload_too_large_read_from_sync() {
+        let huge_len = (MAX_MESSAGE_SIZE + 1) as u32;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&huge_len.to_le_bytes());
+        wire.push(1); // ExecRequest
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = Message::read_from_sync(&mut cursor).unwrap_err();
+        assert!(matches!(err, ProtocolError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn exec_request_debug_redacts_secrets() {
+        let req = ExecRequest {
+            program: "echo".to_string(),
+            args: vec![],
+            stdin: Vec::new(),
+            env: vec![
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret-123".to_string()),
+                ("MY_SECRET".to_string(), "hunter2".to_string()),
+                ("AUTH_TOKEN".to_string(), "tok_abc".to_string()),
+                ("DB_PASSWORD".to_string(), "p@ss".to_string()),
+                ("NORMAL_VAR".to_string(), "visible".to_string()),
+            ],
+            working_dir: None,
+            timeout_secs: None,
+        };
+        let debug_output = format!("{:?}", req);
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("sk-ant-secret-123"));
+        assert!(!debug_output.contains("hunter2"));
+        assert!(!debug_output.contains("tok_abc"));
+        assert!(!debug_output.contains("p@ss"));
+        assert!(debug_output.contains("visible"));
+        assert!(debug_output.contains("/usr/bin"));
     }
 
     #[test]

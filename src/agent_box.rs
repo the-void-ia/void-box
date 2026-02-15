@@ -256,6 +256,54 @@ impl AgentBox {
         builder.build()
     }
 
+    /// Provision security configuration into the guest.
+    ///
+    /// Writes resource limits and command allowlist as JSON files that
+    /// the guest-agent reads at connection time.
+    async fn provision_security(&self, sandbox: &Sandbox) -> Result<()> {
+        let tag = &self.name;
+
+        // Write resource limits
+        let limits = serde_json::json!({
+            "max_virtual_memory": 512 * 1024 * 1024_u64,
+            "max_open_files": 1024_u64,
+            "max_processes": 64_u64,
+            "max_file_size": 100 * 1024 * 1024_u64,
+        });
+        let limits_json = serde_json::to_string_pretty(&limits).map_err(|e| {
+            crate::Error::Config(format!("Failed to serialize resource limits: {}", e))
+        })?;
+        sandbox
+            .mkdir_p("/etc/voidbox")
+            .await?;
+        sandbox
+            .write_file("/etc/voidbox/resource_limits.json", limits_json.as_bytes())
+            .await?;
+        eprintln!(
+            "[vm:{}] Wrote resource limits to /etc/voidbox/resource_limits.json",
+            tag,
+        );
+
+        // Write command allowlist
+        let allowlist: Vec<&str> = crate::vmm::config::DEFAULT_COMMAND_ALLOWLIST.to_vec();
+        let allowlist_json = serde_json::to_string_pretty(&allowlist).map_err(|e| {
+            crate::Error::Config(format!("Failed to serialize command allowlist: {}", e))
+        })?;
+        sandbox
+            .write_file(
+                "/etc/voidbox/allowed_commands.json",
+                allowlist_json.as_bytes(),
+            )
+            .await?;
+        eprintln!(
+            "[vm:{}] Wrote command allowlist ({} commands) to /etc/voidbox/allowed_commands.json",
+            tag,
+            allowlist.len(),
+        );
+
+        Ok(())
+    }
+
     /// Provision skills into the sandbox: write SKILL.md files and MCP config.
     async fn provision_skills(&self, sandbox: &Sandbox) -> Result<()> {
         let tag = &self.name;
@@ -378,6 +426,9 @@ impl AgentBox {
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             crate::Error::Config("AgentBox not built -- call .build() first".into())
         })?;
+
+        // Provision security configuration (resource limits, command allowlist)
+        self.provision_security(sandbox).await?;
 
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;

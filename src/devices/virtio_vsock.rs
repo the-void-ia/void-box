@@ -36,11 +36,19 @@ pub struct VsockDevice {
     cid: u32,
     /// Tracks whether the cold-boot wait has already been applied.
     boot_wait_done: AtomicBool,
+    /// 32-byte session secret for vsock authentication.
+    /// Sent as the Ping payload; guest validates against its cmdline secret.
+    session_secret: [u8; 32],
 }
 
 impl VsockDevice {
-    /// Create a new vsock device with the given CID (guest CID).
+    /// Create a new vsock device with the given CID and session secret.
     pub fn new(cid: u32) -> Result<Self> {
+        Self::with_secret(cid, [0u8; 32])
+    }
+
+    /// Create a new vsock device with the given CID and session secret.
+    pub fn with_secret(cid: u32, session_secret: [u8; 32]) -> Result<Self> {
         if cid < 3 {
             return Err(Error::Config(format!(
                 "Invalid CID {}: must be >= 3 (0-2 reserved)",
@@ -56,6 +64,7 @@ impl VsockDevice {
         Ok(Self {
             cid,
             boot_wait_done: AtomicBool::new(false),
+            session_secret,
         })
     }
 
@@ -309,9 +318,11 @@ impl VsockDevice {
                 delay = std::cmp::min(delay * 2, Duration::from_secs(2));
                 continue;
             }
+            // Ping payload carries the 32-byte session secret for authentication.
+            // The guest-agent validates this against the secret from /proc/cmdline.
             let ping_msg = Message {
                 msg_type: MessageType::Ping,
-                payload: vec![],
+                payload: self.session_secret.to_vec(),
             };
             if s.write_all(&ping_msg.serialize()).is_err() {
                 debug!("vsock[{context}]: attempt {} failed to send Ping", attempt);

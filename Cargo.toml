@@ -49,6 +49,11 @@ opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_ex
 # HTTP client (for fetching remote skills from skills.sh)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+# Security
+getrandom = "0.3"
+seccompiler = "0.4"
+ipnet = "2"
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"

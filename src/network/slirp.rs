@@ -18,10 +18,13 @@
 //! and checksum computation, but all packet handling is done manually.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use ipnet::Ipv4Net;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -181,10 +184,27 @@ pub struct SlirpStack {
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
+    /// Maximum concurrent TCP connections allowed
+    max_concurrent_connections: usize,
+    /// Maximum new connections per second
+    max_connections_per_second: u32,
+    /// Sliding window of recent connection timestamps for rate limiting
+    connection_timestamps: VecDeque<Instant>,
+    /// Network deny list (CIDR ranges that the guest cannot reach)
+    deny_list: Vec<Ipv4Net>,
 }
 
 impl SlirpStack {
     pub fn new() -> Result<Self> {
+        Self::with_security(64, 10, &["169.254.0.0/16".to_string()])
+    }
+
+    /// Create a SLIRP stack with security parameters.
+    pub fn with_security(
+        max_concurrent_connections: usize,
+        max_connections_per_second: u32,
+        deny_list_cidrs: &[String],
+    ) -> Result<Self> {
         debug!("Creating SLIRP stack");
         let queue = Arc::new(Mutex::new(PacketQueue::new()));
         let device = VirtualDevice::new(queue.clone());
@@ -207,9 +227,21 @@ impl SlirpStack {
             .unwrap();
 
         let sockets = SocketSet::new(vec![]);
+
+        // Parse deny list CIDRs
+        let deny_list: Vec<Ipv4Net> = deny_list_cidrs
+            .iter()
+            .filter_map(|cidr| {
+                cidr.parse::<Ipv4Net>().map_err(|e| {
+                    warn!("SLIRP: invalid deny list CIDR '{}': {}", cidr, e);
+                    e
+                }).ok()
+            })
+            .collect();
+
         debug!(
-            "SLIRP stack created - Gateway: {}, DNS: {}",
-            SLIRP_GATEWAY_IP, SLIRP_DNS_IP
+            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs",
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, deny_list.len()
         );
 
         Ok(Self {
@@ -219,7 +251,40 @@ impl SlirpStack {
             _device: device,
             tcp_nat: HashMap::new(),
             inject_to_guest: Vec::new(),
+            max_concurrent_connections,
+            max_connections_per_second,
+            connection_timestamps: VecDeque::new(),
+            deny_list,
         })
+    }
+
+    /// Check if a destination IP is blocked by the deny list.
+    fn is_denied(&self, ip: &Ipv4Address) -> bool {
+        let addr = std::net::Ipv4Addr::new(ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
+        self.deny_list.iter().any(|net| net.contains(&addr))
+    }
+
+    /// Check if a new connection is allowed by the rate limiter.
+    /// Returns true if the connection is allowed.
+    fn check_rate_limit(&mut self) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(1);
+
+        // Remove timestamps older than 1 second
+        while let Some(&oldest) = self.connection_timestamps.front() {
+            if now.duration_since(oldest) > window {
+                self.connection_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.connection_timestamps.len() >= self.max_connections_per_second as usize {
+            return false;
+        }
+
+        self.connection_timestamps.push_back(now);
+        true
     }
 
     // ── Public API ──────────────────────────────────────────────────
@@ -466,6 +531,48 @@ impl SlirpStack {
                 "SLIRP TCP: SYN {}:{} -> {}:{}",
                 src_ip, src_port, dst_ip, dst_port
             );
+
+            // Check deny list before connecting
+            if self.is_denied(&dst_ip) {
+                warn!(
+                    "SLIRP TCP: connection to {}:{} denied by network deny list",
+                    dst_ip, dst_port
+                );
+                let rst = build_tcp_packet_static(
+                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
+                    TcpControl::Rst, &[],
+                );
+                self.inject_to_guest.push(rst);
+                return Ok(());
+            }
+
+            // Check max concurrent connections
+            if self.tcp_nat.len() >= self.max_concurrent_connections {
+                warn!(
+                    "SLIRP TCP: max concurrent connections ({}) reached, rejecting SYN to {}:{}",
+                    self.max_concurrent_connections, dst_ip, dst_port
+                );
+                let rst = build_tcp_packet_static(
+                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
+                    TcpControl::Rst, &[],
+                );
+                self.inject_to_guest.push(rst);
+                return Ok(());
+            }
+
+            // Check rate limit
+            if !self.check_rate_limit() {
+                warn!(
+                    "SLIRP TCP: connection rate limit ({}/s) exceeded, rejecting SYN to {}:{}",
+                    self.max_connections_per_second, dst_ip, dst_port
+                );
+                let rst = build_tcp_packet_static(
+                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
+                    TcpControl::Rst, &[],
+                );
+                self.inject_to_guest.push(rst);
+                return Ok(());
+            }
 
             // Remove any stale entry with the same key
             self.tcp_nat.remove(&key);
