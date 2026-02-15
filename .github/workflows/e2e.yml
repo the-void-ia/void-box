@@ -79,7 +79,12 @@ jobs:
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
         run: |
           # Detect kernel version at runtime (env context can't run commands)
-          export VOID_BOX_KERNEL="/boot/vmlinuz-$(uname -r)"
+          KERNEL_SRC="/boot/vmlinuz-$(uname -r)"
+          KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
+          sudo cp "$KERNEL_SRC" "$KERNEL_COPY"
+          sudo chown "$USER:$USER" "$KERNEL_COPY"
+          chmod 644 "$KERNEL_COPY"
+          export VOID_BOX_KERNEL="$KERNEL_COPY"
           echo "Kernel: $VOID_BOX_KERNEL"
           echo "Initramfs: $VOID_BOX_INITRAMFS"
 
