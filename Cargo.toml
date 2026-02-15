@@ -2,7 +2,7 @@
 name = "void-box"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.83"
 authors = ["Diego Parra <diegolparra@gmail.com>"]
 description = "Composable workflow sandbox with KVM micro-VMs and native observability"
 repository = "https://github.com/the-void-ia/void-box"

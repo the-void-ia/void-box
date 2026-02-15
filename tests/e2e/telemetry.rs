@@ -37,6 +37,10 @@ fn kvm_available() -> bool {
     std::path::Path::new("/dev/kvm").exists()
 }
 
+fn vsock_available() -> bool {
+    std::path::Path::new("/dev/vhost-vsock").exists()
+}
+
 fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
     let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
     let kernel = PathBuf::from(kernel);
@@ -48,6 +52,10 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
 fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not available");
+        return None;
+    }
+    if !vsock_available() {
+        eprintln!("skipping: /dev/vhost-vsock not available");
         return None;
     }
 
@@ -93,6 +101,10 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
         eprintln!("skipping: /dev/kvm not available");
         return None;
     }
+    if !vsock_available() {
+        eprintln!("skipping: /dev/vhost-vsock not available");
+        return None;
+    }
 
     let (kernel, initramfs) = match kvm_artifacts_from_env() {
         Some(a) => a,
@@ -127,6 +139,10 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
 /// Build a Sandbox::local() with custom env vars for claudio configuration.
 fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
     if !kvm_available() {
+        return None;
+    }
+    if !vsock_available() {
+        eprintln!("skipping: /dev/vhost-vsock not available");
         return None;
     }
 

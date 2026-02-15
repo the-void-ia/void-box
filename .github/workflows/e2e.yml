@@ -78,6 +78,11 @@ jobs:
           VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
         run: |
+          if [ ! -e /dev/vhost-vsock ]; then
+            echo "Skipping e2e: /dev/vhost-vsock is not available on this runner."
+            exit 0
+          fi
+
           # Detect kernel version at runtime (env context can't run commands)
           KERNEL_SRC="/boot/vmlinuz-$(uname -r)"
           KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"

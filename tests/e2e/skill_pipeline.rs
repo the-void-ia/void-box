@@ -36,6 +36,10 @@ fn kvm_available() -> bool {
     std::path::Path::new("/dev/kvm").exists()
 }
 
+fn vsock_available() -> bool {
+    std::path::Path::new("/dev/vhost-vsock").exists()
+}
+
 fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
@@ -57,6 +61,10 @@ fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
 fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<AgentBox> {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not available");
+        return None;
+    }
+    if !vsock_available() {
+        eprintln!("skipping: /dev/vhost-vsock not available");
         return None;
     }
 

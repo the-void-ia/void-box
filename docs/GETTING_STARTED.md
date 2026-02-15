@@ -5,7 +5,7 @@ This guide covers local development, KVM execution, and e2e testing for `void-bo
 ## Prerequisites
 
 - Linux host
-- Rust toolchain
+- Rust toolchain (minimum: `1.83`)
 - `/dev/kvm` access for real VM runs
 
 ## Build

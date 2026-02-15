@@ -146,8 +146,11 @@ impl VoidBox {
                     Some(Arc::new(Mutex::new(dev)))
                 }
                 Err(e) => {
-                    debug!("virtio-vsock MMIO unavailable: {}", e);
-                    None
+                    return Err(Error::Device(format!(
+                        "vsock requested but virtio-vsock MMIO backend failed to initialize: {}. \
+Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner supports vhost-vsock.",
+                        e
+                    )));
                 }
             }
         } else {

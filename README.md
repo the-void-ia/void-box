@@ -20,6 +20,8 @@ Composable sandbox runtime for agent workflows with KVM micro-VMs, vsock command
 
 ## Quickstart
 
+Minimum supported Rust version: `1.83`.
+
 ### 1. Mock mode (no KVM required)
 
 ```bash
