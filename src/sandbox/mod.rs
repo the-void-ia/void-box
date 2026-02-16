@@ -183,6 +183,10 @@ impl Sandbox {
         prompt: &str,
         opts: crate::observe::claude::ClaudeExecOpts,
     ) -> Result<crate::observe::claude::ClaudeExecResult> {
+        if let SandboxInner::Local(local) = &self.inner {
+            self.verify_claude_code_compat(local, &opts.env).await?;
+        }
+
         let mut args = vec![
             "-p".to_string(),
             prompt.to_string(),
@@ -251,10 +255,80 @@ impl Sandbox {
             }
         }
 
-        // Parse the stream-json output
+        // Parse the stream-json output even on non-zero exit codes.
+        // claude-code exits 1 when the task fails or has errors, but still
+        // produces valid stream-json with a result event. Only treat it as
+        // a hard failure if we get NO parseable stream-json output at all.
         let result = crate::observe::claude::parse_stream_json(&output.stdout);
 
+        let no_stream_output = result.session_id.is_empty()
+            && result.model.is_empty()
+            && result.result_text.is_empty()
+            && result.tool_calls.is_empty()
+            && result.input_tokens == 0
+            && result.output_tokens == 0
+            && !result.is_error;
+
+        if no_stream_output {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stdout_preview = if stdout_str.len() > 500 {
+                format!("{}...", &stdout_str[..500])
+            } else {
+                stdout_str.to_string()
+            };
+            return Err(Error::Guest(format!(
+                "claude-code returned no stream-json events (exit_code={}). stderr: {}. stdout_head: {}",
+                output.exit_code,
+                if stderr_str.trim().is_empty() {
+                    "(empty)"
+                } else {
+                    stderr_str.trim()
+                },
+                if stdout_preview.trim().is_empty() {
+                    "(empty)"
+                } else {
+                    stdout_preview.trim()
+                }
+            )));
+        }
+
         Ok(result)
+    }
+
+    /// Lightweight check that `claude-code` exists in the guest PATH.
+    ///
+    /// Previously this ran `claude-code --help` which booted the full Node.js
+    /// runtime and wrote state to `~/.claude/`, corrupting guest config for
+    /// the subsequent real execution. Now we run `sh -c "command -v claude-code"`
+    /// which is side-effect-free and sub-second. We use `sh` (which is in the
+    /// guest command allowlist) with the `command -v` builtin.
+    async fn verify_claude_code_compat(
+        &self,
+        local: &LocalSandbox,
+        _extra_env: &[(String, String)],
+    ) -> Result<()> {
+        let probe_output = local
+            .exec_with_stdin("sh", &["-c", "command -v claude-code"], &[])
+            .await
+            .map_err(|e| {
+                Error::Guest(format!(
+                    "failed to probe guest for `claude-code` binary: {e}"
+                ))
+            })?;
+
+        if probe_output.exit_code == 0 {
+            let path = String::from_utf8_lossy(&probe_output.stdout);
+            tracing::debug!("claude-code found at: {}", path.trim());
+            return Ok(());
+        }
+
+        Err(Error::Guest(
+            "guest does not have `claude-code` in PATH. \
+Build a production guest image with claude-code and set VOID_BOX_INITRAMFS: \
+`scripts/build_claude_rootfs.sh` then `export VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz`."
+                .to_string(),
+        ))
     }
 
     /// Get sandbox configuration
@@ -512,9 +586,45 @@ impl MockSandbox {
                 Ok(ExecOutput::new(stdin.to_vec(), Vec::new(), 0))
             }
             "claude-code" => {
-                // Mock claude-code: plan emits one JSON-like line; apply reads stdin and echoes summary
+                // Mock claude-code:
+                // - plan emits one JSON-like line
+                // - apply reads stdin and echoes summary
+                // - prompt mode (-p ... --output-format stream-json) returns deterministic JSONL
                 let first = args.first().map(|s| *s).unwrap_or("");
-                if first == "plan" {
+                if first == "-p" {
+                    let output_format = args
+                        .windows(2)
+                        .find(|w| w[0] == "--output-format")
+                        .map(|w| w[1])
+                        .unwrap_or("");
+
+                    if output_format == "stream-json" {
+                        let prompt = args.get(1).copied().unwrap_or("");
+                        let preview = if prompt.len() > 120 {
+                            format!("{}...", &prompt[..120])
+                        } else {
+                            prompt.to_string()
+                        };
+                        let jsonl = format!(
+                            concat!(
+                                "{{\"type\":\"system\",\"session_id\":\"mock_sess_01\",\"model\":\"mock-claude-code\"}}\n",
+                                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"mock_sess_01\",",
+                                "\"total_cost_usd\":0.0,\"is_error\":false,\"duration_ms\":1,\"duration_api_ms\":1,",
+                                "\"num_turns\":1,\"result\":\"[mock sandbox] {}\",",
+                                "\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\n"
+                            ),
+                            preview.replace('"', "'")
+                        );
+                        Ok(ExecOutput::new(jsonl.into_bytes(), Vec::new(), 0))
+                    } else {
+                        Ok(ExecOutput::new(
+                            Vec::new(),
+                            b"mock claude-code: only --output-format stream-json is supported for -p mode\n"
+                                .to_vec(),
+                            1,
+                        ))
+                    }
+                } else if first == "plan" {
                     let plan = r#"{"steps":[{"id":"1","action":"edit","path":"README.md"}]}"#;
                     Ok(ExecOutput::new(
                         format!("{}\n", plan).into_bytes(),

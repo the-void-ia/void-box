@@ -1,0 +1,25 @@
+api_version: v1
+kind: workflow
+name: quick-workflow
+
+sandbox:
+  mode: mock
+  memory_mb: 256
+  vcpus: 1
+  network: false
+
+workflow:
+  steps:
+    - name: fetch
+      run:
+        program: echo
+        args: ["hello from workflow"]
+
+    - name: transform
+      depends_on: [fetch]
+      run:
+        program: tr
+        args: ["a-z", "A-Z"]
+        stdin_from: fetch
+
+  output_step: transform

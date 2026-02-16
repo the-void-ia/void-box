@@ -1,0 +1,19 @@
+{
+  "api_version": "v1",
+  "kind": "agent",
+  "name": "quick-agent",
+  "sandbox": {
+    "mode": "auto",
+    "memory_mb": 1024,
+    "vcpus": 1,
+    "network": true
+  },
+  "llm": {
+    "provider": "claude"
+  },
+  "agent": {
+    "prompt": "Summarize the latest build output in 3 bullets.",
+    "skills": ["agent:claude-code"],
+    "timeout_secs": 300
+  }
+}

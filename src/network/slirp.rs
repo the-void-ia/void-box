@@ -196,7 +196,7 @@ pub struct SlirpStack {
 
 impl SlirpStack {
     pub fn new() -> Result<Self> {
-        Self::with_security(64, 10, &["169.254.0.0/16".to_string()])
+        Self::with_security(64, 50, &["169.254.0.0/16".to_string()])
     }
 
     /// Create a SLIRP stack with security parameters.
@@ -232,10 +232,12 @@ impl SlirpStack {
         let deny_list: Vec<Ipv4Net> = deny_list_cidrs
             .iter()
             .filter_map(|cidr| {
-                cidr.parse::<Ipv4Net>().map_err(|e| {
-                    warn!("SLIRP: invalid deny list CIDR '{}': {}", cidr, e);
-                    e
-                }).ok()
+                cidr.parse::<Ipv4Net>()
+                    .map_err(|e| {
+                        warn!("SLIRP: invalid deny list CIDR '{}': {}", cidr, e);
+                        e
+                    })
+                    .ok()
             })
             .collect();
 
@@ -539,8 +541,14 @@ impl SlirpStack {
                     dst_ip, dst_port
                 );
                 let rst = build_tcp_packet_static(
-                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
-                    TcpControl::Rst, &[],
+                    dst_ip,
+                    SLIRP_GUEST_IP,
+                    dst_port,
+                    src_port,
+                    0,
+                    seq + 1,
+                    TcpControl::Rst,
+                    &[],
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -553,8 +561,14 @@ impl SlirpStack {
                     self.max_concurrent_connections, dst_ip, dst_port
                 );
                 let rst = build_tcp_packet_static(
-                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
-                    TcpControl::Rst, &[],
+                    dst_ip,
+                    SLIRP_GUEST_IP,
+                    dst_port,
+                    src_port,
+                    0,
+                    seq + 1,
+                    TcpControl::Rst,
+                    &[],
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -567,8 +581,14 @@ impl SlirpStack {
                     self.max_connections_per_second, dst_ip, dst_port
                 );
                 let rst = build_tcp_packet_static(
-                    dst_ip, SLIRP_GUEST_IP, dst_port, src_port, 0, seq + 1,
-                    TcpControl::Rst, &[],
+                    dst_ip,
+                    SLIRP_GUEST_IP,
+                    dst_port,
+                    src_port,
+                    0,
+                    seq + 1,
+                    TcpControl::Rst,
+                    &[],
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());

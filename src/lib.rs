@@ -80,9 +80,13 @@ pub mod workflow;
 
 // Skill + Environment = Box
 pub mod agent_box;
+pub mod daemon;
 pub mod llm;
+pub mod persistence;
 pub mod pipeline;
+pub mod runtime;
 pub mod skill;
+pub mod spec;
 
 // Re-exports for convenience
 pub use error::{Error, Result};

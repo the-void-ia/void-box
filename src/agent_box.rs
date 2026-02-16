@@ -265,7 +265,7 @@ impl AgentBox {
 
         // Write resource limits
         let limits = serde_json::json!({
-            "max_virtual_memory": 512 * 1024 * 1024_u64,
+            "max_virtual_memory": 4096 * 1024 * 1024_u64,
             "max_open_files": 1024_u64,
             "max_processes": 64_u64,
             "max_file_size": 100 * 1024 * 1024_u64,
@@ -273,9 +273,7 @@ impl AgentBox {
         let limits_json = serde_json::to_string_pretty(&limits).map_err(|e| {
             crate::Error::Config(format!("Failed to serialize resource limits: {}", e))
         })?;
-        sandbox
-            .mkdir_p("/etc/voidbox")
-            .await?;
+        sandbox.mkdir_p("/etc/voidbox").await?;
         sandbox
             .write_file("/etc/voidbox/resource_limits.json", limits_json.as_bytes())
             .await?;
@@ -482,7 +480,7 @@ impl AgentBox {
         );
 
         // Execute the agent
-        let claude_result = sandbox
+        let mut claude_result = sandbox
             .exec_claude(
                 &full_prompt,
                 ClaudeExecOpts {
@@ -493,6 +491,12 @@ impl AgentBox {
                 },
             )
             .await?;
+
+        // Local providers (Ollama) have no real API cost; claude-code
+        // still reports a dollar amount using Anthropic pricing, so zero it.
+        if self.config.llm.is_local() {
+            claude_result.total_cost_usd = 0.0;
+        }
 
         eprintln!(
             "[vm:{}] Agent finished | tokens={}in/{}out | tools={} | cost=${:.4} | error={}",

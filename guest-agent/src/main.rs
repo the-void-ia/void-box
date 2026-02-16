@@ -29,7 +29,7 @@ const LISTEN_PORT: u32 = 1234;
 #[allow(dead_code)]
 const HOST_CID: u32 = 2;
 
-const ALLOWED_WRITE_ROOTS: [&str; 2] = ["/workspace", "/home"];
+const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
 
 /// Parsed session secret from kernel cmdline (set once at startup).
 static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
@@ -52,7 +52,7 @@ struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_virtual_memory: 512 * 1024 * 1024, // 512 MB
+            max_virtual_memory: 4096 * 1024 * 1024, // 4 GB (V8/Node.js needs large virtual address space)
             max_open_files: 1024,
             max_processes: 64,
             max_file_size: 100 * 1024 * 1024, // 100 MB
@@ -168,7 +168,10 @@ fn main() {
                 limits
             }
             Err(e) => {
-                kmsg(&format!("WARNING: Failed to parse resource_limits.json: {}, using defaults", e));
+                kmsg(&format!(
+                    "WARNING: Failed to parse resource_limits.json: {}, using defaults",
+                    e
+                ));
                 ResourceLimits::default()
             }
         },
@@ -183,11 +186,17 @@ fn main() {
     match std::fs::read_to_string("/etc/voidbox/allowed_commands.json") {
         Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
             Ok(allowlist) => {
-                kmsg(&format!("Loaded command allowlist: {} commands", allowlist.len()));
+                kmsg(&format!(
+                    "Loaded command allowlist: {} commands",
+                    allowlist.len()
+                ));
                 let _ = COMMAND_ALLOWLIST.set(allowlist);
             }
             Err(e) => {
-                kmsg(&format!("WARNING: Failed to parse allowed_commands.json: {}", e));
+                kmsg(&format!(
+                    "WARNING: Failed to parse allowed_commands.json: {}",
+                    e
+                ));
             }
         },
         Err(_) => {
@@ -556,7 +565,9 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
         // Require authentication for all message types except Ping (which IS the auth).
         if msg_type != 3 && !AUTHENTICATED.with(|a| a.get()) {
             eprintln!("Rejecting unauthenticated message type {}", msg_type);
-            return Err("Connection not authenticated -- send Ping with session secret first".into());
+            return Err(
+                "Connection not authenticated -- send Ping with session secret first".into(),
+            );
         }
 
         // Handle message based on type
@@ -649,8 +660,11 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
         eprintln!("Command not allowed: {}", request.program);
         return ExecResponse {
             stdout: Vec::new(),
-            stderr: format!("Command '{}' is not in the allowed commands list", request.program)
-                .into_bytes(),
+            stderr: format!(
+                "Command '{}' is not in the allowed commands list",
+                request.program
+            )
+            .into_bytes(),
             exit_code: -1,
             error: Some(format!("Command '{}' is not allowed", request.program)),
             duration_ms: Some(start.elapsed().as_millis() as u64),
@@ -779,23 +793,25 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog_handle = if let Some(timeout_secs) = request.timeout_secs {
         let timed_out_flag = timed_out.clone();
-        Some(std::thread::Builder::new()
-            .name("watchdog".into())
-            .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-                eprintln!(
-                    "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
-                    timeout_secs, child_pid
-                );
-                timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                // Kill the entire process group (negative PID)
-                unsafe {
-                    libc::kill(-child_pid, libc::SIGKILL);
-                    // Also kill the specific process in case setpgid wasn't called
-                    libc::kill(child_pid, libc::SIGKILL);
-                }
-            })
-            .ok())
+        Some(
+            std::thread::Builder::new()
+                .name("watchdog".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+                    eprintln!(
+                        "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
+                        timeout_secs, child_pid
+                    );
+                    timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Kill the entire process group (negative PID)
+                    unsafe {
+                        libc::kill(-child_pid, libc::SIGKILL);
+                        // Also kill the specific process in case setpgid wasn't called
+                        libc::kill(child_pid, libc::SIGKILL);
+                    }
+                })
+                .ok(),
+        )
     } else {
         None
     };

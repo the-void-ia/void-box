@@ -140,8 +140,8 @@ impl Pipeline {
 
     /// Execute the pipeline: run each stage in order, piping output forward.
     ///
-    /// For [`PipelineStage::Single`] stages, a single Box is booted and run.
-    /// For [`PipelineStage::Parallel`] stages, all Boxes are run concurrently
+    /// For `PipelineStage::Single` stages, a single Box is booted and run.
+    /// For `PipelineStage::Parallel` stages, all Boxes are run concurrently
     /// via a [`tokio::task::JoinSet`] and their outputs are merged as a JSON
     /// array for the next stage.
     pub async fn run(self) -> crate::Result<PipelineResult> {

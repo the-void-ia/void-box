@@ -221,6 +221,15 @@ impl LlmProvider {
         }
     }
 
+    /// Whether this provider runs locally (no real API cost).
+    ///
+    /// When true, `total_cost_usd` reported by claude-code is meaningless
+    /// (it applies Anthropic pricing to local model tokens) and should be
+    /// zeroed in the final report.
+    pub(crate) fn is_local(&self) -> bool {
+        matches!(self, LlmProvider::Ollama { .. })
+    }
+
     /// Whether this provider requires network access from the guest.
     pub(crate) fn requires_network(&self) -> bool {
         // All providers need network: Claude for api.anthropic.com,

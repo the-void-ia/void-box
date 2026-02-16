@@ -644,7 +644,10 @@ mod tests {
             stdin: Vec::new(),
             env: vec![
                 ("PATH".to_string(), "/usr/bin".to_string()),
-                ("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret-123".to_string()),
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-ant-secret-123".to_string(),
+                ),
                 ("MY_SECRET".to_string(), "hunter2".to_string()),
                 ("AUTH_TOKEN".to_string(), "tok_abc".to_string()),
                 ("DB_PASSWORD".to_string(), "p@ss".to_string()),

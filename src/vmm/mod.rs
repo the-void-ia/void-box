@@ -258,7 +258,10 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             // KVM operation, limiting blast radius of a hypothetical KVM escape.
             if enable_seccomp {
                 if let Err(e) = install_seccomp_filter() {
-                    error!("Failed to install seccomp filter: {} (continuing without seccomp)", e);
+                    error!(
+                        "Failed to install seccomp filter: {} (continuing without seccomp)",
+                        e
+                    );
                 }
             }
 
@@ -681,27 +684,28 @@ impl Drop for VoidBox {
     }
 }
 
-/// Install a seccomp-bpf filter that restricts the VMM process to the minimum
+/// Install a seccomp-bpf filter that restricts the VMM thread to the minimum
 /// set of syscalls needed for KVM operation, vsock, and networking.
 ///
-/// Uses `SECCOMP_RET_KILL_PROCESS` for any disallowed syscall, terminating
-/// the entire VMM if an attacker gains code execution (e.g., via KVM escape).
+/// Uses `SECCOMP_RET_KILL_THREAD` for any disallowed syscall, terminating
+/// only the event-loop thread (not the entire process). This is essential
+/// for daemon mode where the parent process must survive VM teardown.
 fn install_seccomp_filter() -> Result<()> {
-    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule};
+    use seccompiler::{SeccompAction, SeccompFilter};
     use std::convert::TryInto;
 
-    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+    let mut rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         std::collections::BTreeMap::new();
 
     // Allowlisted syscalls for KVM VMM operation
     let allowed_syscalls: &[i64] = &[
         libc::SYS_read,
         libc::SYS_write,
-        libc::SYS_ioctl,       // KVM ioctls
+        libc::SYS_ioctl, // KVM ioctls
         libc::SYS_epoll_wait,
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_create1,
-        libc::SYS_socket,      // AF_VSOCK, AF_INET
+        libc::SYS_socket, // AF_VSOCK, AF_INET
         libc::SYS_connect,
         libc::SYS_close,
         libc::SYS_clock_gettime,
@@ -721,7 +725,7 @@ fn install_seccomp_filter() -> Result<()> {
         libc::SYS_getsockopt,
         libc::SYS_brk,
         libc::SYS_mremap,
-        libc::SYS_clone,       // thread creation
+        libc::SYS_clone, // thread creation
         libc::SYS_clone3,
         libc::SYS_set_robust_list,
         libc::SYS_rseq,
@@ -732,12 +736,12 @@ fn install_seccomp_filter() -> Result<()> {
         libc::SYS_poll,
         libc::SYS_ppoll,
         libc::SYS_eventfd2,
-        libc::SYS_openat,      // for /dev/kvm, etc.
+        libc::SYS_openat, // for /dev/kvm, etc.
         libc::SYS_newfstatat,
         libc::SYS_fstat,
         libc::SYS_fcntl,
         libc::SYS_prctl,
-        libc::SYS_seccomp,     // to install this filter itself
+        libc::SYS_seccomp, // to install this filter itself
         libc::SYS_getpid,
         libc::SYS_gettid,
         libc::SYS_tgkill,
@@ -752,16 +756,17 @@ fn install_seccomp_filter() -> Result<()> {
     ];
 
     for &syscall in allowed_syscalls {
-        rules.insert(syscall, vec![SeccompRule::new(vec![]).unwrap()]);
+        // Empty rule list means "unconditional match" for this syscall.
+        rules.insert(syscall, Vec::new());
     }
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::KillProcess,    // Default: kill for unlisted syscalls
-        SeccompAction::Allow,          // Matched rules: allow
-        std::env::consts::ARCH.try_into().map_err(|_| {
-            Error::Config("Unsupported architecture for seccomp".into())
-        })?,
+        SeccompAction::KillThread, // Default: kill thread (not process) for unlisted syscalls
+        SeccompAction::Allow,       // Matched rules: allow
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|_| Error::Config("Unsupported architecture for seccomp".into()))?,
     )
     .map_err(|e| Error::Config(format!("Failed to create seccomp filter: {:?}", e)))?;
 
@@ -772,7 +777,10 @@ fn install_seccomp_filter() -> Result<()> {
     seccompiler::apply_filter(&bpf_prog)
         .map_err(|e| Error::Config(format!("Failed to apply seccomp filter: {:?}", e)))?;
 
-    info!("Seccomp-BPF filter installed ({} syscalls allowed)", allowed_syscalls.len());
+    info!(
+        "Seccomp-BPF filter installed ({} syscalls allowed)",
+        allowed_syscalls.len()
+    );
     Ok(())
 }
 

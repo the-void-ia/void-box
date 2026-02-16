@@ -8,9 +8,42 @@ use crate::{Error, Result};
 
 /// Default command allowlist for guest execution.
 pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
-    "sh", "bash", "claude-code", "node", "npm", "npx", "python3", "pip", "git", "curl", "wget",
-    "cat", "ls", "mkdir", "cp", "mv", "rm", "chmod", "find", "grep", "sed", "awk", "tr", "head",
-    "tail", "wc", "sort", "uniq", "env", "echo", "printf", "date", "touch", "tar", "gzip", "ip",
+    "sh",
+    "bash",
+    "claude-code",
+    "node",
+    "npm",
+    "npx",
+    "python3",
+    "pip",
+    "git",
+    "curl",
+    "wget",
+    "cat",
+    "ls",
+    "mkdir",
+    "cp",
+    "mv",
+    "rm",
+    "chmod",
+    "find",
+    "grep",
+    "sed",
+    "awk",
+    "tr",
+    "head",
+    "tail",
+    "wc",
+    "sort",
+    "uniq",
+    "env",
+    "echo",
+    "printf",
+    "date",
+    "touch",
+    "tar",
+    "gzip",
+    "ip",
     "test",
 ];
 
@@ -30,7 +63,7 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_virtual_memory: 512 * 1024 * 1024, // 512 MB
+            max_virtual_memory: 4096 * 1024 * 1024, // 4 GB (V8/Node.js needs large virtual address space)
             max_open_files: 1024,
             max_processes: 64,
             max_file_size: 100 * 1024 * 1024, // 100 MB
@@ -73,7 +106,7 @@ impl Default for SecurityConfig {
                 .collect(),
             resource_limits: ResourceLimits::default(),
             network_deny_list: vec!["169.254.0.0/16".to_string()],
-            max_connections_per_second: 10,
+            max_connections_per_second: 50,
             max_concurrent_connections: 64,
             seccomp: true,
         }

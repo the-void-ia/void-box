@@ -65,6 +65,38 @@ Interactive/demo style Claude-compatible session.
 cargo run --example claude_in_voidbox_example
 ```
 
+## hackernews
+
+HackerNews research agent with a real procedural-knowledge skill (`hackernews-api.md`)
+that teaches the agent HOW to use the HN API via curl + jq.
+
+Build a production initramfs (real `claude-code`):
+
+```bash
+CLAUDE_CODE_BIN=/path/to/claude scripts/build_guest_image.sh
+```
+
+Then set runtime image env:
+
+```bash
+export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
+export VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz
+```
+
+Run the HackerNews agent spec (Claude default):
+
+```bash
+cargo run --bin voidbox -- run --file examples/hackernews/hackernews_agent.yaml
+```
+
+Run with Ollama (no spec edits needed):
+
+```bash
+VOIDBOX_LLM_PROVIDER=ollama \
+VOIDBOX_LLM_MODEL=qwen2.5-coder:7b \
+cargo run --bin voidbox -- run --file examples/hackernews/hackernews_agent.yaml
+```
+
 ## playground_pipeline
 
 Observability-first pipeline for Grafana LGTM with OTLP export.

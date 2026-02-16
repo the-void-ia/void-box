@@ -105,23 +105,32 @@ impl VsockDevice {
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
         info!("vsock: sent ExecRequest, waiting for ExecResponse");
-        // Read response
-        let response_msg = Message::read_from_sync(&mut stream)?;
-
-        if response_msg.msg_type != MessageType::ExecResponse {
-            return Err(Error::Guest(format!(
-                "Unexpected response type: {:?}",
-                response_msg.msg_type
-            )));
+        // Read messages in a loop, discarding streaming ExecOutputChunk
+        // messages until we get the final ExecResponse. The guest-agent
+        // always streams stdout/stderr chunks during execution.
+        loop {
+            let msg = Message::read_from_sync(&mut stream)?;
+            match msg.msg_type {
+                MessageType::ExecOutputChunk => {
+                    // Discard streaming chunks in non-streaming mode
+                    continue;
+                }
+                MessageType::ExecResponse => {
+                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
+                    info!(
+                        "vsock: ExecResponse received exit_code={}",
+                        response.exit_code
+                    );
+                    return Ok(response);
+                }
+                other => {
+                    return Err(Error::Guest(format!(
+                        "Unexpected response type: {:?}",
+                        other
+                    )));
+                }
+            }
         }
-
-        let response: ExecResponse = serde_json::from_slice(&response_msg.payload)?;
-        info!(
-            "vsock: ExecResponse received exit_code={}",
-            response.exit_code
-        );
-
-        Ok(response)
     }
 
     /// Send an exec request and stream output chunks as they arrive.

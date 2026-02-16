@@ -1,0 +1,29 @@
+api_version: v1
+kind: pipeline
+name: quick-pipeline
+
+sandbox:
+  mode: auto
+  memory_mb: 512
+  vcpus: 1
+  network: true
+
+pipeline:
+  boxes:
+    - name: analyst
+      prompt: Extract key facts from the input.
+      skills:
+        - "agent:claude-code"
+      timeout_secs: 300
+
+    - name: writer
+      prompt: Turn facts into a concise executive summary.
+      skills:
+        - "agent:claude-code"
+      timeout_secs: 300
+
+  stages:
+    - type: box
+      name: analyst
+    - type: box
+      name: writer
