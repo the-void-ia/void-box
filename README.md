@@ -1,23 +1,43 @@
-# void-box
+<div align="center">
+  <img src="assets/logo/void-box.png" alt="void-box" width="200">
+  <h1>void-box</h1>
+  <p><strong>Composable agent runtime with hardware isolation</strong></p>
+  <p><code>VoidBox = Agent(Skills) + Environment</code></p>
 
-**Composable agent runtime with hardware isolation**
+  <a href="https://github.com/the-void-ia/void-box/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/the-void-ia/void-box/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/the-void-ia/void-box/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/rust-1.83%2B-orange?style=flat-square&logo=rust" alt="Rust 1.83+">
+</div>
 
-> A skill is a declared capability. A capability doesn't exist until it has an isolated boundary.
->
-> `VoidBox = Agent(Skills) + Environment`
+<br>
 
-## Status
+<p align="center">
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="#quick-start">Getting Started</a> ·
+  <a href="#observability">Observability</a>
+</p>
 
-v0 -- functional, tested (158+ tests), KVM + Ollama E2E verified. API is unstable.
+> [!NOTE]
+> **v0 preview** — Functional, 222+ tests passing, KVM + Ollama E2E verified. API may change.
 
-## Why void-box
+## What You Get
 
-- **Hardware isolation** -- KVM micro-VMs, not containers. Each agent runs in a fresh, disposable VM with its own kernel.
-- **Skills as first-class artifacts** -- Procedural knowledge (SKILL.md), MCP servers, CLI tools, and reasoning engines are declared and provisioned into the sandbox.
-- **Composable pipelines** -- Sequential `.pipe()`, parallel `.fan_out()`, and streaming output. Each stage boots a clean VM.
-- **Observability-first** -- OTLP traces and metrics, structured logs with trace correlation, guest telemetry via procfs.
+- **Hardware isolation** — KVM micro-VMs, not containers. Fresh VM per agent.
+- **Skill-native** — Procedural knowledge (SKILL.md), MCP servers, CLI tools. Compatible with [skills.sh](https://skills.sh) ecosystem.
+- **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, streaming output.
+- **Multi-LLM** — Claude, Ollama, or any OpenAI-compatible endpoint. Per-box model selection.
+- **Observability built-in** — OTLP traces/metrics, structured logs, guest telemetry via procfs.
+- **No root required** — Usermode SLIRP networking via smoltcp, no TAP devices.
 
-## Quick Start -- Rust Library
+## Quick Start
+
+### 1. Add dependency
+
+```bash
+cargo add void-box
+```
+
+### 2. Define skills and build a VoidBox
 
 ```rust
 use void_box::agent_box::VoidBox;
@@ -40,12 +60,16 @@ let researcher = VoidBox::new("hn_researcher")
     .network(true)
     .prompt("Analyze top HN stories for AI engineering trends")
     .build()?;
+```
 
+### 3. Run
+
+```rust
 let result = researcher.run(None).await?;
 println!("{}", result.claude_result.result_text);
 ```
 
-## Quick Start -- Spec File
+## Declarative Spec
 
 ```yaml
 api_version: v1
@@ -117,12 +141,12 @@ See [docs/architecture.md](docs/architecture.md) for the full component diagram,
 
 ## Security Model
 
-- **Session secret** -- 32-byte random token (getrandom), injected via kernel cmdline, required for all vsock messages
-- **Seccomp-BPF** -- Restricts VMM thread to minimum syscalls for KVM operation
-- **Command allowlist** -- Guest-agent only executes approved binaries
-- **Resource limits** -- setrlimit on guest processes (memory, open files, processes, file size)
-- **SLIRP rate limiting** -- Max concurrent connections, CIDR deny list
-- **No root required** -- Usermode networking via smoltcp, no TAP devices
+- **Session secret** — 32-byte random token (getrandom), injected via kernel cmdline, required for all vsock messages
+- **Seccomp-BPF** — Restricts VMM thread to minimum syscalls for KVM operation
+- **Command allowlist** — Guest-agent only executes approved binaries
+- **Resource limits** — setrlimit on guest processes (memory, open files, processes, file size)
+- **SLIRP rate limiting** — Max concurrent connections, CIDR deny list
+- **No root required** — Usermode networking via smoltcp, no TAP devices
 
 ## LLM Providers
 
@@ -134,10 +158,10 @@ See [docs/architecture.md](docs/architecture.md) for the full component diagram,
 
 ## Observability
 
-- **OTLP traces** -- Per-box spans, tool call events, pipeline-level trace
-- **Metrics** -- Token counts, cost, duration per stage
-- **Structured logs** -- `[vm:NAME]` prefixed, trace-correlated
-- **Guest telemetry** -- procfs metrics (CPU, memory) exported to host via vsock
+- **OTLP traces** — Per-box spans, tool call events, pipeline-level trace
+- **Metrics** — Token counts, cost, duration per stage
+- **Structured logs** — `[vm:NAME]` prefixed, trace-correlated
+- **Guest telemetry** — procfs metrics (CPU, memory) exported to host via vsock
 
 Enable with `--features opentelemetry` and set `VOIDBOX_OTLP_ENDPOINT`.
 
@@ -160,7 +184,20 @@ void-box-protocol/     Wire format types (host ↔ guest)
 claudio/               Mock claude-code for testing
 ```
 
-## Running
+## Examples
+
+| Example | Description |
+|---|---|
+| `quick_demo` | Two-stage analyst/strategist pipeline |
+| `trading_pipeline` | Four-stage sequential financial pipeline with local skills |
+| `parallel_pipeline` | Diamond topology with `fan_out`, per-box models, streaming |
+| `ollama_local` | Single box with local Ollama model |
+| `remote_skills` | Pulls skills from skills.sh repositories |
+| `claude_workflow` | Workflow plan/apply pattern |
+| `claude_in_voidbox_example` | Interactive Claude session in sandbox |
+| `boot_diag` | VM boot diagnostics |
+
+## Running & Testing
 
 ### Mock mode (no KVM required)
 
@@ -200,20 +237,7 @@ VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
 cargo run --example parallel_pipeline
 ```
 
-## Examples
-
-| Example | Description |
-|---|---|
-| `quick_demo` | Two-stage analyst/strategist pipeline |
-| `trading_pipeline` | Four-stage sequential financial pipeline with local skills |
-| `parallel_pipeline` | Diamond topology with `fan_out`, per-box models, streaming |
-| `ollama_local` | Single box with local Ollama model |
-| `remote_skills` | Pulls skills from skills.sh repositories |
-| `claude_workflow` | Workflow plan/apply pattern |
-| `claude_in_voidbox_example` | Interactive Claude session in sandbox |
-| `boot_diag` | VM boot diagnostics |
-
-## Testing
+### Tests
 
 ```bash
 cargo test --lib                      # Unit tests
@@ -229,12 +253,12 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
 ## Troubleshooting
 
-**`/dev/kvm` permission denied** -- Add your user to the `kvm` group and re-login.
+**`/dev/kvm` permission denied** — Add your user to the `kvm` group and re-login.
 
-**`Not logged in`** -- Use `OLLAMA_MODEL=...` for local inference or set `ANTHROPIC_API_KEY`.
+**`Not logged in`** — Use `OLLAMA_MODEL=...` for local inference or set `ANTHROPIC_API_KEY`.
 
-**Parallel stages timeout** -- Use the same Ollama model for all parallel boxes, or increase `STAGE_TIMEOUT_SECS=600`.
+**Parallel stages timeout** — Use the same Ollama model for all parallel boxes, or increase `STAGE_TIMEOUT_SECS=600`.
 
 ## License
 
-Apache-2.0
+Apache-2.0 · [The Void Platform](https://github.com/the-void-ia)
