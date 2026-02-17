@@ -602,7 +602,7 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 // Shutdown
                 eprintln!("Shutdown requested");
                 unsafe {
-                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF as i32);
+                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
                 }
                 return Ok(());
             }
@@ -1223,8 +1223,7 @@ fn read_netdev() -> (u64, u64) {
     };
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("eth0:") {
-            let after_colon = &trimmed["eth0:".len()..];
+        if let Some(after_colon) = trimmed.strip_prefix("eth0:") {
             let fields: Vec<&str> = after_colon.split_whitespace().collect();
             let rx = fields
                 .first()

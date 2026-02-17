@@ -38,7 +38,17 @@ fn kvm_available() -> bool {
 }
 
 fn vsock_available() -> bool {
-    std::path::Path::new("/dev/vhost-vsock").exists()
+    let path = std::path::Path::new("/dev/vhost-vsock");
+    // Check existence and that we can actually open it (not just EACCES)
+    match std::fs::File::open(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+            eprintln!("skipping: /dev/vhost-vsock exists but is not accessible: {e}");
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
