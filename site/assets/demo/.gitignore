@@ -1,0 +1,4 @@
+# VHS tape and simulation script — local-only tooling for generating the demo GIF.
+# The generated GIF lives in site/assets/img/ and IS tracked.
+*
+!.gitignore

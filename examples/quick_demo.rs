@@ -1,4 +1,4 @@
-//! Quick Demo: Skill + Environment = Box
+//! Quick Demo: Agent(Skills) + Isolation = VoidBox
 //!
 //! A minimal example showing the core void-box abstraction:
 //! each Box is an isolated KVM micro-VM with declared skills and a prompt.
