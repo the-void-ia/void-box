@@ -178,13 +178,11 @@ pub fn load_spec(path: &Path) -> Result<RunSpec> {
         .unwrap_or(false);
 
     let spec: RunSpec = if is_yaml {
-        serde_yaml::from_str(&raw).map_err(|e| {
-            Error::Config(format!("invalid YAML spec {}: {}", path.display(), e))
-        })?
+        serde_yaml::from_str(&raw)
+            .map_err(|e| Error::Config(format!("invalid YAML spec {}: {}", path.display(), e)))?
     } else {
-        serde_json::from_str(&raw).map_err(|e| {
-            Error::Config(format!("invalid JSON spec {}: {}", path.display(), e))
-        })?
+        serde_json::from_str(&raw)
+            .map_err(|e| Error::Config(format!("invalid JSON spec {}: {}", path.display(), e)))?
     };
 
     validate_spec(&spec)?;

@@ -763,7 +763,7 @@ fn install_seccomp_filter() -> Result<()> {
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::KillThread, // Default: kill thread (not process) for unlisted syscalls
-        SeccompAction::Allow,       // Matched rules: allow
+        SeccompAction::Allow,      // Matched rules: allow
         std::env::consts::ARCH
             .try_into()
             .map_err(|_| Error::Config("Unsupported architecture for seccomp".into()))?,
