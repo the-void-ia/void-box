@@ -11,19 +11,14 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// Log levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
     Trace = 0,
     Debug = 1,
+    #[default]
     Info = 2,
     Warn = 3,
     Error = 4,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
 }
 
 impl std::fmt::Display for LogLevel {

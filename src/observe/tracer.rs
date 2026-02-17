@@ -104,20 +104,15 @@ impl SpanContext {
 }
 
 /// Status of a span
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub enum SpanStatus {
     /// Unset status
+    #[default]
     Unset,
     /// Operation completed successfully
     Ok,
     /// Operation failed with error
     Error(String),
-}
-
-impl Default for SpanStatus {
-    fn default() -> Self {
-        Self::Unset
-    }
 }
 
 /// A span representing a unit of work

@@ -101,22 +101,18 @@ fn configure_cpuid(vm: &Vm, vcpu_fd: &VcpuFd) -> Result<()> {
     let mut cpuid = vm
         .kvm()
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
-        .map_err(|e| Error::Kvm(e))?;
+        .map_err(Error::Kvm)?;
 
     // Customize CPUID entries if needed
     // For now, use the host-supported values
     for entry in cpuid.as_mut_slice().iter_mut() {
-        match entry.function {
-            // Processor brand string, etc.
-            1 => {
-                // Clear hypervisor bit if desired (optional)
-                // entry.ecx &= !(1 << 31);
-            }
-            _ => {}
+        if entry.function == 1 {
+            // Clear hypervisor bit if desired (optional)
+            // entry.ecx &= !(1 << 31);
         }
     }
 
-    vcpu_fd.set_cpuid2(&cpuid).map_err(|e| Error::Kvm(e))?;
+    vcpu_fd.set_cpuid2(&cpuid).map_err(Error::Kvm)?;
     debug!("Configured CPUID");
 
     Ok(())
@@ -124,7 +120,7 @@ fn configure_cpuid(vm: &Vm, vcpu_fd: &VcpuFd) -> Result<()> {
 
 /// Configure special registers (segment registers, control registers, etc.)
 fn configure_sregs(vcpu_fd: &VcpuFd, _memory_size: u64) -> Result<()> {
-    let mut sregs = vcpu_fd.get_sregs().map_err(|e| Error::Kvm(e))?;
+    let mut sregs = vcpu_fd.get_sregs().map_err(Error::Kvm)?;
 
     // Set up code segment
     sregs.cs.base = 0;
@@ -166,7 +162,7 @@ fn configure_sregs(vcpu_fd: &VcpuFd, _memory_size: u64) -> Result<()> {
     // for the transition to long mode
     sregs.cr3 = setup_page_tables_address();
 
-    vcpu_fd.set_sregs(&sregs).map_err(|e| Error::Kvm(e))?;
+    vcpu_fd.set_sregs(&sregs).map_err(Error::Kvm)?;
     debug!("Configured special registers");
 
     Ok(())
@@ -174,21 +170,15 @@ fn configure_sregs(vcpu_fd: &VcpuFd, _memory_size: u64) -> Result<()> {
 
 /// Configure general purpose registers
 fn configure_regs(vcpu_fd: &VcpuFd, entry_point: u64) -> Result<()> {
-    let mut regs = kvm_regs::default();
+    let regs = kvm_regs {
+        rip: entry_point,
+        rsp: 0,
+        rsi: crate::vmm::kvm::layout::BOOT_PARAMS_ADDR.raw_value(),
+        rflags: 0x2,
+        ..Default::default()
+    };
 
-    // Set instruction pointer to kernel entry
-    regs.rip = entry_point;
-
-    // Set up initial stack (kernel will set up its own)
-    regs.rsp = 0;
-
-    // Boot protocol: RSI points to boot params (zero page)
-    regs.rsi = crate::vmm::kvm::layout::BOOT_PARAMS_ADDR.raw_value();
-
-    // Flags: interrupts disabled, reserved bit 1 set
-    regs.rflags = 0x2;
-
-    vcpu_fd.set_regs(&regs).map_err(|e| Error::Kvm(e))?;
+    vcpu_fd.set_regs(&regs).map_err(Error::Kvm)?;
     debug!(
         "Configured registers: RIP={:#x}, RSI={:#x}",
         regs.rip, regs.rsi
@@ -386,8 +376,8 @@ mod tests {
     #[test]
     fn test_segment_constants() {
         // Verify selectors are reasonable
-        assert!(x86_64::CODE_SEG_SELECTOR > 0);
-        assert!(x86_64::DATA_SEG_SELECTOR > 0);
+        const { assert!(x86_64::CODE_SEG_SELECTOR > 0) };
+        const { assert!(x86_64::DATA_SEG_SELECTOR > 0) };
         assert_ne!(x86_64::CODE_SEG_SELECTOR, x86_64::DATA_SEG_SELECTOR);
     }
 

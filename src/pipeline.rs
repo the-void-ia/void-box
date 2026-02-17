@@ -93,7 +93,7 @@ impl PipelineResult {
 /// A single stage in a pipeline — either one Box or multiple Boxes in parallel.
 enum PipelineStage {
     /// A single Box executed sequentially.
-    Single(VoidBox),
+    Single(Box<VoidBox>),
     /// Multiple Boxes executed in parallel (fan-out). Their outputs are merged
     /// as a JSON array for the next stage.
     Parallel(Vec<VoidBox>),
@@ -110,7 +110,7 @@ impl Pipeline {
     pub fn from(first: VoidBox) -> Self {
         Self {
             name: first.name.clone(),
-            stages: vec![PipelineStage::Single(first)],
+            stages: vec![PipelineStage::Single(Box::new(first))],
         }
     }
 
@@ -118,13 +118,13 @@ impl Pipeline {
     pub fn named(name: impl Into<String>, first: VoidBox) -> Self {
         Self {
             name: name.into(),
-            stages: vec![PipelineStage::Single(first)],
+            stages: vec![PipelineStage::Single(Box::new(first))],
         }
     }
 
     /// Pipe the output of the previous stage into the next Box.
     pub fn pipe(mut self, next: VoidBox) -> Self {
-        self.stages.push(PipelineStage::Single(next));
+        self.stages.push(PipelineStage::Single(Box::new(next)));
         self
     }
 

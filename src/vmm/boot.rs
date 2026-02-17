@@ -382,8 +382,8 @@ mod tests {
 
     #[test]
     fn test_cmdline_max_size() {
-        assert!(layout::CMDLINE_MAX_SIZE > 0);
-        assert!(layout::CMDLINE_MAX_SIZE <= 4096);
+        const { assert!(layout::CMDLINE_MAX_SIZE > 0) };
+        const { assert!(layout::CMDLINE_MAX_SIZE <= 4096) };
     }
 
     #[test]

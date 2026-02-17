@@ -63,14 +63,14 @@ impl Vm {
         let memory_size = (memory_mb as u64) * 1024 * 1024;
 
         // Open /dev/kvm
-        let kvm = Kvm::new().map_err(|e| Error::Kvm(e))?;
+        let kvm = Kvm::new().map_err(Error::Kvm)?;
         debug!("KVM API version: {}", kvm.get_api_version());
 
         // Check required extensions
         Self::check_extensions(&kvm)?;
 
         // Create the VM
-        let vm_fd = kvm.create_vm().map_err(|e| Error::Kvm(e))?;
+        let vm_fd = kvm.create_vm().map_err(Error::Kvm)?;
         debug!("Created KVM VM");
 
         // Create guest memory
@@ -88,7 +88,7 @@ impl Vm {
         vm.register_memory()?;
 
         // Create irqchip (for interrupt handling)
-        vm.vm_fd.create_irq_chip().map_err(|e| Error::Kvm(e))?;
+        vm.vm_fd.create_irq_chip().map_err(Error::Kvm)?;
         debug!("Created IRQ chip");
 
         // Create PIT (Programmable Interval Timer)
@@ -96,9 +96,7 @@ impl Vm {
             flags: KVM_PIT_SPEAKER_DUMMY,
             ..Default::default()
         };
-        vm.vm_fd
-            .create_pit2(pit_config)
-            .map_err(|e| Error::Kvm(e))?;
+        vm.vm_fd.create_pit2(pit_config).map_err(Error::Kvm)?;
         debug!("Created PIT");
 
         Ok(vm)
@@ -151,7 +149,7 @@ impl Vm {
             unsafe {
                 self.vm_fd
                     .set_user_memory_region(memory_region)
-                    .map_err(|e| Error::Kvm(e))?;
+                    .map_err(Error::Kvm)?;
             }
 
             debug!(
@@ -187,7 +185,7 @@ impl Vm {
 
     /// Create a vCPU for this VM
     pub fn create_vcpu(&self, id: u64) -> Result<kvm_ioctls::VcpuFd> {
-        self.vm_fd.create_vcpu(id).map_err(|e| Error::Kvm(e))
+        self.vm_fd.create_vcpu(id).map_err(Error::Kvm)
     }
 }
 
@@ -207,6 +205,6 @@ mod tests {
         // Verify memory layout makes sense
         assert!(layout::KERNEL_LOAD_ADDR.raw_value() > layout::BOOT_PARAMS_ADDR.raw_value());
         assert!(layout::INITRAMFS_LOAD_ADDR.raw_value() > layout::KERNEL_LOAD_ADDR.raw_value());
-        assert!(layout::MMIO_GAP_START < layout::MMIO_GAP_END);
+        const { assert!(layout::MMIO_GAP_START < layout::MMIO_GAP_END) };
     }
 }

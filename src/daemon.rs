@@ -391,6 +391,7 @@ fn event_with_env(
     e
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event_skill(
     run_id: &str,
     event_type: &str,
@@ -499,9 +500,7 @@ fn plan_events_from_spec(run_id: &str, environment_id: &str, spec: &RunSpec) -> 
 }
 
 fn split_skill(raw: &str) -> Option<(&str, &str)> {
-    let mut p = raw.splitn(2, ':');
-    let t = p.next()?;
-    let id = p.next()?;
+    let (t, id) = raw.split_once(':')?;
     Some((t, id))
 }
 

@@ -140,6 +140,7 @@ impl VirtioVsockMmio {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn setup_vhost(
         cid: u32,
         require_vhost: bool,
@@ -194,11 +195,9 @@ impl VirtioVsockMmio {
                     kick[i] = Some(f);
                 }
                 Err(e) => {
-                    for j in 0..i {
-                        if let Some(f) = kick[j] {
-                            unsafe {
-                                libc::close(f);
-                            }
+                    for f in kick.iter().take(i).flatten() {
+                        unsafe {
+                            libc::close(*f);
                         }
                     }
                     unsafe {
@@ -214,18 +213,14 @@ impl VirtioVsockMmio {
                     call[i] = Some(f);
                 }
                 Err(e) => {
-                    for j in 0..=i {
-                        if let Some(f) = kick[j] {
-                            unsafe {
-                                libc::close(f);
-                            }
+                    for f in kick.iter().take(i + 1).flatten() {
+                        unsafe {
+                            libc::close(*f);
                         }
                     }
-                    for j in 0..i {
-                        if let Some(f) = call[j] {
-                            unsafe {
-                                libc::close(f);
-                            }
+                    for f in call.iter().take(i).flatten() {
+                        unsafe {
+                            libc::close(*f);
                         }
                     }
                     unsafe {
@@ -339,7 +334,7 @@ impl VirtioVsockMmio {
                 .map_err(|e| Error::Device(format!("get_host_address: {}", e)))?;
             let reg = unsafe { &mut *regions_ptr.add(i) };
             reg.guest_phys_addr = region.start_addr().raw_value();
-            reg.memory_size = region.len() as u64;
+            reg.memory_size = region.len();
             reg.userspace_addr = host_addr as u64;
         }
 
@@ -363,6 +358,7 @@ impl VirtioVsockMmio {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_vring(
         &self,
         index: u32,
@@ -501,7 +497,7 @@ impl VirtioVsockMmio {
             mmio::INTERRUPT_STATUS => self.interrupt_status,
             mmio::STATUS => self.status,
             mmio::CONFIG_GENERATION => self.config_generation,
-            o if o >= mmio::CONFIG && o < mmio::CONFIG + 8 => {
+            o if (mmio::CONFIG..mmio::CONFIG + 8).contains(&o) => {
                 let off = (o - mmio::CONFIG) as usize;
                 let cid64 = self.cid as u64;
                 if off == 0 {
@@ -676,18 +672,14 @@ impl Drop for VirtioVsockMmio {
                 libc::close(fd);
             }
         }
-        for fd in &self.kick_eventfds {
-            if let Some(f) = fd {
-                unsafe {
-                    libc::close(*f);
-                }
+        for f in self.kick_eventfds.iter().flatten() {
+            unsafe {
+                libc::close(*f);
             }
         }
-        for fd in &self._call_eventfds {
-            if let Some(f) = fd {
-                unsafe {
-                    libc::close(*f);
-                }
+        for f in self._call_eventfds.iter().flatten() {
+            unsafe {
+                libc::close(*f);
             }
         }
     }

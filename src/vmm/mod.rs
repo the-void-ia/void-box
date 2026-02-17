@@ -844,8 +844,8 @@ fn vsock_irq_thread(
             break;
         }
 
-        for i in 0..nfds as usize {
-            let idx = events[i].u64 as usize;
+        for event in events.iter().take(nfds as usize) {
+            let idx = event.u64 as usize;
             if idx < call_fds.len() {
                 // Consume the eventfd signal
                 let mut buf = [0u8; 8];

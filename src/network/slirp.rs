@@ -871,6 +871,7 @@ impl SlirpStack {
 }
 
 /// Build a TCP packet (free function to avoid borrow issues with &self methods)
+#[allow(clippy::too_many_arguments)]
 fn build_tcp_packet_static(
     src_ip: Ipv4Address,
     dst_ip: Ipv4Address,

@@ -264,7 +264,7 @@ impl VirtioNetDevice {
             mmio::STATUS => self.status,
             mmio::CONFIG_GENERATION => self.config_generation,
             // Device config (MAC address at offset 0x100)
-            o if o >= mmio::CONFIG && o < mmio::CONFIG + 6 => {
+            o if (mmio::CONFIG..mmio::CONFIG + 6).contains(&o) => {
                 let idx = (o - mmio::CONFIG) as usize;
                 self.mac[idx] as u32
             }

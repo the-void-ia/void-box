@@ -46,12 +46,13 @@ const SLIRP_GATEWAY: &str = "10.0.2.2";
 ///
 /// Determines which LLM service the agent talks to. The provider is
 /// translated into environment variables injected into the guest VM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub enum LlmProvider {
     /// Anthropic Claude API (default).
     ///
     /// Requires `ANTHROPIC_API_KEY` in the host environment.
     /// No extra env vars are injected.
+    #[default]
     Claude,
 
     /// Local Ollama instance running on the host.
@@ -79,12 +80,6 @@ pub enum LlmProvider {
         /// Model name override.
         model: Option<String>,
     },
-}
-
-impl Default for LlmProvider {
-    fn default() -> Self {
-        LlmProvider::Claude
-    }
 }
 
 impl LlmProvider {

@@ -88,9 +88,9 @@ pub struct Sandbox {
 
 enum SandboxInner {
     /// Local KVM-based sandbox
-    Local(LocalSandbox),
+    Local(Box<LocalSandbox>),
     /// Mock sandbox for testing
-    Mock(MockSandbox),
+    Mock(Box<MockSandbox>),
 }
 
 impl Sandbox {
@@ -481,11 +481,11 @@ impl SandboxBuilder {
         let inner = match self.sandbox_type {
             SandboxType::Local => {
                 let local = LocalSandbox::new(self.config.clone())?;
-                SandboxInner::Local(local)
+                SandboxInner::Local(Box::new(local))
             }
             SandboxType::Mock => {
                 let mock = MockSandbox::new(self.config.clone());
-                SandboxInner::Mock(mock)
+                SandboxInner::Mock(Box::new(mock))
             }
         };
 
@@ -590,7 +590,7 @@ impl MockSandbox {
                 // - plan emits one JSON-like line
                 // - apply reads stdin and echoes summary
                 // - prompt mode (-p ... --output-format stream-json) returns deterministic JSONL
-                let first = args.first().map(|s| *s).unwrap_or("");
+                let first = args.first().copied().unwrap_or("");
                 if first == "-p" {
                     let output_format = args
                         .windows(2)

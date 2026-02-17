@@ -258,16 +258,14 @@ impl Scheduler {
             } else {
                 (Vec::new(), 1)
             }
-        } else {
-            if let Some(last_step) = plan.steps.last() {
-                if let Some(step_output) = outputs.get(last_step) {
-                    (step_output.stdout.clone(), step_output.exit_code)
-                } else {
-                    (Vec::new(), 1)
-                }
+        } else if let Some(last_step) = plan.steps.last() {
+            if let Some(step_output) = outputs.get(last_step) {
+                (step_output.stdout.clone(), step_output.exit_code)
             } else {
-                (Vec::new(), 0)
+                (Vec::new(), 1)
             }
+        } else {
+            (Vec::new(), 0)
         };
 
         let duration_ms = start_time.elapsed().as_millis() as u64;

@@ -99,11 +99,7 @@ impl TapDevice {
 
         unsafe {
             // Copy name into the ifreq name field
-            libc::strncpy(
-                ifr.ifr_name.as_mut_ptr(),
-                cname.as_ptr(),
-                libc::IFNAMSIZ as usize,
-            );
+            libc::strncpy(ifr.ifr_name.as_mut_ptr(), cname.as_ptr(), libc::IFNAMSIZ);
 
             // Set flags to create a TAP device without extra packet info header.
             ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
