@@ -12,7 +12,7 @@
 
   <!-- CI badge (official GitHub Actions badge) -->
   <a href="https://github.com/the-void-ia/void-box/actions/workflows/ci.yml">
-    <img src="https://github.com/the-void-ia/void-box/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI">
+    <img src="https://github.com/the-void-ia/void-box/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI">
   </a>
 
   <a href="https://github.com/the-void-ia/void-box/blob/main/LICENSE">
