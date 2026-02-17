@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Declarative YAML Specs | void-box guide</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../">Home</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Declarative YAML Specs</h1>
+      <p>Instead of writing Rust code, you can define agents and pipelines as YAML files and run them directly with the CLI.</p>
+
+      <h2>1. Agent spec</h2>
+      <p>A single agent spec declares the sandbox, LLM provider, prompt, and skills:</p>
+<pre><code class="language-yaml"><span class="tok-kw">api_version:</span> v1
+<span class="tok-kw">kind:</span> agent
+<span class="tok-kw">name:</span> hn_researcher
+
+<span class="tok-kw">sandbox:</span>
+  <span class="tok-kw">mode:</span> auto
+  <span class="tok-kw">memory_mb:</span> <span class="tok-num">1024</span>
+  <span class="tok-kw">vcpus:</span> <span class="tok-num">1</span>
+  <span class="tok-kw">network:</span> <span class="tok-num">true</span>
+
+<span class="tok-kw">llm:</span>
+  <span class="tok-kw">provider:</span> claude
+
+<span class="tok-kw">agent:</span>
+  <span class="tok-kw">prompt:</span> <span class="tok-str">&gt;
+    Analyze current HackerNews top stories and produce
+    a tactical briefing for AI engineering teams.</span>
+  <span class="tok-kw">skills:</span>
+    - <span class="tok-str">"file:examples/hackernews/skills/hackernews-api.md"</span>
+  <span class="tok-kw">timeout_secs:</span> <span class="tok-num">600</span></code></pre>
+
+      <h2>2. Pipeline spec</h2>
+      <p>A pipeline spec chains multiple boxes with explicit stage ordering:</p>
+<pre><code class="language-yaml"><span class="tok-kw">api_version:</span> v1
+<span class="tok-kw">kind:</span> pipeline
+<span class="tok-kw">name:</span> quick-pipeline
+
+<span class="tok-kw">sandbox:</span>
+  <span class="tok-kw">mode:</span> auto
+  <span class="tok-kw">memory_mb:</span> <span class="tok-num">512</span>
+  <span class="tok-kw">network:</span> <span class="tok-num">true</span>
+
+<span class="tok-kw">pipeline:</span>
+  <span class="tok-kw">boxes:</span>
+    - <span class="tok-kw">name:</span> analyst
+      <span class="tok-kw">prompt:</span> <span class="tok-str">Extract key facts from the input.</span>
+      <span class="tok-kw">skills:</span> [<span class="tok-str">"agent:claude-code"</span>]
+      <span class="tok-kw">timeout_secs:</span> <span class="tok-num">300</span>
+
+    - <span class="tok-kw">name:</span> writer
+      <span class="tok-kw">prompt:</span> <span class="tok-str">Turn facts into a concise executive summary.</span>
+      <span class="tok-kw">skills:</span> [<span class="tok-str">"agent:claude-code"</span>]
+      <span class="tok-kw">timeout_secs:</span> <span class="tok-num">300</span>
+
+  <span class="tok-kw">stages:</span>
+    - <span class="tok-kw">type:</span> box
+      <span class="tok-kw">name:</span> analyst
+    - <span class="tok-kw">type:</span> box
+      <span class="tok-kw">name:</span> writer</code></pre>
+
+      <h2>3. Running with the CLI</h2>
+      <p>Use <code>void-box run</code> to execute any spec file:</p>
+      <div class="code-wrap">
+        <div class="code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span>terminal</span>
+        </div>
+        <div class="code-run"><span>$</span> <code>void-box run examples/hackernews/hackernews_agent.yaml</code></div>
+        <div class="code-run"><span>$</span> <code>void-box run examples/specs/pipeline.yaml</code></div>
+      </div>
+
+      <h2>4. Environment overrides</h2>
+      <p>Override the LLM provider at runtime without changing the spec:</p>
+      <div class="code-wrap">
+        <div class="code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span>terminal</span>
+        </div>
+        <div class="code-run"><span>$</span> <code>VOIDBOX_LLM_PROVIDER=ollama OLLAMA_MODEL=phi4-mini \</code></div>
+        <div class="code-run"><span>&nbsp;</span> <code>void-box run examples/specs/pipeline.yaml</code></div>
+      </div>
+      <p>Environment variables take precedence over spec-level <code>llm.provider</code> settings.</p>
+
+      <h2>5. Next</h2>
+      <p>Learn how to <a href="../pipeline-composition/">compose pipelines in Rust</a>, or set up <a href="../ollama-local/">local LLMs with Ollama</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">← Back to guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

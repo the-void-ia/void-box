@@ -9,11 +9,11 @@
 <body>
   <header class="site">
     <div class="wrap inner">
-      <a class="brand" href="../"><img src="../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a>
+      <a class="brand" href="../"><img src="../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
       <nav class="top">
         <a href="../">Home</a>
-        <a href="../guides/">Guides</a>
         <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
       </nav>
     </div>
   </header>
@@ -22,12 +22,27 @@
     <section>
       <h1>Docs</h1>
       <p>Start with the architecture and runtime model, then move to examples and guides.</p>
-      <div class="list">
-        <a href="architecture/"><strong>Architecture</strong><span>Host/guest execution model and security layers.</span></a>
-        <a href="runtime/"><strong>Runtime Model</strong><span>Claude Code first-class runtime and provider backend path.</span></a>
-        <a href="cli-tui/"><strong>CLI + TUI</strong><span>Command surface and current interaction model.</span></a>
-        <a href="events-observability/"><strong>Events + Observability</strong><span>Run event schema and persistence model.</span></a>
+
+      <h2>Quickstart</h2>
+      <div class="code-wrap">
+        <div class="code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span>terminal</span>
+        </div>
+        <div class="code-run"><span>$</span> <code>cargo install void-box</code></div>
+        <div class="code-run"><span>$</span> <code>void-box run examples/hackernews/hackernews_agent.yaml</code></div>
       </div>
+
+      <h2>Reference</h2>
+      <div class="list">
+        <a href="architecture/"><strong>Architecture</strong><span>Host/guest execution model, KVM isolation boundary, and security layers.</span></a>
+        <a href="runtime/"><strong>Runtime Model</strong><span>Claude Code as the canonical runtime, provider backend selection, and Ollama compatibility.</span></a>
+        <a href="cli-tui/"><strong>CLI + TUI</strong><span>Command surface (<code>run</code>, <code>validate</code>, <code>status</code>, <code>logs</code>) and TUI interaction model.</span></a>
+        <a href="events-observability/"><strong>Events + Observability</strong><span>Structured run events, session persistence, and traceability.</span></a>
+      </div>
+
+      <h2>Next</h2>
+      <p>See the <a href="../guides/">Guides</a> for practical walkthroughs: pipeline composition, YAML specs, local LLMs, and agent sandboxing.</p>
     </section>
   </main>
 

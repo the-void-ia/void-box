@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pipeline Composition | void-box guide</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../">Home</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Pipeline Composition</h1>
+      <p>Pipelines chain multiple Boxes into a sequence where the output of one stage becomes the input of the next. Each stage boots a fresh micro-VM, so there are no state leaks between stages.</p>
+
+      <h2>1. Why pipelines</h2>
+      <p>Running everything in a single agent context means a long-lived VM accumulates side effects: temp files, environment mutations, leaked credentials in memory. Pipelines solve this by giving each stage a clean slate.</p>
+      <ul>
+        <li>Fresh VM per stage — no cross-contamination.</li>
+        <li>Explicit data flow via <code>/workspace/input.json</code>.</li>
+        <li>Independent timeouts and resource limits per stage.</li>
+      </ul>
+
+      <h2>2. Simple 2-stage pipeline</h2>
+      <p>The <code>quick_demo.rs</code> example chains an analyst and a strategist:</p>
+<pre><code class="language-rust"><span class="tok-kw">use</span> void_box::agent_box::VoidBox;
+<span class="tok-kw">use</span> void_box::pipeline::Pipeline;
+<span class="tok-kw">use</span> void_box::skill::Skill;
+
+<span class="tok-kw">let</span> reasoning = <span class="tok-ty">Skill</span>::<span class="tok-fn">agent</span>(<span class="tok-str">"claude-code"</span>);
+
+<span class="tok-kw">let</span> analyst = <span class="tok-ty">VoidBox</span>::<span class="tok-fn">new</span>(<span class="tok-str">"analyst"</span>)
+    .<span class="tok-fn">skill</span>(reasoning.clone())
+    .<span class="tok-fn">prompt</span>(<span class="tok-str">"List 3 bullish and 3 bearish signals for AAPL."</span>)
+    .<span class="tok-fn">build</span>()?;
+
+<span class="tok-kw">let</span> strategist = <span class="tok-ty">VoidBox</span>::<span class="tok-fn">new</span>(<span class="tok-str">"strategist"</span>)
+    .<span class="tok-fn">skill</span>(reasoning.clone())
+    .<span class="tok-fn">prompt</span>(<span class="tok-str">"Read /workspace/input.json and produce a BUY/SELL/HOLD verdict."</span>)
+    .<span class="tok-fn">build</span>()?;
+
+<span class="tok-kw">let</span> result = <span class="tok-ty">Pipeline</span>::<span class="tok-fn">named</span>(<span class="tok-str">"quick_demo"</span>, analyst)
+    .<span class="tok-fn">pipe</span>(strategist)
+    .<span class="tok-fn">run</span>().<span class="tok-kw">await</span>?;</code></pre>
+
+      <h2>3. Fan-out (parallel stages)</h2>
+      <p>Use <code>.fan_out()</code> to run multiple Boxes in parallel. All receive the same input from the previous stage.</p>
+<pre><code class="language-rust"><span class="tok-kw">let</span> result = <span class="tok-ty">Pipeline</span>::<span class="tok-fn">named</span>(<span class="tok-str">"research"</span>, researcher)
+    .<span class="tok-fn">fan_out</span>(<span class="tok-kw">vec!</span>[analyst, writer]) <span class="tok-com">// parallel</span>
+    .<span class="tok-fn">run</span>().<span class="tok-kw">await</span>?;</code></pre>
+
+      <h2>4. Pipeline results API</h2>
+      <p>The <code>PipelineResult</code> returned by <code>.run()</code> gives you structured access to every stage:</p>
+<pre><code class="language-rust">println!(<span class="tok-str">"Success: {}"</span>, result.<span class="tok-fn">success</span>());
+println!(<span class="tok-str">"Cost:    ${:.4}"</span>, result.<span class="tok-fn">total_cost_usd</span>());
+println!(<span class="tok-str">"Stages:  {}"</span>, result.stages.len());
+
+<span class="tok-kw">for</span> stage <span class="tok-kw">in</span> &amp;result.stages {
+    println!(<span class="tok-str">"  {} — {} tokens"</span>,
+        stage.box_name,
+        stage.claude_result.input_tokens + stage.claude_result.output_tokens);
+}</code></pre>
+
+      <h2>5. Next</h2>
+      <p>Define pipelines declaratively with <a href="../yaml-specs/">YAML Specs</a>, or run agents with <a href="../ollama-local/">local LLMs via Ollama</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">← Back to guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

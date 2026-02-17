@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Local LLMs with Ollama | void-box guide</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../">Home</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Local LLMs with Ollama</h1>
+      <p>VoidBox can use local models served by Ollama instead of the Anthropic API. The guest VM reaches Ollama through SLIRP networking — no API key required.</p>
+
+      <h2>1. Prerequisites</h2>
+      <ul>
+        <li>Install Ollama: <a href="https://ollama.com" target="_blank" rel="noreferrer">ollama.com</a></li>
+        <li>Pull a model: <code>ollama pull phi4-mini</code></li>
+        <li>Ensure Ollama is running: <code>ollama serve</code></li>
+        <li>Build the guest initramfs (see <a href="../../docs/architecture/">Architecture</a>)</li>
+      </ul>
+
+      <h2>2. How SLIRP networking works</h2>
+      <p>The guest VM uses SLIRP usermode networking. The gateway IP <code>10.0.2.2</code> is transparently mapped to <code>127.0.0.1</code> on the host:</p>
+<pre><code> Guest VM                        Host
+ ┌──────────────┐               ┌──────────────┐
+ │ claude-code   │──SLIRP──────>│ Ollama:11434 │
+ │ (stream-json) │  10.0.2.2    │ (localhost)   │
+ └──────────────┘               └──────────────┘</code></pre>
+      <p>Inside the guest, <code>ANTHROPIC_BASE_URL=http://10.0.2.2:11434</code> reaches the host's Ollama process.</p>
+
+      <h2>3. Code example</h2>
+<pre><code class="language-rust"><span class="tok-kw">use</span> void_box::agent_box::VoidBox;
+<span class="tok-kw">use</span> void_box::llm::LlmProvider;
+<span class="tok-kw">use</span> void_box::skill::Skill;
+
+<span class="tok-kw">let</span> model = std::env::var(<span class="tok-str">"OLLAMA_MODEL"</span>)
+    .unwrap_or_else(|_| <span class="tok-str">"phi4-mini"</span>.into());
+
+<span class="tok-kw">let</span> agent = <span class="tok-ty">VoidBox</span>::<span class="tok-fn">new</span>(<span class="tok-str">"ollama_demo"</span>)
+    .<span class="tok-fn">llm</span>(<span class="tok-ty">LlmProvider</span>::<span class="tok-fn">ollama</span>(&amp;model))
+    .<span class="tok-fn">skill</span>(<span class="tok-ty">Skill</span>::<span class="tok-fn">agent</span>(<span class="tok-str">"claude-code"</span>))
+    .<span class="tok-fn">memory_mb</span>(<span class="tok-num">256</span>)
+    .<span class="tok-fn">prompt</span>(<span class="tok-str">"Write a Python script that prints the first 10 Fibonacci numbers."</span>)
+    .<span class="tok-fn">build</span>()?;
+
+<span class="tok-kw">let</span> result = agent.<span class="tok-fn">run</span>(None).<span class="tok-kw">await</span>?;</code></pre>
+
+      <h2>4. Running the example</h2>
+      <div class="code-wrap">
+        <div class="code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span>terminal</span>
+        </div>
+        <div class="code-run"><span>$</span> <code>OLLAMA_MODEL=phi4-mini \</code></div>
+        <div class="code-run"><span>&nbsp;</span> <code>VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \</code></div>
+        <div class="code-run"><span>&nbsp;</span> <code>VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \</code></div>
+        <div class="code-run"><span>&nbsp;</span> <code>cargo run --example ollama_local</code></div>
+      </div>
+
+      <h2>5. Environment variables</h2>
+      <ul>
+        <li><code>OLLAMA_MODEL</code> — Ollama model name (e.g. <code>phi4-mini</code>, <code>qwen3-coder</code>)</li>
+        <li><code>VOID_BOX_KERNEL</code> — path to the host kernel image for KVM</li>
+        <li><code>VOID_BOX_INITRAMFS</code> — path to the guest initramfs built by <code>build_guest_image.sh</code></li>
+      </ul>
+      <p>Without <code>VOID_BOX_KERNEL</code> set, the example falls back to mock mode (no real VM).</p>
+
+      <h2>6. Next</h2>
+      <p>See <a href="../pipeline-composition/">Pipeline Composition</a> to chain Ollama-backed boxes, or define specs with <a href="../yaml-specs/">YAML</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">← Back to guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

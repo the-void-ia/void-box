@@ -9,11 +9,11 @@
 <body>
   <header class="site">
     <div class="wrap inner">
-      <a class="brand" href="../"><img src="../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a>
+      <a class="brand" href="../"><img src="../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
       <nav class="top">
         <a href="../">Home</a>
-        <a href="../docs/">Docs</a>
         <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
       </nav>
     </div>
   </header>
@@ -23,7 +23,10 @@
       <h1>Guides</h1>
       <p>Practical implementation walkthroughs.</p>
       <div class="list">
-        <a href="ai-agent-sandboxing/"><strong>AI Agent Sandboxing with VoidBox</strong><span>How to execute capability-driven agents inside isolated micro-VM boundaries.</span></a>
+        <a href="ai-agent-sandboxing/"><strong>AI Agent Sandboxing</strong><span>Execute capability-driven agents inside isolated micro-VM boundaries.</span></a>
+        <a href="pipeline-composition/"><strong>Pipeline Composition</strong><span>Build multi-stage pipelines with <code>.pipe()</code> and <code>.fan_out()</code> — fresh VM per stage, no state leaks.</span></a>
+        <a href="yaml-specs/"><strong>Declarative YAML Specs</strong><span>Define agents and pipelines as config files and run them with <code>void-box run</code>.</span></a>
+        <a href="ollama-local/"><strong>Local LLMs with Ollama</strong><span>Use local models via SLIRP networking — no API key required.</span></a>
       </div>
     </section>
   </main>
