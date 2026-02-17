@@ -146,10 +146,7 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
         return None;
     }
 
-    let (kernel, initramfs) = match kvm_artifacts_from_env() {
-        Some(a) => a,
-        None => return None,
-    };
+    let (kernel, initramfs) = kvm_artifacts_from_env()?;
 
     if !kernel.exists() {
         return None;

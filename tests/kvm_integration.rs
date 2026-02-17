@@ -8,7 +8,7 @@
 //! - Require environment variables pointing to guest artifacts:
 //!   - `VOID_BOX_KERNEL`    -> path to vmlinux or bzImage
 //!   - `VOID_BOX_INITRAMFS` -> path to initramfs (cpio.gz) that boots
-//!                             the guest-agent as PID 1.
+//!     the guest-agent as PID 1.
 //!
 //! All tests are marked `#[ignore]` so they only run when explicitly
 //! requested, e.g.:
