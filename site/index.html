@@ -42,7 +42,12 @@
           <a class="btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
         </div>
 
-        <div class="code-wrap">
+        <div class="code-tabs">
+          <button class="code-tab active" data-tab="rust">Rust</button>
+          <button class="code-tab" data-tab="yaml">YAML</button>
+        </div>
+
+        <div class="code-wrap" data-panel="rust">
           <div class="code-head">
             <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
             <span>rust</span>
@@ -71,6 +76,43 @@ let report = Pipeline::new()
     .pipe(researcher)
     .fan_out(vec![analyst, writer]) // parallel
     .run().await?;</code></pre>
+        </div>
+
+        <div class="code-wrap" data-panel="yaml" style="display:none">
+          <div class="code-head">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span>hn_pipeline.yaml</span>
+          </div>
+<pre><code class="language-yaml">api_version: v1
+kind: pipeline
+name: hn-research
+
+sandbox:
+  memory_mb: 1024
+  network: outbound
+
+pipeline:
+  boxes:
+    - name: researcher
+      prompt: "Find today's top AI stories"
+      skills: ["mcp:hackernews-api"]
+
+    - name: analyst
+      prompt: "Extract key trends"
+      skills: ["agent:claude-code"]
+
+    - name: writer
+      prompt: "Draft a summary report"
+      skills: ["agent:claude-code"]
+
+  stages:
+    - type: box
+      name: researcher
+    - type: fan_out        # parallel
+      boxes: [analyst, writer]</code></pre>
+          <div class="code-run">
+            <span>$</span> <code>void-box run hn_pipeline.yaml</code>
+          </div>
         </div>
       </div>
     </section>

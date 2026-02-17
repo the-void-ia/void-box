@@ -124,6 +124,36 @@ main section { padding: 2.4rem 0; }
   border-color: #101828;
 }
 
+.code-tabs {
+  display: flex;
+  justify-content: center;
+  gap: 0;
+  margin: 2.2rem auto 0;
+  max-width: 760px;
+}
+.code-tab {
+  background: none;
+  border: none;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+.code-tab:hover { color: var(--text); }
+.code-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.code-tabs ~ .code-wrap {
+  margin-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
 .code-wrap {
   margin: 2.2rem auto 0;
   max-width: 760px;
@@ -131,6 +161,20 @@ main section { padding: 2.4rem 0; }
   border: 1px solid #1f2a44;
   border-radius: 0.75rem;
   overflow: hidden;
+}
+.code-run {
+  border-top: 1px solid #1f2a44;
+  padding: 0.6rem 1rem;
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  font-size: 0.9rem;
+  color: #7ee787;
+}
+.code-run span {
+  color: #7d8590;
+  margin-right: 0.3rem;
+}
+.code-run code {
+  color: #e8f2ff;
 }
 .code-head {
   display: flex;
