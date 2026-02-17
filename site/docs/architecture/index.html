@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>void-box architecture</title><link rel="stylesheet" href="../../assets/css/site.css" />
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a><nav class="top"><a href="../">Docs</a><a href="../runtime/">Runtime</a><a href="../events-observability/">Events</a></nav></div></header>
+<main class="doc-main wrap">
+<section>
+<div class="kicker">Architecture</div>
+<h1>Agent(Skills) + Isolation Boundary</h1>
+<p>VoidBox composes declared skills with a hardware-isolated execution environment. Each run is provisioned through host orchestration and enforced by guest runtime controls.</p>
+<div class="grid-2">
+  <article class="card"><h3>Host Layer</h3><p>CLI/daemon orchestrates runs, provisions skills/config, manages KVM VM lifecycle, and records run events.</p></article>
+  <article class="card"><h3>Guest Layer</h3><p>`guest-agent` authenticates host requests, enforces command allowlist + rlimits, drops privilege, then executes `claude-code`.</p></article>
+  <article class="card"><h3>Communication</h3><p>vsock protocol frames requests/responses and supports streaming chunks plus telemetry.</p></article>
+  <article class="card"><h3>Security Model</h3><p>KVM isolation + seccomp + session auth + policy controls + controlled networking.</p></article>
+</div>
+</section>
+<section>
+<h2>Execution Flow</h2>
+<pre><code>spec -> env provision -> skill mount -> claude-code run -> events/report</code></pre>
+<p>For pipelines, stages compose sequentially and in fan-out mode with explicit failure boundaries per stage.</p>
+</section>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>void-box events and observability</title><link rel="stylesheet" href="../../assets/css/site.css" />
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a><nav class="top"><a href="../">Docs</a><a href="../architecture/">Architecture</a><a href="../cli-tui/">CLI/TUI</a></nav></div></header>
+<main class="doc-main wrap">
+<section>
+<div class="kicker">Events + Observability</div>
+<h1>Run Event Model</h1>
+<p>VoidBox events are designed to keep capability and boundary context explicit for every action.</p>
+<div class="card"><h3>Identity fields</h3><p><code>run_id</code>, <code>box_name</code>, <code>skill_id</code>, <code>environment_id</code>, <code>mode</code>, <code>stream</code>, <code>seq</code>.</p></div>
+</section>
+<section>
+<h2>Core Event Types</h2>
+<ul>
+  <li><code>run.started</code>, <code>run.finished</code>, <code>run.failed</code>, <code>run.cancelled</code></li>
+  <li><code>env.provisioned</code></li>
+  <li><code>skill.mounted</code></li>
+  <li><code>box.started</code>, <code>workflow.planned</code></li>
+  <li><code>log.chunk</code>, <code>log.closed</code></li>
+</ul>
+</section>
+<section>
+<h2>Persistence Providers</h2>
+<p>Daemon run/session state uses a provider abstraction: <code>disk</code> (default), plus example adapters for <code>sqlite</code> and <code>valkey</code>.</p>
+</section>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

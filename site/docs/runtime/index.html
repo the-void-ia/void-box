@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>void-box runtime model</title><link rel="stylesheet" href="../../assets/css/site.css" />
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a><nav class="top"><a href="../">Docs</a><a href="../architecture/">Architecture</a><a href="../cli-tui/">CLI/TUI</a></nav></div></header>
+<main class="doc-main wrap">
+<section>
+<div class="kicker">Runtime Model</div>
+<h1>Claude Code First-Class Runtime</h1>
+<p>VoidBox uses <code>claude-code</code> as the canonical agent runtime. This is the execution identity in guest environments.</p>
+<div class="card"><h3>Important Clarification</h3><p>When configured for Ollama, VoidBox still runs <code>claude-code</code>; only the provider backend changes via runtime env config.</p></div>
+</section>
+<section>
+<h2>Backend Selection</h2>
+<pre><code># default provider path
+cargo run --bin voidbox -- run --file examples/specs/hackernews_agent.json
+
+# same spec, ollama backend through claude-code compatibility
+VOIDBOX_LLM_PROVIDER=ollama \
+VOIDBOX_LLM_MODEL=qwen2.5-coder:7b \
+cargo run --bin voidbox -- run --file examples/specs/hackernews_agent.json</code></pre>
+</section>
+<section>
+<h2>Compatibility Guardrails</h2>
+<p>Runs should fail fast when guest image/runtime is incompatible with required execution mode. Use production guest image builds for runtime examples.</p>
+</section>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

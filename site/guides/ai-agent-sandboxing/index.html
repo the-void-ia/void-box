@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Agent Sandboxing | void-box guide</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a>
+      <nav class="top">
+        <a href="../../">Home</a>
+        <a href="../../docs/">Docs</a>
+        <a href="../">Guides</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <h1>AI Agent Sandboxing with VoidBox</h1>
+      <p>Most agent systems run tools in shared host processes. VoidBox takes a stricter model: declare capabilities as skills, then execute them inside isolated micro-VM boundaries.</p>
+
+      <h2>1. Why this matters</h2>
+      <p>Agents execute untrusted tool paths: shell commands, API clients, filesystem writes, and model-controlled side effects. Isolation is not optional if you want strong boundaries.</p>
+
+      <h2>2. VoidBox model</h2>
+      <p><code>VoidBox = Agent(Skills) + Isolation</code></p>
+      <ul>
+        <li>Skills define what the agent is allowed to do.</li>
+        <li>Environment boundary defines where it can do it.</li>
+        <li>Policy controls enforce limits while running.</li>
+      </ul>
+
+      <h2>3. Minimal setup</h2>
+<pre><code class="language-rust">use void_box::agent_box::VoidBox;
+use void_box::skill::Skill;
+
+let agent = VoidBox::new("researcher")
+    .skill(Skill::agent("claude-code"))
+    .skill(Skill::mcp("hackernews-api"))
+    .prompt("Summarize today's top HN stories")
+    .memory_mb(1024)
+    .network(true)
+    .build()?;
+
+let result = agent.run(None).await?;</code></pre>
+
+      <h2>4. Runtime truth</h2>
+      <p>VoidBox runs <code>claude-code</code> as the canonical runtime. If you configure Ollama, you are still running Claude Code with a compatible provider backend.</p>
+
+      <h2>5. Production checklist</h2>
+      <ul>
+        <li>Use production guest image for runtime flows.</li>
+        <li>Set kernel/initramfs explicitly.</li>
+        <li>Enable run event collection and persistence for traceability.</li>
+      </ul>
+
+      <h2>6. Next</h2>
+      <p>Continue with <a href="../../docs/">Docs</a> for architecture, runtime model, and event schema.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">← Back to guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

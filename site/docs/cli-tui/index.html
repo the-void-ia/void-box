@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>void-box cli and tui</title><link rel="stylesheet" href="../../assets/css/site.css" />
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>void-box</span></a><nav class="top"><a href="../">Docs</a><a href="../runtime/">Runtime</a><a href="../events-observability/">Events</a></nav></div></header>
+<main class="doc-main wrap">
+<section>
+<div class="kicker">CLI / TUI</div>
+<h1>Current Interface Surface</h1>
+<p>The CLI provides run/validate/status/log flows and a TUI command mode layered on daemon HTTP endpoints.</p>
+<div class="grid-2">
+  <article class="card"><h3>CLI Commands</h3><p><code>serve</code>, <code>run</code>, <code>validate</code>, <code>status</code>, <code>logs</code>, <code>tui</code></p></article>
+  <article class="card"><h3>TUI Commands</h3><p><code>/run</code>, <code>/input</code>, <code>/status</code>, <code>/logs</code>, <code>/cancel</code>, <code>/history</code></p></article>
+</div>
+</section>
+<section>
+<h2>Daemon APIs used by TUI</h2>
+<ul>
+  <li><code>POST /v1/runs</code></li>
+  <li><code>GET /v1/runs/:id</code></li>
+  <li><code>GET /v1/runs/:id/events</code></li>
+  <li><code>POST /v1/runs/:id/cancel</code></li>
+  <li><code>POST /v1/sessions/:id/messages</code></li>
+  <li><code>GET /v1/sessions/:id/messages</code></li>
+</ul>
+</section>
+<section>
+<h2>Known UX Gap</h2>
+<p>Current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX can be layered on top of event streaming APIs.</p>
+</section>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

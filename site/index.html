@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>void-box | Composable agent runtime with hardware isolation</title>
+  <meta name="description" content="VoidBox is a composable agent runtime with hardware isolation. VoidBox = Agent(Skills) + Isolation." />
+  <link rel="stylesheet" href="assets/css/site.css" />
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="./">
+        <img src="assets/img/void-box.png" alt="void-box logo" />
+        <span>void-box</span>
+      </a>
+      <nav class="top">
+        <a href="docs/">Docs</a>
+        <a href="guides/">Guides</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <h1>Compose. Isolate. Ship.</h1>
+        <p class="lead">Composable agent runtime with hardware isolation</p>
+        <p class="sub">Skills are declared capabilities. They execute inside isolated micro-VM boundaries.</p>
+        <div class="eq">VoidBox = Agent(Skills) + Isolation</div>
+
+        <div class="chips">
+          <span>KVM micro-VM isolation</span>
+          <span>Agent-native skills</span>
+          <span>Claude Code runtime</span>
+          <span>Pipeline composition</span>
+        </div>
+
+        <div class="cta">
+          <a class="btn primary" href="docs/">Get Started</a>
+          <a class="btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-head">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span>rust</span>
+          </div>
+<pre><code class="language-rust">use void_box::{VoidBox, Skill, Pipeline, Network};
+
+// 5 lines to isolate an agent
+let researcher = VoidBox::new("researcher")
+    .skill(Skill::mcp("hackernews-api"))
+    .prompt("Find today's top AI stories")
+    .network(Network::outbound())
+    .build()?;
+
+let analyst = VoidBox::new("analyst")
+    .skill(Skill::agent("claude-code"))
+    .prompt("Extract key trends")
+    .build()?;
+
+let writer = VoidBox::new("writer")
+    .skill(Skill::agent("claude-code"))
+    .prompt("Draft a summary report")
+    .build()?;
+
+// compose into a pipeline — fresh VM per stage
+let report = Pipeline::new()
+    .pipe(researcher)
+    .fan_out(vec![analyst, writer]) // parallel
+    .run().await?;</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <h2 class="section-title">Why Choose VoidBox?</h2>
+        <p class="section-sub">Agent runtime boundaries with the simplicity of declarative skills.</p>
+        <div class="grid-3">
+          <article class="card">
+            <h3>Hardware Isolated</h3>
+            <small>Why stronger than shared-process agents?</small>
+            <p>Each run executes behind a micro-VM boundary, reducing cross-run blast radius.</p>
+          </article>
+          <article class="card">
+            <h3>Composable Runtime</h3>
+            <small>Can I orchestrate multi-step agents?</small>
+            <p>Yes. Run single agents, pipelines, and workflows with explicit stage boundaries.</p>
+          </article>
+          <article class="card">
+            <h3>Skill-Native</h3>
+            <small>How are capabilities declared?</small>
+            <p>MCP servers, SKILL files, and CLI tools are mounted as declared capabilities.</p>
+          </article>
+          <article class="card">
+            <h3>Policy Enforced</h3>
+            <small>What controls exist at runtime?</small>
+            <p>Command allowlist, resource limits, seccomp, and controlled egress are applied in execution path.</p>
+          </article>
+          <article class="card">
+            <h3>Claude Code First-Class</h3>
+            <small>What is the canonical runtime?</small>
+            <p>VoidBox always runs <code>claude-code</code>. Ollama support works through Claude-compatible provider mode.</p>
+          </article>
+          <article class="card">
+            <h3>Built-in Run Visibility</h3>
+            <small>Can I inspect what happened?</small>
+            <p>Structured run events, logs, and session persistence make execution behavior inspectable.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div>void-box · Apache-2.0 · <a href="docs/">Docs</a> · <a href="guides/">Guides</a> · <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a></div>
+    </div>
+  </footer>
+  <script src="assets/js/site.js"></script>
+</body>
+</html>
