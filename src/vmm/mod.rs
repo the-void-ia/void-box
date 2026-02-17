@@ -38,8 +38,8 @@ use self::config::VoidBoxConfig;
 use self::cpu::VcpuHandle;
 use self::kvm::Vm;
 
-/// Main VoidBox instance representing a running micro-VM
-pub struct VoidBox {
+/// Main MicroVm instance representing a running micro-VM
+pub struct MicroVm {
     /// The underlying KVM VM
     #[allow(dead_code)]
     vm: Arc<Vm>,
@@ -101,10 +101,10 @@ enum VmCommand {
     Stop,
 }
 
-impl VoidBox {
+impl MicroVm {
     /// Create and start a new micro-VM with the given configuration
     pub async fn new(config: VoidBoxConfig) -> Result<Self> {
-        info!("Creating new VoidBox with config: {:?}", config);
+        info!("Creating new MicroVm with config: {:?}", config);
 
         // Validate configuration
         config.validate()?;
@@ -345,7 +345,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         debug!("Set PR_SET_NO_NEW_PRIVS");
 
         info!(
-            "VoidBox started with CID {}, network={}",
+            "MicroVm started with CID {}, network={}",
             cid, config.network
         );
 
@@ -643,7 +643,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             return Ok(());
         }
 
-        info!("Stopping VoidBox");
+        info!("Stopping MicroVm");
 
         // Signal stop through command channel
         let _ = self.command_tx.send(VmCommand::Stop).await;
@@ -670,16 +670,16 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                 .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
         }
 
-        info!("VoidBox stopped");
+        info!("MicroVm stopped");
         Ok(())
     }
 }
 
-impl Drop for VoidBox {
+impl Drop for MicroVm {
     fn drop(&mut self) {
         if self.running.load(Ordering::SeqCst) {
             self.running.store(false, Ordering::SeqCst);
-            error!("VoidBox dropped while still running - forcing stop");
+            error!("MicroVm dropped while still running - forcing stop");
         }
     }
 }

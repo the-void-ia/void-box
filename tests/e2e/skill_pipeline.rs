@@ -1,4 +1,4 @@
-//! E2E tests for Skill + AgentBox + Pipeline with real KVM VMs and claudio.
+//! E2E tests for Skill + VoidBox + Pipeline with real KVM VMs and claudio.
 //!
 //! These tests verify that:
 //! 1. Skills (SKILL.md files) are correctly provisioned into the guest filesystem
@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use void_box::agent_box::AgentBox;
+use void_box::agent_box::VoidBox;
 use void_box::pipeline::Pipeline;
 use void_box::skill::Skill;
 
@@ -56,9 +56,9 @@ fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
     Some((kernel, initramfs))
 }
 
-/// Build an AgentBox pointing at real KVM artifacts.
+/// Build an VoidBox pointing at real KVM artifacts.
 /// Returns None if KVM or artifacts are unavailable (test will skip).
-fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<AgentBox> {
+fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<VoidBox> {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not available");
         return None;
@@ -76,7 +76,7 @@ fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<AgentBo
         }
     };
 
-    let mut builder = AgentBox::new(name)
+    let mut builder = VoidBox::new(name)
         .kernel(&kernel)
         .initramfs(&initramfs)
         .memory_mb(256)
@@ -89,14 +89,14 @@ fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<AgentBo
     match builder.build() {
         Ok(ab) => Some(ab),
         Err(e) => {
-            eprintln!("skipping: failed to build AgentBox: {}", e);
+            eprintln!("skipping: failed to build VoidBox: {}", e);
             None
         }
     }
 }
 
 // ===========================================================================
-// Test 1: AgentBox with a local SKILL.md file
+// Test 1: VoidBox with a local SKILL.md file
 // ===========================================================================
 
 /// Verify that a local SKILL.md is provisioned into the guest and claudio
@@ -115,7 +115,7 @@ async fn test_agent_box_with_local_skill() {
         None => return,
     };
 
-    let result = ab.run(None).await.expect("AgentBox::run failed");
+    let result = ab.run(None).await.expect("VoidBox::run failed");
 
     // Basic checks
     assert_eq!(result.box_name, "data_analyst");
@@ -146,7 +146,7 @@ async fn test_agent_box_with_local_skill() {
 }
 
 // ===========================================================================
-// Test 2: AgentBox with multiple skills
+// Test 2: VoidBox with multiple skills
 // ===========================================================================
 
 /// Verify that multiple SKILL.md files are all provisioned and discovered.
@@ -164,7 +164,7 @@ async fn test_agent_box_with_multiple_skills() {
         None => return,
     };
 
-    let result = ab.run(None).await.expect("AgentBox::run failed");
+    let result = ab.run(None).await.expect("VoidBox::run failed");
 
     assert!(!result.claude_result.is_error);
 
@@ -190,7 +190,7 @@ async fn test_agent_box_with_multiple_skills() {
 }
 
 // ===========================================================================
-// Test 3: AgentBox with MCP skill
+// Test 3: VoidBox with MCP skill
 // ===========================================================================
 
 /// Verify that MCP config is written to the guest and claudio discovers it.
@@ -210,7 +210,7 @@ async fn test_agent_box_with_mcp_skill() {
         None => return,
     };
 
-    let result = ab.run(None).await.expect("AgentBox::run failed");
+    let result = ab.run(None).await.expect("VoidBox::run failed");
 
     assert!(!result.claude_result.is_error);
 
@@ -244,7 +244,7 @@ async fn test_agent_box_with_mcp_skill() {
 }
 
 // ===========================================================================
-// Test 4: AgentBox with mixed skills (file + MCP)
+// Test 4: VoidBox with mixed skills (file + MCP)
 // ===========================================================================
 
 /// Verify that both file skills and MCP servers are provisioned together.
@@ -262,7 +262,7 @@ async fn test_agent_box_mixed_skills() {
         None => return,
     };
 
-    let result = ab.run(None).await.expect("AgentBox::run failed");
+    let result = ab.run(None).await.expect("VoidBox::run failed");
 
     assert!(!result.claude_result.is_error);
 
@@ -348,7 +348,7 @@ async fn test_pipeline_two_stages_kvm() {
 }
 
 // ===========================================================================
-// Test 6: AgentBox with input data
+// Test 6: VoidBox with input data
 // ===========================================================================
 
 /// Verify that input data is written to the guest and the agent receives it.
@@ -366,7 +366,7 @@ async fn test_agent_box_with_input_data_kvm() {
     };
 
     let input = br#"{"symbols": ["AAPL", "NVDA"], "period": "30d"}"#;
-    let result = ab.run(Some(input)).await.expect("AgentBox::run failed");
+    let result = ab.run(Some(input)).await.expect("VoidBox::run failed");
 
     assert_eq!(result.box_name, "input_box");
     assert!(!result.claude_result.is_error);

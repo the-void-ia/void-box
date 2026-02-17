@@ -6,6 +6,7 @@ rust-version = "1.83"
 authors = ["Diego Parra <diegolparra@gmail.com>"]
 description = "Composable workflow sandbox with KVM micro-VMs and native observability"
 repository = "https://github.com/the-void-ia/void-box"
+license = "Apache-2.0"
 readme = "README.md"
 keywords = ["sandbox", "workflow", "observability", "virtualization", "kvm"]
 categories = ["development-tools", "virtualization"]

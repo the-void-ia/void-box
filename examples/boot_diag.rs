@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use void_box::vmm::config::VoidBoxConfig;
-use void_box::vmm::VoidBox;
+use void_box::vmm::MicroVm;
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +28,7 @@ async fn main() {
         config = config.initramfs(PathBuf::from(p));
     }
 
-    let mut vm = VoidBox::new(config).await.expect("Failed to create VM");
+    let mut vm = MicroVm::new(config).await.expect("Failed to create VM");
 
     eprintln!("[diag] VM started, reading serial output for 20 seconds...");
 

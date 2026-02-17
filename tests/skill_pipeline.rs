@@ -1,4 +1,4 @@
-//! Test battery for the Skill + AgentBox + Pipeline stack.
+//! Test battery for the Skill + VoidBox + Pipeline stack.
 //!
 //! Covers:
 //! - Skill provisioning (all 5 types: agent, file, mcp, cli, remote)
@@ -8,7 +8,7 @@
 //!
 //! All tests run with mock sandbox (no KVM required) unless marked `#[ignore]`.
 
-use void_box::agent_box::AgentBox;
+use void_box::agent_box::VoidBox;
 use void_box::pipeline::Pipeline;
 use void_box::skill::Skill;
 
@@ -20,7 +20,7 @@ async fn test_provision_local_skill_file() {
         .description("Financial data methodology");
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("data_analyst")
+    let ab = VoidBox::new("data_analyst")
         .skill(skill)
         .skill(reasoning)
         .prompt("Analyze data")
@@ -43,7 +43,7 @@ async fn test_provision_mcp_skill() {
         .env("API_KEY", "test-key");
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("mcp_box")
+    let ab = VoidBox::new("mcp_box")
         .skill(mcp)
         .skill(reasoning)
         .prompt("Use MCP tools")
@@ -63,7 +63,7 @@ async fn test_provision_cli_skill() {
     let cli = Skill::cli("jq").description("JSON processor");
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("cli_box")
+    let ab = VoidBox::new("cli_box")
         .skill(cli)
         .skill(reasoning)
         .prompt("Process JSON")
@@ -87,7 +87,7 @@ async fn test_provision_mixed_skills() {
     // Remote will hit fallback (nonexistent repo) -- should not fail
     let remote = Skill::remote("nonexistent-test-org/nonexistent-repo/fake-skill");
 
-    let ab = AgentBox::new("mixed_box")
+    let ab = VoidBox::new("mixed_box")
         .skill(agent)
         .skill(file)
         .skill(mcp)
@@ -113,7 +113,7 @@ async fn test_provision_remote_skill_fallback() {
         .description("This will fail to fetch");
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("fallback_box")
+    let ab = VoidBox::new("fallback_box")
         .skill(remote)
         .skill(reasoning)
         .prompt("Try with fallback")
@@ -136,7 +136,7 @@ async fn test_remote_skill_provision_live() {
         Skill::remote("obra/superpowers/brainstorming").description("Brainstorming methodology");
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("live_fetch_box")
+    let ab = VoidBox::new("live_fetch_box")
         .skill(brainstorm)
         .skill(reasoning)
         .prompt("Brainstorm ideas")
@@ -175,7 +175,7 @@ async fn test_remote_skill_url_patterns() {
 async fn test_pipeline_single_stage() {
     let reasoning = Skill::agent("claude-code");
 
-    let single_box = AgentBox::new("solo")
+    let single_box = VoidBox::new("solo")
         .skill(reasoning)
         .prompt("Do one thing")
         .mock()
@@ -191,8 +191,8 @@ async fn test_pipeline_single_stage() {
 
 #[tokio::test]
 async fn test_pipeline_three_stages() {
-    let make_box = |name: &str, prompt: &str| -> AgentBox {
-        AgentBox::new(name)
+    let make_box = |name: &str, prompt: &str| -> VoidBox {
+        VoidBox::new(name)
             .skill(Skill::agent("claude-code"))
             .prompt(prompt)
             .mock()
@@ -221,14 +221,14 @@ async fn test_pipeline_three_stages() {
 
 #[tokio::test]
 async fn test_pipeline_result_accessors() {
-    let box1 = AgentBox::new("a")
+    let box1 = VoidBox::new("a")
         .skill(Skill::agent("claude-code"))
         .prompt("Step A")
         .mock()
         .build()
         .unwrap();
 
-    let box2 = AgentBox::new("b")
+    let box2 = VoidBox::new("b")
         .skill(Skill::agent("claude-code"))
         .prompt("Step B")
         .mock()
@@ -252,13 +252,13 @@ async fn test_pipeline_result_accessors() {
 
 #[tokio::test]
 async fn test_pipeline_len() {
-    let box1 = AgentBox::new("x")
+    let box1 = VoidBox::new("x")
         .skill(Skill::agent("claude-code"))
         .prompt("X")
         .mock()
         .build()
         .unwrap();
-    let box2 = AgentBox::new("y")
+    let box2 = VoidBox::new("y")
         .skill(Skill::agent("claude-code"))
         .prompt("Y")
         .mock()
@@ -277,7 +277,7 @@ async fn test_trading_pipeline_mock() {
     // Reproduces the trading_pipeline example as an automated test
     let reasoning = Skill::agent("claude-code");
 
-    let data_box = AgentBox::new("data_analyst")
+    let data_box = VoidBox::new("data_analyst")
         .skill(Skill::file(
             "examples/trading_pipeline/skills/financial-data-analysis.md",
         ))
@@ -287,7 +287,7 @@ async fn test_trading_pipeline_mock() {
         .build()
         .unwrap();
 
-    let quant_box = AgentBox::new("quant_analyst")
+    let quant_box = VoidBox::new("quant_analyst")
         .skill(Skill::file(
             "examples/trading_pipeline/skills/quant-technical-analysis.md",
         ))
@@ -297,14 +297,14 @@ async fn test_trading_pipeline_mock() {
         .build()
         .unwrap();
 
-    let sentiment_box = AgentBox::new("research_analyst")
+    let sentiment_box = VoidBox::new("research_analyst")
         .skill(reasoning.clone())
         .prompt("Assess market sentiment for each symbol")
         .mock()
         .build()
         .unwrap();
 
-    let strategy_box = AgentBox::new("portfolio_strategist")
+    let strategy_box = VoidBox::new("portfolio_strategist")
         .skill(Skill::file(
             "examples/trading_pipeline/skills/portfolio-risk-management.md",
         ))
@@ -335,13 +335,13 @@ async fn test_trading_pipeline_mock() {
     assert_eq!(result.stages[3].box_name, "portfolio_strategist");
 }
 
-// ─── AgentBox with Input Data ───────────────────────────────────────────────
+// ─── VoidBox with Input Data ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_agent_box_with_input_data() {
     let reasoning = Skill::agent("claude-code");
 
-    let ab = AgentBox::new("processor")
+    let ab = VoidBox::new("processor")
         .skill(reasoning)
         .prompt("Process the input data")
         .mock()

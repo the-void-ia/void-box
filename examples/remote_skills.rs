@@ -1,7 +1,7 @@
 //! Remote Skills Example: Fetch SKILL.md files from skills.sh
 //!
 //! Demonstrates fetching real skills from the open agent skills ecosystem
-//! (https://skills.sh) and provisioning them into a void-box AgentBox.
+//! (https://skills.sh) and provisioning them into a void-box VoidBox.
 //!
 //! Each skill is fetched live from GitHub (raw.githubusercontent.com),
 //! printed with a preview, and installed into a mock Box.
@@ -14,7 +14,7 @@
 
 use std::error::Error;
 
-use void_box::agent_box::AgentBox;
+use void_box::agent_box::VoidBox;
 use void_box::skill::Skill;
 
 #[tokio::main]
@@ -87,13 +87,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Build a Box with these skills ----
 
-    println!("--- Building AgentBox with remote skills ---");
+    println!("--- Building VoidBox with remote skills ---");
     println!();
 
     let reasoning =
         Skill::agent("claude-code").description("Autonomous reasoning and code execution");
 
-    let mut builder = AgentBox::new("developer")
+    let mut builder = VoidBox::new("developer")
         .skill(reasoning)
         .prompt(
             "You are a senior developer. Use your brainstorming, debugging, and TDD skills \

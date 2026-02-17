@@ -27,7 +27,7 @@ use void_box::observe::claude::{parse_stream_json, ClaudeExecOpts};
 use void_box::observe::tracer::{SpanContext, Tracer, TracerConfig};
 use void_box::sandbox::Sandbox;
 use void_box::vmm::config::VoidBoxConfig;
-use void_box::vmm::VoidBox;
+use void_box::vmm::MicroVm;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -315,7 +315,7 @@ async fn test_default_scenario() {
 }
 
 // ===========================================================================
-// Test 2: TRACEPARENT propagation (needs raw VoidBox for set_span_context)
+// Test 2: TRACEPARENT propagation (needs raw MicroVm for set_span_context)
 // ===========================================================================
 
 /// Set a known span context on the VM and verify TRACEPARENT reaches the guest
@@ -329,7 +329,7 @@ async fn test_traceparent_propagation() {
     };
 
     cfg.validate().expect("invalid config");
-    let mut vm = VoidBox::new(cfg).await.expect("failed to create VM");
+    let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
 
     let trace_id = "aaaabbbbccccddddeeeeffff00001111";
     let span_id = "1234567890abcdef";
@@ -366,7 +366,7 @@ async fn test_traceparent_propagation() {
 }
 
 // ===========================================================================
-// Test 3: Telemetry aggregator with guest metrics (needs raw VoidBox)
+// Test 3: Telemetry aggregator with guest metrics (needs raw MicroVm)
 // ===========================================================================
 
 /// Boot a VM, subscribe to telemetry, verify guest CPU/memory metrics arrive.
@@ -379,7 +379,7 @@ async fn test_telemetry_aggregator() {
     };
 
     cfg.validate().expect("invalid config");
-    let mut vm = VoidBox::new(cfg).await.expect("failed to create VM");
+    let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
 
     // Warmup: ensure VM is ready
     let _warmup = vm

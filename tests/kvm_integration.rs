@@ -26,7 +26,7 @@ use std::sync::Arc;
 use void_box::observe::ObserveConfig;
 use void_box::sandbox::Sandbox;
 use void_box::vmm::config::VoidBoxConfig;
-use void_box::vmm::VoidBox;
+use void_box::vmm::MicroVm;
 use void_box::workflow::{Workflow, WorkflowExt};
 use void_box::Error;
 
@@ -132,9 +132,9 @@ async fn kvm_real_vm_exec_uname() {
     cfg.validate().expect("invalid VoidBoxConfig for KVM test");
 
     // Start the micro-VM.
-    let mut vm = VoidBox::new(cfg)
+    let mut vm = MicroVm::new(cfg)
         .await
-        .expect("failed to create KVM-backed VoidBox");
+        .expect("failed to create KVM-backed MicroVm");
 
     // Try to run uname; if the VM isn't healthy or guest comms fail, treat this
     // as a soft skip and, where possible, dump serial output for debugging.

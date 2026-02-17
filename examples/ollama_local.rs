@@ -1,4 +1,4 @@
-//! Example: Run an AgentBox with a local Ollama model.
+//! Example: Run an VoidBox with a local Ollama model.
 //!
 //! This demonstrates using `LlmProvider::Ollama` so that `claude-code` in
 //! the guest VM talks to a local Ollama instance instead of the Anthropic API.
@@ -41,7 +41,7 @@
 
 use std::path::PathBuf;
 
-use void_box::agent_box::AgentBox;
+use void_box::agent_box::VoidBox;
 use void_box::llm::LlmProvider;
 use void_box::skill::Skill;
 
@@ -54,8 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model: {}", model);
     println!();
 
-    // -- Build the AgentBox --
-    let mut builder = AgentBox::new("ollama_demo")
+    // -- Build the VoidBox --
+    let mut builder = VoidBox::new("ollama_demo")
         .llm(LlmProvider::ollama(&model))
         .skill(Skill::agent("claude-code"))
         .memory_mb(256)

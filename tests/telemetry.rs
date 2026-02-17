@@ -534,7 +534,7 @@ fn observer_integration_telemetry_plus_spans() {
 #[ignore = "requires KVM + kernel/initramfs artifacts"]
 async fn kvm_telemetry_end_to_end() {
     use void_box::vmm::config::VoidBoxConfig;
-    use void_box::vmm::VoidBox;
+    use void_box::vmm::MicroVm;
 
     let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
         eprintln!(
@@ -557,9 +557,9 @@ async fn kvm_telemetry_end_to_end() {
 
     cfg.validate().expect("invalid VoidBoxConfig");
 
-    let mut vm = VoidBox::new(cfg)
+    let mut vm = MicroVm::new(cfg)
         .await
-        .expect("failed to create KVM-backed VoidBox");
+        .expect("failed to create KVM-backed MicroVm");
 
     // Verify the VM boots by running a trivial command first
     match vm.exec("echo", &["telemetry-test"]).await {

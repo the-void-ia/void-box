@@ -1,12 +1,12 @@
-//! AgentBox: Skill + Environment = Box
+//! VoidBox: Agent(Skills) + Environment
 //!
-//! An `AgentBox` binds skills (MCP servers, CLI tools, procedural knowledge)
-//! to an isolated execution environment (KVM micro-VM). Each Box:
+//! A `VoidBox` binds skills (MCP servers, CLI tools, procedural knowledge)
+//! to an isolated execution environment (KVM micro-VM). Each VoidBox:
 //!
 //! - Has a name and a purpose (prompt)
 //! - Has one or more Skills installed
 //! - Runs in a fresh, disposable VM
-//! - Produces structured output for the next Box
+//! - Produces structured output for the next VoidBox
 //!
 //! Inspired by [Ed Huang's "Box" concept](https://me.0xffff.me/agent_infra.html):
 //! *"A Box exposes no execution details, has no external dependencies,
@@ -17,7 +17,7 @@
 //!
 //! ```no_run
 //! use void_box::skill::Skill;
-//! use void_box::agent_box::AgentBox;
+//! use void_box::agent_box::VoidBox;
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let reasoning = Skill::agent("claude-code")
@@ -26,7 +26,7 @@
 //! let market_data = Skill::mcp("market-data-mcp")
 //!     .description("Provides OHLCV and news data for equities");
 //!
-//! let data_box = AgentBox::new("data_analyst")
+//! let data_box = VoidBox::new("data_analyst")
 //!     .skill(market_data)
 //!     .skill(reasoning)
 //!     .memory_mb(256)
@@ -48,10 +48,10 @@ use crate::Result;
 
 const CLAUDE_HOME: &str = "/home/sandbox/.claude";
 
-/// An agent Box: Skill + Environment.
+/// An agent Box: Agent(Skills) + Environment.
 ///
-/// Constructed via the builder pattern with `AgentBox::new("name")`.
-pub struct AgentBox {
+/// Constructed via the builder pattern with `VoidBox::new("name")`.
+pub struct VoidBox {
     /// Human-readable name of this Box
     pub name: String,
     /// The prompt that defines what this Box does
@@ -61,12 +61,12 @@ pub struct AgentBox {
     /// The underlying sandbox (built lazily or eagerly)
     sandbox: Option<Arc<Sandbox>>,
     /// Builder config (before build)
-    config: AgentBoxConfig,
+    config: BoxConfig,
 }
 
 /// Internal configuration before the Box is built.
 #[derive(Debug, Clone)]
-struct AgentBoxConfig {
+struct BoxConfig {
     memory_mb: usize,
     vcpus: usize,
     network: bool,
@@ -84,7 +84,7 @@ struct AgentBoxConfig {
     timeout_secs: Option<u64>,
 }
 
-impl Default for AgentBoxConfig {
+impl Default for BoxConfig {
     fn default() -> Self {
         Self {
             memory_mb: 256,
@@ -101,15 +101,15 @@ impl Default for AgentBoxConfig {
     }
 }
 
-impl AgentBox {
-    /// Create a new AgentBox builder with the given name.
+impl VoidBox {
+    /// Create a new VoidBox builder with the given name.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             prompt: String::new(),
             skills: Vec::new(),
             sandbox: None,
-            config: AgentBoxConfig::default(),
+            config: BoxConfig::default(),
         }
     }
 
@@ -177,10 +177,10 @@ impl AgentBox {
     ///
     /// ```no_run
     /// use void_box::llm::LlmProvider;
-    /// use void_box::agent_box::AgentBox;
+    /// use void_box::agent_box::VoidBox;
     ///
     /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// let ab = AgentBox::new("local")
+    /// let ab = VoidBox::new("local")
     ///     .llm(LlmProvider::ollama("qwen3-coder"))
     ///     .prompt("hello")
     ///     .build()?;
@@ -198,8 +198,8 @@ impl AgentBox {
     /// small local models that are slower or faster than the default.
     ///
     /// ```no_run
-    /// # use void_box::agent_box::AgentBox;
-    /// let ab = AgentBox::new("fast_box")
+    /// # use void_box::agent_box::VoidBox;
+    /// let ab = VoidBox::new("fast_box")
     ///     .timeout_secs(300) // 5 minutes
     ///     .prompt("Quick task")
     ///     .build().unwrap();
@@ -422,7 +422,7 @@ impl AgentBox {
     /// the agent runs, and the prompt is augmented to reference it.
     pub async fn run(self, input: Option<&[u8]>) -> Result<StageResult> {
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
-            crate::Error::Config("AgentBox not built -- call .build() first".into())
+            crate::Error::Config("VoidBox not built — call .build() first".into())
         })?;
 
         // Provision security configuration (resource limits, command allowlist)
@@ -546,7 +546,7 @@ mod tests {
 
         let market_data = Skill::mcp("market-data-mcp").description("Market data provider");
 
-        let ab = AgentBox::new("data_analyst")
+        let ab = VoidBox::new("data_analyst")
             .skill(market_data)
             .skill(reasoning)
             .memory_mb(512)
@@ -565,7 +565,7 @@ mod tests {
     async fn test_agent_box_run_mock() {
         let reasoning = Skill::agent("claude-code");
 
-        let ab = AgentBox::new("test_box")
+        let ab = VoidBox::new("test_box")
             .skill(reasoning)
             .prompt("Do something")
             .mock()

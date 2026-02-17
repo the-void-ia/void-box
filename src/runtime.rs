@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::agent_box::AgentBox;
+use crate::agent_box::VoidBox;
 use crate::llm::LlmProvider;
 use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
@@ -44,7 +44,7 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
         .as_ref()
         .ok_or_else(|| Error::Config("missing agent section".into()))?;
 
-    let mut builder = AgentBox::new(&spec.name).prompt(&agent.prompt);
+    let mut builder = VoidBox::new(&spec.name).prompt(&agent.prompt);
     builder = apply_box_sandbox(builder, spec);
     builder = apply_box_llm(builder, spec.llm.as_ref());
 
@@ -81,7 +81,7 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
         .as_ref()
         .ok_or_else(|| Error::Config("missing pipeline section".into()))?;
 
-    let mut boxes_by_name: HashMap<String, AgentBox> = HashMap::new();
+    let mut boxes_by_name: HashMap<String, VoidBox> = HashMap::new();
     for b in &pipeline.boxes {
         let ab = build_pipeline_box(spec, b)?;
         boxes_by_name.insert(b.name.clone(), ab);
@@ -231,8 +231,8 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     })
 }
 
-fn build_pipeline_box(spec: &RunSpec, b: &PipelineBoxSpec) -> Result<AgentBox> {
-    let mut builder = AgentBox::new(&b.name).prompt(&b.prompt);
+fn build_pipeline_box(spec: &RunSpec, b: &PipelineBoxSpec) -> Result<VoidBox> {
+    let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
     builder = apply_box_sandbox(builder, spec);
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
     for s in &b.skills {
@@ -288,7 +288,7 @@ fn build_shared_sandbox(spec: &RunSpec) -> Result<std::sync::Arc<Sandbox>> {
     })
 }
 
-fn apply_box_sandbox(mut builder: AgentBox, spec: &RunSpec) -> AgentBox {
+fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec) -> VoidBox {
     let mode = spec.sandbox.mode.to_ascii_lowercase();
     if mode == "mock" {
         return builder.mock();
@@ -338,7 +338,7 @@ fn resolve_initramfs(spec: &RunSpec) -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-fn apply_box_llm(builder: AgentBox, llm: Option<&LlmSpec>) -> AgentBox {
+fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
     let Some(llm) = llm else {
         return builder;
     };

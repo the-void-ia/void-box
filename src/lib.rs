@@ -46,7 +46,7 @@
 //! # Example: Low-Level VM Access
 //!
 //! ```no_run
-//! use void_box::{VoidBox, VoidBoxConfig};
+//! use void_box::{MicroVm, VoidBoxConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +54,7 @@
 //!         .kernel("/path/to/vmlinux")
 //!         .memory_mb(128);
 //!
-//!     let mut vbox = VoidBox::new(config).await?;
+//!     let mut vbox = MicroVm::new(config).await?;
 //!     let output = vbox.exec("echo", &["hello", "world"]).await?;
 //!
 //!     println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
@@ -91,11 +91,11 @@ pub mod spec;
 // Re-exports for convenience
 pub use error::{Error, Result};
 pub use vmm::config::VoidBoxConfig;
-pub use vmm::VoidBox;
+pub use vmm::MicroVm;
 
 // Prelude for common imports
 pub mod prelude {
-    pub use crate::agent_box::AgentBox;
+    pub use crate::agent_box::VoidBox;
     pub use crate::error::{Error, Result};
     pub use crate::llm::LlmProvider;
     pub use crate::observe::{ObserveConfig, Observer};

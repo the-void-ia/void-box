@@ -1,6 +1,6 @@
-//! LLM Provider configuration for AgentBox.
+//! LLM Provider configuration for VoidBox.
 //!
-//! By default, `AgentBox` uses Claude via the Anthropic API. The `LlmProvider`
+//! By default, `VoidBox` uses Claude via the Anthropic API. The `LlmProvider`
 //! enum allows opting in to alternative backends -- most notably a local
 //! [Ollama](https://ollama.com) instance -- without changing anything else in
 //! the execution pipeline.
@@ -22,14 +22,14 @@
 //!
 //! ```no_run
 //! use void_box::llm::LlmProvider;
-//! use void_box::agent_box::AgentBox;
+//! use void_box::agent_box::VoidBox;
 //!
 //! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! // Default: uses Claude API (requires ANTHROPIC_API_KEY)
-//! let claude_box = AgentBox::new("default").prompt("hello").build()?;
+//! let claude_box = VoidBox::new("default").prompt("hello").build()?;
 //!
 //! // Opt-in: use a local Ollama model
-//! let ollama_box = AgentBox::new("local")
+//! let ollama_box = VoidBox::new("local")
 //!     .llm(LlmProvider::ollama("qwen3-coder"))
 //!     .prompt("hello")
 //!     .build()?;
@@ -42,7 +42,7 @@
 /// allowing the guest to reach host services like Ollama.
 const SLIRP_GATEWAY: &str = "10.0.2.2";
 
-/// LLM backend provider for an [`AgentBox`](crate::agent_box::AgentBox).
+/// LLM backend provider for an [`VoidBox`](crate::agent_box::VoidBox).
 ///
 /// Determines which LLM service the agent talks to. The provider is
 /// translated into environment variables injected into the guest VM.

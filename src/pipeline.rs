@@ -1,6 +1,6 @@
 //! Pipeline: Compose Boxes into sequential data-flow pipelines.
 //!
-//! A Pipeline chains multiple [`AgentBox`] instances so that the output of one
+//! A Pipeline chains multiple [`VoidBox`] instances so that the output of one
 //! becomes the input of the next.  Each Box boots a fresh, isolated VM, runs its
 //! agent with the provisioned skills, and produces structured output.
 //!
@@ -8,12 +8,12 @@
 //!
 //! ```no_run
 //! use void_box::pipeline::Pipeline;
-//! # use void_box::agent_box::AgentBox;
+//! # use void_box::agent_box::VoidBox;
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! # let data_box: AgentBox = todo!();
-//! # let quant_box: AgentBox = todo!();
-//! # let strategy_box: AgentBox = todo!();
+//! # let data_box: VoidBox = todo!();
+//! # let quant_box: VoidBox = todo!();
+//! # let strategy_box: VoidBox = todo!();
 //! let result = Pipeline::from(data_box)
 //!     .pipe(quant_box)
 //!     .pipe(strategy_box)
@@ -25,7 +25,7 @@
 //! # }
 //! ```
 
-use crate::agent_box::AgentBox;
+use crate::agent_box::VoidBox;
 use crate::guest::protocol::ExecOutputChunk;
 use crate::observe::claude::ClaudeExecResult;
 
@@ -93,10 +93,10 @@ impl PipelineResult {
 /// A single stage in a pipeline — either one Box or multiple Boxes in parallel.
 enum PipelineStage {
     /// A single Box executed sequentially.
-    Single(AgentBox),
+    Single(VoidBox),
     /// Multiple Boxes executed in parallel (fan-out). Their outputs are merged
     /// as a JSON array for the next stage.
-    Parallel(Vec<AgentBox>),
+    Parallel(Vec<VoidBox>),
 }
 
 /// A composable pipeline of Boxes.
@@ -107,7 +107,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Start a pipeline from a single Box.
-    pub fn from(first: AgentBox) -> Self {
+    pub fn from(first: VoidBox) -> Self {
         Self {
             name: first.name.clone(),
             stages: vec![PipelineStage::Single(first)],
@@ -115,7 +115,7 @@ impl Pipeline {
     }
 
     /// Create a named pipeline from a single Box.
-    pub fn named(name: impl Into<String>, first: AgentBox) -> Self {
+    pub fn named(name: impl Into<String>, first: VoidBox) -> Self {
         Self {
             name: name.into(),
             stages: vec![PipelineStage::Single(first)],
@@ -123,7 +123,7 @@ impl Pipeline {
     }
 
     /// Pipe the output of the previous stage into the next Box.
-    pub fn pipe(mut self, next: AgentBox) -> Self {
+    pub fn pipe(mut self, next: VoidBox) -> Self {
         self.stages.push(PipelineStage::Single(next));
         self
     }
@@ -133,7 +133,7 @@ impl Pipeline {
     /// All Boxes in the group receive the same carry-forward data from the
     /// previous stage. Their outputs are merged into a JSON array that becomes
     /// the input for the next stage.
-    pub fn fan_out(mut self, boxes: Vec<AgentBox>) -> Self {
+    pub fn fan_out(mut self, boxes: Vec<VoidBox>) -> Self {
         self.stages.push(PipelineStage::Parallel(boxes));
         self
     }
@@ -270,7 +270,7 @@ impl Pipeline {
                         box_name
                     );
 
-                    // TODO: When AgentBox gains streaming exec support, use it
+                    // TODO: When VoidBox gains streaming exec support, use it
                     // here to call on_output(box_name, chunk) for each chunk.
                     let stage_result = agent_box.run(carry_data.as_deref()).await?;
 

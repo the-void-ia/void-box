@@ -5,7 +5,7 @@
 //! ## Skill & MCP awareness
 //!
 //! On startup, claudio scans the guest filesystem for provisioned skills and MCP config:
-//! - `/home/sandbox/.claude/skills/*.md` -- SKILL.md files provisioned by AgentBox
+//! - `/home/sandbox/.claude/skills/*.md` -- SKILL.md files provisioned by VoidBox
 //! - `/home/sandbox/.claude/mcp.json` -- MCP server configuration
 //!
 //! Discovered skills and MCP servers are:

@@ -25,7 +25,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use void_box::agent_box::AgentBox;
+use void_box::agent_box::VoidBox;
 use void_box::llm::LlmProvider;
 use void_box::pipeline::Pipeline;
 use void_box::skill::Skill;
@@ -199,9 +199,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // Helpers (shared pattern with other examples)
 // ---------------------------------------------------------------------------
 
-/// Create an AgentBox builder pre-configured for the current environment.
-fn make_box(name: &str, use_kvm: bool, llm: &LlmProvider) -> AgentBox {
-    let mut ab = AgentBox::new(name).llm(llm.clone()).memory_mb(1024);
+/// Create an VoidBox builder pre-configured for the current environment.
+fn make_box(name: &str, use_kvm: bool, llm: &LlmProvider) -> VoidBox {
+    let mut ab = VoidBox::new(name).llm(llm.clone()).memory_mb(1024);
 
     // Allow per-stage timeout override via STAGE_TIMEOUT_SECS env var
     if let Ok(secs) = std::env::var("STAGE_TIMEOUT_SECS") {

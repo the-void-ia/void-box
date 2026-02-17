@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use super::SandboxConfig;
 use crate::vmm::config::VoidBoxConfig;
-use crate::vmm::VoidBox;
+use crate::vmm::MicroVm;
 use crate::{Error, ExecOutput, Result};
 
 /// Local sandbox using KVM
@@ -14,7 +14,7 @@ pub struct LocalSandbox {
     /// Sandbox configuration
     config: SandboxConfig,
     /// The underlying VM (lazily initialized)
-    vm: Mutex<Option<VoidBox>>,
+    vm: Mutex<Option<MicroVm>>,
     /// Whether the sandbox is started
     started: std::sync::atomic::AtomicBool,
 }
@@ -72,7 +72,7 @@ impl LocalSandbox {
         }
 
         // Create and start VM
-        let vm = VoidBox::new(vm_config).await?;
+        let vm = MicroVm::new(vm_config).await?;
         *vm_lock = Some(vm);
         self.started.store(true, Ordering::SeqCst);
 
@@ -261,7 +261,7 @@ impl LocalSandbox {
 
 impl Drop for LocalSandbox {
     fn drop(&mut self) {
-        // VM will be stopped when dropped through VoidBox's Drop impl
+        // VM will be stopped when dropped through MicroVm's Drop impl
     }
 }
 
