@@ -91,7 +91,7 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
   chmod +x "$OUT_DIR/bin/busybox"
   ln -sf busybox "$OUT_DIR/bin/sh"
   # Optional links for common commands (so exec("echo", ...) works)
-  for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env wget nc bash; do
+  for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env wget nc; do
     ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
   done
 else
@@ -136,6 +136,69 @@ _install_host_binary() {
 
 _install_host_binary curl
 _install_host_binary jq
+_install_host_binary bash
+# Ensure /bin/bash points to real bash (not busybox applet)
+if [[ -f "$OUT_DIR/usr/local/bin/bash" ]]; then
+  ln -sf /usr/local/bin/bash "$OUT_DIR/bin/bash"
+  echo "[void-box] Symlinked /bin/bash -> /usr/local/bin/bash (real bash)"
+fi
+_install_host_binary git
+
+# git-core helpers: git-remote-https and git-credential-store are separate
+# executables that git shells out to for HTTPS push and credential storage.
+_git_exec_dir=$(git --exec-path 2>/dev/null || true)
+if [[ -n "$_git_exec_dir" && -d "$_git_exec_dir" ]]; then
+  mkdir -p "$OUT_DIR/$_git_exec_dir"
+  for helper in git-remote-https git-credential-store; do
+    if [[ -f "$_git_exec_dir/$helper" ]]; then
+      echo "[void-box] Installing git helper $helper..."
+      cp -L "$_git_exec_dir/$helper" "$OUT_DIR/$_git_exec_dir/$helper"
+      chmod +x "$OUT_DIR/$_git_exec_dir/$helper"
+      # Copy shared libraries for this helper
+      if file -L "$_git_exec_dir/$helper" | grep -q "dynamically linked"; then
+        ldd "$_git_exec_dir/$helper" 2>/dev/null | while read -r line; do
+          lib_path=""
+          if echo "$line" | grep -q "=>"; then
+            lib_path=$(echo "$line" | awk '{print $3}')
+          elif echo "$line" | grep -q "^[[:space:]]*/"; then
+            lib_path=$(echo "$line" | awk '{print $1}')
+          fi
+          if [[ -z "$lib_path" || "$lib_path" == "linux-vdso"* || ! -f "$lib_path" ]]; then
+            continue
+          fi
+          lib_dir=$(dirname "$lib_path")
+          mkdir -p "$OUT_DIR$lib_dir"
+          if [[ ! -f "$OUT_DIR$lib_path" ]]; then
+            cp -L "$lib_path" "$OUT_DIR$lib_path"
+            echo "  -> $lib_path"
+          fi
+        done
+      fi
+    fi
+  done
+else
+  echo "[void-box] git --exec-path not found; skipping git-core helpers"
+fi
+
+# gh CLI: try host binary first, fallback to downloading from GitHub releases.
+if command -v gh &>/dev/null; then
+  _install_host_binary gh
+else
+  GH_VERSION="2.65.0"
+  GH_TARBALL="gh_${GH_VERSION}_linux_amd64.tar.gz"
+  GH_URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}/${GH_TARBALL}"
+  GH_TMP=$(mktemp -d)
+  echo "[void-box] gh not found on host -- downloading v${GH_VERSION} from GitHub..."
+  if curl -fsSL "$GH_URL" -o "$GH_TMP/$GH_TARBALL"; then
+    tar -xzf "$GH_TMP/$GH_TARBALL" -C "$GH_TMP"
+    cp "$GH_TMP/gh_${GH_VERSION}_linux_amd64/bin/gh" "$OUT_DIR/usr/local/bin/gh"
+    chmod +x "$OUT_DIR/usr/local/bin/gh"
+    echo "[void-box] Installed gh v${GH_VERSION} (static Go binary)"
+  else
+    echo "[void-box] WARNING: failed to download gh -- skipping"
+  fi
+  rm -rf "$GH_TMP"
+fi
 
 # Copy kernel modules needed for virtio-mmio and vsock
 KVER=$(uname -r)

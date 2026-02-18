@@ -1,0 +1,16 @@
+api_version: v1
+kind: agent
+name: smoke_test
+
+sandbox:
+  mode: auto
+  memory_mb: 3072
+  vcpus: 2
+  network: true
+
+llm:
+  provider: claude
+
+agent:
+  prompt: "Say exactly: Hello from void-box! Then stop."
+  timeout_secs: 120

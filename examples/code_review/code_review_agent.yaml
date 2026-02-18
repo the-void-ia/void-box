@@ -4,8 +4,9 @@ name: code_review
 
 sandbox:
   mode: auto
-  memory_mb: 1024
-  vcpus: 1
+  memory_mb: 3072
+  vcpus: 4
+  network: true
 
 llm:
   provider: claude
@@ -14,8 +15,7 @@ pipeline:
   boxes:
     - name: analyzer
       sandbox:
-        network: true
-        memory_mb: 2048
+        memory_mb: 3072
       skills:
         - "agent:claude-code"
         - "remote:obra/superpowers/systematic-debugging"
@@ -23,36 +23,66 @@ pipeline:
       prompt: >
         You are a senior code reviewer with expertise in systematic debugging and TDD.
 
-        Clone the repository provided in /workspace/input.json (or use
-        https://github.com/the-void-ia/void-box if no input is provided).
+        Clone the repository https://github.com/dpsoft/ap-agent:
+
+          git clone https://github.com/dpsoft/ap-agent.git /workspace/repo
+
         Read the code structure and key files.
 
         Identify exactly 3 concrete improvements. For each one provide:
         - Category: one of BUG, MISSING_TEST, CODE_QUALITY
         - File path and line number(s)
         - Description of the issue
-        - Suggested fix (high-level)
+        - Suggested fix (include a short code snippet showing the change)
 
         Output a structured analysis in this format:
 
         ## Analysis
 
         ### 1. [CATEGORY] Title
-        **File:** path/to/file.rs:42
+        **File:** path/to/file:42
         **Issue:** Description of what's wrong.
-        **Fix:** How to fix it.
+        **Fix:** How to fix it, with a code snippet.
       timeout_secs: 600
 
     - name: proposer
+      sandbox:
+        memory_mb: 3072
+        env:
+          GITHUB_TOKEN: ""
       skills:
         - "agent:claude-code"
+        - "file:examples/code_review/skills/github-pr.md"
       prompt: >
-        You are a senior developer. Read the code review analysis from
-        /workspace/input.json.
+        You receive a code review analysis in /workspace/input.json.
+        Your ONLY job is to apply the fixes and submit a PR. Do NOT re-analyze
+        the code or explore the repository beyond what is needed to apply fixes.
 
-        For each identified improvement, write a concrete code change as a
-        unified diff. Output a markdown report with the diffs and a summary
-        of all changes and their combined impact.
+        Execute these commands in order:
+
+        Step 1 - Auth:
+          git config --global user.name "void-box[bot]"
+          git config --global user.email "void-box[bot]@users.noreply.github.com"
+          git config --global credential.helper store
+          printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$GITHUB_TOKEN" | git credential-store store
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
+
+        Step 2 - Clone and branch:
+          git clone https://github.com/dpsoft/ap-agent.git /workspace/repo
+          cd /workspace/repo
+          git checkout -b void-box/code-review-improvements
+
+        Step 3 - Apply fixes:
+          Read the analysis from /workspace/input.json. For each improvement,
+          edit ONLY the specific file and lines mentioned. Make minimal changes.
+
+        Step 4 - Commit, push, and create PR:
+          git add -A
+          git commit -m "fix: apply code review improvements from void-box analysis"
+          git push -u origin HEAD
+          gh pr create --title "fix: code review improvements" --body "$(cat /workspace/input.json)"
+
+        Output the PR URL. Do not do anything else.
       timeout_secs: 300
 
   stages:

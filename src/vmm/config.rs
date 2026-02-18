@@ -15,6 +15,7 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "python3",
     "pip",
     "git",
+    "gh",
     "curl",
     "wget",
     "jq",

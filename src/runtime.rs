@@ -7,7 +7,9 @@ use crate::llm::LlmProvider;
 use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
 use crate::skill::Skill;
-use crate::spec::{load_spec, LlmSpec, PipelineBoxSpec, PipelineStageSpec, RunKind, RunSpec};
+use crate::spec::{
+    load_spec, BoxSandboxOverride, LlmSpec, PipelineBoxSpec, PipelineStageSpec, RunKind, RunSpec,
+};
 use crate::workflow::Workflow;
 use crate::workflow::WorkflowExt;
 use crate::{Error, Result};
@@ -244,6 +246,7 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 fn build_pipeline_box(spec: &RunSpec, b: &PipelineBoxSpec) -> Result<VoidBox> {
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
     builder = apply_box_sandbox(builder, spec);
+    builder = apply_box_overrides(builder, b.sandbox.as_ref());
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
     for s in &b.skills {
         builder = builder.skill(parse_skill(s)?);
@@ -317,7 +320,7 @@ fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec) -> VoidBox {
     }
 
     for (k, v) in &spec.sandbox.env {
-        builder = builder.env(k, v);
+        builder = builder.env(k, &resolve_env_value(k, v));
     }
 
     if mode == "auto" {
@@ -346,6 +349,37 @@ fn resolve_initramfs(spec: &RunSpec) -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from))
         .filter(|p| p.exists())
+}
+
+/// Apply per-box sandbox overrides on top of the base sandbox config.
+fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverride>) -> VoidBox {
+    let Some(ov) = overrides else {
+        return builder;
+    };
+    if let Some(mb) = ov.memory_mb {
+        builder = builder.memory_mb(mb);
+    }
+    if let Some(v) = ov.vcpus {
+        builder = builder.vcpus(v);
+    }
+    if let Some(net) = ov.network {
+        builder = builder.network(net);
+    }
+    for (k, v) in &ov.env {
+        builder = builder.env(k, &resolve_env_value(k, v));
+    }
+    builder
+}
+
+/// Resolve an env-var value: if the spec value is empty (`""`), read the
+/// actual value from the host process environment. This lets YAML authors
+/// write `GITHUB_TOKEN: ""` to mean "inject from host".
+fn resolve_env_value(key: &str, spec_value: &str) -> String {
+    if spec_value.is_empty() {
+        std::env::var(key).unwrap_or_default()
+    } else {
+        spec_value.to_string()
+    }
 }
 
 fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {

@@ -94,6 +94,18 @@ pub struct PipelineSpec {
     pub stages: Vec<PipelineStageSpec>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BoxSandboxOverride {
+    #[serde(default)]
+    pub memory_mb: Option<usize>,
+    #[serde(default)]
+    pub vcpus: Option<usize>,
+    #[serde(default)]
+    pub network: Option<bool>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineBoxSpec {
     pub name: String,
@@ -104,6 +116,8 @@ pub struct PipelineBoxSpec {
     pub llm: Option<LlmSpec>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub sandbox: Option<BoxSandboxOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
