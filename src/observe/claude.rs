@@ -108,8 +108,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        // Find the nearest char boundary at or before `max`
-        let end = s.floor_char_boundary(max);
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &s[..end])
     }
 }
@@ -168,8 +170,7 @@ pub fn parse_jsonl_line(
 
                 if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
                     for block in content {
-                        let block_type =
-                            block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if block_type == "tool_use" {
                             let tool = ClaudeToolCall {
                                 tool_name: block
@@ -207,8 +208,7 @@ pub fn parse_jsonl_line(
             if let Some(msg) = event.get("message") {
                 if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
                     for block in content {
-                        let block_type =
-                            block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if block_type == "tool_result" {
                             let tool_use_id = block
                                 .get("tool_use_id")
@@ -245,8 +245,7 @@ pub fn parse_jsonl_line(
                 .get("duration_api_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            state.num_turns =
-                event.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            state.num_turns = event.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             state.is_error = event
                 .get("is_error")
                 .and_then(|v| v.as_bool())
@@ -812,10 +811,7 @@ mod tests {
             &mut tool_id_map,
         );
         assert!(events.is_empty());
-        assert_eq!(
-            state.tool_calls[0].output,
-            Some("file1\nfile2".to_string())
-        );
+        assert_eq!(state.tool_calls[0].output, Some("file1\nfile2".to_string()));
     }
 
     #[test]

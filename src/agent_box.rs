@@ -519,10 +519,7 @@ impl VoidBox {
                         if summary.is_empty() {
                             eprintln!("[vm:{}]   tool: {}", tag_clone, tc.tool_name);
                         } else {
-                            eprintln!(
-                                "[vm:{}]   tool: {}  {}",
-                                tag_clone, tc.tool_name, summary
-                            );
+                            eprintln!("[vm:{}]   tool: {}  {}", tag_clone, tc.tool_name, summary);
                         }
                     }
                 },

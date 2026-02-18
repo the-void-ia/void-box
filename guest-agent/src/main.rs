@@ -140,8 +140,7 @@ fn sync_clock_from_cmdline() {
                     tv_sec: secs,
                     tv_nsec: 0,
                 };
-                let ret =
-                    unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
                 if ret == 0 {
                     kmsg(&format!("System clock set to epoch {}", secs));
                 } else {

@@ -437,9 +437,7 @@ impl Sandbox {
             }
             SandboxInner::Mock(mock) => {
                 // Mock: fall back to non-streaming, emit events from batch result
-                let output = mock
-                    .exec_with_stdin("claude-code", &args_refs, &[])
-                    .await?;
+                let output = mock.exec_with_stdin("claude-code", &args_refs, &[]).await?;
                 let result = crate::observe::claude::parse_stream_json(&output.stdout);
 
                 for tc in &result.tool_calls {

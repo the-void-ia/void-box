@@ -915,11 +915,7 @@ fn vsock_irq_thread(
 ///
 /// This thread wakes every 5 ms, reads any pending host data via
 /// `try_inject_rx`, and fires IRQ 10 to notify the guest.
-fn net_poll_thread(
-    net_dev: Arc<Mutex<VirtioNetDevice>>,
-    vm: Arc<Vm>,
-    running: Arc<AtomicBool>,
-) {
+fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
         irq: u32,

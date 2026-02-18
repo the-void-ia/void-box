@@ -320,7 +320,7 @@ fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec) -> VoidBox {
     }
 
     for (k, v) in &spec.sandbox.env {
-        builder = builder.env(k, &resolve_env_value(k, v));
+        builder = builder.env(k, resolve_env_value(k, v));
     }
 
     if mode == "auto" {
@@ -366,7 +366,7 @@ fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverri
         builder = builder.network(net);
     }
     for (k, v) in &ov.env {
-        builder = builder.env(k, &resolve_env_value(k, v));
+        builder = builder.env(k, resolve_env_value(k, v));
     }
     builder
 }

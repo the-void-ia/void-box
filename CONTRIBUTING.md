@@ -19,7 +19,7 @@ Thank you for your interest in contributing to void-box! This document provides 
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.83 or later
 - Linux with KVM support (for testing KVM features)
 - `musl-tools` for building guest-agent
 - `cpio` and `gzip` for initramfs creation
@@ -221,7 +221,7 @@ Looking for ideas? Here are some areas that need work:
 
 ## License
 
-By contributing to void-box, you agree that your contributions will be licensed under the same license as the project (to be determined).
+By contributing to void-box, you agree that your contributions will be licensed under the Apache-2.0 license.
 
 ## Questions?
 

@@ -479,8 +479,7 @@ impl SlirpStack {
                             key,
                             DnsCacheEntry {
                                 response: resp.clone(),
-                                expires: Instant::now()
-                                    + Duration::from_secs(DNS_CACHE_TTL_SECS),
+                                expires: Instant::now() + Duration::from_secs(DNS_CACHE_TTL_SECS),
                             },
                         );
                     }
