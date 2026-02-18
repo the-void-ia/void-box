@@ -36,7 +36,7 @@
 > **Status:** v0 (early release). Production-ready architecture; APIs are still stabilizing.
 
 <p align="center">
-  <img src="site/assets/img/quick_demo.gif" alt="quick_demo — two-stage stock analysis pipeline" width="800">
+  <img src="site/assets/img/hn_demo.gif" alt="hn_demo — two-stage stock analysis pipeline" width="800">
 </p>
 
 ---
