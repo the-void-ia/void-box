@@ -91,12 +91,51 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
   chmod +x "$OUT_DIR/bin/busybox"
   ln -sf busybox "$OUT_DIR/bin/sh"
   # Optional links for common commands (so exec("echo", ...) works)
-  for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env; do
+  for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env wget nc bash; do
     ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
   done
 else
   echo "[void-box] No BUSYBOX set; guest will have no /bin/sh (set BUSYBOX=/path/to/busybox for full shell support)."
 fi
+
+# Optional: install host curl and jq for HTTP/JSON skills (e.g., HackerNews agent).
+# These are dynamically linked, so we copy their shared libraries too.
+_install_host_binary() {
+  local bin_name="$1"
+  local bin_path
+  bin_path=$(command -v "$bin_name" 2>/dev/null || true)
+  if [[ -z "$bin_path" || ! -f "$bin_path" ]]; then
+    echo "[void-box] $bin_name not found on host -- skipping"
+    return
+  fi
+  echo "[void-box] Installing $bin_name from $bin_path..."
+  cp -L "$bin_path" "$OUT_DIR/usr/local/bin/$bin_name"
+  chmod +x "$OUT_DIR/usr/local/bin/$bin_name"
+
+  # Copy shared libraries if dynamically linked
+  if file -L "$bin_path" | grep -q "dynamically linked"; then
+    ldd "$bin_path" 2>/dev/null | while read -r line; do
+      lib_path=""
+      if echo "$line" | grep -q "=>"; then
+        lib_path=$(echo "$line" | awk '{print $3}')
+      elif echo "$line" | grep -q "^[[:space:]]*/"; then
+        lib_path=$(echo "$line" | awk '{print $1}')
+      fi
+      if [[ -z "$lib_path" || "$lib_path" == "linux-vdso"* || ! -f "$lib_path" ]]; then
+        continue
+      fi
+      lib_dir=$(dirname "$lib_path")
+      mkdir -p "$OUT_DIR$lib_dir"
+      if [[ ! -f "$OUT_DIR$lib_path" ]]; then
+        cp -L "$lib_path" "$OUT_DIR$lib_path"
+        echo "  -> $lib_path"
+      fi
+    done
+  fi
+}
+
+_install_host_binary curl
+_install_host_binary jq
 
 # Copy kernel modules needed for virtio-mmio and vsock
 KVER=$(uname -r)

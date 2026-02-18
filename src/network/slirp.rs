@@ -24,6 +24,17 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Cached DNS response with expiry.
+struct DnsCacheEntry {
+    response: Vec<u8>,
+    expires: Instant,
+}
+
+/// DNS cache TTL (seconds).  DNS responses carry their own TTL but parsing
+/// every record type is overkill — a short blanket TTL covers 99 % of cases
+/// while keeping the implementation simple.
+const DNS_CACHE_TTL_SECS: u64 = 60;
+
 use ipnet::Ipv4Net;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -172,6 +183,46 @@ impl TxToken for VTx {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+//  Host DNS discovery
+// ──────────────────────────────────────────────────────────────────────
+
+/// Read the host's `/etc/resolv.conf` and return `"ip:53"` entries.
+/// Falls back to `["8.8.8.8:53", "1.1.1.1:53"]` if the file is missing
+/// or contains no usable nameservers.
+fn parse_resolv_conf() -> Vec<String> {
+    let fallback = vec!["8.8.8.8:53".to_string(), "1.1.1.1:53".to_string()];
+    let content = match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(c) => c,
+        Err(_) => return fallback,
+    };
+    let servers: Vec<String> = content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "nameserver" {
+                return None;
+            }
+            let ip = parts.next()?;
+            // Skip localhost entries (systemd-resolved stub) — they won't
+            // work from inside the VMM's network namespace.
+            if ip.starts_with("127.") {
+                return None;
+            }
+            Some(format!("{}:53", ip))
+        })
+        .collect();
+    if servers.is_empty() {
+        fallback
+    } else {
+        servers
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  SLIRP Stack
 // ──────────────────────────────────────────────────────────────────────
 
@@ -192,6 +243,10 @@ pub struct SlirpStack {
     connection_timestamps: VecDeque<Instant>,
     /// Network deny list (CIDR ranges that the guest cannot reach)
     deny_list: Vec<Ipv4Net>,
+    /// Host DNS servers (parsed from /etc/resolv.conf, fallback to public)
+    dns_servers: Vec<String>,
+    /// DNS response cache keyed by the raw query bytes (question section)
+    dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
 }
 
 impl SlirpStack {
@@ -241,9 +296,10 @@ impl SlirpStack {
             })
             .collect();
 
+        let dns_servers = parse_resolv_conf();
         debug!(
-            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs",
-            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, deny_list.len()
+            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, dns_servers: {:?}",
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, deny_list.len(), dns_servers
         );
 
         Ok(Self {
@@ -257,6 +313,8 @@ impl SlirpStack {
             max_connections_per_second,
             connection_timestamps: VecDeque::new(),
             deny_list,
+            dns_servers,
+            dns_cache: HashMap::new(),
         })
     }
 
@@ -352,15 +410,80 @@ impl SlirpStack {
         frames
     }
 
+    /// Extract the DNS question section (bytes after the 12-byte header up to
+    /// and including the QCLASS) to use as a cache key.  This is stable for
+    /// identical queries regardless of the random transaction ID.
+    fn dns_cache_key(query: &[u8]) -> Option<Vec<u8>> {
+        if query.len() < 17 {
+            return None; // too short to contain a question
+        }
+        // Question section starts at byte 12.  Walk labels until the root
+        // (0-length label), then grab QTYPE (2) + QCLASS (2).
+        let mut pos = 12;
+        loop {
+            if pos >= query.len() {
+                return None;
+            }
+            let len = query[pos] as usize;
+            if len == 0 {
+                pos += 1; // skip root label
+                break;
+            }
+            pos += 1 + len;
+        }
+        pos += 4; // QTYPE + QCLASS
+        if pos > query.len() {
+            return None;
+        }
+        Some(query[12..pos].to_vec())
+    }
+
     /// Forward a DNS query to host resolvers and return the response.
-    fn forward_dns_query(&self, query: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// Uses a 60-second cache and reads nameservers from the host's
+    /// `/etc/resolv.conf` (falls back to 8.8.8.8 / 1.1.1.1).  Timeout is
+    /// kept short (2 s) so that tool preflight checks don't stall.
+    fn forward_dns_query(&mut self, query: &[u8]) -> Option<Vec<u8>> {
+        // ── Check cache ────────────────────────────────────────────
+        if let Some(key) = Self::dns_cache_key(query) {
+            if let Some(entry) = self.dns_cache.get(&key) {
+                if Instant::now() < entry.expires {
+                    // Patch the cached response with the caller's
+                    // transaction ID (first 2 bytes) so the guest
+                    // matches it to its pending request.
+                    let mut resp = entry.response.clone();
+                    if resp.len() >= 2 && query.len() >= 2 {
+                        resp[0] = query[0];
+                        resp[1] = query[1];
+                    }
+                    debug!("SLIRP DNS: cache hit");
+                    return Some(resp);
+                } else {
+                    self.dns_cache.remove(&key);
+                }
+            }
+        }
+
+        // ── Forward to upstream ────────────────────────────────────
         let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-        sock.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        for server in &["8.8.8.8:53", "1.1.1.1:53"] {
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+
+        for server in &self.dns_servers {
             if sock.send_to(query, server).is_ok() {
                 let mut resp = vec![0u8; 4096];
                 if let Ok((n, _)) = sock.recv_from(&mut resp) {
                     resp.truncate(n);
+                    // Store in cache
+                    if let Some(key) = Self::dns_cache_key(query) {
+                        self.dns_cache.insert(
+                            key,
+                            DnsCacheEntry {
+                                response: resp.clone(),
+                                expires: Instant::now()
+                                    + Duration::from_secs(DNS_CACHE_TTL_SECS),
+                            },
+                        );
+                    }
                     return Some(resp);
                 }
             }
@@ -607,7 +730,7 @@ impl SlirpStack {
             };
             let addr = SocketAddr::new(std::net::IpAddr::V4(host_ip), dst_port);
 
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
                 Ok(stream) => {
                     stream.set_nonblocking(true).ok();
                     let our_seq: u32 = rand_seq();

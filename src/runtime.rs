@@ -63,11 +63,21 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
     let ab = builder.build()?;
     let stage = ab.run(input.as_deref().map(str::as_bytes)).await?;
 
+    // Prefer the JSONL result_text, but fall back to file_output when
+    // claude-code is killed before emitting the result event.
+    let output = if !stage.claude_result.result_text.is_empty() {
+        stage.claude_result.result_text.clone()
+    } else if let Some(ref data) = stage.file_output {
+        String::from_utf8_lossy(data).into_owned()
+    } else {
+        String::new()
+    };
+
     Ok(RunReport {
         name: spec.name.clone(),
         kind: "agent".to_string(),
         success: !stage.claude_result.is_error,
-        output: stage.claude_result.result_text.clone(),
+        output,
         stages: 1,
         total_cost_usd: stage.claude_result.total_cost_usd,
         input_tokens: stage.claude_result.input_tokens,

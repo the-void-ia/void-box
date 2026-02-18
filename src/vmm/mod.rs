@@ -63,6 +63,8 @@ pub struct MicroVm {
     event_loop_handle: Option<JoinHandle<()>>,
     /// Handle to the vsock IRQ handler thread (if vsock enabled)
     vsock_irq_handle: Option<JoinHandle<()>>,
+    /// Handle to the network polling thread (SLIRP RX relay)
+    net_poll_handle: Option<JoinHandle<()>>,
     /// Guest telemetry aggregator (if telemetry is active)
     telemetry: Option<Arc<TelemetryAggregator>>,
     /// Active span context for trace propagation into the guest.
@@ -245,6 +247,26 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             None
         };
 
+        // Spawn a background thread that polls SLIRP for host→guest TCP data
+        // independently of the vCPU.  Without this, data from host sockets can
+        // sit unread for seconds while the guest is doing computation (Node.js
+        // startup, V8 JIT) because KVM_RUN doesn't exit during pure computation.
+        let net_poll_handle = if let Some(ref net_dev) = mmio_devices.virtio_net {
+            let net_dev_clone = net_dev.clone();
+            let vm_clone2 = vm.clone();
+            let running_net = running.clone();
+            let handle = std::thread::Builder::new()
+                .name("net-poll".into())
+                .spawn(move || {
+                    net_poll_thread(net_dev_clone, vm_clone2, running_net);
+                })
+                .expect("Failed to spawn net-poll thread");
+            debug!("Spawned net-poll thread for SLIRP RX relay");
+            Some(handle)
+        } else {
+            None
+        };
+
         // Create command channel
         let (command_tx, mut command_rx) = mpsc::channel::<VmCommand>(32);
 
@@ -360,6 +382,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             command_tx,
             event_loop_handle: Some(event_loop_handle),
             vsock_irq_handle,
+            net_poll_handle,
             telemetry: None,
             active_span_context: None,
         })
@@ -670,6 +693,13 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                 .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
         }
 
+        // Wait for net-poll thread if present
+        if let Some(handle) = self.net_poll_handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
+        }
+
         info!("MicroVm stopped");
         Ok(())
     }
@@ -874,6 +904,56 @@ fn vsock_irq_thread(
         libc::close(epfd);
     }
     debug!("vsock-irq thread exiting");
+}
+
+/// Background thread that polls SLIRP for host→guest TCP data.
+///
+/// When the guest vCPU is busy executing (e.g. Node.js JIT compilation),
+/// `KVM_RUN` does not exit and the in-loop SLIRP poll never runs.  Data
+/// from host TCP sockets accumulates unread, causing TLS handshakes and
+/// API calls to time out.
+///
+/// This thread wakes every 5 ms, reads any pending host data via
+/// `try_inject_rx`, and fires IRQ 10 to notify the guest.
+fn net_poll_thread(
+    net_dev: Arc<Mutex<VirtioNetDevice>>,
+    vm: Arc<Vm>,
+    running: Arc<AtomicBool>,
+) {
+    #[repr(C)]
+    struct KvmIrqLevel {
+        irq: u32,
+        level: u32,
+    }
+    const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+    let vm_fd = vm.vm_fd().as_raw_fd();
+    let guest_memory = vm.guest_memory();
+
+    while running.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let has_interrupt = {
+            let mut guard = match net_dev.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            let _ = guard.try_inject_rx(guest_memory);
+            guard.has_pending_interrupt()
+        };
+
+        if has_interrupt {
+            let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
+            unsafe {
+                libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert_irq);
+            }
+            let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
+            unsafe {
+                libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert_irq);
+            }
+        }
+    }
+
+    debug!("net-poll thread exiting");
 }
 
 #[cfg(test)]

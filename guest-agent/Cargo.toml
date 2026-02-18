@@ -3,6 +3,7 @@ name = "guest-agent"
 version = "0.1.0"
 edition = "2021"
 description = "Guest agent for void-box VMs - runs as init process"
+publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

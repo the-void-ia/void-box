@@ -11,14 +11,13 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "sh",
     "bash",
     "claude-code",
-    "node",
-    "npm",
-    "npx",
+    "claude",
     "python3",
     "pip",
     "git",
     "curl",
     "wget",
+    "jq",
     "cat",
     "ls",
     "mkdir",
@@ -63,9 +62,9 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_virtual_memory: 4096 * 1024 * 1024, // 4 GB (V8/Node.js needs large virtual address space)
+            max_virtual_memory: 4 * 1024 * 1024 * 1024, // 4 GB — Bun/JSC needs ~640MB for startup, more for JIT at runtime
             max_open_files: 1024,
-            max_processes: 64,
+            max_processes: 512, // Bun worker threads count towards NPROC on Linux
             max_file_size: 100 * 1024 * 1024, // 100 MB
         }
     }
@@ -277,6 +276,15 @@ impl VoidBoxConfig {
             .map(|b| format!("{:02x}", b))
             .collect();
         cmdline.push(format!("voidbox.secret={}", secret_hex));
+
+        // Inject host wall-clock so the guest can set its system time.
+        // Without this, the guest starts at epoch (1970) and TLS cert
+        // validation fails.
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        cmdline.push(format!("voidbox.clock={}", epoch_secs));
 
         // Add extra arguments
         cmdline.extend(self.extra_cmdline.clone());

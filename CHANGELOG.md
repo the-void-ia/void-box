@@ -7,18 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Switch from Node.js + npm claude-code to native claude-code binary (Bun SEA)
+- SLIRP networking: DNS caching, host resolv.conf forwarding, reduced timeouts
+- Guest clock sync via kernel cmdline (`voidbox.clock=<epoch_secs>`)
+- Net-poll background thread for improved network throughput
+- HLT sleep reduced from 10ms to 1ms for lower latency
+- NPROC limit raised to 512 (from 256) for Bun worker threads
+- Code review agent example with two-stage pipeline and remote skills
+
+### Fixed
+- RLIMIT_AS re-enabled at 1GB — Bun/JSC needs only ~640MB virtual (vs V8's 10GB+)
+- `file_output` fallback when claude-code output file is missing
+- `skipWebFetchPreflight` added to agent config defaults
+
+## [0.1.0] - 2025-02-12
+
 ### Added
+- Initial release of void-box
 - Comprehensive CI/CD pipeline with GitHub Actions
 - Automated testing on push and pull requests
 - Security audit checks
 - Multi-platform build verification (Linux, macOS)
 - Documentation build verification
 - Contributing guidelines
-
-## [0.1.0] - 2025-02-12
-
-### Added
-- Initial release of void-box
 - KVM-based micro-VM sandbox implementation
 - Mock sandbox for testing and development
 - Workflow composition engine with DAG support

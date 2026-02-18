@@ -1,0 +1,62 @@
+api_version: v1
+kind: pipeline
+name: code_review
+
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  vcpus: 1
+
+llm:
+  provider: claude
+
+pipeline:
+  boxes:
+    - name: analyzer
+      sandbox:
+        network: true
+        memory_mb: 2048
+      skills:
+        - "agent:claude-code"
+        - "remote:obra/superpowers/systematic-debugging"
+        - "remote:obra/superpowers/test-driven-development"
+      prompt: >
+        You are a senior code reviewer with expertise in systematic debugging and TDD.
+
+        Clone the repository provided in /workspace/input.json (or use
+        https://github.com/the-void-ia/void-box if no input is provided).
+        Read the code structure and key files.
+
+        Identify exactly 3 concrete improvements. For each one provide:
+        - Category: one of BUG, MISSING_TEST, CODE_QUALITY
+        - File path and line number(s)
+        - Description of the issue
+        - Suggested fix (high-level)
+
+        Output a structured analysis in this format:
+
+        ## Analysis
+
+        ### 1. [CATEGORY] Title
+        **File:** path/to/file.rs:42
+        **Issue:** Description of what's wrong.
+        **Fix:** How to fix it.
+      timeout_secs: 600
+
+    - name: proposer
+      skills:
+        - "agent:claude-code"
+      prompt: >
+        You are a senior developer. Read the code review analysis from
+        /workspace/input.json.
+
+        For each identified improvement, write a concrete code change as a
+        unified diff. Output a markdown report with the diffs and a summary
+        of all changes and their combined impact.
+      timeout_secs: 300
+
+  stages:
+    - type: box
+      name: analyzer
+    - type: box
+      name: proposer

@@ -299,9 +299,10 @@ fn vcpu_run_loop(
                     }
                     VcpuExit::Hlt => {
                         debug!("vCPU {} halted", vcpu_id);
-                        // In a real VMM, we'd wait for an interrupt
-                        // For now, yield and continue
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        // Yield briefly so the host networking thread can make
+                        // progress (SLIRP, vsock).  1 ms keeps latency low while
+                        // avoiding a busy-spin.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     VcpuExit::Shutdown => {
                         debug!("vCPU {} shutdown", vcpu_id);

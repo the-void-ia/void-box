@@ -43,18 +43,18 @@ thread_local! {
 /// Resource limits applied to child processes via setrlimit.
 #[derive(Clone, serde::Deserialize)]
 struct ResourceLimits {
-    max_virtual_memory: u64,
+    max_virtual_memory: u64, // Not enforced — see comment in pre_exec
     max_open_files: u64,
-    max_processes: u64,
+    max_processes: u64, // Bun worker threads count towards NPROC on Linux
     max_file_size: u64,
 }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_virtual_memory: 4096 * 1024 * 1024, // 4 GB (V8/Node.js needs large virtual address space)
+            max_virtual_memory: 4 * 1024 * 1024 * 1024, // 4 GB — Bun/JSC needs ~640MB for startup, more for JIT at runtime
             max_open_files: 1024,
-            max_processes: 64,
+            max_processes: 512, // Bun worker threads count towards NPROC on Linux
             max_file_size: 100 * 1024 * 1024, // 100 MB
         }
     }
@@ -125,12 +125,48 @@ fn parse_session_secret() -> Option<[u8; 32]> {
     None
 }
 
+/// Set the guest system clock from the `voidbox.clock=<epoch_secs>` kernel
+/// cmdline parameter.  Without this the guest starts at 1970-01-01 and TLS
+/// certificate validation fails.
+fn sync_clock_from_cmdline() {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for param in cmdline.split_whitespace() {
+        if let Some(secs_str) = param.strip_prefix("voidbox.clock=") {
+            if let Ok(secs) = secs_str.parse::<i64>() {
+                let ts = libc::timespec {
+                    tv_sec: secs,
+                    tv_nsec: 0,
+                };
+                let ret =
+                    unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                if ret == 0 {
+                    kmsg(&format!("System clock set to epoch {}", secs));
+                } else {
+                    kmsg(&format!(
+                        "WARNING: clock_settime failed (errno={})",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return;
+            }
+        }
+    }
+}
+
 fn main() {
     kmsg("void-box guest agent starting...");
 
     // Initialize the system if we're PID 1
     if std::process::id() == 1 {
         init_system();
+    }
+
+    // Set the wall clock before anything that needs accurate time (e.g. TLS).
+    if std::process::id() == 1 {
+        sync_clock_from_cmdline();
     }
 
     // Load kernel modules needed for vsock (virtio_mmio + vsock transport)
@@ -727,14 +763,18 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // Apply resource limits
+            // Apply resource limits.
             if let Some(limits) = RESOURCE_LIMITS.get() {
-                // RLIMIT_AS: virtual memory
-                let rlim_as = libc::rlimit {
-                    rlim_cur: limits.max_virtual_memory,
-                    rlim_max: limits.max_virtual_memory,
-                };
-                libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
+                // RLIMIT_AS: virtual address space (defense-in-depth).
+                // Bun/JSC needs ~640MB virtual minimum. Default is 1GB which
+                // gives headroom. Set to 0 to disable.
+                if limits.max_virtual_memory > 0 {
+                    let rlim_as = libc::rlimit {
+                        rlim_cur: limits.max_virtual_memory,
+                        rlim_max: limits.max_virtual_memory,
+                    };
+                    libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
+                }
 
                 // RLIMIT_NOFILE: open file descriptors
                 let rlim_nofile = libc::rlimit {

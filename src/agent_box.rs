@@ -263,12 +263,13 @@ impl VoidBox {
     async fn provision_security(&self, sandbox: &Sandbox) -> Result<()> {
         let tag = &self.name;
 
-        // Write resource limits
+        // Write resource limits (use defaults from SecurityConfig)
+        let rl = crate::vmm::config::ResourceLimits::default();
         let limits = serde_json::json!({
-            "max_virtual_memory": 4096 * 1024 * 1024_u64,
-            "max_open_files": 1024_u64,
-            "max_processes": 64_u64,
-            "max_file_size": 100 * 1024 * 1024_u64,
+            "max_virtual_memory": rl.max_virtual_memory,
+            "max_open_files": rl.max_open_files,
+            "max_processes": rl.max_processes,
+            "max_file_size": rl.max_file_size,
         });
         let limits_json = serde_json::to_string_pretty(&limits).map_err(|e| {
             crate::Error::Config(format!("Failed to serialize resource limits: {}", e))
@@ -431,6 +432,19 @@ impl VoidBox {
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
 
+        // Write claude-code settings.  skipWebFetchPreflight avoids the
+        // preflight call to claude.ai/api/web/domain_info which is
+        // unreachable from inside the SLIRP network in many environments.
+        let settings = serde_json::json!({
+            "skipWebFetchPreflight": true
+        });
+        sandbox
+            .write_file(
+                &format!("{}/settings.json", CLAUDE_HOME),
+                settings.to_string().as_bytes(),
+            )
+            .await?;
+
         let tag = &self.name;
 
         // Write input data if provided
@@ -479,13 +493,22 @@ impl VoidBox {
             full_prompt.len()
         );
 
-        // Execute the agent
+        // Execute the agent.
+        // Pass skipWebFetchPreflight via --settings so WebFetch skips the
+        // preflight call to claude.ai/api/web/domain_info (unreachable from
+        // inside SLIRP in many environments — see anthropics/claude-code#6388).
+        let mut extra_args = self.config.llm.cli_args();
+        extra_args.extend([
+            "--settings".to_string(),
+            r#"{"skipWebFetchPreflight":true}"#.to_string(),
+        ]);
+
         let mut claude_result = sandbox
             .exec_claude(
                 &full_prompt,
                 ClaudeExecOpts {
                     dangerously_skip_permissions: true,
-                    extra_args: self.config.llm.cli_args(),
+                    extra_args,
                     timeout_secs: self.config.timeout_secs,
                     ..Default::default()
                 },
