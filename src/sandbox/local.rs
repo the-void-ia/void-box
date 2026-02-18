@@ -245,6 +245,57 @@ impl LocalSandbox {
             .await
     }
 
+    /// Streaming variant of `exec_claude_internal`.
+    ///
+    /// Returns a channel of `ExecOutputChunk` and a oneshot for the final
+    /// `ExecResponse`.  In simulation mode (no kernel), falls back to the
+    /// non-streaming path and synthesises a single stdout chunk.
+    pub(crate) async fn exec_claude_streaming_internal(
+        &self,
+        args: &[&str],
+        extra_env: &[(String, String)],
+        timeout_secs: Option<u64>,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<crate::guest::protocol::ExecOutputChunk>,
+        tokio::sync::oneshot::Receiver<Result<crate::guest::protocol::ExecResponse>>,
+    )> {
+        use crate::guest::protocol::{ExecOutputChunk, ExecResponse};
+
+        if self.config.kernel.is_none() {
+            // Simulation mode — run synchronously, wrap in channels
+            let output = self.simulate_exec("claude-code", args, &[])?;
+            let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(1);
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+            if !output.stdout.is_empty() {
+                let _ = chunk_tx
+                    .send(ExecOutputChunk {
+                        stream: "stdout".to_string(),
+                        data: output.stdout.clone(),
+                        seq: 0,
+                    })
+                    .await;
+            }
+            let _ = resp_tx.send(Ok(ExecResponse::success(
+                output.stdout,
+                output.stderr,
+                output.exit_code,
+                0,
+            )));
+            return Ok((chunk_rx, resp_rx));
+        }
+
+        self.ensure_started().await?;
+
+        let vm_lock = self.vm.lock().await;
+        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+
+        let mut env = self.config.env.clone();
+        env.extend(extra_env.iter().cloned());
+        vm.exec_streaming("claude-code", args, &env, None, timeout_secs)
+            .await
+    }
+
     /// Stop the sandbox
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;

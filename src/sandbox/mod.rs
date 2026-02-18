@@ -296,6 +296,161 @@ impl Sandbox {
         Ok(result)
     }
 
+    /// Execute `claude-code` with streaming output and incremental JSONL parsing.
+    ///
+    /// Like [`exec_claude()`](Self::exec_claude), but parses JSONL lines as
+    /// they arrive from the guest VM and calls `on_event` for each tool-use
+    /// event in real-time.  Returns the same `ClaudeExecResult` as the
+    /// non-streaming variant.
+    pub async fn exec_claude_streaming<F>(
+        &self,
+        prompt: &str,
+        opts: crate::observe::claude::ClaudeExecOpts,
+        mut on_event: F,
+    ) -> Result<crate::observe::claude::ClaudeExecResult>
+    where
+        F: FnMut(crate::observe::claude::ClaudeStreamEvent),
+    {
+        use crate::observe::claude::{parse_jsonl_line, ClaudeExecResult, ClaudeStreamEvent};
+        use std::collections::HashMap;
+
+        if let SandboxInner::Local(local) = &self.inner {
+            self.verify_claude_code_compat(local, &opts.env).await?;
+        }
+
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        if opts.dangerously_skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        for extra in &opts.extra_args {
+            args.push(extra.clone());
+        }
+
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        match &self.inner {
+            SandboxInner::Local(local) => {
+                let (mut chunk_rx, response_rx) = local
+                    .exec_claude_streaming_internal(&args_refs, &opts.env, opts.timeout_secs)
+                    .await?;
+
+                let mut state = ClaudeExecResult {
+                    result_text: String::new(),
+                    model: String::new(),
+                    session_id: String::new(),
+                    total_cost_usd: 0.0,
+                    duration_ms: 0,
+                    duration_api_ms: 0,
+                    num_turns: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    is_error: false,
+                    error: None,
+                    tool_calls: Vec::new(),
+                };
+                let mut tool_id_map: HashMap<String, usize> = HashMap::new();
+                let mut line_buf = String::new();
+
+                // Process stdout chunks as they arrive
+                while let Some(chunk) = chunk_rx.recv().await {
+                    if chunk.stream != "stdout" {
+                        continue;
+                    }
+
+                    let text = String::from_utf8_lossy(&chunk.data);
+                    line_buf.push_str(&text);
+
+                    // Process all complete lines in the buffer
+                    while let Some(newline_pos) = line_buf.find('\n') {
+                        let line: String = line_buf.drain(..=newline_pos).collect();
+                        for event in parse_jsonl_line(&line, &mut state, &mut tool_id_map) {
+                            on_event(event);
+                        }
+                    }
+                }
+
+                // Process any remaining partial line
+                if !line_buf.trim().is_empty() {
+                    for event in parse_jsonl_line(&line_buf, &mut state, &mut tool_id_map) {
+                        on_event(event);
+                    }
+                }
+
+                // Wait for the final response (for exit code / error info)
+                let response = response_rx
+                    .await
+                    .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+
+                // Log raw output on failure
+                if let Ok(ref resp) = response {
+                    if resp.exit_code != 0 {
+                        let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                        tracing::warn!(
+                            exit_code = resp.exit_code,
+                            "claude-code failed; stderr={}",
+                            if stderr_str.is_empty() {
+                                "(empty)"
+                            } else {
+                                stderr_str.trim()
+                            },
+                        );
+                    }
+                }
+
+                // Check for empty stream output
+                let no_stream_output = state.session_id.is_empty()
+                    && state.model.is_empty()
+                    && state.result_text.is_empty()
+                    && state.tool_calls.is_empty()
+                    && state.input_tokens == 0
+                    && state.output_tokens == 0
+                    && !state.is_error;
+
+                if no_stream_output {
+                    let (stderr_str, exit_code) = match &response {
+                        Ok(resp) => (
+                            String::from_utf8_lossy(&resp.stderr).to_string(),
+                            resp.exit_code,
+                        ),
+                        Err(e) => (format!("{}", e), -1),
+                    };
+                    return Err(Error::Guest(format!(
+                        "claude-code returned no stream-json events (exit_code={}). stderr: {}",
+                        exit_code,
+                        if stderr_str.trim().is_empty() {
+                            "(empty)"
+                        } else {
+                            stderr_str.trim()
+                        }
+                    )));
+                }
+
+                Ok(state)
+            }
+            SandboxInner::Mock(mock) => {
+                // Mock: fall back to non-streaming, emit events from batch result
+                let output = mock
+                    .exec_with_stdin("claude-code", &args_refs, &[])
+                    .await?;
+                let result = crate::observe::claude::parse_stream_json(&output.stdout);
+
+                for tc in &result.tool_calls {
+                    on_event(ClaudeStreamEvent::ToolUse(tc.clone()));
+                }
+
+                Ok(result)
+            }
+        }
+    }
+
     /// Lightweight check that `claude-code` exists in the guest PATH.
     ///
     /// Previously this ran `claude-code --help` which booted the full Node.js

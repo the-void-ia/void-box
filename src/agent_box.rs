@@ -503,14 +503,28 @@ impl VoidBox {
             r#"{"skipWebFetchPreflight":true}"#.to_string(),
         ]);
 
+        let tag_clone = tag.to_string();
         let mut claude_result = sandbox
-            .exec_claude(
+            .exec_claude_streaming(
                 &full_prompt,
                 ClaudeExecOpts {
                     dangerously_skip_permissions: true,
                     extra_args,
                     timeout_secs: self.config.timeout_secs,
                     ..Default::default()
+                },
+                |event| match event {
+                    crate::observe::claude::ClaudeStreamEvent::ToolUse(ref tc) => {
+                        let summary = tc.tool_summary();
+                        if summary.is_empty() {
+                            eprintln!("[vm:{}]   tool: {}", tag_clone, tc.tool_name);
+                        } else {
+                            eprintln!(
+                                "[vm:{}]   tool: {}  {}",
+                                tag_clone, tc.tool_name, summary
+                            );
+                        }
+                    }
                 },
             )
             .await?;
@@ -530,11 +544,6 @@ impl VoidBox {
             claude_result.total_cost_usd,
             claude_result.is_error,
         );
-
-        // Log tool calls if any
-        for tc in &claude_result.tool_calls {
-            eprintln!("[vm:{}]   tool: {}({})", tag, tc.tool_name, tc.tool_use_id);
-        }
 
         // Try to read the output file
         let file_output = match sandbox.read_file(&self.config.output_file).await {

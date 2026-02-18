@@ -4,7 +4,7 @@ name: hn_researcher
 
 sandbox:
   mode: auto
-  memory_mb: 1024
+  memory_mb: 2048
   vcpus: 1
   network: true
 
@@ -13,11 +13,14 @@ llm:
 
 agent:
   prompt: >
-    Analyze the current HackerNews top stories and produce a tactical briefing
-    for AI engineering teams. Group stories by theme, prioritize by engagement
-    density (score/time, comments/time), and extract 3-5 actionable signals.
-    Output a clean markdown report with sections: Top Signals, Emerging Themes,
-    and Watchlist (next 24h). Include source links.
+    Use the HackerNews API skill to fetch real data via curl and jq (do NOT use
+    WebSearch or WebFetch — use Bash with curl commands from your hackernews-api
+    skill). Fetch the top 10 stories with details, then produce a tactical
+    briefing for AI engineering teams. Group stories by theme, prioritize by
+    engagement density (score/time, comments/time), and extract 3-5 actionable
+    signals. Output a clean markdown report with sections: Top Signals, Emerging
+    Themes, and Watchlist (next 24h). Include source links. Write the report to
+    /workspace/output.md.
   skills:
     - "file:examples/hackernews/skills/hackernews-api.md"
   timeout_secs: 600

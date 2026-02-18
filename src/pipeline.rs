@@ -270,8 +270,7 @@ impl Pipeline {
                         box_name
                     );
 
-                    // TODO: When VoidBox gains streaming exec support, use it
-                    // here to call on_output(box_name, chunk) for each chunk.
+                    // Tool events stream in real-time via AgentBox::run() → exec_claude_streaming().
                     let stage_result = agent_box.run(carry_data.as_deref()).await?;
 
                     // Emit a synthetic chunk with the full result text so
