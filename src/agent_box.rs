@@ -1,4 +1,4 @@
-//! VoidBox: Agent(Skills) + Environment
+//! VoidBox: Agent(Skills) + Isolation
 //!
 //! A `VoidBox` binds skills (MCP servers, CLI tools, procedural knowledge)
 //! to an isolated execution environment (KVM micro-VM). Each VoidBox:
@@ -48,7 +48,7 @@ use crate::Result;
 
 const CLAUDE_HOME: &str = "/home/sandbox/.claude";
 
-/// An agent Box: Agent(Skills) + Environment.
+/// An agent Box: Agent(Skills) + Isolation.
 ///
 /// Constructed via the builder pattern with `VoidBox::new("name")`.
 pub struct VoidBox {

@@ -5,7 +5,7 @@
 void-box is a composable agent runtime where each agent runs in a hardware-isolated KVM micro-VM. The core equation is:
 
 ```
-VoidBox = Agent(Skills) + Environment
+VoidBox = Agent(Skills) + Isolation
 ```
 
 A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledge files, reasoning engines) to an isolated execution environment. Boxes compose into pipelines where output flows between stages, each in a fresh VM.
@@ -14,60 +14,60 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ User / Daemon / CLI                                               │
-│                                                                   │
+│ User / Daemon / CLI                                              │
+│                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │ VoidBox (agent_box.rs)                                    │    │
-│  │  name: "analyst"                                          │    │
-│  │  prompt: "Analyze AAPL..."                                │    │
-│  │  skills: [claude-code, financial-data.md, market-mcp]     │    │
-│  │  config: memory=1024MB, vcpus=1, network=true             │    │
+│  │ VoidBox (agent_box.rs)                                   │    │
+│  │  name: "analyst"                                         │    │
+│  │  prompt: "Analyze AAPL..."                               │    │
+│  │  skills: [claude-code, financial-data.md, market-mcp]    │    │
+│  │  config: memory=1024MB, vcpus=1, network=true            │    │
 │  └─────────────────────┬────────────────────────────────────┘    │
-│                         │ .build() → .run()                       │
-│  ┌──────────────────────▼───────────────────────────────────┐    │
-│  │ Sandbox (sandbox/)                                        │    │
-│  │  ┌─────────────┐  ┌──────────────┐                       │    │
-│  │  │ MockSandbox  │  │ LocalSandbox │                       │    │
-│  │  │ (testing)    │  │ (KVM)        │                       │    │
-│  │  └─────────────┘  └──────┬───────┘                       │    │
-│  └───────────────────────────┼──────────────────────────────┘    │
-│                               │                                   │
-│  ┌────────────────────────────▼─────────────────────────────┐    │
-│  │ MicroVm (vmm/)                                            │    │
-│  │  ┌────────┐ ┌────────┐ ┌─────────────┐ ┌──────────────┐ │    │
-│  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │    │
-│  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │    │
-│  │  └────────┘ └────────┘ └──────┬──────┘ └──────┬───────┘ │    │
-│  │  Seccomp-BPF on VMM thread    │               │          │    │
-│  └────────────────────────────────┼───────────────┼──────────┘    │
-│                                   │               │               │
-└═══════════════════════════════════╪═══════════════╪═══════════════┘
+│                        │ .build() → .run()                       │
+│  ┌─────────────────────▼───────────────────────────────────┐     │
+│  │ Sandbox (sandbox/)                                      │     │
+│  │  ┌─────────────┐  ┌──────────────┐                      │     │
+│  │  │ MockSandbox │  │ LocalSandbox │                      │     │
+│  │  │ (testing)   │  │ (KVM)        │                      │     │
+│  │  └─────────────┘  └──────┬───────┘                      │     │
+│  └──────────────────────────┼──────────────────────────────┘     │
+│                             │                                    │
+│  ┌──────────────────────────▼──────────────────────────────┐     │
+│  │ MicroVm (vmm/)                                          │     │
+│  │  ┌────────┐ ┌────────┐ ┌─────────────┐ ┌──────────────┐ │     │
+│  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │     │
+│  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │     │
+│  │  └────────┘ └────────┘ └───────┬─────┘ └───────┬──────┘ │     │
+│  │  Seccomp-BPF on VMM thread     │               │        │     │
+│  └────────────────────────────────┼───────────────┼────────┘     │
+│                                   │               │              │
+└═══════════════════════════════════╪═══════════════╪══════════════┘
               Hardware Isolation    │               │
                                     │ vsock:1234    │ SLIRP NAT
 ┌───────────────────────────────────▼───────────────▼───────────────┐
-│ Guest VM (Linux kernel)                                            │
-│                                                                    │
+│ Guest VM (Linux kernel)                                           │
+│                                                                   │
 │  ┌──────────────────────────────────────────────────────────────┐ │
 │  │ guest-agent (PID 1)                                          │ │
-│  │  - Authenticates via session secret (kernel cmdline)          │ │
-│  │  - Reads /etc/voidbox/allowed_commands.json                   │ │
-│  │  - Reads /etc/voidbox/resource_limits.json                    │ │
-│  │  - Applies setrlimit + command allowlist                      │ │
-│  │  - Drops privileges to uid:1000                               │ │
-│  │  - Listens on vsock port 1234                                 │ │
+│  │  - Authenticates via session secret (kernel cmdline)         │ │
+│  │  - Reads /etc/voidbox/allowed_commands.json                  │ │
+│  │  - Reads /etc/voidbox/resource_limits.json                   │ │
+│  │  - Applies setrlimit + command allowlist                     │ │
+│  │  - Drops privileges to uid:1000                              │ │
+│  │  - Listens on vsock port 1234                                │ │
 │  └────────────────────────┬─────────────────────────────────────┘ │
-│                            │ fork+exec                             │
-│  ┌─────────────────────────▼────────────────────────────────────┐ │
-│  │ claude-code (or claudio mock)                                 │ │
-│  │  --output-format stream-json                                  │ │
-│  │  --dangerously-skip-permissions                               │ │
-│  │  Skills: ~/.claude/skills/*.md                                │ │
-│  │  MCP:    ~/.claude/mcp.json                                   │ │
+│                           │ fork+exec                             │
+│  ┌────────────────────────▼─────────────────────────────────────┐ │
+│  │ claude-code (or claudio mock)                                │ │
+│  │  --output-format stream-json                                 │ │
+│  │  --dangerously-skip-permissions                              │ │
+│  │  Skills: ~/.claude/skills/*.md                               │ │
+│  │  MCP:    ~/.claude/mcp.json                                  │ │
 │  │  LLM:    Claude API / Ollama (via SLIRP → host:11434)        │ │
 │  └──────────────────────────────────────────────────────────────┘ │
-│                                                                    │
-│  eth0: 10.0.2.15/24  gw: 10.0.2.2  dns: 10.0.2.3               │
-└────────────────────────────────────────────────────────────────────┘
+│                                                                   │
+│  eth0: 10.0.2.15/24  gw: 10.0.2.2  dns: 10.0.2.3                  │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Data Flow
@@ -133,7 +133,7 @@ Host and guest communicate over AF_VSOCK (port 1234) using the `void-box-protoco
 
 ```
 ┌──────────────┬───────────┬──────────────────┐
-│ length (4 B) │ type (1B) │ payload (N bytes) │
+│ length (4 B) │ type (1B) │ payload (N bytes)│
 └──────────────┴───────────┴──────────────────┘
 ```
 
