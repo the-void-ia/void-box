@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::guest::protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest,
-    MkdirPResponse, TelemetryBatch, WriteFileRequest, WriteFileResponse,
+    MkdirPResponse, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::{Error, Result};
 
@@ -367,9 +367,14 @@ impl VsockDevice {
     /// Open a persistent telemetry subscription to the guest agent.
     ///
     /// Connects to the guest, performs a Ping/Pong handshake, sends a
-    /// SubscribeTelemetry message, then reads TelemetryData messages in a
-    /// loop, calling `on_batch` for each one. Returns when the connection drops.
-    pub async fn subscribe_telemetry<F>(&self, mut on_batch: F) -> Result<()>
+    /// SubscribeTelemetry message with the given options, then reads
+    /// TelemetryData messages in a loop, calling `on_batch` for each one.
+    /// Returns when the connection drops.
+    pub async fn subscribe_telemetry<F>(
+        &self,
+        opts: &TelemetrySubscribeRequest,
+        mut on_batch: F,
+    ) -> Result<()>
     where
         F: FnMut(TelemetryBatch) + Send + 'static,
     {
@@ -377,19 +382,23 @@ impl VsockDevice {
             .connect_with_handshake(Duration::from_secs(5), "telemetry-subscribe")
             .await?;
 
-        // Send SubscribeTelemetry
+        // Send SubscribeTelemetry with subscription options
         let sub_msg = Message {
             msg_type: MessageType::SubscribeTelemetry,
-            payload: vec![],
+            payload: serde_json::to_vec(opts).unwrap_or_default(),
         };
         stream
             .write_all(&sub_msg.serialize())
             .map_err(|e| Error::Guest(format!("Failed to send SubscribeTelemetry: {}", e)))?;
 
-        info!("Telemetry subscription active (cid={})", self.cid);
+        info!(
+            "Telemetry subscription active (cid={}, interval={}ms)",
+            self.cid, opts.interval_ms
+        );
 
-        // Clear read timeout - telemetry messages come every 2s
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        // Set read timeout with headroom above the collection interval
+        let read_timeout_ms = opts.interval_ms.max(1000) * 5;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
 
         // Read TelemetryData messages in a loop
         loop {

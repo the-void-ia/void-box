@@ -63,7 +63,8 @@ impl TelemetryAggregator {
     fn ingest_system(&self, sys: &SystemMetrics, labels: &[(&str, &str)]) {
         let metrics = self.observer.metrics();
 
-        metrics.record_cpu_usage(sys.cpu_percent, labels);
+        // CPU as histogram (distribution analysis) — also records the gauge
+        metrics.record_cpu_histogram(sys.cpu_percent, labels);
         metrics.record_memory_usage(sys.memory_used_bytes, labels);
         metrics.record_network_io(sys.net_rx_bytes, sys.net_tx_bytes, labels);
         metrics.set_gauge(

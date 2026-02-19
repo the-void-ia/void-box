@@ -207,5 +207,5 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
 ## License
 
-Apache-2.0 · [The Void Platform](https://github.com/the-void-ia)
+Apache-2.0 · [The Void Platform](LICENSE)
 

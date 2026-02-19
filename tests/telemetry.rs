@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use void_box::guest::protocol::{
     ExecResponse, Message, MessageType, ProcessMetrics, SystemMetrics, TelemetryBatch,
+    TelemetrySubscribeRequest,
 };
 use void_box::observe::telemetry::TelemetryAggregator;
 use void_box::observe::Observer;
@@ -98,6 +99,50 @@ fn subscribe_telemetry_message_round_trip() {
 
     assert_eq!(decoded.msg_type, MessageType::SubscribeTelemetry);
     assert!(decoded.payload.is_empty());
+}
+
+/// Verify TelemetrySubscribeRequest defaults serialize correctly in a Message frame.
+#[test]
+fn subscribe_telemetry_with_defaults_in_message_frame() {
+    let opts = TelemetrySubscribeRequest::default();
+    let payload = serde_json::to_vec(&opts).unwrap();
+
+    let msg = Message {
+        msg_type: MessageType::SubscribeTelemetry,
+        payload: payload.clone(),
+    };
+
+    let wire = msg.serialize();
+    let decoded_msg = Message::deserialize(&wire).unwrap();
+
+    assert_eq!(decoded_msg.msg_type, MessageType::SubscribeTelemetry);
+    let decoded_opts: TelemetrySubscribeRequest =
+        serde_json::from_slice(&decoded_msg.payload).unwrap();
+    assert_eq!(decoded_opts.interval_ms, 1000);
+    assert!(!decoded_opts.include_kernel_threads);
+}
+
+/// Verify custom TelemetrySubscribeRequest round-trips through a Message frame.
+#[test]
+fn subscribe_telemetry_custom_opts_in_message_frame() {
+    let opts = TelemetrySubscribeRequest {
+        interval_ms: 500,
+        include_kernel_threads: true,
+    };
+    let payload = serde_json::to_vec(&opts).unwrap();
+
+    let msg = Message {
+        msg_type: MessageType::SubscribeTelemetry,
+        payload,
+    };
+
+    let wire = msg.serialize();
+    let decoded_msg = Message::deserialize(&wire).unwrap();
+    let decoded_opts: TelemetrySubscribeRequest =
+        serde_json::from_slice(&decoded_msg.payload).unwrap();
+
+    assert_eq!(decoded_opts.interval_ms, 500);
+    assert!(decoded_opts.include_kernel_threads);
 }
 
 /// Verify Message::read_from_sync works for TelemetryData messages.
@@ -573,8 +618,15 @@ async fn kvm_telemetry_end_to_end() {
     }
 
     // Start telemetry subscription
-    let telemetry_observer = Observer::test();
-    match vm.start_telemetry(telemetry_observer).await {
+    let telemetry_observer = if std::env::var("VOIDBOX_OTLP_ENDPOINT").is_ok()
+        || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok()
+    {
+        Observer::new(void_box::observe::ObserveConfig::from_env())
+    } else {
+        Observer::test()
+    };
+    let opts = TelemetrySubscribeRequest::default(); // 1s interval, no kernel threads
+    match vm.start_telemetry(telemetry_observer, opts).await {
         Ok(_agg) => {}
         Err(e) => {
             eprintln!("kvm_telemetry_end_to_end: start_telemetry failed: {e}");
@@ -583,8 +635,8 @@ async fn kvm_telemetry_end_to_end() {
         }
     }
 
-    // Wait for a few telemetry batches (guest streams every 2s)
-    tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+    // Wait for a few telemetry batches (guest streams every 1s with default opts)
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // Check that telemetry data was received
     if let Some(agg) = vm.telemetry() {
@@ -616,6 +668,90 @@ async fn kvm_telemetry_end_to_end() {
         }
     } else {
         eprintln!("kvm_telemetry_end_to_end: telemetry aggregator not available");
+    }
+
+    // Flush OTel data before stopping (no-op when OTel is not configured)
+    let _ = void_box::observe::flush_global_otel();
+
+    vm.stop().await.expect("failed to stop VM");
+}
+
+/// KVM test with kernel threads included — verify we see zero-RSS processes.
+///
+/// ```bash
+/// cargo test --test telemetry kvm_telemetry_with_kernel_threads -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts"]
+async fn kvm_telemetry_with_kernel_threads() {
+    use void_box::vmm::config::VoidBoxConfig;
+    use void_box::vmm::MicroVm;
+
+    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
+        eprintln!(
+            "skipping kvm_telemetry_with_kernel_threads: \
+             set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS"
+        );
+        return;
+    };
+
+    let mut cfg = VoidBoxConfig::new()
+        .memory_mb(256)
+        .vcpus(1)
+        .kernel(&kernel)
+        .enable_vsock(true);
+
+    if let Some(ref initramfs_path) = initramfs {
+        cfg = cfg.initramfs(initramfs_path);
+    }
+    cfg.validate().expect("invalid VoidBoxConfig");
+
+    let mut vm = MicroVm::new(cfg)
+        .await
+        .expect("failed to create KVM-backed MicroVm");
+
+    // Verify VM boots
+    match vm.exec("echo", &["kernel-thread-test"]).await {
+        Ok(output) => assert!(output.success(), "echo failed: {}", output.stderr_str()),
+        Err(e) => {
+            eprintln!("kvm_telemetry_with_kernel_threads: exec failed, skipping: {e}");
+            return;
+        }
+    }
+
+    // Subscribe with kernel threads included
+    let opts = TelemetrySubscribeRequest {
+        interval_ms: 1000,
+        include_kernel_threads: true,
+    };
+    let telemetry_observer = Observer::test();
+    match vm.start_telemetry(telemetry_observer, opts).await {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("kvm_telemetry_with_kernel_threads: start_telemetry failed: {e}");
+            let _ = vm.stop().await;
+            return;
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    if let Some(agg) = vm.telemetry() {
+        if let Some(batch) = agg.latest_batch() {
+            eprintln!(
+                "Received batch seq={}, {} processes",
+                batch.seq,
+                batch.processes.len()
+            );
+            // With kernel threads included, we should see some processes with zero RSS
+            let zero_rss_count = batch.processes.iter().filter(|p| p.rss_bytes == 0).count();
+            eprintln!("  {} processes with zero RSS (likely kernel threads)", zero_rss_count);
+            // Kernel threads like kthreadd, ksoftirqd, etc. should appear
+            assert!(
+                zero_rss_count > 0,
+                "expected kernel threads (zero RSS) when include_kernel_threads=true"
+            );
+        }
     }
 
     vm.stop().await.expect("failed to stop VM");

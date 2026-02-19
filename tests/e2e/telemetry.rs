@@ -397,8 +397,9 @@ async fn test_telemetry_aggregator() {
         .await;
 
     let observer = void_box::observe::Observer::test();
+    let opts = void_box::guest::protocol::TelemetrySubscribeRequest::default();
     let agg = vm
-        .start_telemetry(observer.clone())
+        .start_telemetry(observer.clone(), opts)
         .await
         .expect("failed to start telemetry");
 

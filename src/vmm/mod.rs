@@ -25,8 +25,8 @@ use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::guest::protocol::{
-    ExecOutputChunk, ExecRequest, ExecResponse, MkdirPRequest, MkdirPResponse, WriteFileRequest,
-    WriteFileResponse,
+    ExecOutputChunk, ExecRequest, ExecResponse, MkdirPRequest, MkdirPResponse,
+    TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::network::slirp::SlirpStack;
 use crate::observe::telemetry::TelemetryAggregator;
@@ -98,6 +98,7 @@ enum VmCommand {
     /// Start a telemetry subscription
     SubscribeTelemetry {
         aggregator: Arc<TelemetryAggregator>,
+        opts: TelemetrySubscribeRequest,
     },
     /// Stop the VM
     Stop,
@@ -331,12 +332,12 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                                     };
                                     let _ = response_tx.send(result);
                                 }
-                                VmCommand::SubscribeTelemetry { aggregator } => {
+                                VmCommand::SubscribeTelemetry { aggregator, opts } => {
                                     if let Some(ref vsock) = vsock_clone {
                                         let vsock = vsock.clone();
                                         let agg = aggregator.clone();
                                         tokio::spawn(async move {
-                                            if let Err(e) = vsock.subscribe_telemetry(move |batch| {
+                                            if let Err(e) = vsock.subscribe_telemetry(&opts, move |batch| {
                                                 agg.ingest(&batch);
                                             }).await {
                                                 tracing::warn!("Telemetry subscription ended: {}", e);
@@ -604,9 +605,12 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
     /// Creates a `TelemetryAggregator` that feeds guest metrics into the
     /// provided `Observer`. The subscription runs in the background until
     /// the VM stops or the guest connection drops.
+    ///
+    /// `opts` controls the collection interval and kernel thread filtering.
     pub async fn start_telemetry(
         &mut self,
         observer: Observer,
+        opts: TelemetrySubscribeRequest,
     ) -> Result<Arc<TelemetryAggregator>> {
         let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
         self.telemetry = Some(aggregator.clone());
@@ -614,6 +618,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         self.command_tx
             .send(VmCommand::SubscribeTelemetry {
                 aggregator: aggregator.clone(),
+                opts,
             })
             .await
             .map_err(|_| Error::Guest("Failed to send telemetry subscribe command".into()))?;

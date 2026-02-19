@@ -393,10 +393,56 @@ impl MetricsCollector {
         }
     }
 
-    /// Record CPU usage
+    /// Record CPU usage (gauge for current-value queries).
     pub fn record_cpu_usage(&self, percent: f64, labels: &[(&str, &str)]) {
         if self.config.cpu_usage {
             self.set_gauge("cpu_usage_percent", percent, labels);
+        }
+    }
+
+    /// Record CPU usage as a histogram for distribution analysis.
+    ///
+    /// Records both the existing gauge (for dashboards) and a histogram
+    /// (for p50/p90/p99 analysis).
+    pub fn record_cpu_histogram(&self, percent: f64, labels: &[(&str, &str)]) {
+        if !self.config.cpu_usage {
+            return;
+        }
+
+        // Also record the gauge for current-value queries
+        self.set_gauge("cpu_usage_percent", percent, labels);
+
+        let label_map: HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let key = format!("cpu_usage_percent_histogram:{:?}", label_map);
+
+        let mut metrics = self.metrics.lock().unwrap();
+        let metric = metrics.entry(key).or_insert_with(|| Metric {
+            name: "cpu_usage_percent_histogram".to_string(),
+            help: "CPU usage distribution".to_string(),
+            value: MetricValue::Histogram(HistogramValue::with_buckets(&[
+                5.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 100.0,
+            ])),
+            labels: label_map,
+        });
+
+        if let MetricValue::Histogram(h) = &mut metric.value {
+            h.observe(percent);
+        }
+
+        #[cfg(feature = "opentelemetry")]
+        if let Some(ref meter) = self.otel_meter {
+            use opentelemetry::KeyValue;
+            let histogram = meter
+                .f64_histogram("cpu_usage_percent_histogram")
+                .build();
+            let otel_labels: Vec<KeyValue> = labels
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                .collect();
+            histogram.record(percent, &otel_labels);
         }
     }
 

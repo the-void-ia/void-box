@@ -466,13 +466,73 @@ mod otel_sdk_tests {
         aggregator.ingest(&batch);
 
         let snap = observer.get_metrics();
-        // CPU should be recorded
+        // CPU gauge should be recorded
         assert!(snap.metrics.values().any(|m| m.name == "cpu_usage_percent"));
+        // CPU histogram should also be recorded
+        assert!(
+            snap.metrics
+                .values()
+                .any(|m| m.name == "cpu_usage_percent_histogram"),
+            "expected cpu_usage_percent_histogram after ingest"
+        );
         // Memory should be recorded
         assert!(snap
             .metrics
             .values()
             .any(|m| m.name == "memory_usage_bytes"));
+    }
+
+    #[test]
+    fn test_cpu_histogram_via_aggregator() {
+        use void_box::guest::protocol::{SystemMetrics, TelemetryBatch};
+        use void_box::observe::telemetry::TelemetryAggregator;
+        use void_box::observe::Observer;
+
+        let observer = Observer::test();
+        let aggregator = TelemetryAggregator::new(observer.clone(), 42);
+
+        // Ingest multiple batches with varying CPU to populate histogram buckets
+        for i in 0..10 {
+            let batch = TelemetryBatch {
+                seq: i,
+                timestamp_ms: 1700000000000 + i * 1000,
+                system: Some(SystemMetrics {
+                    cpu_percent: (i as f64) * 10.0, // 0, 10, 20, ..., 90
+                    memory_used_bytes: 512 * 1024 * 1024,
+                    memory_total_bytes: 1024 * 1024 * 1024,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    procs_running: 1,
+                    open_fds: 10,
+                }),
+                processes: vec![],
+                trace_context: None,
+            };
+            aggregator.ingest(&batch);
+        }
+
+        let snap = observer.get_metrics();
+        let hist_metric = snap
+            .metrics
+            .values()
+            .find(|m| m.name == "cpu_usage_percent_histogram")
+            .expect("cpu_usage_percent_histogram metric should exist");
+
+        if let void_box::observe::metrics::MetricValue::Histogram(h) = &hist_metric.value {
+            assert_eq!(h.count, 10, "expected 10 observations");
+            // Sum should be 0+10+20+...+90 = 450
+            assert!((h.sum - 450.0).abs() < 0.001, "sum should be 450, got {}", h.sum);
+            // Bucket le=10.0 should have count 2 (values 0 and 10)
+            let bucket_10 = h.buckets.iter().find(|(le, _)| (*le - 10.0).abs() < 0.001);
+            assert!(bucket_10.is_some(), "expected bucket for le=10.0");
+            assert_eq!(bucket_10.unwrap().1, 2, "le=10 bucket should have 2 observations (0 and 10)");
+            // Bucket le=100.0 should have count 10 (all values <= 100)
+            let bucket_100 = h.buckets.iter().find(|(le, _)| (*le - 100.0).abs() < 0.001);
+            assert!(bucket_100.is_some(), "expected bucket for le=100.0");
+            assert_eq!(bucket_100.unwrap().1, 10, "le=100 bucket should have all 10 observations");
+        } else {
+            panic!("expected Histogram metric value");
+        }
     }
 
     #[test]

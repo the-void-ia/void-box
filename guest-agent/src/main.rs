@@ -18,8 +18,8 @@ use serde::Serialize;
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse,
-    ProcessMetrics, SystemMetrics, TelemetryBatch, WriteFileRequest, WriteFileResponse,
-    MAX_MESSAGE_SIZE,
+    ProcessMetrics, SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest,
+    WriteFileResponse, MAX_MESSAGE_SIZE,
 };
 
 /// vsock port we listen on
@@ -643,8 +643,16 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             }
             10 => {
                 // SubscribeTelemetry - enter streaming mode
-                kmsg("Telemetry subscription started");
-                telemetry_stream_loop(fd);
+                let opts: TelemetrySubscribeRequest = if payload.is_empty() {
+                    TelemetrySubscribeRequest::default()
+                } else {
+                    serde_json::from_slice(&payload).unwrap_or_default()
+                };
+                kmsg(&format!(
+                    "Telemetry subscription started (interval={}ms, kernel_threads={})",
+                    opts.interval_ms, opts.include_kernel_threads
+                ));
+                telemetry_stream_loop(fd, &opts);
                 return Ok(());
             }
             11 => {
@@ -1132,12 +1140,13 @@ fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
 // ---------------------------------------------------------------------------
 
 /// Stream telemetry data to the host until the connection drops.
-fn telemetry_stream_loop(fd: RawFd) {
+fn telemetry_stream_loop(fd: RawFd, opts: &TelemetrySubscribeRequest) {
+    let interval = std::time::Duration::from_millis(opts.interval_ms.max(100)); // floor at 100ms
     let mut seq: u64 = 0;
     let mut prev_cpu = read_cpu_jiffies();
 
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(interval);
 
         let curr_cpu = read_cpu_jiffies();
         let cpu_percent = compute_cpu_percent(&prev_cpu, &curr_cpu);
@@ -1147,7 +1156,7 @@ fn telemetry_stream_loop(fd: RawFd) {
         let (net_rx_bytes, net_tx_bytes) = read_netdev();
         let procs_running = read_procs_running();
         let open_fds = read_open_fds();
-        let processes = collect_process_metrics();
+        let processes = collect_process_metrics(opts.include_kernel_threads);
 
         let batch = TelemetryBatch {
             seq,
@@ -1298,7 +1307,11 @@ fn read_open_fds() -> u32 {
 }
 
 /// Collect per-process metrics by scanning /proc/[0-9]*/.
-fn collect_process_metrics() -> Vec<ProcessMetrics> {
+///
+/// When `include_kernel_threads` is false, kernel threads are filtered out.
+/// Kernel threads have an empty `/proc/PID/cmdline` — this is the standard
+/// Linux way to distinguish them.
+fn collect_process_metrics(include_kernel_threads: bool) -> Vec<ProcessMetrics> {
     let mut processes = Vec::new();
     let page_size = page_size_bytes();
     let entries = match std::fs::read_dir("/proc") {
@@ -1316,6 +1329,14 @@ fn collect_process_metrics() -> Vec<ProcessMetrics> {
         };
 
         let base = format!("/proc/{}", pid);
+
+        // Filter kernel threads: they have an empty /proc/PID/cmdline
+        if !include_kernel_threads {
+            let cmdline = std::fs::read(format!("{}/cmdline", base)).unwrap_or_default();
+            if cmdline.is_empty() {
+                continue;
+            }
+        }
 
         // Read comm
         let comm = std::fs::read_to_string(format!("{}/comm", base))

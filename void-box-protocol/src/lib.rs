@@ -426,6 +426,34 @@ pub struct SystemMetrics {
     pub open_fds: u32,
 }
 
+/// Subscription options sent by the host with `SubscribeTelemetry`.
+///
+/// The `#[serde(default)]` annotations ensure backward compatibility:
+/// an empty `{}` payload or old hosts sending `vec![]` will deserialize
+/// with defaults (1 s interval, no kernel threads).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetrySubscribeRequest {
+    /// Collection interval in milliseconds. Default: 1000.
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    /// Include kernel threads in per-process metrics. Default: false.
+    #[serde(default)]
+    pub include_kernel_threads: bool,
+}
+
+fn default_interval_ms() -> u64 {
+    1000
+}
+
+impl Default for TelemetrySubscribeRequest {
+    fn default() -> Self {
+        Self {
+            interval_ms: 1000,
+            include_kernel_threads: false,
+        }
+    }
+}
+
 /// Per-process metrics collected from procfs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMetrics {
@@ -664,6 +692,33 @@ mod tests {
         assert!(!debug_output.contains("p@ss"));
         assert!(debug_output.contains("visible"));
         assert!(debug_output.contains("/usr/bin"));
+    }
+
+    #[test]
+    fn telemetry_subscribe_request_json_round_trip() {
+        let req = TelemetrySubscribeRequest {
+            interval_ms: 500,
+            include_kernel_threads: true,
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let decoded: TelemetrySubscribeRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.interval_ms, 500);
+        assert!(decoded.include_kernel_threads);
+    }
+
+    #[test]
+    fn telemetry_subscribe_request_empty_payload_defaults() {
+        // Simulates old host sending empty vec![] — deserialization should use defaults
+        let decoded: TelemetrySubscribeRequest = serde_json::from_slice(b"{}").unwrap();
+        assert_eq!(decoded.interval_ms, 1000);
+        assert!(!decoded.include_kernel_threads);
+    }
+
+    #[test]
+    fn telemetry_subscribe_request_default_trait() {
+        let req = TelemetrySubscribeRequest::default();
+        assert_eq!(req.interval_ms, 1000);
+        assert!(!req.include_kernel_threads);
     }
 
     #[test]
