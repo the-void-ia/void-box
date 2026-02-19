@@ -43,15 +43,32 @@
 
 ## What You Get
 
-- **Hardware isolation** — KVM micro-VMs, not containers. Fresh micro-VM per stage.
-- **Policy-enforced execution** — Command allowlists, rlimits, seccomp-BPF, and controlled network egress.
-- **Skill-native** — Procedural knowledge (SKILL.md), MCP servers, and CLI tools provisioned into the sandbox.
-- **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, streaming output with stage-level failure domains.
-- **Model flexibility** — claude-code agent per stage, backed by Claude API (default) or local Ollama models.
-- **Observability built-in** — OTLP traces/metrics, structured logs, and guest telemetry via procfs.
+- **Isolated execution** — Each stage runs inside its own micro-VM boundary (not shared-process containers).
+- **Policy-enforced runtime** — Command allowlists, resource limits, seccomp-BPF, and controlled network egress.
+- **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
+- **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
+- **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude (default) or Ollama via Claude-compatible provider mode.
+- **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
-Isolation is the primitive. Pipelines are compositions of bounded execution environments.
+> Isolation is the primitive. Pipelines are compositions of bounded execution environments.
+
+## Why Not Containers?
+
+Containers share a host kernel.
+
+For general application isolation, this is often sufficient.
+For AI agents executing tools, code, and external integrations, it creates shared failure domains.
+
+In a shared-process model:
+
+- Tool execution and agent runtime share the same kernel.
+- Escape surfaces are reduced, but not eliminated.
+- Resource isolation depends on cgroups and cooperative enforcement.
+
+VoidBox binds each agent stage to its own micro-VM boundary.
+
+Isolation is enforced by hardware virtualization — not advisory process controls.
 
 ---
 
@@ -176,14 +193,6 @@ inside each micro-VM.
 Enable with `--features opentelemetry` and set `VOIDBOX_OTLP_ENDPOINT`.
 See the [playground](playground/) for a ready-to-run stack with Grafana, Tempo, and Prometheus.
 
-## Next Up
-
-- **Session persistence** — Run/session state with pluggable backends (disk, SQLite, Valkey).
-- **Rich TUI** — Claude-like interactive experience: panel-based, live-streaming dashboard built on the event API.
-- **virtio-blk** — Persistent block devices for stateful workloads across VM restarts.
-- **aarch64** — ARM64 builds and CI (cross-compilation in a release pipeline).
-- **Language bindings** — Python and Node.js SDKs for the daemon API.
-
 ## Running & Testing
 
 ### Mock mode (no KVM required)
@@ -237,6 +246,19 @@ VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 ```
+
+---
+
+## Roadmap
+
+VoidBox is evolving toward a durable, capability-bound execution platform.
+
+- **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
+- **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
+- **Persistent block devices (virtio-blk)** — Stateful workloads across VM restarts.
+- **aarch64 support** — Native ARM64 builds with release pipeline cross-compilation.
+- **Codex-style backend support** — Optional execution backend for code-first workflows.
+- **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 
 ## License
 
