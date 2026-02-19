@@ -658,7 +658,13 @@ async fn kvm_telemetry_end_to_end() {
                 assert!(sys.memory_total_bytes > 0, "memory_total should be > 0");
             }
 
-            eprintln!("  {} processes reported", batch.processes.len());
+            eprintln!("  {} processes reported:", batch.processes.len());
+            for p in &batch.processes {
+                eprintln!(
+                    "    pid={} comm={:16} state={} rss={:>10}",
+                    p.pid, p.comm, p.state, p.rss_bytes,
+                );
+            }
             assert!(
                 !batch.processes.is_empty(),
                 "expected at least one process (the guest-agent)"
@@ -738,11 +744,24 @@ async fn kvm_telemetry_with_kernel_threads() {
 
     if let Some(agg) = vm.telemetry() {
         if let Some(batch) = agg.latest_batch() {
+            if let Some(ref sys) = batch.system {
+                eprintln!(
+                    "System: cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
+                    sys.cpu_percent, sys.memory_used_bytes, sys.memory_total_bytes,
+                    sys.net_rx_bytes, sys.net_tx_bytes, sys.procs_running, sys.open_fds,
+                );
+            }
             eprintln!(
-                "Received batch seq={}, {} processes",
+                "Received batch seq={}, {} processes:",
                 batch.seq,
                 batch.processes.len()
             );
+            for p in &batch.processes {
+                eprintln!(
+                    "    pid={:<5} comm={:20} state={} rss={:>10}",
+                    p.pid, p.comm, p.state, p.rss_bytes,
+                );
+            }
             // With kernel threads included, we should see some processes with zero RSS
             let zero_rss_count = batch.processes.iter().filter(|p| p.rss_bytes == 0).count();
             eprintln!("  {} processes with zero RSS (likely kernel threads)", zero_rss_count);
