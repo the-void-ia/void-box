@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -e
+cd "$(git rev-parse --show-toplevel)/void-box"
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo "cargo fmt check failed. Run 'cargo fmt --all' and re-commit."
+    exit 1
+fi

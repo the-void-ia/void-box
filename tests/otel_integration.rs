@@ -521,15 +521,27 @@ mod otel_sdk_tests {
         if let void_box::observe::metrics::MetricValue::Histogram(h) = &hist_metric.value {
             assert_eq!(h.count, 10, "expected 10 observations");
             // Sum should be 0+10+20+...+90 = 450
-            assert!((h.sum - 450.0).abs() < 0.001, "sum should be 450, got {}", h.sum);
+            assert!(
+                (h.sum - 450.0).abs() < 0.001,
+                "sum should be 450, got {}",
+                h.sum
+            );
             // Bucket le=10.0 should have count 2 (values 0 and 10)
             let bucket_10 = h.buckets.iter().find(|(le, _)| (*le - 10.0).abs() < 0.001);
             assert!(bucket_10.is_some(), "expected bucket for le=10.0");
-            assert_eq!(bucket_10.unwrap().1, 2, "le=10 bucket should have 2 observations (0 and 10)");
+            assert_eq!(
+                bucket_10.unwrap().1,
+                2,
+                "le=10 bucket should have 2 observations (0 and 10)"
+            );
             // Bucket le=100.0 should have count 10 (all values <= 100)
             let bucket_100 = h.buckets.iter().find(|(le, _)| (*le - 100.0).abs() < 0.001);
             assert!(bucket_100.is_some(), "expected bucket for le=100.0");
-            assert_eq!(bucket_100.unwrap().1, 10, "le=100 bucket should have all 10 observations");
+            assert_eq!(
+                bucket_100.unwrap().1,
+                10,
+                "le=100 bucket should have all 10 observations"
+            );
         } else {
             panic!("expected Histogram metric value");
         }

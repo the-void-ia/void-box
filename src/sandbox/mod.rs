@@ -761,7 +761,10 @@ impl MockSandbox {
                         let jsonl = format!(
                             "{}\n{}\n",
                             r#"{"type":"system","session_id":"mock_sess","model":"mock","tools":[],"cwd":"/workspace"}"#,
-                            format!(r#"{{"type":"result","subtype":"success","session_id":"mock_sess","total_cost_usd":0.0,"is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"[mock] {}","usage":{{"input_tokens":1,"output_tokens":1}}}}"#, preview)
+                            format_args!(
+                                r#"{{"type":"result","subtype":"success","session_id":"mock_sess","total_cost_usd":0.0,"is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"[mock] {}","usage":{{"input_tokens":1,"output_tokens":1}}}}"#,
+                                preview
+                            )
                         );
                         Ok(ExecOutput::new(jsonl.into_bytes(), Vec::new(), 0))
                     } else {

@@ -435,10 +435,8 @@ impl ObservablePipeline {
                         box_name
                     );
 
-                    let mut stage_span = tracer.start_span_with_parent(
-                        &format!("stage:{}", box_name),
-                        &root_ctx,
-                    );
+                    let mut stage_span =
+                        tracer.start_span_with_parent(&format!("stage:{}", box_name), &root_ctx);
                     let stage_ctx = stage_span.context.clone();
                     let stage_start = Instant::now();
 
@@ -446,11 +444,7 @@ impl ObservablePipeline {
                     let elapsed = stage_start.elapsed();
 
                     // Instrument: create claude.exec + tool spans, record metrics
-                    instrument_stage_result(
-                        &stage_result,
-                        &stage_ctx,
-                        &observer,
-                    );
+                    instrument_stage_result(&stage_result, &stage_ctx, &observer);
 
                     // Set stage span attributes and status
                     set_stage_span_attrs(&mut stage_span, &stage_result);
@@ -500,8 +494,7 @@ impl ObservablePipeline {
                         boxes.len()
                     );
 
-                    let mut fan_out_span =
-                        tracer.start_span_with_parent(&fan_out_label, &root_ctx);
+                    let mut fan_out_span = tracer.start_span_with_parent(&fan_out_label, &root_ctx);
                     let fan_out_ctx = fan_out_span.context.clone();
                     let fan_out_start = Instant::now();
 
@@ -524,11 +517,7 @@ impl ObservablePipeline {
                         );
                         let stage_ctx = stage_span.context.clone();
 
-                        instrument_stage_result(
-                            &stage_result,
-                            &stage_ctx,
-                            &observer,
-                        );
+                        instrument_stage_result(&stage_result, &stage_ctx, &observer);
 
                         set_stage_span_attrs(&mut stage_span, &stage_result);
                         let stage_duration = std::time::Duration::from_millis(
@@ -557,10 +546,7 @@ impl ObservablePipeline {
                         );
 
                         if stage_result.claude_result.is_error {
-                            log_stage_error(
-                                &stage_result.box_name,
-                                &stage_result.claude_result,
-                            );
+                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
                             had_error = true;
                         }
 
@@ -647,10 +633,8 @@ impl ObservablePipeline {
                         box_name
                     );
 
-                    let mut stage_span = tracer.start_span_with_parent(
-                        &format!("stage:{}", box_name),
-                        &root_ctx,
-                    );
+                    let mut stage_span =
+                        tracer.start_span_with_parent(&format!("stage:{}", box_name), &root_ctx);
                     let stage_ctx = stage_span.context.clone();
                     let stage_start = Instant::now();
 
@@ -659,11 +643,7 @@ impl ObservablePipeline {
 
                     emit_synthetic_chunk(&stage_result, &box_name, &mut on_output);
 
-                    instrument_stage_result(
-                        &stage_result,
-                        &stage_ctx,
-                        &observer,
-                    );
+                    instrument_stage_result(&stage_result, &stage_ctx, &observer);
 
                     set_stage_span_attrs(&mut stage_span, &stage_result);
                     stage_span.duration = Some(elapsed);
@@ -712,8 +692,7 @@ impl ObservablePipeline {
                         boxes.len()
                     );
 
-                    let mut fan_out_span =
-                        tracer.start_span_with_parent(&fan_out_label, &root_ctx);
+                    let mut fan_out_span = tracer.start_span_with_parent(&fan_out_label, &root_ctx);
                     let fan_out_ctx = fan_out_span.context.clone();
                     let fan_out_start = Instant::now();
 
@@ -741,11 +720,7 @@ impl ObservablePipeline {
                         );
                         let stage_ctx = stage_span.context.clone();
 
-                        instrument_stage_result(
-                            &stage_result,
-                            &stage_ctx,
-                            &observer,
-                        );
+                        instrument_stage_result(&stage_result, &stage_ctx, &observer);
 
                         set_stage_span_attrs(&mut stage_span, &stage_result);
                         let stage_duration = std::time::Duration::from_millis(
@@ -766,10 +741,7 @@ impl ObservablePipeline {
                         tracer.finish_span(stage_span);
 
                         if stage_result.claude_result.is_error {
-                            log_stage_error(
-                                &stage_result.box_name,
-                                &stage_result.claude_result,
-                            );
+                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
                             had_error = true;
                         }
 

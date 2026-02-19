@@ -24,6 +24,16 @@ Thank you for your interest in contributing to void-box! This document provides 
 - `musl-tools` for building guest-agent
 - `cpio` and `gzip` for initramfs creation
 
+### Git Hooks
+
+Enable the project's pre-commit hook to catch formatting issues before they reach CI:
+
+```bash
+git config core.hooksPath void-box/.githooks
+```
+
+This runs `cargo fmt --all -- --check` on every commit.
+
 ### Building the Project
 
 ```bash

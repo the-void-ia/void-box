@@ -435,9 +435,7 @@ impl MetricsCollector {
         #[cfg(feature = "opentelemetry")]
         if let Some(ref meter) = self.otel_meter {
             use opentelemetry::KeyValue;
-            let histogram = meter
-                .f64_histogram("cpu_usage_percent_histogram")
-                .build();
+            let histogram = meter.f64_histogram("cpu_usage_percent_histogram").build();
             let otel_labels: Vec<KeyValue> = labels
                 .iter()
                 .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))

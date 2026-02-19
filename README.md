@@ -65,6 +65,8 @@ cargo add void-box
 
 ### 2. Define skills and build a VoidBox
 
+#### Rust API
+
 ```rust
 use void_box::agent_box::VoidBox;
 use void_box::skill::Skill;
@@ -88,11 +90,42 @@ let researcher = VoidBox::new("hn_researcher")
     .build()?;
 ```
 
+#### Or use a YAML spec
+
+```yaml
+# hackernews_agent.yaml
+api_version: v1
+kind: agent
+name: hn_researcher
+
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  network: true
+
+llm:
+  provider: ollama
+  model: qwen3-coder
+
+agent:
+  prompt: "Analyze top HN stories for AI engineering trends"
+  skills:
+    - "file:skills/hackernews-api.md"
+    - "agent:claude-code"
+  timeout_secs: 600
+```
+
 ### 3. Run
 
 ```rust
+// Rust API
 let result = researcher.run(None).await?;
 println!("{}", result.claude_result.result_text);
+```
+
+```bash
+# Or via CLI with a YAML spec
+voidbox run --file hackernews_agent.yaml
 ```
 
 ---

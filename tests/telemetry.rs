@@ -747,8 +747,13 @@ async fn kvm_telemetry_with_kernel_threads() {
             if let Some(ref sys) = batch.system {
                 eprintln!(
                     "System: cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
-                    sys.cpu_percent, sys.memory_used_bytes, sys.memory_total_bytes,
-                    sys.net_rx_bytes, sys.net_tx_bytes, sys.procs_running, sys.open_fds,
+                    sys.cpu_percent,
+                    sys.memory_used_bytes,
+                    sys.memory_total_bytes,
+                    sys.net_rx_bytes,
+                    sys.net_tx_bytes,
+                    sys.procs_running,
+                    sys.open_fds,
                 );
             }
             eprintln!(
@@ -764,7 +769,10 @@ async fn kvm_telemetry_with_kernel_threads() {
             }
             // With kernel threads included, we should see some processes with zero RSS
             let zero_rss_count = batch.processes.iter().filter(|p| p.rss_bytes == 0).count();
-            eprintln!("  {} processes with zero RSS (likely kernel threads)", zero_rss_count);
+            eprintln!(
+                "  {} processes with zero RSS (likely kernel threads)",
+                zero_rss_count
+            );
             // Kernel threads like kthreadd, ksoftirqd, etc. should appear
             assert!(
                 zero_rss_count > 0,

@@ -80,8 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let risk_skill = Skill::file("examples/trading_pipeline/skills/portfolio-risk-management.md")
         .description("Portfolio risk management and position sizing");
 
-    let market_data_mcp = Skill::mcp("market-data")
-        .description("Provides OHLCV and news data for equities");
+    let market_data_mcp =
+        Skill::mcp("market-data").description("Provides OHLCV and news data for equities");
 
     // ---- Boxes (real KVM) ----
 
@@ -196,10 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Playground Pipeline ===");
     println!("pipeline: {}", result.name);
     println!("stages: {}", result.stages.len());
-    println!(
-        "success: {}",
-        if result.success() { "YES" } else { "NO" }
-    );
+    println!("success: {}", if result.success() { "YES" } else { "NO" });
     println!("total_cost: ${:.6}", result.total_cost_usd());
     println!(
         "total_tokens: {} in / {} out",
@@ -235,12 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Service: {}", service_name);
     println!(
         "Traces URL: {}",
-        grafana_trace_url(
-            &grafana_base,
-            &service_name,
-            started_at_ms,
-            ended_at_ms
-        )
+        grafana_trace_url(&grafana_base, &service_name, started_at_ms, ended_at_ms)
     );
     println!(
         "Metrics URL: {}",
@@ -262,12 +254,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn grafana_trace_url(
-    grafana_base: &str,
-    service_name: &str,
-    from_ms: u64,
-    to_ms: u64,
-) -> String {
+fn grafana_trace_url(grafana_base: &str, service_name: &str, from_ms: u64, to_ms: u64) -> String {
     let query = format!(
         "{{ resource.service.name = \"{}\" && name =~ \"pipeline:.*\" }}",
         service_name
@@ -287,8 +274,7 @@ fn grafana_trace_url(
 }
 
 fn grafana_metrics_url(grafana_base: &str, from_ms: u64, to_ms: u64) -> String {
-    let expr =
-        "sum by (stage) (pipeline_stage_input_tokens_total)";
+    let expr = "sum by (stage) (pipeline_stage_input_tokens_total)";
     let left = format!(
         "[{}, {}, \"prometheus\", {{\"refId\":\"A\",\"expr\":\"{}\"}}]",
         from_ms,
