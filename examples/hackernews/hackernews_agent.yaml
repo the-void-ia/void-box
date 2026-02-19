@@ -5,7 +5,7 @@ name: hn_researcher
 sandbox:
   mode: auto
   memory_mb: 2048
-  vcpus: 1
+  vcpus: 4
   network: true
 
 llm:

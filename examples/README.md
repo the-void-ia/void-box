@@ -97,10 +97,35 @@ VOIDBOX_LLM_MODEL=qwen2.5-coder:7b \
 cargo run --bin voidbox -- run --file examples/hackernews/hackernews_agent.yaml
 ```
 
-## playground_pipeline
+## parallel_pipeline
 
-Observability-first pipeline for Grafana LGTM with OTLP export.
+Fan-out / fan-in diamond topology: multiple Boxes run in parallel on the same
+input and their outputs are merged as a JSON array for the next stage.
 
 ```bash
-cargo run --example playground_pipeline --features opentelemetry
+cargo run --example parallel_pipeline
+```
+
+## code_review
+
+Two-stage YAML pipeline: `analyzer` clones a repo and identifies improvements,
+then `proposer` applies the fixes and opens a GitHub PR.
+
+```bash
+cargo run --bin voidbox -- run --file examples/code_review/code_review_agent.yaml
+```
+
+## specs/
+
+Reference spec files for the `voidbox run --file` CLI:
+
+| File | Kind | Description |
+|------|------|-------------|
+| `agent.json` | agent | Minimal single-agent spec (JSON) |
+| `pipeline.yaml` | pipeline | Two-stage analyst → writer pipeline |
+| `workflow.yaml` | workflow | Shell-step workflow with `depends_on` |
+| `smoke_test.yaml` | agent | Quick "Hello from void-box!" smoke test |
+
+```bash
+cargo run --bin voidbox -- run --file examples/specs/smoke_test.yaml
 ```

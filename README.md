@@ -5,7 +5,7 @@
 
   <p>
     <em>Design principle:</em> Skills are declared capabilities.<br>
-    They execute inside isolated micro-VM boundaries — not shared processes.
+    Capabilities only exist when bound to an isolated execution boundary.
   </p>
 
   <p><code>VoidBox = Agent(Skills) + Isolation</code></p>
@@ -99,27 +99,27 @@ println!("{}", result.claude_result.result_text);
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
+┌──────────────────────────────────────────────┐
 │ Host                                         │
 │  VoidBox Engine / Pipeline Orchestrator      │
 │                                              │
-│  ┌─────────────────────────────────────┐    │
-│  │ VMM (KVM)                           │    │
-│  │  vsock ←→ guest-agent (PID 1)       │    │
-│  │  SLIRP ←→ eth0 (10.0.2.15)           │    │
-│  └─────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────┐     │
+│  │ VMM (KVM)                           │     │
+│  │  vsock ←→ guest-agent (PID 1)       │     │
+│  │  SLIRP ←→ eth0 (10.0.2.15)          │     │
+│  └─────────────────────────────────────┘     │
 │                                              │
-│  Seccomp-BPF │ OTLP export                  │
+│  Seccomp-BPF │ OTLP export                   │
 └──────────────┼───────────────────────────────┘
-     Hardware   │  Isolation
-═══════════════╪════════════════════════
+     Hardware  │  Isolation
+═══════════════╪════════════════════════════════
                │
-┌──────────────▼───────────────────────────────┐
-│ Guest VM (Linux)                              │
-│  guest-agent: auth, allowlist, rlimits        │
+┌──────────────▼──────────────────────────────────────┐
+│ Guest VM (Linux)                                    │
+│  guest-agent: auth, allowlist, rlimits              │
 │  claude-code runtime (Claude API or Ollama backend) │
-│  skills provisioned into isolated runtime     │
-└───────────────────────────────────────────────┘
+│  skills provisioned into isolated runtime           │
+└─────────────────────────────────────────────────────┘
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full component diagram, wire protocol, and security model.
