@@ -164,19 +164,19 @@ cargo run --example parallel_pipeline
 ### KVM mode
 
 ```bash
-# Build guest initramfs
-scripts/build_guest_image.sh
+# Build guest initramfs (includes claude-code binary, busybox, CA certs)
+scripts/build_claude_rootfs.sh
 
 # Run with Claude API
 ANTHROPIC_API_KEY=sk-ant-xxx \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --example trading_pipeline
 
 # Or with Ollama
 OLLAMA_MODEL=qwen3-coder \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --example trading_pipeline
 ```
 
@@ -187,7 +187,7 @@ OLLAMA_MODEL=phi4-mini \
 OLLAMA_MODEL_QUANT=qwen3-coder \
 OLLAMA_MODEL_SENTIMENT=phi4-mini \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --example parallel_pipeline
 ```
 
