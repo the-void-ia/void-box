@@ -133,6 +133,14 @@ See [docs/architecture.md](docs/architecture.md) for the full component diagram,
 
 Enable with `--features opentelemetry` and set `VOIDBOX_OTLP_ENDPOINT`.
 
+## Next Up
+
+- **Session persistence** — Run/session state with pluggable backends (disk, SQLite, Valkey).
+- **Rich TUI** — Claude-like interactive experience: panel-based, live-streaming dashboard built on the event API.
+- **virtio-blk** — Persistent block devices for stateful workloads across VM restarts.
+- **aarch64** — ARM64 builds and CI (cross-compilation in release pipeline).
+- **Language bindings** — Python and Node.js SDKs for the daemon API.
+
 ## Running & Testing
 
 ### Mock mode (no KVM required)
