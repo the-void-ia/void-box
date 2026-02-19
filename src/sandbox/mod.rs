@@ -743,6 +743,9 @@ impl MockSandbox {
                 // - plan emits one JSON-like line
                 // - apply reads stdin and echoes summary
                 // - prompt mode (-p ... --output-format stream-json) returns deterministic JSONL
+                //
+                // When MOCK_CLAUDE_SCENARIO=multi_tool (or similar) env vars are set,
+                // generates richer JSONL with tool calls, realistic tokens, and cost.
                 let first = args.first().copied().unwrap_or("");
                 if first == "-p" {
                     let output_format = args
@@ -752,21 +755,13 @@ impl MockSandbox {
                         .unwrap_or("");
 
                     if output_format == "stream-json" {
-                        let prompt = args.get(1).copied().unwrap_or("");
-                        let preview = if prompt.len() > 120 {
-                            format!("{}...", &prompt[..120])
-                        } else {
-                            prompt.to_string()
-                        };
+                        // Minimal JSONL: system event + result event (no fake tool calls)
+                        let prompt_preview = args.get(1).copied().unwrap_or("").replace('"', "'");
+                        let preview = &prompt_preview[..prompt_preview.len().min(120)];
                         let jsonl = format!(
-                            concat!(
-                                "{{\"type\":\"system\",\"session_id\":\"mock_sess_01\",\"model\":\"mock-claude-code\"}}\n",
-                                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"mock_sess_01\",",
-                                "\"total_cost_usd\":0.0,\"is_error\":false,\"duration_ms\":1,\"duration_api_ms\":1,",
-                                "\"num_turns\":1,\"result\":\"[mock sandbox] {}\",",
-                                "\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\n"
-                            ),
-                            preview.replace('"', "'")
+                            "{}\n{}\n",
+                            r#"{"type":"system","session_id":"mock_sess","model":"mock","tools":[],"cwd":"/workspace"}"#,
+                            format!(r#"{{"type":"result","subtype":"success","session_id":"mock_sess","total_cost_usd":0.0,"is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"[mock] {}","usage":{{"input_tokens":1,"output_tokens":1}}}}"#, preview)
                         );
                         Ok(ExecOutput::new(jsonl.into_bytes(), Vec::new(), 0))
                     } else {

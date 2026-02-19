@@ -28,11 +28,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let skills = vec![
         Skill::remote("obra/superpowers/brainstorming")
-            .description("Structured brainstorming methodology (18.7K installs)"),
+            .description("Structured brainstorming methodology"),
         Skill::remote("obra/superpowers/systematic-debugging")
-            .description("Systematic debugging methodology (10.2K installs)"),
+            .description("Systematic debugging methodology"),
         Skill::remote("obra/superpowers/test-driven-development")
-            .description("Test-driven development methodology (8.5K installs)"),
+            .description("Test-driven development methodology"),
     ];
 
     // ---- Fetch each skill and show a preview ----

@@ -243,15 +243,20 @@ impl OtelBridge {
         use opentelemetry::trace::{SpanKind, TraceContextExt, Tracer as OtelTracer};
         use opentelemetry::{Context, KeyValue};
 
+        // Parse our internal IDs into OTel types so the SDK uses our IDs
+        // instead of generating its own. This ensures parent-child references
+        // resolve correctly within a single trace.
+        let our_trace_id = opentelemetry::trace::TraceId::from_hex(&span.context.trace_id)
+            .unwrap_or(opentelemetry::trace::TraceId::INVALID);
+        let our_span_id = opentelemetry::trace::SpanId::from_hex(&span.context.span_id)
+            .unwrap_or(opentelemetry::trace::SpanId::INVALID);
+
         // Build parent context if this span has a parent
         let parent_ctx = if let Some(ref parent_id) = span.context.parent_span_id {
-            // Create a remote parent context from the trace/span IDs
-            let trace_id = opentelemetry::trace::TraceId::from_hex(&span.context.trace_id)
-                .unwrap_or(opentelemetry::trace::TraceId::INVALID);
             let parent_span_id = opentelemetry::trace::SpanId::from_hex(parent_id)
                 .unwrap_or(opentelemetry::trace::SpanId::INVALID);
             let span_ctx = opentelemetry::trace::SpanContext::new(
-                trace_id,
+                our_trace_id,
                 parent_span_id,
                 opentelemetry::trace::TraceFlags::SAMPLED,
                 true, // remote
@@ -262,18 +267,25 @@ impl OtelBridge {
             Context::new()
         };
 
-        let mut otel_span = self.tracer.build_with_context(
-            opentelemetry::trace::SpanBuilder::from_name(span.name.clone())
-                .with_kind(SpanKind::Internal)
-                .with_start_time(span.start_time)
-                .with_attributes(
-                    span.attributes
-                        .iter()
-                        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-                        .collect::<Vec<_>>(),
-                ),
-            &parent_ctx,
-        );
+        let mut builder = opentelemetry::trace::SpanBuilder::from_name(span.name.clone());
+        builder = builder
+            .with_kind(SpanKind::Internal)
+            .with_start_time(span.start_time)
+            .with_attributes(
+                span.attributes
+                    .iter()
+                    .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            );
+
+        // Force our trace_id for root spans (child spans inherit from parent context).
+        // Force our span_id always so child spans' parent references resolve.
+        if span.context.parent_span_id.is_none() {
+            builder.trace_id = Some(our_trace_id);
+        }
+        builder.span_id = Some(our_span_id);
+
+        let mut otel_span = self.tracer.build_with_context(builder, &parent_ctx);
 
         // Set status
         use opentelemetry::trace::Span as OtelSpanTrait;

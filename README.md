@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/logo/void-box.png" alt="void-box" width="200">
-  <h1>void-box</h1>
+  <h1>Void-Box</h1>
   <p><strong>Composable agent runtime with hardware isolation</strong></p>
 
   <p>
@@ -47,7 +47,7 @@
 - **Policy-enforced execution** — Command allowlists, rlimits, seccomp-BPF, and controlled network egress.
 - **Skill-native** — Procedural knowledge (SKILL.md), MCP servers, and CLI tools provisioned into the sandbox.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, streaming output with stage-level failure domains.
-- **Model backend options** — claude-code runtime using Claude (default) or Ollama.
+- **Model flexibility** — claude-code agent per stage, backed by Claude API (default) or local Ollama models.
 - **Observability built-in** — OTLP traces/metrics, structured logs, and guest telemetry via procfs.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
@@ -126,19 +126,29 @@ See [docs/architecture.md](docs/architecture.md) for the full component diagram,
 
 ## Observability
 
+Every pipeline run is fully instrumented out of the box. Each VM stage emits
+spans and metrics via OTLP, giving you end-to-end visibility across isolated
+execution boundaries — from pipeline orchestration down to individual tool calls
+inside each micro-VM.
+
+<p align="center">
+  <img src="site/assets/img/void-box-tracing-5.png" alt="Pipeline trace waterfall in Grafana Tempo" width="800">
+</p>
+
 - **OTLP traces** — Per-box spans, tool call events, pipeline-level trace
 - **Metrics** — Token counts, cost, duration per stage
 - **Structured logs** — `[vm:NAME]` prefixed, trace-correlated
 - **Guest telemetry** — procfs metrics (CPU, memory) exported to host via vsock
 
 Enable with `--features opentelemetry` and set `VOIDBOX_OTLP_ENDPOINT`.
+See the [playground](playground/) for a ready-to-run stack with Grafana, Tempo, and Prometheus.
 
 ## Next Up
 
 - **Session persistence** — Run/session state with pluggable backends (disk, SQLite, Valkey).
 - **Rich TUI** — Claude-like interactive experience: panel-based, live-streaming dashboard built on the event API.
 - **virtio-blk** — Persistent block devices for stateful workloads across VM restarts.
-- **aarch64** — ARM64 builds and CI (cross-compilation in release pipeline).
+- **aarch64** — ARM64 builds and CI (cross-compilation in a release pipeline).
 - **Language bindings** — Python and Node.js SDKs for the daemon API.
 
 ## Running & Testing

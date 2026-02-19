@@ -32,20 +32,18 @@ select_provider() {
   elif [[ -t 0 ]]; then
     echo "[playground] Choose provider:"
     echo "  1) Anthropic API key"
-    echo "  2) Ollama"
-    echo "  3) Mock"
-    read -r -p "Select [1-3] (default 3): " choice
-    case "${choice:-3}" in
+    echo "  2) Ollama (default)"
+    read -r -p "Select [1-2] (default 2): " choice
+    case "${choice:-2}" in
       1) provider="anthropic" ;;
       2) provider="ollama" ;;
-      3) provider="mock" ;;
       *)
-        echo "[playground] invalid choice, using mock"
-        provider="mock"
+        echo "[playground] invalid choice, using ollama"
+        provider="ollama"
         ;;
     esac
   else
-    provider="mock"
+    provider="ollama"
   fi
 
   case "$provider" in
@@ -60,7 +58,7 @@ select_provider() {
         echo "[playground] WARN: ANTHROPIC_API_KEY is empty; run will still proceed"
       fi
       ;;
-    ollama)
+    *)
       export PLAYGROUND_PROVIDER="ollama"
       if [[ -t 0 ]]; then
         read -r -p "[playground] Ollama model [${OLLAMA_MODEL:-phi4-mini}]: " model
@@ -69,9 +67,6 @@ select_provider() {
         export OLLAMA_MODEL="${OLLAMA_MODEL:-phi4-mini}"
       fi
       ;;
-    *)
-      export PLAYGROUND_PROVIDER="mock"
-      ;;
   esac
 
   echo "[playground] provider=$PLAYGROUND_PROVIDER"
@@ -79,54 +74,43 @@ select_provider() {
 
 configure_kvm_artifacts() {
   if [[ ! -e /dev/kvm ]]; then
-    echo "[playground] /dev/kvm not available; example will run in mock sandbox mode"
-    return
+    echo "[playground] ERROR: /dev/kvm not available. KVM is required for the playground." >&2
+    echo "[playground] Run on a KVM-capable host or enable nested virtualisation." >&2
+    exit 1
   fi
 
   export VOID_BOX_KERNEL="${VOID_BOX_KERNEL:-/boot/vmlinuz-$(uname -r)}"
   if [[ ! -f "$VOID_BOX_KERNEL" ]]; then
-    echo "[playground] WARN: kernel not found at $VOID_BOX_KERNEL; using mock sandbox mode"
-    unset VOID_BOX_KERNEL
-    return
+    echo "[playground] ERROR: kernel not found at $VOID_BOX_KERNEL" >&2
+    echo "[playground] Set VOID_BOX_KERNEL to the path of your vmlinuz." >&2
+    exit 1
   fi
 
-  if [[ "$PLAYGROUND_PROVIDER" == "mock" ]]; then
-    export VOID_BOX_INITRAMFS="${VOID_BOX_INITRAMFS:-/tmp/void-box-test-rootfs.cpio.gz}"
-    if [[ ! -f "$VOID_BOX_INITRAMFS" ]]; then
-      echo "[playground] building test initramfs (claudio mock)..."
-      (cd "$ROOT_DIR" && scripts/build_test_image.sh)
-    fi
-  else
-    export VOID_BOX_INITRAMFS="${VOID_BOX_INITRAMFS:-/tmp/void-box-rootfs.cpio.gz}"
-    if [[ ! -f "$VOID_BOX_INITRAMFS" ]]; then
-      echo "[playground] building runtime initramfs..."
-      (cd "$ROOT_DIR" && scripts/build_guest_image.sh)
-    fi
+  export VOID_BOX_INITRAMFS="${VOID_BOX_INITRAMFS:-/tmp/void-box-rootfs.cpio.gz}"
+  if [[ ! -f "$VOID_BOX_INITRAMFS" ]]; then
+    echo "[playground] building runtime initramfs..."
+    (cd "$ROOT_DIR" && scripts/build_guest_image.sh)
   fi
 
-  if [[ -f "${VOID_BOX_INITRAMFS:-}" ]]; then
-    echo "[playground] KVM artifacts ready:"
-    echo "  VOID_BOX_KERNEL=$VOID_BOX_KERNEL"
-    echo "  VOID_BOX_INITRAMFS=$VOID_BOX_INITRAMFS"
+  if [[ ! -f "$VOID_BOX_INITRAMFS" ]]; then
+    echo "[playground] ERROR: initramfs not found at $VOID_BOX_INITRAMFS after build" >&2
+    exit 1
   fi
+
+  echo "[playground] KVM artifacts ready:"
+  echo "  VOID_BOX_KERNEL=$VOID_BOX_KERNEL"
+  echo "  VOID_BOX_INITRAMFS=$VOID_BOX_INITRAMFS"
 }
 
 print_run_summary() {
-  local mode
-  if [[ -n "${VOID_BOX_KERNEL:-}" && -n "${VOID_BOX_INITRAMFS:-}" ]]; then
-    mode="KVM"
-  else
-    mode="Mock"
-  fi
-
   echo
   echo "[playground] run summary"
   echo "  provider:        ${PLAYGROUND_PROVIDER}"
-  echo "  sandbox mode:    ${mode}"
+  echo "  sandbox mode:    KVM"
   echo "  otlp endpoint:   ${VOIDBOX_OTLP_ENDPOINT}"
   echo "  service name:    ${VOIDBOX_SERVICE_NAME}"
-  echo "  kernel:          ${VOID_BOX_KERNEL:-<not set>}"
-  echo "  initramfs:       ${VOID_BOX_INITRAMFS:-<not set>}"
+  echo "  kernel:          ${VOID_BOX_KERNEL}"
+  echo "  initramfs:       ${VOID_BOX_INITRAMFS}"
   if [[ "${PLAYGROUND_PROVIDER}" == "ollama" ]]; then
     echo "  ollama model:    ${OLLAMA_MODEL:-<not set>}"
   fi
@@ -160,6 +144,7 @@ export VOIDBOX_OTLP_ENDPOINT="${VOIDBOX_OTLP_ENDPOINT:-http://localhost:4317}"
 export VOIDBOX_SERVICE_NAME="${VOIDBOX_SERVICE_NAME:-void-box-playground}"
 export PLAYGROUND_GRAFANA_URL="${PLAYGROUND_GRAFANA_URL:-http://localhost:3000}"
 export PLAYGROUND_LOG_PATH="${PLAYGROUND_LOG_PATH:-/tmp/void-box-playground-last.log}"
+
 print_run_summary
 
 echo "[playground] running pipeline example..."
