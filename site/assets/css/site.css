@@ -125,27 +125,30 @@ main section { padding: 2.4rem 0; }
 }
 
 .code-tabs {
-  display: flex;
+  display: inline-flex;
   justify-content: center;
   gap: 0;
   margin: 2.2rem auto 0;
-  max-width: 760px;
+  background: var(--accent-soft);
+  border-radius: 0.5rem;
+  padding: 0.25rem;
 }
 .code-tab {
   background: none;
   border: none;
-  padding: 0.5rem 1.1rem;
-  font-size: 0.95rem;
-  font-weight: 500;
+  padding: 0.45rem 1.2rem;
+  font-size: 0.9rem;
+  font-weight: 600;
   color: var(--muted);
   cursor: pointer;
-  border-bottom: 2px solid transparent;
-  transition: color 0.15s, border-color 0.15s;
+  border-radius: 0.35rem;
+  transition: color 0.15s, background 0.15s;
 }
 .code-tab:hover { color: var(--text); }
 .code-tab.active {
   color: var(--text);
-  border-bottom-color: var(--text);
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
 }
 
 .code-tabs ~ .code-wrap {
@@ -213,6 +216,27 @@ pre code {
 .tok-fn { color: #d2a8ff; }
 .tok-num { color: #79c0ff; }
 
+.demo {
+  margin: 1.6rem auto 0;
+  max-width: 760px;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  border: 1px solid #1f2a44;
+  background: #0b1220;
+}
+.demo img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.demo-caption {
+  margin: 1.2rem auto 0;
+  max-width: 760px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
 .section-title {
   text-align: center;
   margin: 0;
@@ -278,6 +302,7 @@ footer {
   margin-top: 2.4rem;
   padding: 1.2rem 0 2rem;
   color: #667085;
+  text-align: center;
 }
 
 .kicker {

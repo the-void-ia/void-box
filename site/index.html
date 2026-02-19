@@ -24,8 +24,8 @@
   <main>
     <section class="hero">
       <div class="wrap">
-        <h1>Isolation-First Agent Runtime</h1>
-        <p class="lead">Composable agent runtime with hardware isolation</p>
+        <h1>Capability-Bound Agent Runtime</h1>
+        <p class="lead">Composable agent runtime with enforced isolation boundaries</p>
         <p class="sub">Skills are declared capabilities.<br />Capabilities only exist when bound to an isolated execution boundary.</p>
         <div class="eq">VoidBox = Agent(Skills) + Isolation</div>
 
@@ -51,68 +51,62 @@
             <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
             <span>rust</span>
           </div>
-<pre><code class="language-rust">use void_box::{VoidBox, Skill, Pipeline, Network};
+<pre><code class="language-rust">use void_box::agent_box::VoidBox;
+use void_box::skill::Skill;
+use void_box::llm::LlmProvider;
 
-// 5 lines to isolate an agent
-let researcher = VoidBox::new("researcher")
-    .skill(Skill::mcp("hackernews-api"))
-    .prompt("Find today's top AI stories")
-    .network(Network::outbound())
-    .build()?;
+// Skills = declared capabilities
+let hn_api = Skill::file("skills/hackernews-api.md")
+    .description("HN API via curl + jq");
 
-let analyst = VoidBox::new("analyst")
-    .skill(Skill::agent("claude-code"))
-    .prompt("Extract key trends")
-    .build()?;
+let reasoning = Skill::agent("claude-code")
+    .description("Autonomous reasoning and code execution");
 
-let writer = VoidBox::new("writer")
-    .skill(Skill::agent("claude-code"))
-    .prompt("Draft a summary report")
-    .build()?;
-
-// compose into a pipeline — fresh VM per stage
-let report = Pipeline::new()
-    .pipe(researcher)
-    .fan_out(vec![analyst, writer]) // parallel
-    .run().await?;</code></pre>
+// VoidBox = Agent(Skills) + Isolation
+let researcher = VoidBox::new("hn_researcher")
+    .skill(hn_api)
+    .skill(reasoning)
+    .llm(LlmProvider::ollama("qwen3-coder"))
+    .memory_mb(1024)
+    .network(true)
+    .prompt("Analyze top HN stories for AI engineering trends")
+    .build()?;</code></pre>
         </div>
 
         <div class="code-wrap" data-panel="yaml" style="display:none">
           <div class="code-head">
             <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-            <span>hn_pipeline.yaml</span>
+            <span>hackernews_agent.yaml</span>
           </div>
-<pre><code class="language-yaml">api_version: v1
-kind: pipeline
-name: hn-research
+<pre><code class="language-yaml"># hackernews_agent.yaml
+api_version: v1
+kind: agent
+name: hn_researcher
 
 sandbox:
+  mode: auto
   memory_mb: 1024
-  network: outbound
+  network: true
 
-pipeline:
-  boxes:
-    - name: researcher
-      prompt: "Find today's top AI stories"
-      skills: ["mcp:hackernews-api"]
+llm:
+  provider: ollama
+  model: qwen3-coder
 
-    - name: analyst
-      prompt: "Extract key trends"
-      skills: ["agent:claude-code"]
-
-    - name: writer
-      prompt: "Draft a summary report"
-      skills: ["agent:claude-code"]
-
-  stages:
-    - type: box
-      name: researcher
-    - type: fan_out        # parallel
-      boxes: [analyst, writer]</code></pre>
+agent:
+  prompt: "Analyze top HN stories for AI engineering trends"
+  skills:
+    - "file:skills/hackernews-api.md"
+    - "agent:claude-code"
+  timeout_secs: 600</code></pre>
           <div class="code-run">
-            <span>$</span> <code>void-box run hn_pipeline.yaml</code>
+            <span>$</span> <code>voidbox run --file hackernews_agent.yaml</code>
           </div>
         </div>
+
+        <div class="demo">
+          <img src="assets/img/hn_demo.gif" alt="hn_demo — HN researcher agent" width="800" />
+        </div>
+        <p class="demo-caption">hn_researcher agent — live HN analysis with Ollama + Claude Code skills, running inside a KVM micro-VM</p>
       </div>
     </section>
 
@@ -123,33 +117,33 @@ pipeline:
         <div class="grid-3">
           <article class="card">
             <h3>Hardware Isolated</h3>
-            <small>Why stronger than shared-process agents?</small>
+            <small>Stronger than shared-process agents</small>
             <p>Each run executes behind a micro-VM boundary, reducing cross-run blast radius.</p>
           </article>
           <article class="card">
             <h3>Composable Runtime</h3>
-            <small>Can I orchestrate multi-step agents?</small>
-            <p>Yes. Run single agents, pipelines, and workflows with explicit stage boundaries.</p>
+            <small>Multi-stage agents, explicitly bounded</small>
+            <p>Compose single agents into pipelines with isolated stages.</p>
           </article>
           <article class="card">
             <h3>Skill-Native</h3>
-            <small>How are capabilities declared?</small>
-            <p>MCP servers, SKILL files, and CLI tools are mounted as declared capabilities.</p>
+            <small>Capabilities declared, not improvised</small>
+            <p>MCP servers, SKILL files, and CLI tools are mounted as explicits skills.</p>
           </article>
           <article class="card">
             <h3>Policy Enforced</h3>
-            <small>What controls exist at runtime?</small>
-            <p>Command allowlist, resource limits, seccomp, and controlled egress are applied in execution path.</p>
+            <small>Execution is constrained by design</small>
+            <p>Command allowlist, resource limits, seccomp, and controlled egress apply at runtime.</p>
           </article>
           <article class="card">
-            <h3>Claude Code First-Class</h3>
-            <small>What is the canonical runtime?</small>
-            <p>VoidBox always runs <code>claude-code</code>. Ollama support works through Claude-compatible provider mode.</p>
+            <h3>Claude Code Native Runtime</h3>
+            <small>Canonical execution model</small>
+            <p>VoidBox runs <code>claude-code</code> by default. Ollama operates via Claude-compatible provider mode.</p>
           </article>
           <article class="card">
-            <h3>Built-in Run Visibility</h3>
-            <small>Can I inspect what happened?</small>
-            <p>Structured run events, logs, and session persistence make execution behavior inspectable.</p>
+            <h3>Observability Native</h3>
+            <small>First-class Opentelemetry support</small>
+            <p>Per-stage traces, metrics, structured logs, and telemetry are emitted by design via OpenTelemetry.</p>
           </article>
         </div>
       </div>

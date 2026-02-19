@@ -1,10 +1,10 @@
 <div align="center">
   <img src="assets/logo/void-box.png" alt="void-box" width="400">
   <h1>Void-Box</h1>
-  <p><strong>Composable agent runtime with hardware isolation</strong></p>
+  <p><strong>Composable agent runtime with enforced isolation boundaries</strong></p>
 
   <p>
-    <em>Design principle:</em> Skills are declared capabilities.<br>
+    <em><strong>Design principle:</strong></em> Skills are declared capabilities.<br>
     Capabilities only exist when bound to an isolated execution boundary.
   </p>
 
