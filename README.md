@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo/void-box.png" alt="void-box" width="200">
+  <img src="assets/logo/void-box.png" alt="void-box" width="400">
   <h1>Void-Box</h1>
   <p><strong>Composable agent runtime with hardware isolation</strong></p>
 
