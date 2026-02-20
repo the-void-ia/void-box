@@ -78,7 +78,7 @@ pub mod observe;
 pub mod sandbox;
 pub mod workflow;
 
-// Skill + Environment = Box
+// Agent(Skills) + Isolation = VoidBox
 pub mod agent_box;
 pub mod daemon;
 pub mod llm;

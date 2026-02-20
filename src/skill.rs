@@ -1,6 +1,6 @@
 //! Skill: A declared capability that gets installed into a Box.
 //!
-//! Skills are the building blocks of the "Skill + Environment = Box" abstraction.
+//! Skills are the building blocks of the "Agent(Skills) + Isolation = VoidBox" abstraction.
 //! They represent what a Box *can do* -- procedural knowledge, structured tools,
 //! CLI binaries, or the LLM agent itself.
 //!

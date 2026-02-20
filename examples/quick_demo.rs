@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     println!("╔══════════════════════════════════════════════════╗");
-    println!("║   Quick Demo: Skill + Environment = Box         ║");
+    println!("║   Quick Demo: Agent(Skills) + Isolation = VoidBox║");
     println!("╚══════════════════════════════════════════════════╝");
     println!();
 
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Box 1: Analyst ----
     //
-    // Skill + Environment = Box.
+    // Agent(Skills) + Isolation = VoidBox.
     // This Box has reasoning capability and a focused prompt.
 
     let analyst = make_box("analyst", use_kvm, &llm)

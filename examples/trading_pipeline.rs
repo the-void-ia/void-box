@@ -1,4 +1,4 @@
-//! Trading Analysis Pipeline: Skill + Environment = Box
+//! Trading Analysis Pipeline: Agent(Skills) + Isolation = VoidBox
 //!
 //! Demonstrates the void-box "Box" abstraction inspired by Ed Huang's article
 //! (https://me.0xffff.me/agent_infra.html) where each Box is an autonomous
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║     Trading Analysis Pipeline: Skill + Environment = Box    ║");
+    println!("║   Trading Pipeline: Agent(Skills) + Isolation = VoidBox     ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
