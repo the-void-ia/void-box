@@ -200,39 +200,47 @@ else
   rm -rf "$GH_TMP"
 fi
 
-# Copy kernel modules needed for virtio-mmio and vsock
+# Copy kernel modules needed for virtio-mmio and vsock.
+# Supports .ko.xz (older kernels), .ko.zst (Ubuntu/Pop!_OS 6.x+), and uncompressed .ko.
 KVER=$(uname -r)
 MODDIR="/lib/modules/$KVER/kernel"
 DEST_MODDIR="$OUT_DIR/lib/modules"
 mkdir -p "$DEST_MODDIR"
 
+# Install a kernel module by base path (without extension).
+# Tries .ko.xz, .ko.zst, and .ko in that order; decompresses as needed.
+_install_kmod() {
+  local mod_base="$1"   # full path without extension, e.g. $MODDIR/net/vmw_vsock/vsock
+  local dest_dir="$2"
+  local mod_name
+  mod_name=$(basename "$mod_base")
+
+  if [[ -f "${mod_base}.ko.xz" ]]; then
+    cp "${mod_base}.ko.xz" "$dest_dir/${mod_name}.ko.xz"
+    xz -d "$dest_dir/${mod_name}.ko.xz"
+    echo "  -> ${mod_name}.ko (from .ko.xz)"
+  elif [[ -f "${mod_base}.ko.zst" ]]; then
+    zstd -d "${mod_base}.ko.zst" -o "$dest_dir/${mod_name}.ko" --force -q
+    echo "  -> ${mod_name}.ko (from .ko.zst)"
+  elif [[ -f "${mod_base}.ko" ]]; then
+    cp "${mod_base}.ko" "$dest_dir/${mod_name}.ko"
+    echo "  -> ${mod_name}.ko (uncompressed)"
+  else
+    echo "  WARNING: ${mod_name} not found as module (may be built-in or missing)"
+  fi
+}
+
 echo "[void-box] Adding kernel modules for virtio-mmio, vsock, and networking (kernel $KVER)..."
 # virtio_mmio: virtio device on MMIO bus
 # vsock: VM socket communication
 # virtio_net + deps: network driver for SLIRP networking
-for mod_path in \
-  "$MODDIR/drivers/virtio/virtio_mmio.ko.xz" \
-  "$MODDIR/net/vmw_vsock/vsock.ko.xz" \
-  "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.xz" \
-  "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport.ko.xz" \
-  "$MODDIR/net/core/failover.ko.xz" \
-  "$MODDIR/drivers/net/net_failover.ko.xz" \
-  "$MODDIR/drivers/net/virtio_net.ko.xz" \
-  ; do
-  if [[ -f "$mod_path" ]]; then
-    base=$(basename "$mod_path")
-    cp "$mod_path" "$DEST_MODDIR/$base"
-    # Decompress .ko.xz -> .ko (finit_module needs raw ELF)
-    if [[ "$base" == *.ko.xz ]]; then
-      xz -d "$DEST_MODDIR/$base"
-      echo "  -> ${base%.xz} (decompressed)"
-    else
-      echo "  -> $base"
-    fi
-  else
-    echo "  WARNING: $mod_path not found"
-  fi
-done
+_install_kmod "$MODDIR/drivers/virtio/virtio_mmio"                        "$DEST_MODDIR"
+_install_kmod "$MODDIR/net/vmw_vsock/vsock"                               "$DEST_MODDIR"
+_install_kmod "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport_common"   "$DEST_MODDIR"
+_install_kmod "$MODDIR/net/vmw_vsock/vmw_vsock_virtio_transport"          "$DEST_MODDIR"
+_install_kmod "$MODDIR/net/core/failover"                                 "$DEST_MODDIR"
+_install_kmod "$MODDIR/drivers/net/net_failover"                          "$DEST_MODDIR"
+_install_kmod "$MODDIR/drivers/net/virtio_net"                            "$DEST_MODDIR"
 
 echo "[void-box] Creating initramfs at: $OUT_CPIO"
 ( cd "$OUT_DIR" && find . | cpio -o -H newc | gzip ) > "$OUT_CPIO"
