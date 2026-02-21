@@ -276,7 +276,10 @@ impl LlmProvider {
     /// (it applies Anthropic pricing to local model tokens) and should be
     /// zeroed in the final report.
     pub(crate) fn is_local(&self) -> bool {
-        matches!(self, LlmProvider::Ollama { .. } | LlmProvider::LmStudio { .. })
+        matches!(
+            self,
+            LlmProvider::Ollama { .. } | LlmProvider::LmStudio { .. }
+        )
     }
 
     /// Whether this provider requires network access from the guest.
@@ -450,7 +453,10 @@ mod tests {
         let provider = LlmProvider::lm_studio("qwen2.5-coder-7b-instruct");
         let vars = provider.env_vars();
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-        assert_eq!(map.get("ANTHROPIC_BASE_URL").unwrap(), "http://10.0.2.2:1234");
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://10.0.2.2:1234"
+        );
         assert_eq!(map.get("ANTHROPIC_API_KEY").unwrap(), "lm-studio");
         assert_eq!(map.get("HOME").unwrap(), "/home/sandbox");
     }
@@ -460,13 +466,19 @@ mod tests {
         let provider = LlmProvider::lm_studio_with_host("model", "http://10.0.2.2:5678");
         let vars = provider.env_vars();
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-        assert_eq!(map.get("ANTHROPIC_BASE_URL").unwrap(), "http://10.0.2.2:5678");
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://10.0.2.2:5678"
+        );
     }
 
     #[test]
     fn test_lm_studio_cli_args() {
         let provider = LlmProvider::lm_studio("qwen2.5-coder-7b-instruct");
-        assert_eq!(provider.cli_args(), vec!["--model", "qwen2.5-coder-7b-instruct"]);
+        assert_eq!(
+            provider.cli_args(),
+            vec!["--model", "qwen2.5-coder-7b-instruct"]
+        );
     }
 
     #[test]

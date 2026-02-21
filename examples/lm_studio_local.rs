@@ -49,8 +49,8 @@ use void_box::skill::Skill;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -- Configuration --
-    let model = std::env::var("LM_STUDIO_MODEL")
-        .unwrap_or_else(|_| "qwen2.5-coder-7b-instruct".into());
+    let model =
+        std::env::var("LM_STUDIO_MODEL").unwrap_or_else(|_| "qwen2.5-coder-7b-instruct".into());
 
     println!("=== void-box: LM Studio Local LLM Example ===");
     println!("Model: {}", model);
