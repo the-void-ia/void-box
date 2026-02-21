@@ -7,7 +7,7 @@ use void_box::llm::LlmProvider;
 
 /// Create an VoidBox builder pre-configured for the current environment.
 pub fn make_box(name: &str, use_kvm: bool, llm: &LlmProvider) -> VoidBox {
-    let mut ab = VoidBox::new(name).llm(llm.clone()).memory_mb(1024);
+    let mut ab = VoidBox::new(name).llm(llm.clone()).memory_mb(2048);
 
     // Allow per-stage timeout override via STAGE_TIMEOUT_SECS env var
     if let Ok(secs) = std::env::var("STAGE_TIMEOUT_SECS") {
@@ -36,6 +36,13 @@ pub fn make_box(name: &str, use_kvm: bool, llm: &LlmProvider) -> VoidBox {
 /// - `LLM_BASE_URL=...` -> Custom provider
 /// - Otherwise -> Claude (default)
 pub fn detect_llm_provider() -> LlmProvider {
+    // Check for LM Studio
+    if let Ok(model) = std::env::var("LM_STUDIO_MODEL") {
+        if !model.is_empty() {
+            return LlmProvider::lm_studio(model);
+        }
+    }
+
     // Check for Ollama
     if let Ok(model) = std::env::var("OLLAMA_MODEL") {
         if !model.is_empty() {

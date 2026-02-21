@@ -68,6 +68,21 @@ pub enum LlmProvider {
         host: Option<String>,
     },
 
+    /// Local LM Studio instance running on the host.
+    ///
+    /// LM Studio must be running with the local server enabled (default port 1234).
+    /// The guest reaches it through the SLIRP gateway IP (`10.0.2.2`), which is
+    /// mapped to `127.0.0.1` on the host.
+    ///
+    /// LM Studio 0.3.x+ exposes an Anthropic-compatible API; no proxy needed.
+    LmStudio {
+        /// Model identifier as shown in LM Studio (e.g. `"qwen2.5-coder-7b-instruct"`).
+        model: String,
+        /// LM Studio host URL as seen from the guest.
+        /// Default: `http://10.0.2.2:1234` (SLIRP gateway → host localhost).
+        host: Option<String>,
+    },
+
     /// Any Anthropic-compatible API endpoint.
     ///
     /// Use this for OpenRouter, Together AI, or self-hosted vLLM/TGI with
@@ -109,6 +124,25 @@ impl LlmProvider {
         }
     }
 
+    /// Create an LM Studio provider with the given model identifier.
+    pub fn lm_studio(model: impl Into<String>) -> Self {
+        LlmProvider::LmStudio {
+            model: model.into(),
+            host: None,
+        }
+    }
+
+    /// Create an LM Studio provider with a custom host URL.
+    ///
+    /// Use this when LM Studio is not on the default port, or is running
+    /// on a different machine accessible from the host.
+    pub fn lm_studio_with_host(model: impl Into<String>, host: impl Into<String>) -> Self {
+        LlmProvider::LmStudio {
+            model: model.into(),
+            host: Some(host.into()),
+        }
+    }
+
     /// Create a custom provider with the given base URL.
     pub fn custom(base_url: impl Into<String>) -> Self {
         LlmProvider::Custom {
@@ -142,6 +176,11 @@ impl LlmProvider {
             } => {
                 *m = name.into();
             }
+            LlmProvider::LmStudio {
+                model: ref mut m, ..
+            } => {
+                *m = name.into();
+            }
             _ => {}
         }
         self
@@ -159,6 +198,9 @@ impl LlmProvider {
         match self {
             LlmProvider::Claude => Vec::new(),
             LlmProvider::Ollama { model, .. } => {
+                vec!["--model".into(), model.clone()]
+            }
+            LlmProvider::LmStudio { model, .. } => {
                 vec!["--model".into(), model.clone()]
             }
             LlmProvider::Custom { model: Some(m), .. } => {
@@ -200,6 +242,18 @@ impl LlmProvider {
                     ("HOME".into(), "/home/sandbox".into()),
                 ]
             }
+            LlmProvider::LmStudio { host, .. } => {
+                let base_url = host
+                    .clone()
+                    .unwrap_or_else(|| format!("http://{}:1234", SLIRP_GATEWAY));
+                // LM Studio requires a non-empty API key; "lm-studio" is the
+                // conventional placeholder value.
+                vec![
+                    ("ANTHROPIC_BASE_URL".into(), base_url),
+                    ("ANTHROPIC_API_KEY".into(), "lm-studio".into()),
+                    ("HOME".into(), "/home/sandbox".into()),
+                ]
+            }
             LlmProvider::Custom {
                 base_url, api_key, ..
             } => {
@@ -222,7 +276,10 @@ impl LlmProvider {
     /// (it applies Anthropic pricing to local model tokens) and should be
     /// zeroed in the final report.
     pub(crate) fn is_local(&self) -> bool {
-        matches!(self, LlmProvider::Ollama { .. })
+        matches!(
+            self,
+            LlmProvider::Ollama { .. } | LlmProvider::LmStudio { .. }
+        )
     }
 
     /// Whether this provider requires network access from the guest.
@@ -239,6 +296,10 @@ impl LlmProvider {
             LlmProvider::Ollama { model, host } => {
                 let h = host.as_deref().unwrap_or("localhost:11434");
                 format!("Ollama ({} @ {})", model, h)
+            }
+            LlmProvider::LmStudio { model, host } => {
+                let h = host.as_deref().unwrap_or("localhost:1234");
+                format!("LM Studio ({} @ {})", model, h)
             }
             LlmProvider::Custom {
                 base_url, model, ..
@@ -385,5 +446,51 @@ mod tests {
     fn test_cli_args_custom_without_model() {
         let provider = LlmProvider::custom("http://localhost:8000");
         assert!(provider.cli_args().is_empty());
+    }
+
+    #[test]
+    fn test_lm_studio_env_vars() {
+        let provider = LlmProvider::lm_studio("qwen2.5-coder-7b-instruct");
+        let vars = provider.env_vars();
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://10.0.2.2:1234"
+        );
+        assert_eq!(map.get("ANTHROPIC_API_KEY").unwrap(), "lm-studio");
+        assert_eq!(map.get("HOME").unwrap(), "/home/sandbox");
+    }
+
+    #[test]
+    fn test_lm_studio_custom_host() {
+        let provider = LlmProvider::lm_studio_with_host("model", "http://10.0.2.2:5678");
+        let vars = provider.env_vars();
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(
+            map.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://10.0.2.2:5678"
+        );
+    }
+
+    #[test]
+    fn test_lm_studio_cli_args() {
+        let provider = LlmProvider::lm_studio("qwen2.5-coder-7b-instruct");
+        assert_eq!(
+            provider.cli_args(),
+            vec!["--model", "qwen2.5-coder-7b-instruct"]
+        );
+    }
+
+    #[test]
+    fn test_lm_studio_is_local() {
+        assert!(LlmProvider::lm_studio("x").is_local());
+    }
+
+    #[test]
+    fn test_lm_studio_description() {
+        assert_eq!(
+            LlmProvider::lm_studio("qwen2.5-coder-7b-instruct").description(),
+            "LM Studio (qwen2.5-coder-7b-instruct @ localhost:1234)"
+        );
     }
 }
