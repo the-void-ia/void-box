@@ -1,13 +1,14 @@
-//! Example: Run an VoidBox with a local Ollama model.
+//! Example: Run a VoidBox with a local LM Studio model.
 //!
-//! This demonstrates using `LlmProvider::Ollama` so that `claude-code` in
-//! the guest VM talks to a local Ollama instance instead of the Anthropic API.
+//! This demonstrates using `LlmProvider::LmStudio` so that `claude-code` in
+//! the guest VM talks to a local LM Studio instance instead of the Anthropic API.
 //!
 //! ## Prerequisites
 //!
-//! 1. Install Ollama: https://ollama.com
-//! 2. Pull a model: `ollama pull phi4-mini`
-//! 3. Ensure Ollama is running: `ollama serve`
+//! 1. Install LM Studio: https://lmstudio.ai
+//! 2. Load a model in LM Studio and enable the Local Server (default port 1234).
+//! 3. Ensure the server listens on all interfaces (`0.0.0.0:1234`), not just
+//!    `127.0.0.1`, so the SLIRP gateway can reach it from the guest VM.
 //! 4. Build the guest initramfs:
 //!    ```
 //!    CLAUDE_CODE_BIN=$(which claude) BUSYBOX=/usr/bin/busybox \
@@ -17,27 +18,27 @@
 //! ## Run
 //!
 //! ```bash
-//! OLLAMA_MODEL=phi4-mini \
+//! LM_STUDIO_MODEL=qwen2.5-coder-7b-instruct \
 //! VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 //! VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
-//! cargo run --example ollama_local
+//! cargo run --example lm_studio_local
 //! ```
 //!
 //! ## How it works
 //!
-//! The guest VM reaches Ollama through SLIRP networking:
+//! The guest VM reaches LM Studio through SLIRP networking:
 //!
 //! ```text
-//! Guest VM                        Host
-//! ┌──────────────┐               ┌──────────────┐
-//! │ claude-code   │──SLIRP──────>│ Ollama:11434 │
-//! │ (stream-json) │  10.0.2.2    │ (localhost)   │
-//! └──────────────┘               └──────────────┘
+//! Guest VM                          Host
+//! ┌──────────────┐                 ┌────────────────┐
+//! │ claude-code   │──SLIRP────────>│ LM Studio:1234 │
+//! │ (stream-json) │  10.0.2.2      │ (localhost)     │
+//! └──────────────┘                 └────────────────┘
 //! ```
 //!
 //! The SLIRP gateway IP (10.0.2.2) is transparently mapped to 127.0.0.1
-//! on the host, so `ANTHROPIC_BASE_URL=http://10.0.2.2:11434` reaches
-//! the host's Ollama process.
+//! on the host, so `ANTHROPIC_BASE_URL=http://10.0.2.2:1234` reaches
+//! the host's LM Studio process.
 
 use std::path::PathBuf;
 
@@ -48,15 +49,16 @@ use void_box::skill::Skill;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -- Configuration --
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3-coder".into());
+    let model = std::env::var("LM_STUDIO_MODEL")
+        .unwrap_or_else(|_| "qwen2.5-coder-7b-instruct".into());
 
-    println!("=== void-box: Ollama Local LLM Example ===");
+    println!("=== void-box: LM Studio Local LLM Example ===");
     println!("Model: {}", model);
     println!();
 
     // -- Build the VoidBox --
-    let mut builder = VoidBox::new("ollama_demo")
-        .llm(LlmProvider::ollama(&model))
+    let mut builder = VoidBox::new("lm_studio_demo")
+        .llm(LlmProvider::lm_studio(&model))
         .skill(Skill::agent("claude-code"))
         .memory_mb(2048)
         .prompt("Write a short Python script that prints the first 10 Fibonacci numbers. Save it to /workspace/fib.py");
@@ -88,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent_box = builder.build()?;
 
-    println!("LLM Provider: {}", LlmProvider::ollama(&model));
+    println!("LLM Provider: {}", LlmProvider::lm_studio(&model));
     println!();
 
     // -- Run --
