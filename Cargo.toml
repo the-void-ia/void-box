@@ -23,12 +23,11 @@ exclude = [
 # rust-vmm core
 kvm-ioctls = "0.19"
 kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
-vm-memory = { version = "0.17", features = ["backend-mmap"] }
+vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.12"
 linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 
 # Virtio devices
-virtio-queue = "0.14"
 virtio-bindings = "0.2"
 vm-superio = "0.8"
 event-manager = "0.4"
