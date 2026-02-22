@@ -12,7 +12,7 @@
 //! 4. Build the guest initramfs:
 //!    ```
 //!    CLAUDE_CODE_BIN=$(which claude) BUSYBOX=/usr/bin/busybox \
-//!      scripts/build_guest_image.sh
+//!      scripts/build_claude_rootfs.sh
 //!    ```
 //!
 //! ## Run

@@ -226,7 +226,14 @@ _install_kmod() {
     cp "${mod_base}.ko" "$dest_dir/${mod_name}.ko"
     echo "  -> ${mod_name}.ko (uncompressed)"
   else
-    echo "  WARNING: ${mod_name} not found as module (may be built-in or missing)"
+    local config_key
+    config_key="CONFIG_$(echo "${mod_name}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    local kconfig="/boot/config-${KVER}"
+    if [[ -f "$kconfig" ]] && grep -q "^${config_key}=y" "$kconfig" 2>/dev/null; then
+      echo "  -> ${mod_name} built-in (${config_key}=y)"
+    else
+      echo "  WARNING: ${mod_name} not found as module (may be built-in or missing)"
+    fi
   fi
 }
 
