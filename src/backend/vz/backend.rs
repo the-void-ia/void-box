@@ -44,7 +44,6 @@ use super::vsock::VzSocketStream;
 // ObjC imports for Virtualization.framework
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization::*;
@@ -105,7 +104,7 @@ impl VzBackend {
     /// calls the completion handler with a `VZVirtioSocketConnection`.
     /// The connection's `fileDescriptor()` gives us a raw fd for I/O.
     fn build_connector(socket_device: &SendSyncDevice) -> GuestConnector {
-        let device = socket_device.0.clone();
+        let device = Arc::new(SendSyncDevice(socket_device.0.clone()));
         Box::new(move || {
             // Bridge the ObjC completion handler to a blocking Rust call.
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
@@ -129,7 +128,7 @@ impl VzBackend {
             );
 
             unsafe {
-                device.connectToPort_completionHandler(1234, &handler);
+                device.0.connectToPort_completionHandler(1234, &handler);
             }
 
             // Wait for the completion handler (with timeout)
@@ -185,7 +184,7 @@ impl VmmBackend for VzBackend {
 
         // 3. Virtio socket device (for host↔guest control channel)
         let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
-        let socket_configs: Retained<NSArray<AnyObject>> =
+        let socket_configs: Retained<NSArray<VZSocketDeviceConfiguration>> =
             unsafe { NSArray::arrayWithObject(&vsock_config) };
         unsafe {
             vm_config.setSocketDevices(&socket_configs);
@@ -198,7 +197,7 @@ impl VmmBackend for VzBackend {
             unsafe {
                 net_config.setAttachment(Some(&nat_attachment));
             }
-            let net_configs: Retained<NSArray<AnyObject>> =
+            let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
                 unsafe { NSArray::arrayWithObject(&net_config) };
             unsafe {
                 vm_config.setNetworkDevices(&net_configs);
@@ -222,22 +221,23 @@ impl VmmBackend for VzBackend {
 
         // Start VM with completion handler
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        let tx = std::sync::Mutex::new(Some(tx));
+        {
+            let tx = std::sync::Mutex::new(Some(tx));
+            let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                let result = if err.is_null() {
+                    Ok(())
+                } else {
+                    let desc = unsafe { &*err }.localizedDescription().to_string();
+                    Err(desc)
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            });
 
-        let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-            let result = if err.is_null() {
-                Ok(())
-            } else {
-                let desc = unsafe { &*err }.localizedDescription().to_string();
-                Err(desc)
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
+            unsafe {
+                vm.startWithCompletionHandler(&handler);
             }
-        });
-
-        unsafe {
-            vm.startWithCompletionHandler(&handler);
         }
 
         rx.await
@@ -250,7 +250,7 @@ impl VmmBackend for VzBackend {
         let socket_devices = unsafe { vm.socketDevices() };
         let socket_device = unsafe { socket_devices.objectAtIndex(0) };
         let socket_device: Retained<VZVirtioSocketDevice> =
-            unsafe { Retained::cast(socket_device) };
+            unsafe { Retained::cast_unchecked(socket_device) };
         let socket_device = SendSyncDevice(socket_device);
 
         // 9. Build the control channel
@@ -383,13 +383,13 @@ impl VmmBackend for VzBackend {
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?
             .clone();
 
-        let aggregator = Arc::new(TelemetryAggregator::new(self.cid, observer));
+        let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
         let agg_clone = aggregator.clone();
 
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let _ = rt.block_on(cc.subscribe_telemetry(&opts, move |batch| {
-                agg_clone.ingest(batch);
+                agg_clone.ingest(&batch);
             }));
         });
 
@@ -409,22 +409,23 @@ impl VmmBackend for VzBackend {
             info!("VzBackend: stopping VM");
 
             let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-            let tx = std::sync::Mutex::new(Some(tx));
+            {
+                let tx = std::sync::Mutex::new(Some(tx));
+                let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                    let result = if err.is_null() {
+                        Ok(())
+                    } else {
+                        let desc = unsafe { &*err }.localizedDescription().to_string();
+                        Err(desc)
+                    };
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(result);
+                    }
+                });
 
-            let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                let result = if err.is_null() {
-                    Ok(())
-                } else {
-                    let desc = unsafe { &*err }.localizedDescription().to_string();
-                    Err(desc)
-                };
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(result);
+                unsafe {
+                    vm.stopWithCompletionHandler(&handler);
                 }
-            });
-
-            unsafe {
-                vm.stopWithCompletionHandler(&handler);
             }
 
             match rx.await {
