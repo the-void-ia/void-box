@@ -45,6 +45,12 @@ pub struct KvmBackend {
     span_context: Option<SpanContext>,
 }
 
+impl Default for KvmBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvmBackend {
     /// Create a new (unstarted) KVM backend.
     pub fn new() -> Self {
@@ -182,7 +188,7 @@ impl VmmBackend for KvmBackend {
                     let _ = chunk_tx.try_send(chunk);
                 })
                 .await;
-            let _ = response_tx.send(result.map_err(Into::into));
+            let _ = response_tx.send(result);
         });
 
         Ok((chunk_rx, response_rx))
@@ -250,7 +256,7 @@ impl VmmBackend for KvmBackend {
     }
 
     fn is_running(&self) -> bool {
-        self.vm.as_ref().map_or(false, |vm| vm.is_running())
+        self.vm.as_ref().is_some_and(|vm| vm.is_running())
     }
 
     async fn stop(&mut self) -> Result<()> {

@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_nonzero() {
-        assert!(PROTOCOL_VERSION > 0, "PROTOCOL_VERSION must be > 0");
+        const { assert!(PROTOCOL_VERSION > 0, "PROTOCOL_VERSION must be > 0") };
     }
 
     #[test]

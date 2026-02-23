@@ -5,3 +5,7 @@ if ! cargo fmt --all -- --check 2>/dev/null; then
     echo "cargo fmt check failed. Run 'cargo fmt --all' and re-commit."
     exit 1
 fi
+if ! cargo clippy --workspace --all-targets --all-features -- -D warnings 2>/dev/null; then
+    echo "clippy check failed. Fix warnings and re-commit."
+    exit 1
+fi
