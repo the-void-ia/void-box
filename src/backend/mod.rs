@@ -5,7 +5,7 @@
 //! telemetry, and teardown.
 //!
 //! Platform-specific backends:
-//! - **Linux**: [`KvmBackend`](kvm::KvmBackend) — KVM micro-VMs with virtio-mmio devices
+//! - **Linux**: `KvmBackend` — KVM micro-VMs with virtio-mmio devices
 //! - **macOS**: `VzBackend` — Apple Virtualization.framework
 
 pub mod control_channel;

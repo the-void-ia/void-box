@@ -3,7 +3,7 @@
 //! `VZVirtioSocketConnection.fileDescriptor()` returns a raw `c_int` fd.
 //! This module wraps that fd in a `VzSocketStream` that implements
 //! [`GuestStream`], making it usable with the transport-agnostic
-//! [`ControlChannel`].
+//! `ControlChannel`.
 //!
 //! The implementation is nearly identical to how `VsockStream` works for
 //! AF_VSOCK on Linux — both are just thin wrappers around `libc::read`,
@@ -18,7 +18,7 @@ use crate::backend::control_channel::GuestStream;
 /// A stream wrapping a raw file descriptor from `VZVirtioSocketConnection`.
 ///
 /// Implements `Read`, `Write`, and [`GuestStream`] for use with
-/// [`ControlChannel`].
+/// `ControlChannel`.
 ///
 /// The fd is owned by the ObjC `VZVirtioSocketConnection` object.
 /// Callers must ensure the connection outlives this stream.

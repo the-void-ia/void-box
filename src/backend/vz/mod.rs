@@ -1,6 +1,6 @@
 //! macOS Virtualization.framework backend for VoidBox.
 //!
-//! This module implements [`VmmBackend`] using Apple's Virtualization.framework,
+//! This module implements `VmmBackend` using Apple's Virtualization.framework,
 //! enabling VoidBox to run isolated micro-VMs on macOS (Apple Silicon).
 //!
 //! ## Architecture

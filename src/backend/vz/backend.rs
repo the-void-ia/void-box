@@ -85,6 +85,12 @@ pub struct VzBackend {
 unsafe impl Send for VzBackend {}
 unsafe impl Sync for VzBackend {}
 
+impl Default for VzBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VzBackend {
     /// Create a new, unstarted VzBackend.
     pub fn new() -> Self {
