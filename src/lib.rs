@@ -43,9 +43,9 @@
 //! }
 //! ```
 //!
-//! # Example: Low-Level VM Access
+//! # Example: Low-Level VM Access (Linux only)
 //!
-//! ```no_run
+//! ```no_run,ignore
 //! use void_box::{MicroVm, VoidBoxConfig};
 //!
 //! #[tokio::main]
