@@ -645,26 +645,18 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 // followed by a 4-byte LE protocol version (36 bytes total).
                 // Old hosts send 32 bytes (version 0); new hosts send 36.
                 match SESSION_SECRET.get() {
-                    Some(secret)
-                        if payload.len() >= 32 && payload[..32] == secret[..] =>
-                    {
+                    Some(secret) if payload.len() >= 32 && payload[..32] == secret[..] => {
                         AUTHENTICATED.with(|a| a.set(true));
 
                         // Parse optional protocol version from bytes 32..36.
                         let peer_version = if payload.len() >= 36 {
-                            u32::from_le_bytes([
-                                payload[32],
-                                payload[33],
-                                payload[34],
-                                payload[35],
-                            ])
+                            u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
                         } else {
                             0 // legacy host, no version field
                         };
 
                         // Reply with our protocol version in the Pong payload.
-                        let version_bytes =
-                            void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
+                        let version_bytes = void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
                         send_raw_message(fd, MessageType::Pong, &version_bytes)?;
 
                         kmsg(&format!(
@@ -1065,11 +1057,7 @@ fn send_response<T: Serialize>(
 /// Unlike [`send_response`] which JSON-serializes a `T`, this writes the
 /// payload bytes verbatim. Used for the Pong reply that carries raw
 /// protocol-version bytes instead of JSON.
-fn send_raw_message(
-    fd: RawFd,
-    msg_type: MessageType,
-    payload: &[u8],
-) -> Result<(), String> {
+fn send_raw_message(fd: RawFd, msg_type: MessageType, payload: &[u8]) -> Result<(), String> {
     let length = payload.len() as u32;
     let mut msg = Vec::with_capacity(5 + payload.len());
     msg.extend_from_slice(&length.to_le_bytes());

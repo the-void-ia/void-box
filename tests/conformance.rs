@@ -161,7 +161,14 @@ async fn conformance_write_file() {
         .expect("write_file failed");
 
     let output = backend
-        .exec("cat", &["/tmp/conformance_test.txt"], &[], &[], None, Some(10))
+        .exec(
+            "cat",
+            &["/tmp/conformance_test.txt"],
+            &[],
+            &[],
+            None,
+            Some(10),
+        )
         .await
         .expect("exec cat failed");
 
@@ -194,14 +201,18 @@ async fn conformance_mkdir_p() {
 
     // Verify the directory exists
     let output = backend
-        .exec("test", &["-d", "/tmp/conformance/nested/dir"], &[], &[], None, Some(10))
+        .exec(
+            "test",
+            &["-d", "/tmp/conformance/nested/dir"],
+            &[],
+            &[],
+            None,
+            Some(10),
+        )
         .await
         .expect("exec test failed");
 
-    assert_eq!(
-        output.exit_code, 0,
-        "directory should exist after mkdir_p"
-    );
+    assert_eq!(output.exit_code, 0, "directory should exist after mkdir_p");
 }
 
 // ===========================================================================
@@ -238,9 +249,10 @@ async fn conformance_exec_streaming() {
     // The output should contain "streaming-test" either in chunks or final response
     let stdout = String::from_utf8_lossy(&response.stdout);
     assert!(
-        stdout.contains("streaming-test") || chunks.iter().any(|c| {
-            String::from_utf8_lossy(&c.data).contains("streaming-test")
-        }),
+        stdout.contains("streaming-test")
+            || chunks
+                .iter()
+                .any(|c| { String::from_utf8_lossy(&c.data).contains("streaming-test") }),
         "streaming output should contain 'streaming-test'"
     );
 }
@@ -284,7 +296,10 @@ async fn conformance_lifecycle() {
         None => return,
     };
 
-    assert!(backend.is_running(), "backend should be running after start");
+    assert!(
+        backend.is_running(),
+        "backend should be running after start"
+    );
 
     backend.stop().await.expect("stop failed");
     assert!(

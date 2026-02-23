@@ -40,8 +40,7 @@ impl VzSocketStream {
 
 impl Read for VzSocketStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n =
-            unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -52,8 +51,7 @@ impl Read for VzSocketStream {
 
 impl Write for VzSocketStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n =
-            unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {

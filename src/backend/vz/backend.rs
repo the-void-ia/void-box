@@ -42,11 +42,11 @@ use super::config;
 use super::vsock::VzSocketStream;
 
 // ObjC imports for Virtualization.framework
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization::*;
-use block2::RcBlock;
 
 /// macOS Virtualization.framework backend.
 ///
@@ -85,28 +85,29 @@ impl VzBackend {
     /// Uses `VZVirtioSocketDevice.connectToPort:completionHandler:` which
     /// calls the completion handler with a `VZVirtioSocketConnection`.
     /// The connection's `fileDescriptor()` gives us a raw fd for I/O.
-    fn build_connector(
-        socket_device: &Retained<VZVirtioSocketDevice>,
-    ) -> GuestConnector {
+    fn build_connector(socket_device: &Retained<VZVirtioSocketDevice>) -> GuestConnector {
         let device = socket_device.clone();
         Box::new(move || {
             // Bridge the ObjC completion handler to a blocking Rust call.
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
 
             let tx_clone = tx.clone();
-            let handler = RcBlock::new(move |connection: *mut VZVirtioSocketConnection, err: *mut objc2_foundation::NSError| {
-                if !err.is_null() {
-                    let desc = unsafe { &*err }.localizedDescription().to_string();
-                    let _ = tx_clone.send(Err(desc));
-                    return;
-                }
-                if connection.is_null() {
-                    let _ = tx_clone.send(Err("null connection".into()));
-                    return;
-                }
-                let fd = unsafe { (*connection).fileDescriptor() };
-                let _ = tx_clone.send(Ok(fd as i32));
-            });
+            let handler = RcBlock::new(
+                move |connection: *mut VZVirtioSocketConnection,
+                      err: *mut objc2_foundation::NSError| {
+                    if !err.is_null() {
+                        let desc = unsafe { &*err }.localizedDescription().to_string();
+                        let _ = tx_clone.send(Err(desc));
+                        return;
+                    }
+                    if connection.is_null() {
+                        let _ = tx_clone.send(Err("null connection".into()));
+                        return;
+                    }
+                    let fd = unsafe { (*connection).fileDescriptor() };
+                    let _ = tx_clone.send(Ok(fd as i32));
+                },
+            );
 
             unsafe {
                 device.connectToPort_completionHandler(1234, &handler);
@@ -127,13 +128,14 @@ impl VzBackend {
 #[async_trait::async_trait]
 impl VmmBackend for VzBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
-        info!("VzBackend: starting VM (memory={}MB, vcpus={})", config.memory_mb, config.vcpus);
+        info!(
+            "VzBackend: starting VM (memory={}MB, vcpus={})",
+            config.memory_mb, config.vcpus
+        );
 
         // 1. Boot loader
         let kernel_url = unsafe {
-            NSURL::fileURLWithPath(&NSString::from_str(
-                config.kernel.to_str().unwrap_or(""),
-            ))
+            NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")))
         };
         let boot_loader = unsafe {
             VZLinuxBootLoader::initWithKernelURL(&VZLinuxBootLoader::alloc(), &kernel_url)
@@ -142,9 +144,7 @@ impl VmmBackend for VzBackend {
         // Set initramfs
         if let Some(ref initrd) = config.initramfs {
             let initrd_url = unsafe {
-                NSURL::fileURLWithPath(&NSString::from_str(
-                    initrd.to_str().unwrap_or(""),
-                ))
+                NSURL::fileURLWithPath(&NSString::from_str(initrd.to_str().unwrap_or("")))
             };
             unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
         }
@@ -166,9 +166,8 @@ impl VmmBackend for VzBackend {
 
         // 3. Virtio socket device (for host↔guest control channel)
         let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
-        let socket_configs: Retained<NSArray<AnyObject>> = unsafe {
-            NSArray::arrayWithObject(&vsock_config)
-        };
+        let socket_configs: Retained<NSArray<AnyObject>> =
+            unsafe { NSArray::arrayWithObject(&vsock_config) };
         unsafe {
             vm_config.setSocketDevices(&socket_configs);
         }
@@ -180,9 +179,8 @@ impl VmmBackend for VzBackend {
             unsafe {
                 net_config.setAttachment(Some(&nat_attachment));
             }
-            let net_configs: Retained<NSArray<AnyObject>> = unsafe {
-                NSArray::arrayWithObject(&net_config)
-            };
+            let net_configs: Retained<NSArray<AnyObject>> =
+                unsafe { NSArray::arrayWithObject(&net_config) };
             unsafe {
                 vm_config.setNetworkDevices(&net_configs);
             }
@@ -231,17 +229,16 @@ impl VmmBackend for VzBackend {
 
         // 8. Get the socket device for vsock connections
         let socket_devices = unsafe { vm.socketDevices() };
-        let socket_device = unsafe {
-            socket_devices
-                .objectAtIndex(0)
-        };
-        let socket_device: Retained<VZVirtioSocketDevice> = unsafe {
-            Retained::cast(socket_device)
-        };
+        let socket_device = unsafe { socket_devices.objectAtIndex(0) };
+        let socket_device: Retained<VZVirtioSocketDevice> =
+            unsafe { Retained::cast(socket_device) };
 
         // 9. Build the control channel
         let connector = Self::build_connector(&socket_device);
-        let control_channel = Arc::new(ControlChannel::new(connector, config.security.session_secret));
+        let control_channel = Arc::new(ControlChannel::new(
+            connector,
+            config.security.session_secret,
+        ));
 
         self.vm = Some(vm);
         self.socket_device = Some(socket_device);

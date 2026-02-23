@@ -214,7 +214,9 @@ impl Message {
     }
 
     /// Read a complete message from a synchronous [`std::io::Read`] stream.
-    pub fn read_from_sync<R: std::io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolError> {
+    pub fn read_from_sync<R: std::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, ProtocolError> {
         let mut header = [0u8; HEADER_SIZE];
         reader.read_exact(&mut header)?;
 

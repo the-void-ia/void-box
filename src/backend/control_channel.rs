@@ -154,10 +154,7 @@ impl ControlChannel {
                     return Ok(response);
                 }
                 other => {
-                    warn!(
-                        "Unexpected message type during streaming exec: {:?}",
-                        other
-                    );
+                    warn!("Unexpected message type during streaming exec: {:?}", other);
                 }
             }
         }
@@ -318,10 +315,7 @@ impl ControlChannel {
 
             let mut s = match (self.connector)() {
                 Ok(stream) => {
-                    debug!(
-                        "control_channel[{context}]: attempt {} connect OK",
-                        attempt
-                    );
+                    debug!("control_channel[{context}]: attempt {} connect OK", attempt);
                     stream
                 }
                 Err(e) => {
@@ -348,9 +342,7 @@ impl ControlChannel {
 
             // Build Ping payload: [secret: 32 bytes][version: 4 bytes LE]
             let mut ping_payload = self.session_secret.to_vec();
-            ping_payload.extend_from_slice(
-                &crate::guest::protocol::PROTOCOL_VERSION.to_le_bytes(),
-            );
+            ping_payload.extend_from_slice(&crate::guest::protocol::PROTOCOL_VERSION.to_le_bytes());
             let ping_msg = Message {
                 msg_type: MessageType::Ping,
                 payload: ping_payload,

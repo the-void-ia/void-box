@@ -114,10 +114,7 @@ impl VmmBackend for KvmBackend {
         working_dir: Option<&str>,
         timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
-        let cc = self
-            .control_channel
-            .as_ref()
-            .ok_or(Error::VmNotRunning)?;
+        let cc = self.control_channel.as_ref().ok_or(Error::VmNotRunning)?;
 
         let mut exec_env = env.to_vec();
         if let Some(ref ctx) = self.span_context {
@@ -192,10 +189,7 @@ impl VmmBackend for KvmBackend {
     }
 
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
-        let cc = self
-            .control_channel
-            .as_ref()
-            .ok_or(Error::VmNotRunning)?;
+        let cc = self.control_channel.as_ref().ok_or(Error::VmNotRunning)?;
 
         let response = cc.send_write_file(path, content).await?;
         if response.success {
@@ -209,10 +203,7 @@ impl VmmBackend for KvmBackend {
     }
 
     async fn mkdir_p(&self, path: &str) -> Result<()> {
-        let cc = self
-            .control_channel
-            .as_ref()
-            .ok_or(Error::VmNotRunning)?;
+        let cc = self.control_channel.as_ref().ok_or(Error::VmNotRunning)?;
 
         let response = cc.send_mkdir_p(path).await?;
         if response.success {

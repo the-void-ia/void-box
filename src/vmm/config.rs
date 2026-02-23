@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::{Error, Result};
 
 // Re-export from the cross-platform backend module for backward compatibility.
-pub use crate::backend::{DEFAULT_COMMAND_ALLOWLIST, ResourceLimits};
+pub use crate::backend::{ResourceLimits, DEFAULT_COMMAND_ALLOWLIST};
 
 /// Security configuration for VoidBox VMs.
 ///
