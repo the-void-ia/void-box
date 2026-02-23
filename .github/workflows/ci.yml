@@ -12,11 +12,18 @@ env:
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        rust: [stable, beta]
+        include:
+          - os: ubuntu-latest
+            rust: stable
+          - os: ubuntu-latest
+            rust: beta
+          - os: macos-latest
+            rust: stable
 
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +59,12 @@ jobs:
         run: cargo test --doc --workspace --all-features
 
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -64,17 +75,19 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   build:
-    name: Build
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest]
         rust: [stable]
 
     steps:
@@ -95,8 +108,12 @@ jobs:
         run: cargo build --release --examples
 
   docs:
-    name: Documentation
-    runs-on: ubuntu-latest
+    name: Documentation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -110,8 +127,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: Minimum Supported Rust Version
-    runs-on: ubuntu-latest
+    name: MSRV (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4

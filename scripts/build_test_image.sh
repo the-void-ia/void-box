@@ -14,6 +14,8 @@ set -euo pipefail
 #   cargo test -- --ignored
 #
 # Supports both x86_64 and aarch64. Auto-detects host architecture.
+# On macOS (Apple Silicon), cross-compiles for aarch64-linux-musl using
+# a musl cross-compiler (brew install filosottile/musl-cross/musl-cross).
 # Handles kernel modules in any compression format (.ko, .ko.xz, .ko.zst).
 # Requires: cpio, gzip, musl target.
 
@@ -23,13 +25,26 @@ cd "$ROOT_DIR"
 OUT_DIR="${OUT_DIR:-/tmp/void-box-test-rootfs}"
 OUT_CPIO="${OUT_CPIO:-/tmp/void-box-test-rootfs.cpio.gz}"
 
-# Auto-detect architecture
+# Detect host OS and architecture
+HOST_OS=$(uname -s)
 ARCH=$(uname -m)
+
+# Map macOS arm64 → aarch64
+if [[ "$ARCH" == "arm64" ]]; then
+    ARCH="aarch64"
+fi
+
 case "$ARCH" in
   x86_64)  GUEST_TARGET="x86_64-unknown-linux-musl" ;;
   aarch64) GUEST_TARGET="aarch64-unknown-linux-musl" ;;
   *)       echo "[test-image] ERROR: unsupported architecture: $ARCH"; exit 1 ;;
 esac
+
+# On macOS, set up the musl cross-compiler for building Linux guest binaries
+if [[ "$HOST_OS" == "Darwin" ]]; then
+    echo "[test-image] macOS detected — using musl cross-compilation for $GUEST_TARGET"
+    export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+fi
 
 # ---- Build guest-agent (static musl) ----
 echo "[test-image] Building guest-agent (release, static, target=$GUEST_TARGET)..."
@@ -68,59 +83,65 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
     done
 fi
 
-# ---- Kernel modules for virtio-mmio and vsock ----
-KVER=$(uname -r)
-MODDIR="/lib/modules/$KVER/kernel"
-DEST_MODDIR="$OUT_DIR/lib/modules"
-mkdir -p "$DEST_MODDIR"
+# ---- Kernel modules (Linux only) ----
+# On macOS the VZ backend uses PCI auto-discovery — no virtio-mmio kernel
+# modules are needed in the initramfs.
+if [[ "$HOST_OS" == "Linux" ]]; then
+    KVER=$(uname -r)
+    MODDIR="/lib/modules/$KVER/kernel"
+    DEST_MODDIR="$OUT_DIR/lib/modules"
+    mkdir -p "$DEST_MODDIR"
 
-# copy_module: find a kernel module by name (any compression) and decompress it
-copy_module() {
-    local mod_name="$1"
-    local found=""
+    # copy_module: find a kernel module by name (any compression) and decompress it
+    copy_module() {
+        local mod_name="$1"
+        local found=""
 
-    # Search for .ko, .ko.xz, .ko.zst (covers Ubuntu, Fedora, etc.)
-    for ext in ko ko.xz ko.zst; do
-        found=$(find "$MODDIR" -name "${mod_name}.${ext}" 2>/dev/null | head -1)
-        [[ -n "$found" ]] && break
+        # Search for .ko, .ko.xz, .ko.zst (covers Ubuntu, Fedora, etc.)
+        for ext in ko ko.xz ko.zst; do
+            found=$(find "$MODDIR" -name "${mod_name}.${ext}" 2>/dev/null | head -1)
+            [[ -n "$found" ]] && break
+        done
+
+        if [[ -z "$found" ]]; then
+            echo "  WARNING: ${mod_name} not found under $MODDIR"
+            return
+        fi
+
+        cp "$found" "$DEST_MODDIR/"
+        local base
+        base=$(basename "$found")
+
+        case "$base" in
+            *.ko.xz)
+                xz -d "$DEST_MODDIR/$base"
+                echo "  -> ${base%.xz}"
+                ;;
+            *.ko.zst)
+                zstd -d --rm "$DEST_MODDIR/$base" 2>/dev/null
+                echo "  -> ${base%.zst}"
+                ;;
+            *.ko)
+                echo "  -> $base"
+                ;;
+        esac
+    }
+
+    echo "[test-image] Adding kernel modules (kernel $KVER, arch $ARCH)..."
+    for mod_name in \
+        virtio_mmio \
+        vsock \
+        vmw_vsock_virtio_transport_common \
+        vmw_vsock_virtio_transport \
+        failover \
+        net_failover \
+        virtio_net \
+        ; do
+        copy_module "$mod_name"
     done
-
-    if [[ -z "$found" ]]; then
-        echo "  WARNING: ${mod_name} not found under $MODDIR"
-        return
-    fi
-
-    cp "$found" "$DEST_MODDIR/"
-    local base
-    base=$(basename "$found")
-
-    case "$base" in
-        *.ko.xz)
-            xz -d "$DEST_MODDIR/$base"
-            echo "  -> ${base%.xz}"
-            ;;
-        *.ko.zst)
-            zstd -d --rm "$DEST_MODDIR/$base" 2>/dev/null
-            echo "  -> ${base%.zst}"
-            ;;
-        *.ko)
-            echo "  -> $base"
-            ;;
-    esac
-}
-
-echo "[test-image] Adding kernel modules (kernel $KVER, arch $ARCH)..."
-for mod_name in \
-    virtio_mmio \
-    vsock \
-    vmw_vsock_virtio_transport_common \
-    vmw_vsock_virtio_transport \
-    failover \
-    net_failover \
-    virtio_net \
-    ; do
-    copy_module "$mod_name"
-done
+else
+    echo "[test-image] Skipping kernel modules (not needed for VZ backend on macOS)"
+fi
 
 # ---- Create initramfs ----
 echo "[test-image] Creating test initramfs at: $OUT_CPIO"

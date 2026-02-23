@@ -1,0 +1,83 @@
+name: E2E macOS (Virtualization.framework)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pinned Ubuntu arm64 kernel version for reproducibility
+  KERNEL_VER: "6.8.0-51"
+
+jobs:
+  e2e-macos:
+    name: E2E VZ (macOS Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- System dependencies ----
+      - name: Install musl cross-compilation toolchain
+        run: |
+          brew install filosottile/musl-cross/musl-cross
+          # Verify the cross-compiler is available
+          which aarch64-linux-musl-gcc
+          aarch64-linux-musl-gcc --version
+
+      # ---- Rust toolchain ----
+      - name: Install Rust stable + aarch64 musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # ---- Cargo cache ----
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-e2e-vz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-vz-
+
+      # ---- Build test initramfs ----
+      - name: Build test initramfs (guest-agent + claudio)
+        run: scripts/build_test_image.sh
+
+      # ---- Download prebuilt arm64 Linux kernel ----
+      - name: Download arm64 Linux kernel
+        run: |
+          KERNEL_DEB="linux-image-${KERNEL_VER}-generic_${KERNEL_VER}.0_arm64.deb"
+          KERNEL_URL="http://ports.ubuntu.com/pool/main/l/linux/${KERNEL_DEB}"
+          echo "Downloading kernel: ${KERNEL_URL}"
+          curl -LO "${KERNEL_URL}"
+
+          # Extract vmlinuz from the .deb (macOS has no dpkg-deb, use ar + tar)
+          ar x "${KERNEL_DEB}"
+          tar xf data.tar.* ./boot/
+          cp ./boot/vmlinuz-* /tmp/void-box-kernel
+          chmod 644 /tmp/void-box-kernel
+
+          echo "Kernel extracted to /tmp/void-box-kernel"
+          ls -la /tmp/void-box-kernel
+
+      # ---- Run conformance tests ----
+      - name: Run conformance E2E tests
+        env:
+          VOID_BOX_KERNEL: /tmp/void-box-kernel
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          echo "Kernel: $VOID_BOX_KERNEL"
+          echo "Initramfs: $VOID_BOX_INITRAMFS"
+          ls -la "$VOID_BOX_KERNEL"
+          ls -la "$VOID_BOX_INITRAMFS"
+
+          # Run conformance tests (--ignored to include VM tests, sequential to avoid resource contention)
+          cargo test --test conformance -- --ignored --test-threads=1

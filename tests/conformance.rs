@@ -1,4 +1,3 @@
-#![cfg(target_os = "linux")]
 //! Backend conformance test suite.
 //!
 //! These tests verify that any [`VmmBackend`] implementation satisfies the
@@ -28,12 +27,21 @@ use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn kvm_available() -> bool {
-    std::path::Path::new("/dev/kvm").exists()
-}
-
-fn vsock_available() -> bool {
-    std::path::Path::new("/dev/vhost-vsock").exists()
+/// Returns `true` when the platform's VM backend is available.
+fn backend_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/dev/kvm").exists()
+            && std::path::Path::new("/dev/vhost-vsock").exists()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true // Virtualization.framework is always available on macOS 13+
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 fn backend_config() -> Option<BackendConfig> {
@@ -74,8 +82,8 @@ fn backend_config() -> Option<BackendConfig> {
 }
 
 async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    if !kvm_available() || !vsock_available() {
-        eprintln!("skipping: /dev/kvm or /dev/vhost-vsock not available");
+    if !backend_available() {
+        eprintln!("skipping: VM backend not available on this platform");
         return None;
     }
 
@@ -103,7 +111,7 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
 
 /// Backend can execute a simple command and return stdout.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_echo() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -126,7 +134,7 @@ async fn conformance_exec_echo() {
 
 /// Backend reports non-zero exit codes.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_nonzero_exit() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -147,7 +155,7 @@ async fn conformance_exec_nonzero_exit() {
 
 /// Backend can write a file and read it back via exec.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_write_file() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -187,7 +195,7 @@ async fn conformance_write_file() {
 
 /// Backend can create nested directories.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_mkdir_p() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -221,7 +229,7 @@ async fn conformance_mkdir_p() {
 
 /// Backend can stream output chunks during execution.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_streaming() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -263,7 +271,7 @@ async fn conformance_exec_streaming() {
 
 /// Backend enforces execution timeouts.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_timeout() {
     let backend = match create_started_backend().await {
         Some(b) => b,
@@ -289,7 +297,7 @@ async fn conformance_exec_timeout() {
 
 /// Backend reports running state correctly.
 #[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_lifecycle() {
     let mut backend = match create_started_backend().await {
         Some(b) => b,
