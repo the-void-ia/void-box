@@ -123,7 +123,7 @@ impl VzBackend {
                         return;
                     }
                     let fd = unsafe { (*connection).fileDescriptor() };
-                    let _ = tx_clone.send(Ok(fd as i32));
+                    let _ = tx_clone.send(Ok(fd));
                 },
             );
 

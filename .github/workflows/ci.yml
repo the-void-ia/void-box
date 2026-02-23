@@ -139,7 +139,7 @@ jobs:
       - name: Build documentation
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            cargo doc --no-deps --all-features --exclude guest-agent
+            cargo doc --workspace --no-deps --all-features --exclude guest-agent
           else
             cargo doc --no-deps --all-features
           fi
