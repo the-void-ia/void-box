@@ -53,10 +53,20 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --workspace --all-features --verbose
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo test --workspace --exclude guest-agent --all-features --verbose
+          else
+            cargo test --workspace --all-features --verbose
+          fi
 
       - name: Run doc tests
-        run: cargo test --doc --workspace --all-features
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo test --doc --workspace --exclude guest-agent --all-features
+          else
+            cargo test --doc --workspace --all-features
+          fi
 
   lint:
     name: Lint (${{ matrix.os }})
@@ -79,7 +89,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+          fi
 
   build:
     name: Build (${{ matrix.os }})
@@ -122,7 +137,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build documentation
-        run: cargo doc --no-deps --all-features
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo doc --no-deps --all-features --exclude guest-agent
+          else
+            cargo doc --no-deps --all-features
+          fi
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -143,7 +163,12 @@ jobs:
           toolchain: "1.83"
 
       - name: Check build with MSRV
-        run: cargo build --workspace --all-features
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo build --workspace --exclude guest-agent --all-features
+          else
+            cargo build --workspace --all-features
+          fi
 
   security:
     name: Security Audit

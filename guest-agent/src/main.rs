@@ -6,6 +6,9 @@
 //! - File transfers
 //! - Process management
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("guest-agent is Linux-only (runs as PID 1 inside the micro-VM)");
+
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
