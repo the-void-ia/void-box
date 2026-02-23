@@ -45,8 +45,20 @@ use super::vsock::VzSocketStream;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
+use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization::*;
+
+/// Wrapper to assert `Send + Sync` for `Retained<VZVirtioSocketDevice>`.
+///
+/// # Safety
+///
+/// The only operation performed on the device from another thread is
+/// `connectToPort:completionHandler:`, which dispatches work to the VZ
+/// internal queue and is documented as safe to call from any thread.
+struct SendSyncDevice(Retained<VZVirtioSocketDevice>);
+unsafe impl Send for SendSyncDevice {}
+unsafe impl Sync for SendSyncDevice {}
 
 /// macOS Virtualization.framework backend.
 ///
@@ -56,7 +68,7 @@ pub struct VzBackend {
     /// The running VZ virtual machine (set after `start()`).
     vm: Option<Retained<VZVirtualMachine>>,
     /// The virtio socket device (needed to connect to the guest).
-    socket_device: Option<Retained<VZVirtioSocketDevice>>,
+    socket_device: Option<SendSyncDevice>,
     /// Transport-agnostic control channel for guest communication.
     control_channel: Option<Arc<ControlChannel>>,
     /// Whether the VM is currently running.
@@ -66,6 +78,13 @@ pub struct VzBackend {
     /// Active span context for TRACEPARENT propagation.
     span_context: Option<SpanContext>,
 }
+
+// Safety: The ObjC `vm` and `socket_device` handles are only mutated in
+// `start()` (set) and `stop()` (clear), both of which take `&mut self`
+// guaranteeing exclusive access. All guest communication goes through
+// `Arc<ControlChannel>` which is already Send + Sync.
+unsafe impl Send for VzBackend {}
+unsafe impl Sync for VzBackend {}
 
 impl VzBackend {
     /// Create a new, unstarted VzBackend.
@@ -85,8 +104,8 @@ impl VzBackend {
     /// Uses `VZVirtioSocketDevice.connectToPort:completionHandler:` which
     /// calls the completion handler with a `VZVirtioSocketConnection`.
     /// The connection's `fileDescriptor()` gives us a raw fd for I/O.
-    fn build_connector(socket_device: &Retained<VZVirtioSocketDevice>) -> GuestConnector {
-        let device = socket_device.clone();
+    fn build_connector(socket_device: &SendSyncDevice) -> GuestConnector {
+        let device = socket_device.0.clone();
         Box::new(move || {
             // Bridge the ObjC completion handler to a blocking Rust call.
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
@@ -138,7 +157,7 @@ impl VmmBackend for VzBackend {
             NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")))
         };
         let boot_loader = unsafe {
-            VZLinuxBootLoader::initWithKernelURL(&VZLinuxBootLoader::alloc(), &kernel_url)
+            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
         };
 
         // Set initramfs
@@ -198,7 +217,7 @@ impl VmmBackend for VzBackend {
 
         // 7. Create and start the VM
         let vm = unsafe {
-            VZVirtualMachine::initWithConfiguration(&VZVirtualMachine::alloc(), &vm_config)
+            VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vm_config)
         };
 
         // Start VM with completion handler
@@ -232,6 +251,7 @@ impl VmmBackend for VzBackend {
         let socket_device = unsafe { socket_devices.objectAtIndex(0) };
         let socket_device: Retained<VZVirtioSocketDevice> =
             unsafe { Retained::cast(socket_device) };
+        let socket_device = SendSyncDevice(socket_device);
 
         // 9. Build the control channel
         let connector = Self::build_connector(&socket_device);

@@ -6,7 +6,7 @@
 //!
 //! Platform-specific backends:
 //! - **Linux**: [`KvmBackend`](kvm::KvmBackend) — KVM micro-VMs with virtio-mmio devices
-//! - **macOS**: [`VzBackend`](vz::VzBackend) — Apple Virtualization.framework
+//! - **macOS**: `VzBackend` — Apple Virtualization.framework
 
 pub mod control_channel;
 
@@ -207,7 +207,7 @@ impl Default for ResourceLimits {
 /// Create the platform-appropriate backend.
 ///
 /// On Linux, returns a [`KvmBackend`](kvm::KvmBackend).
-/// On macOS, returns a [`VzBackend`](voidbox_backend_vz::VzBackend).
+/// On macOS, returns a `VzBackend`.
 #[cfg(target_os = "linux")]
 pub fn create_backend() -> Box<dyn VmmBackend> {
     Box::new(kvm::KvmBackend::new())
@@ -215,7 +215,7 @@ pub fn create_backend() -> Box<dyn VmmBackend> {
 
 /// Create the platform-appropriate backend.
 ///
-/// On macOS, returns a [`VzBackend`](vz::VzBackend).
+/// On macOS, returns a `VzBackend`.
 #[cfg(target_os = "macos")]
 pub fn create_backend() -> Box<dyn VmmBackend> {
     Box::new(vz::VzBackend::new())
