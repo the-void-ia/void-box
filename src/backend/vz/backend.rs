@@ -146,83 +146,85 @@ impl VzBackend {
 #[async_trait::async_trait]
 impl VmmBackend for VzBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
-        info!(
-            "VzBackend: starting VM (memory={}MB, vcpus={})",
-            config.memory_mb, config.vcpus
-        );
+        // All ObjC types are !Send, so we run the entire VM setup
+        // synchronously via block_in_place to avoid holding them across
+        // an .await point.
+        tokio::task::block_in_place(|| {
+            info!(
+                "VzBackend: starting VM (memory={}MB, vcpus={})",
+                config.memory_mb, config.vcpus
+            );
 
-        // 1. Boot loader
-        let kernel_url = unsafe {
-            NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")))
-        };
-        let boot_loader = unsafe {
-            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
-        };
-
-        // Set initramfs
-        if let Some(ref initrd) = config.initramfs {
-            let initrd_url = unsafe {
-                NSURL::fileURLWithPath(&NSString::from_str(initrd.to_str().unwrap_or("")))
+            // 1. Boot loader
+            let kernel_url =
+                NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")));
+            let boot_loader = unsafe {
+                VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
             };
-            unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
-        }
 
-        // Set kernel cmdline
-        let cmdline = config::build_kernel_cmdline(&config);
-        unsafe {
-            boot_loader.setCommandLine(&NSString::from_str(&cmdline));
-        }
-        debug!("VzBackend: kernel cmdline = {}", cmdline);
-
-        // 2. VM configuration
-        let vm_config = unsafe { VZVirtualMachineConfiguration::new() };
-        unsafe {
-            vm_config.setBootLoader(Some(&boot_loader));
-            vm_config.setMemorySize(config::memory_bytes(&config));
-            vm_config.setCPUCount(config.vcpus);
-        }
-
-        // 3. Virtio socket device (for host↔guest control channel)
-        let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
-        let socket_configs: Retained<NSArray<VZSocketDeviceConfiguration>> =
-            unsafe { NSArray::arrayWithObject(&vsock_config) };
-        unsafe {
-            vm_config.setSocketDevices(&socket_configs);
-        }
-
-        // 4. NAT networking (if enabled)
-        if config.network {
-            let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
-            let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-            unsafe {
-                net_config.setAttachment(Some(&nat_attachment));
+            // Set initramfs
+            if let Some(ref initrd) = config.initramfs {
+                let initrd_url =
+                    NSURL::fileURLWithPath(&NSString::from_str(initrd.to_str().unwrap_or("")));
+                unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
             }
-            let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
-                unsafe { NSArray::arrayWithObject(&net_config) };
+
+            // Set kernel cmdline
+            let cmdline = config::build_kernel_cmdline(&config);
             unsafe {
-                vm_config.setNetworkDevices(&net_configs);
+                boot_loader.setCommandLine(&NSString::from_str(&cmdline));
             }
-        }
+            debug!("VzBackend: kernel cmdline = {}", cmdline);
 
-        // 5. Shared directory (virtiofs) — M6 enhancement
-        // TODO: implement VZVirtioFileSystemDeviceConfiguration when shared_dir is set
+            // 2. VM configuration
+            let vm_config = unsafe { VZVirtualMachineConfiguration::new() };
+            unsafe {
+                vm_config.setBootLoader(Some(&boot_loader));
+                vm_config.setMemorySize(config::memory_bytes(&config));
+                vm_config.setCPUCount(config.vcpus);
+            }
 
-        // 6. Validate configuration
-        unsafe {
-            vm_config
-                .validateWithError()
-                .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
-        }
+            // 3. Virtio socket device (for host↔guest control channel)
+            let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
+            let socket_configs: Retained<NSArray<VZSocketDeviceConfiguration>> =
+                NSArray::arrayWithObject(&vsock_config);
+            unsafe {
+                vm_config.setSocketDevices(&socket_configs);
+            }
 
-        // 7. Create and start the VM
-        let vm = unsafe {
-            VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vm_config)
-        };
+            // 4. NAT networking (if enabled)
+            if config.network {
+                let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
+                let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
+                unsafe {
+                    net_config.setAttachment(Some(&nat_attachment));
+                }
+                let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
+                    NSArray::arrayWithObject(&net_config);
+                unsafe {
+                    vm_config.setNetworkDevices(&net_configs);
+                }
+            }
 
-        // Start VM with completion handler
-        let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        {
+            // 5. Shared directory (virtiofs) — M6 enhancement
+            // TODO: implement VZVirtioFileSystemDeviceConfiguration when shared_dir is set
+
+            // 6. Validate configuration
+            unsafe {
+                vm_config
+                    .validateWithError()
+                    .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
+            }
+
+            // 7. Create and start the VM
+            let vm = unsafe {
+                VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vm_config)
+            };
+
+            // Start VM with completion handler (blocking wait)
+            let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
             let tx = std::sync::Mutex::new(Some(tx));
+
             let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
                 let result = if err.is_null() {
                     Ok(())
@@ -238,34 +240,34 @@ impl VmmBackend for VzBackend {
             unsafe {
                 vm.startWithCompletionHandler(&handler);
             }
-        }
 
-        rx.await
-            .map_err(|_| crate::Error::Backend("VM start: channel closed".into()))?
-            .map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))?;
+            rx.recv()
+                .map_err(|_| crate::Error::Backend("VM start: channel closed".into()))?
+                .map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))?;
 
-        info!("VzBackend: VM started successfully");
+            info!("VzBackend: VM started successfully");
 
-        // 8. Get the socket device for vsock connections
-        let socket_devices = unsafe { vm.socketDevices() };
-        let socket_device = unsafe { socket_devices.objectAtIndex(0) };
-        let socket_device: Retained<VZVirtioSocketDevice> =
-            unsafe { Retained::cast_unchecked(socket_device) };
-        let socket_device = SendSyncDevice(socket_device);
+            // 8. Get the socket device for vsock connections
+            let socket_devices = unsafe { vm.socketDevices() };
+            let socket_device = socket_devices.objectAtIndex(0);
+            let socket_device: Retained<VZVirtioSocketDevice> =
+                unsafe { Retained::cast_unchecked(socket_device) };
+            let socket_device = SendSyncDevice(socket_device);
 
-        // 9. Build the control channel
-        let connector = Self::build_connector(&socket_device);
-        let control_channel = Arc::new(ControlChannel::new(
-            connector,
-            config.security.session_secret,
-        ));
+            // 9. Build the control channel
+            let connector = Self::build_connector(&socket_device);
+            let control_channel = Arc::new(ControlChannel::new(
+                connector,
+                config.security.session_secret,
+            ));
 
-        self.vm = Some(vm);
-        self.socket_device = Some(socket_device);
-        self.control_channel = Some(control_channel);
-        self.running.store(true, Ordering::SeqCst);
+            self.vm = Some(vm);
+            self.socket_device = Some(socket_device);
+            self.control_channel = Some(control_channel);
+            self.running.store(true, Ordering::SeqCst);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn exec(
@@ -405,12 +407,13 @@ impl VmmBackend for VzBackend {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if let Some(ref vm) = self.vm {
-            info!("VzBackend: stopping VM");
+        tokio::task::block_in_place(|| {
+            if let Some(ref vm) = self.vm {
+                info!("VzBackend: stopping VM");
 
-            let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-            {
+                let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
                 let tx = std::sync::Mutex::new(Some(tx));
+
                 let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
                     let result = if err.is_null() {
                         Ok(())
@@ -426,20 +429,20 @@ impl VmmBackend for VzBackend {
                 unsafe {
                     vm.stopWithCompletionHandler(&handler);
                 }
+
+                match rx.recv() {
+                    Ok(Ok(())) => info!("VzBackend: VM stopped"),
+                    Ok(Err(e)) => error!("VzBackend: VM stop error: {}", e),
+                    Err(_) => error!("VzBackend: VM stop channel closed"),
+                }
             }
 
-            match rx.await {
-                Ok(Ok(())) => info!("VzBackend: VM stopped"),
-                Ok(Err(e)) => error!("VzBackend: VM stop error: {}", e),
-                Err(_) => error!("VzBackend: VM stop channel closed"),
-            }
-        }
-
-        self.running.store(false, Ordering::SeqCst);
-        self.control_channel = None;
-        self.socket_device = None;
-        self.vm = None;
-        Ok(())
+            self.running.store(false, Ordering::SeqCst);
+            self.control_channel = None;
+            self.socket_device = None;
+            self.vm = None;
+            Ok(())
+        })
     }
 
     fn cid(&self) -> u32 {
