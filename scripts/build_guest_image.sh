@@ -17,10 +17,20 @@ cd "$ROOT_DIR"
 OUT_DIR="${OUT_DIR:-/tmp/void-box-rootfs}"
 OUT_CPIO="${OUT_CPIO:-/tmp/void-box-rootfs.cpio.gz}"
 
+# Determine target architecture. Default to host arch (uname -m).
+# Override with ARCH=aarch64 or ARCH=x86_64.
+HOST_ARCH="$(uname -m)"
+ARCH="${ARCH:-$HOST_ARCH}"
+
+case "$ARCH" in
+  x86_64)  GUEST_TARGET="x86_64-unknown-linux-musl" ;;
+  aarch64) GUEST_TARGET="aarch64-unknown-linux-musl" ;;
+  *)       echo "[void-box] ERROR: unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
 # Build guest-agent as a statically-linked musl binary so it runs inside
 # a minimal initramfs without any shared libraries.
-GUEST_TARGET="x86_64-unknown-linux-musl"
-echo "[void-box] Building guest-agent (release, static, target=$GUEST_TARGET)..."
+echo "[void-box] Building guest-agent (release, static, target=$GUEST_TARGET, arch=$ARCH)..."
 cargo build --release -p guest-agent --target "$GUEST_TARGET"
 GUEST_AGENT_BIN="target/$GUEST_TARGET/release/guest-agent"
 
@@ -185,13 +195,17 @@ if command -v gh &>/dev/null; then
   _install_host_binary gh
 else
   GH_VERSION="2.65.0"
-  GH_TARBALL="gh_${GH_VERSION}_linux_amd64.tar.gz"
+  case "$ARCH" in
+    x86_64)  GH_ARCH="amd64" ;;
+    aarch64) GH_ARCH="arm64" ;;
+  esac
+  GH_TARBALL="gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz"
   GH_URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}/${GH_TARBALL}"
   GH_TMP=$(mktemp -d)
   echo "[void-box] gh not found on host -- downloading v${GH_VERSION} from GitHub..."
   if curl -fsSL "$GH_URL" -o "$GH_TMP/$GH_TARBALL"; then
     tar -xzf "$GH_TMP/$GH_TARBALL" -C "$GH_TMP"
-    cp "$GH_TMP/gh_${GH_VERSION}_linux_amd64/bin/gh" "$OUT_DIR/usr/local/bin/gh"
+    cp "$GH_TMP/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" "$OUT_DIR/usr/local/bin/gh"
     chmod +x "$OUT_DIR/usr/local/bin/gh"
     echo "[void-box] Installed gh v${GH_VERSION} (static Go binary)"
   else

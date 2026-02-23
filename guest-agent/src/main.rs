@@ -420,16 +420,41 @@ fn load_kernel_modules() {
 }
 
 /// Load a single kernel module using finit_module(2), with optional parameters.
+///
+/// Returns `Ok(())` if the module was loaded, is already loaded, or is built
+/// into the kernel (no .ko file on disk). This makes the function resilient
+/// to aarch64/VZ environments where virtio modules are compiled in (`=y`)
+/// and no .ko files exist.
 fn load_module_file(path: &str, params: &str) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::io::AsRawFd;
+
+    // If the .ko file doesn't exist, check if the module is already built
+    // into the kernel. Built-in modules appear in /sys/module/<name>.
+    if !std::path::Path::new(path).exists() {
+        let mod_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // Kernel uses underscores internally even if the .ko has hyphens
+        let sys_name = mod_name.replace('-', "_");
+        let sys_path = format!("/sys/module/{}", sys_name);
+        if std::path::Path::new(&sys_path).exists() {
+            kmsg(&format!(
+                "Module {} built-in (found {})",
+                mod_name, sys_path
+            ));
+            return Ok(());
+        }
+        return Err(format!("file not found: {}", path));
+    }
 
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
 
     let fd = file.as_raw_fd();
     let params_c = CString::new(params).unwrap();
 
-    // finit_module(fd, params, flags) - syscall 313 on x86_64
+    // finit_module(fd, params, flags)
     let ret = unsafe { libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32) };
 
     if ret < 0 {
@@ -616,11 +641,37 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
             3 => {
-                // Ping -- payload must carry the 32-byte session secret.
+                // Ping -- payload carries the 32-byte session secret, optionally
+                // followed by a 4-byte LE protocol version (36 bytes total).
+                // Old hosts send 32 bytes (version 0); new hosts send 36.
                 match SESSION_SECRET.get() {
-                    Some(secret) if payload.len() == 32 && payload[..] == secret[..] => {
+                    Some(secret)
+                        if payload.len() >= 32 && payload[..32] == secret[..] =>
+                    {
                         AUTHENTICATED.with(|a| a.set(true));
-                        send_response(fd, MessageType::Pong, &())?;
+
+                        // Parse optional protocol version from bytes 32..36.
+                        let peer_version = if payload.len() >= 36 {
+                            u32::from_le_bytes([
+                                payload[32],
+                                payload[33],
+                                payload[34],
+                                payload[35],
+                            ])
+                        } else {
+                            0 // legacy host, no version field
+                        };
+
+                        // Reply with our protocol version in the Pong payload.
+                        let version_bytes =
+                            void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
+                        send_raw_message(fd, MessageType::Pong, &version_bytes)?;
+
+                        kmsg(&format!(
+                            "Authenticated (peer_version={}, our_version={})",
+                            peer_version,
+                            void_box_protocol::PROTOCOL_VERSION
+                        ));
                     }
                     Some(_) => {
                         eprintln!("Authentication failed: invalid secret");
@@ -990,6 +1041,40 @@ fn send_response<T: Serialize>(
     msg.extend_from_slice(&length.to_le_bytes());
     msg.push(msg_type as u8);
     msg.extend_from_slice(&payload_bytes);
+
+    let mut total_written = 0;
+    while total_written < msg.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                msg[total_written..].as_ptr() as *const libc::c_void,
+                msg.len() - total_written,
+            )
+        };
+        if n <= 0 {
+            return Err("Write failed".into());
+        }
+        total_written += n as usize;
+    }
+
+    Ok(())
+}
+
+/// Send a raw (non-JSON) message to the host over the vsock fd.
+///
+/// Unlike [`send_response`] which JSON-serializes a `T`, this writes the
+/// payload bytes verbatim. Used for the Pong reply that carries raw
+/// protocol-version bytes instead of JSON.
+fn send_raw_message(
+    fd: RawFd,
+    msg_type: MessageType,
+    payload: &[u8],
+) -> Result<(), String> {
+    let length = payload.len() as u32;
+    let mut msg = Vec::with_capacity(5 + payload.len());
+    msg.extend_from_slice(&length.to_le_bytes());
+    msg.push(msg_type as u8);
+    msg.extend_from_slice(payload);
 
     let mut total_written = 0;
     while total_written < msg.len() {

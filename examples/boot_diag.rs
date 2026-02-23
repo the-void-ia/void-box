@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Boot diagnostic: start a VM and capture serial output to see what the guest kernel is doing.
 
 use std::path::PathBuf;

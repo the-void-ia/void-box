@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Telemetry Integration Tests
 //!
 //! Dedicated test battery for the guest → host telemetry pipeline:

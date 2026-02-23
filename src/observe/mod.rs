@@ -39,6 +39,25 @@ pub use logs::{LogConfig, LogEntry, LogLevel, StructuredLogger};
 pub use metrics::{MetricsCollector, MetricsConfig, MetricsSnapshot};
 pub use tracer::{Span, SpanContext, SpanStatus, Tracer, TracerConfig};
 
+/// Returns the name of the VM backend for the current platform.
+///
+/// Used as a span attribute (`backend_type`) for observability parity
+/// across Linux (kvm) and macOS (vz).
+pub fn backend_type() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "kvm"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "vz"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "unknown"
+    }
+}
+
 /// Configuration for observability features
 #[derive(Debug, Clone)]
 pub struct ObserveConfig {
@@ -233,9 +252,13 @@ impl Observer {
         &self.logger
     }
 
-    /// Start a new span for a workflow
+    /// Start a new span for a workflow.
+    ///
+    /// Automatically sets the `backend_type` attribute to the platform's
+    /// VM backend (kvm on Linux, vz on macOS).
     pub fn start_workflow_span(&self, name: &str) -> SpanGuard {
-        let span = self.tracer.start_span(&format!("workflow:{}", name));
+        let mut span = self.tracer.start_span(&format!("workflow:{}", name));
+        span.set_attribute("backend_type", backend_type());
         self.logger
             .info(&format!("Starting workflow: {}", name), &[]);
         SpanGuard {

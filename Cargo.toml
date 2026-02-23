@@ -20,6 +20,37 @@ exclude = [
 ]
 
 [dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Observability -- OpenTelemetry 0.31
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics", "internal-logs"], optional = true }
+
+# OTel Semantic Conventions (typed constants for attribute names)
+opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
+
+# HTTP client (for fetching remote skills from skills.sh)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Security (cross-platform)
+getrandom = "0.3"
+
+# Utilities
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+void-box-protocol = { path = "void-box-protocol" }
+libc = "0.2"
+byteorder = "1"
+
+# --- Linux-only dependencies ---
+[target.'cfg(target_os = "linux")'.dependencies]
 # rust-vmm core
 kvm-ioctls = "0.19"
 kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
@@ -35,36 +66,20 @@ event-manager = "0.4"
 # SLIRP networking (smoltcp-based user-mode networking)
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# Observability (KEY DIFFERENTIATOR) -- OpenTelemetry 0.31
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics", "internal-logs"], optional = true }
-
-# OTel Semantic Conventions (typed constants for attribute names)
-opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
-
-# HTTP client (for fetching remote skills from skills.sh)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-
-# Security
-getrandom = "0.3"
+# Security (Linux-specific)
 seccompiler = "0.4"
 ipnet = "2"
-
-# Utilities
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-void-box-protocol = { path = "void-box-protocol" }
-libc = "0.2"
 nix = { version = "0.29", features = ["fs", "ioctl", "net", "socket", "event"] }
-byteorder = "1"
+
+# --- macOS-only dependencies ---
+[target.'cfg(target_os = "macos")'.dependencies]
+# Objective-C 2.0 bindings (auto-generated from Apple frameworks)
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray", "NSString", "NSURL", "NSError", "NSRunLoop", "NSDate",
+] }
+objc2-virtualization = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 regex-lite = "0.1.9"
@@ -95,6 +110,10 @@ path = "tests/e2e/skill_pipeline.rs"
 [[test]]
 name = "e2e_telemetry"
 path = "tests/e2e/telemetry.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
 
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio"]

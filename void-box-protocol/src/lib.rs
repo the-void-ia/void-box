@@ -81,6 +81,18 @@ pub const HEADER_SIZE: usize = 5;
 /// can send `0xFFFFFFFF` as the length and force a 4 GB allocation.
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Protocol version for host↔guest wire format negotiation.
+///
+/// The version is exchanged during the Ping/Pong handshake:
+///
+/// - **Ping payload**: `[secret: 32 bytes][version: 4 bytes LE]` (36 bytes total)
+/// - **Pong payload**: `[version: 4 bytes LE]` (4 bytes)
+///
+/// Backward compatibility: old agents that send a 32-byte Ping (no version)
+/// are treated as version 0. New agents check `payload.len() >= 36` to detect
+/// the version extension.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // MessageType
 // ---------------------------------------------------------------------------
@@ -202,7 +214,7 @@ impl Message {
     }
 
     /// Read a complete message from a synchronous [`std::io::Read`] stream.
-    pub fn read_from_sync<R: std::io::Read>(reader: &mut R) -> Result<Self, ProtocolError> {
+    pub fn read_from_sync<R: std::io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolError> {
         let mut header = [0u8; HEADER_SIZE];
         reader.read_exact(&mut header)?;
 
@@ -719,6 +731,73 @@ mod tests {
         let req = TelemetrySubscribeRequest::default();
         assert_eq!(req.interval_ms, 1000);
         assert!(!req.include_kernel_threads);
+    }
+
+    #[test]
+    fn protocol_version_is_nonzero() {
+        assert!(PROTOCOL_VERSION > 0, "PROTOCOL_VERSION must be > 0");
+    }
+
+    #[test]
+    fn ping_with_version_round_trip() {
+        // Simulate a v1 Ping: 32-byte secret + 4-byte LE version
+        let secret = [0xABu8; 32];
+        let mut ping_payload = secret.to_vec();
+        ping_payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        assert_eq!(ping_payload.len(), 36);
+
+        // Parse back
+        assert_eq!(&ping_payload[..32], &secret[..]);
+        let ver = u32::from_le_bytes([
+            ping_payload[32],
+            ping_payload[33],
+            ping_payload[34],
+            ping_payload[35],
+        ]);
+        assert_eq!(ver, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn pong_with_version_round_trip() {
+        // Simulate a v1 Pong: 4-byte LE version
+        let pong_payload = PROTOCOL_VERSION.to_le_bytes().to_vec();
+        let msg = Message {
+            msg_type: MessageType::Pong,
+            payload: pong_payload,
+        };
+        let bytes = msg.serialize();
+        let decoded = Message::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::Pong);
+        assert_eq!(decoded.payload.len(), 4);
+        let ver = u32::from_le_bytes([
+            decoded.payload[0],
+            decoded.payload[1],
+            decoded.payload[2],
+            decoded.payload[3],
+        ]);
+        assert_eq!(ver, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn legacy_ping_32_bytes_still_valid() {
+        // Old hosts send only 32 bytes (no version field).
+        // The parser should treat this as version 0.
+        let secret = [0xCDu8; 32];
+        let ping_payload = secret.to_vec();
+        assert_eq!(ping_payload.len(), 32);
+
+        // Version detection: if len < 36, treat as version 0
+        let ver = if ping_payload.len() >= 36 {
+            u32::from_le_bytes([
+                ping_payload[32],
+                ping_payload[33],
+                ping_payload[34],
+                ping_payload[35],
+            ])
+        } else {
+            0
+        };
+        assert_eq!(ver, 0);
     }
 
     #[test]

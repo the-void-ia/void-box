@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Real KVM-backed integration tests for void-box.
 //!
 //! These tests boot an actual micro-VM via KVM and execute commands inside
