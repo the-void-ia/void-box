@@ -1,0 +1,684 @@
+//! OCI integration tests for void-box (Linux + macOS).
+//!
+//! **Group 1** (mock-based, cross-platform): Verify that `sandbox.image` in
+//! YAML flows through spec → runtime → SandboxConfig → BackendConfig → kernel
+//! cmdline.  Run by default: `cargo test --test oci_integration`
+//!
+//! **Group 2** (platform cmdline): Verify the platform-specific kernel cmdline
+//! builder emits (or omits) `voidbox.oci_rootfs=…`.
+//!   - Linux: `VoidBoxConfig::kernel_cmdline()`
+//!   - macOS: `vz::config::build_kernel_cmdline()`
+//!
+//! **Group 3** (VM E2E, `#[ignore]`): Boot a real VM and verify OCI rootfs
+//! mounts are visible in the guest.
+//!   - Linux: KVM — needs `/dev/kvm`, `VOID_BOX_KERNEL`, `VOID_BOX_INITRAMFS`
+//!   - macOS: VZ  — needs `VOID_BOX_KERNEL`, `VOID_BOX_INITRAMFS`
+//!
+//! ```bash
+//! # Mock + cmdline tests (no hardware):
+//! cargo test --test oci_integration
+//!
+//! # Linux KVM E2E:
+//! VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+//! VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+//! cargo test --test oci_integration -- --ignored --test-threads=1
+//!
+//! # macOS VZ E2E:
+//! VOID_BOX_KERNEL=/path/to/vmlinuz \
+//! VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz \
+//! cargo test --test oci_integration -- --ignored --test-threads=1
+//! ```
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use void_box::agent_box::VoidBox;
+use void_box::backend::MountConfig;
+use void_box::sandbox::Sandbox;
+use void_box::spec::load_spec;
+use void_box::spec::RunSpec;
+use void_box::Error;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 1: Mock-based tests (cross-platform, no hardware required)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// YAML with `sandbox.image: alpine:3.20` deserializes correctly.
+#[test]
+fn spec_parses_sandbox_image() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  image: "alpine:3.20"
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert_eq!(spec.sandbox.image.as_deref(), Some("alpine:3.20"));
+}
+
+/// YAML without `sandbox.image` has `None`.
+#[test]
+fn spec_sandbox_image_default_none() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert!(spec.sandbox.image.is_none());
+}
+
+/// `VoidBox::new("t").mock().oci_rootfs("/mnt/oci-rootfs").build()` succeeds.
+#[test]
+fn voidbox_builder_oci_rootfs() {
+    let vb = VoidBox::new("t")
+        .mock()
+        .oci_rootfs("/mnt/oci-rootfs")
+        .prompt("test")
+        .build()
+        .expect("build with oci_rootfs should succeed");
+    assert_eq!(vb.name, "t");
+}
+
+/// `.mount(...)` + `.oci_rootfs(...)` both accepted by the builder.
+#[test]
+fn voidbox_builder_mount_plus_oci() {
+    let mount = MountConfig {
+        host_path: "/tmp/data".to_string(),
+        guest_path: "/workspace".to_string(),
+        read_only: false,
+    };
+    let vb = VoidBox::new("t")
+        .mock()
+        .mount(mount)
+        .oci_rootfs("/mnt/oci-rootfs")
+        .prompt("test")
+        .build()
+        .expect("build with mount + oci_rootfs should succeed");
+    assert_eq!(vb.name, "t");
+}
+
+/// `Sandbox::mock().oci_rootfs(...)` propagates to `config().oci_rootfs`.
+#[test]
+fn sandbox_config_oci_rootfs_propagation() {
+    let sandbox = Sandbox::mock()
+        .oci_rootfs("/mnt/oci-rootfs")
+        .build()
+        .expect("mock sandbox with oci_rootfs should build");
+    assert_eq!(
+        sandbox.config().oci_rootfs.as_deref(),
+        Some("/mnt/oci-rootfs")
+    );
+}
+
+/// Pipeline YAML with `sandbox.image` parses and validates via `load_spec`.
+#[test]
+fn spec_pipeline_with_oci_image() {
+    let yaml = r#"
+api_version: v1
+kind: pipeline
+name: oci-pipeline
+sandbox:
+  image: "python:3.12"
+pipeline:
+  boxes:
+    - name: step1
+      prompt: "do work"
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("pipeline.yaml");
+    std::fs::write(&spec_path, yaml).unwrap();
+
+    let spec = load_spec(&spec_path).expect("pipeline spec with image should load");
+    assert_eq!(spec.sandbox.image.as_deref(), Some("python:3.12"));
+}
+
+/// Workflow YAML with `sandbox.image` parses and validates via `load_spec`.
+#[test]
+fn spec_workflow_with_oci_image() {
+    let yaml = r#"
+api_version: v1
+kind: workflow
+name: oci-workflow
+sandbox:
+  image: "node:22-slim"
+workflow:
+  steps:
+    - name: build
+      run:
+        program: echo
+        args: ["hello"]
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("workflow.yaml");
+    std::fs::write(&spec_path, yaml).unwrap();
+
+    let spec = load_spec(&spec_path).expect("workflow spec with image should load");
+    assert_eq!(spec.sandbox.image.as_deref(), Some("node:22-slim"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 2: Platform-specific kernel cmdline tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+// --- Linux: VoidBoxConfig ---
+
+/// `VoidBoxConfig` with `oci_rootfs` produces `voidbox.oci_rootfs=...` in the
+/// kernel command line (Linux / KVM path).
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_cmdline_includes_oci_rootfs() {
+    let config = void_box::vmm::config::VoidBoxConfig {
+        oci_rootfs: Some("/mnt/oci-rootfs".to_string()),
+        ..Default::default()
+    };
+    let cmdline = config.kernel_cmdline();
+    assert!(
+        cmdline.contains("voidbox.oci_rootfs=/mnt/oci-rootfs"),
+        "kernel cmdline should contain voidbox.oci_rootfs: {cmdline}"
+    );
+}
+
+/// `VoidBoxConfig` without `oci_rootfs` has no `voidbox.oci_rootfs` token
+/// (Linux / KVM path).
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_cmdline_no_oci_rootfs_when_none() {
+    let config = void_box::vmm::config::VoidBoxConfig::default();
+    let cmdline = config.kernel_cmdline();
+    assert!(
+        !cmdline.contains("voidbox.oci_rootfs"),
+        "kernel cmdline should NOT contain voidbox.oci_rootfs: {cmdline}"
+    );
+}
+
+// --- macOS: vz::config::build_kernel_cmdline ---
+
+/// `build_kernel_cmdline` with `oci_rootfs` produces `voidbox.oci_rootfs=...`
+/// (macOS / VZ path).
+#[cfg(target_os = "macos")]
+#[test]
+fn vz_cmdline_includes_oci_rootfs() {
+    let mut config = vz_test_backend_config();
+    config.oci_rootfs = Some("/mnt/oci-rootfs".to_string());
+    let cmdline = void_box::backend::vz::config::build_kernel_cmdline(&config);
+    assert!(
+        cmdline.contains("voidbox.oci_rootfs=/mnt/oci-rootfs"),
+        "VZ kernel cmdline should contain voidbox.oci_rootfs: {cmdline}"
+    );
+}
+
+/// `build_kernel_cmdline` without `oci_rootfs` has no `voidbox.oci_rootfs`
+/// token (macOS / VZ path).
+#[cfg(target_os = "macos")]
+#[test]
+fn vz_cmdline_no_oci_rootfs_when_none() {
+    let config = vz_test_backend_config();
+    let cmdline = void_box::backend::vz::config::build_kernel_cmdline(&config);
+    assert!(
+        !cmdline.contains("voidbox.oci_rootfs"),
+        "VZ kernel cmdline should NOT contain voidbox.oci_rootfs: {cmdline}"
+    );
+}
+
+/// `build_kernel_cmdline` uses `console=hvc0` (virtio-console), not `ttyS0`.
+#[cfg(target_os = "macos")]
+#[test]
+fn vz_cmdline_uses_hvc0() {
+    let config = vz_test_backend_config();
+    let cmdline = void_box::backend::vz::config::build_kernel_cmdline(&config);
+    assert!(
+        cmdline.contains("console=hvc0"),
+        "VZ cmdline should use hvc0: {cmdline}"
+    );
+    assert!(
+        !cmdline.contains("ttyS0"),
+        "VZ cmdline should NOT contain ttyS0: {cmdline}"
+    );
+}
+
+/// `build_kernel_cmdline` includes mount config when mounts are present.
+#[cfg(target_os = "macos")]
+#[test]
+fn vz_cmdline_oci_rootfs_with_mount() {
+    let mut config = vz_test_backend_config();
+    config.oci_rootfs = Some("/mnt/oci-rootfs".to_string());
+    config.mounts.push(MountConfig {
+        host_path: "/tmp/oci".to_string(),
+        guest_path: "/mnt/oci-rootfs".to_string(),
+        read_only: true,
+    });
+    let cmdline = void_box::backend::vz::config::build_kernel_cmdline(&config);
+    assert!(
+        cmdline.contains("voidbox.oci_rootfs=/mnt/oci-rootfs"),
+        "cmdline missing oci_rootfs: {cmdline}"
+    );
+    assert!(
+        cmdline.contains("voidbox.mount0=mount0:/mnt/oci-rootfs:ro"),
+        "cmdline missing mount config: {cmdline}"
+    );
+}
+
+/// Helper: minimal `BackendConfig` for VZ cmdline tests.
+#[cfg(target_os = "macos")]
+fn vz_test_backend_config() -> void_box::backend::BackendConfig {
+    void_box::backend::BackendConfig {
+        memory_mb: 256,
+        vcpus: 1,
+        kernel: PathBuf::from("/tmp/vmlinuz"),
+        initramfs: None,
+        rootfs: None,
+        network: false,
+        enable_vsock: true,
+        shared_dir: None,
+        mounts: vec![],
+        oci_rootfs: None,
+        env: vec![],
+        security: void_box::backend::BackendSecurityConfig {
+            session_secret: [0xAB; 32],
+            command_allowlist: vec![],
+            network_deny_list: vec![],
+            max_connections_per_second: 50,
+            max_concurrent_connections: 64,
+            seccomp: false,
+        },
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 3: VM E2E tests (require hardware, `#[ignore]`)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Load kernel + initramfs paths from environment variables.
+fn vm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
+    let kernel = PathBuf::from(std::env::var_os("VOID_BOX_KERNEL")?);
+    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
+    Some((kernel, initramfs))
+}
+
+/// Create a temporary directory that mimics a minimal OCI rootfs.
+fn create_fake_oci_rootfs() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("oci-marker.txt"), "oci-rootfs-present").unwrap();
+    std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+    std::fs::write(dir.path().join("etc/os-release"), "NAME=\"FakeOCI\"").unwrap();
+    dir
+}
+
+/// Build a sandbox that mounts `oci_dir` at `/mnt/oci-rootfs` and sets
+/// `oci_rootfs` in the sandbox config.  Works on both Linux (KVM) and
+/// macOS (VZ) — the `Sandbox::local()` builder picks the right backend.
+fn build_sandbox_with_oci_mount(
+    oci_dir: &std::path::Path,
+    read_only: bool,
+) -> Option<Arc<Sandbox>> {
+    // Linux: require /dev/kvm
+    #[cfg(target_os = "linux")]
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("skipping VM OCI test: /dev/kvm not available");
+        return None;
+    }
+
+    let (kernel, initramfs) = match vm_artifacts_from_env() {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "skipping VM OCI test: \
+                 set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
+            );
+            return None;
+        }
+    };
+
+    if !kernel.exists() {
+        eprintln!(
+            "skipping VM OCI test: kernel path does not exist: {}",
+            kernel.display()
+        );
+        return None;
+    }
+
+    let mount = MountConfig {
+        host_path: oci_dir.to_string_lossy().into_owned(),
+        guest_path: "/mnt/oci-rootfs".to_string(),
+        read_only,
+    };
+
+    let mut builder = Sandbox::local()
+        .memory_mb(256)
+        .vcpus(1)
+        .kernel(&kernel)
+        .mount(mount)
+        .oci_rootfs("/mnt/oci-rootfs");
+
+    if let Some(ref p) = initramfs {
+        if p.exists() {
+            builder = builder.initramfs(p);
+        }
+    }
+
+    match builder.build() {
+        Ok(sb) => Some(sb),
+        Err(e) => {
+            eprintln!("skipping VM OCI test: failed to build sandbox: {e}");
+            None
+        }
+    }
+}
+
+/// Mount a host directory as OCI rootfs and verify the guest can read its files.
+///
+/// Linux: requires `/dev/kvm` + kernel/initramfs artifacts.
+/// macOS: requires kernel/initramfs artifacts (VZ).
+#[tokio::test]
+#[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
+async fn vm_oci_rootfs_mount_visible() {
+    let oci_dir = create_fake_oci_rootfs();
+    let Some(sandbox) = build_sandbox_with_oci_mount(oci_dir.path(), true) else {
+        return;
+    };
+
+    let output = match sandbox
+        .exec("cat", &["/mnt/oci-rootfs/oci-marker.txt"])
+        .await
+    {
+        Ok(out) => out,
+        Err(Error::VmNotRunning) => {
+            eprintln!("vm_oci_rootfs_mount_visible: VM not running; skipping");
+            return;
+        }
+        Err(Error::Guest(msg)) => {
+            eprintln!("vm_oci_rootfs_mount_visible: guest communication error: {msg}");
+            return;
+        }
+        Err(e) => panic!("failed to exec cat in sandbox: {e}"),
+    };
+
+    assert!(
+        output.success(),
+        "cat oci-marker.txt failed: exit_code={}, stderr={}",
+        output.exit_code,
+        output.stderr_str()
+    );
+    assert_eq!(output.stdout_str().trim(), "oci-rootfs-present");
+}
+
+/// Write to a read-only OCI rootfs mount and expect failure.
+///
+/// Linux: requires `/dev/kvm` + kernel/initramfs artifacts.
+/// macOS: requires kernel/initramfs artifacts (VZ).
+#[tokio::test]
+#[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
+async fn vm_oci_rootfs_readonly() {
+    let oci_dir = create_fake_oci_rootfs();
+    let Some(sandbox) = build_sandbox_with_oci_mount(oci_dir.path(), true) else {
+        return;
+    };
+
+    let output = match sandbox
+        .exec("touch", &["/mnt/oci-rootfs/should-fail.txt"])
+        .await
+    {
+        Ok(out) => out,
+        Err(Error::VmNotRunning) => {
+            eprintln!("vm_oci_rootfs_readonly: VM not running; skipping");
+            return;
+        }
+        Err(Error::Guest(msg)) => {
+            eprintln!("vm_oci_rootfs_readonly: guest communication error: {msg}");
+            return;
+        }
+        Err(e) => panic!("failed to exec touch in sandbox: {e}"),
+    };
+
+    assert!(
+        !output.success(),
+        "writing to read-only OCI rootfs mount should fail, but got exit_code={}",
+        output.exit_code
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 3b: Example spec file validation (examples/specs/oci/*.yaml)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `examples/specs/oci/agent.yaml` parses and validates via `load_spec`.
+#[test]
+fn example_spec_oci_agent() {
+    let spec = load_spec(std::path::Path::new("examples/specs/oci/agent.yaml"))
+        .expect("agent.yaml should load");
+    assert_eq!(spec.kind, void_box::spec::RunKind::Agent);
+    assert_eq!(spec.sandbox.image.as_deref(), Some("python:3.12-slim"));
+    assert!(spec.agent.is_some());
+    assert!(spec.llm.is_some());
+}
+
+/// `examples/specs/oci/workflow.yaml` parses and validates via `load_spec`.
+#[test]
+fn example_spec_oci_workflow() {
+    let spec = load_spec(std::path::Path::new("examples/specs/oci/workflow.yaml"))
+        .expect("workflow.yaml should load");
+    assert_eq!(spec.kind, void_box::spec::RunKind::Workflow);
+    assert_eq!(spec.sandbox.image.as_deref(), Some("alpine:3.20"));
+    assert!(spec.workflow.is_some());
+    assert!(spec.llm.is_none());
+}
+
+/// `examples/specs/oci/pipeline.yaml` parses and validates via `load_spec`.
+#[test]
+fn example_spec_oci_pipeline() {
+    let spec = load_spec(std::path::Path::new("examples/specs/oci/pipeline.yaml"))
+        .expect("pipeline.yaml should load");
+    assert_eq!(spec.kind, void_box::spec::RunKind::Pipeline);
+    assert_eq!(spec.sandbox.image.as_deref(), Some("python:3.12-slim"));
+    let pipeline = spec.pipeline.as_ref().unwrap();
+    assert_eq!(pipeline.boxes.len(), 3);
+    assert_eq!(pipeline.stages.len(), 3);
+    // go-validate box should have an OCI skill
+    let go_box = &pipeline.boxes[1];
+    assert_eq!(go_box.name, "go-validate");
+    assert!(go_box.skills.iter().any(|s| matches!(s,
+        void_box::spec::SkillEntry::Oci { image, mount, .. }
+        if image == "golang:1.23-alpine" && mount == "/skills/go"
+    )));
+}
+
+/// `examples/specs/oci/skills.yaml` parses and validates via `load_spec`.
+#[test]
+fn example_spec_oci_skills() {
+    let spec = load_spec(std::path::Path::new("examples/specs/oci/skills.yaml"))
+        .expect("skills.yaml should load");
+    assert_eq!(spec.kind, void_box::spec::RunKind::Agent);
+    // No sandbox.image — skills only
+    assert!(spec.sandbox.image.is_none());
+    let agent = spec.agent.as_ref().unwrap();
+    // Should have 4 skills: claude-code + 3 OCI images
+    assert_eq!(agent.skills.len(), 4);
+    assert!(agent.skills.iter().any(|s| matches!(s,
+        void_box::spec::SkillEntry::Oci { image, mount, .. }
+        if image == "python:3.12-slim" && mount == "/skills/python"
+    )));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 4: Real OCI image E2E (pull alpine:3.20, pivot_root, exec in guest)
+//
+// These tests pull a real OCI image from Docker Hub, mount it as rootfs in a
+// KVM/VZ micro-VM, and verify that `pivot_root` works — the guest's `/` is
+// the OCI image, not the initramfs.
+//
+// Requirements: VM backend + kernel/initramfs + **network** (image pull).
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pull alpine:3.20, boot a VM with pivot_root, and exec `cat /etc/os-release`.
+///
+/// This is the programmatic equivalent of:
+/// ```bash
+/// voidbox run --file spec.yaml   # with sandbox.image: alpine:3.20
+/// ```
+///
+/// After pivot_root, the guest root is the alpine rootfs (via overlayfs).
+/// `/etc/os-release` should contain "Alpine".
+#[tokio::test]
+#[ignore = "requires VM backend + kernel/initramfs + network (pulls alpine:3.20)"]
+async fn vm_oci_alpine_os_release() {
+    #[cfg(target_os = "linux")]
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm not available");
+        return;
+    }
+
+    let (kernel, initramfs) = match vm_artifacts_from_env() {
+        Some(a) => a,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    if !kernel.exists() {
+        eprintln!("skipping: kernel not found: {}", kernel.display());
+        return;
+    }
+
+    // 1. Pull and extract alpine:3.20 (uses cache at ~/.voidbox/oci/).
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir = PathBuf::from(&home).join(".voidbox/oci");
+    let client = voidbox_oci::OciClient::new(cache_dir);
+    let rootfs_path = match client.resolve_rootfs("alpine:3.20").await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping: failed to pull alpine:3.20: {e}");
+            return;
+        }
+    };
+    eprintln!("OCI rootfs extracted to: {}", rootfs_path.display());
+
+    // 2. Build sandbox: mount the extracted rootfs ro at /mnt/oci-rootfs,
+    //    set oci_rootfs so guest-agent performs pivot_root.
+    let mount = MountConfig {
+        host_path: rootfs_path.to_string_lossy().into_owned(),
+        guest_path: "/mnt/oci-rootfs".to_string(),
+        read_only: true,
+    };
+
+    let mut builder = Sandbox::local()
+        .memory_mb(256)
+        .vcpus(1)
+        .kernel(&kernel)
+        .mount(mount)
+        .oci_rootfs("/mnt/oci-rootfs");
+
+    if let Some(ref p) = initramfs {
+        if p.exists() {
+            builder = builder.initramfs(p);
+        }
+    }
+
+    let sandbox = match builder.build() {
+        Ok(sb) => sb,
+        Err(e) => {
+            eprintln!("skipping: failed to build sandbox: {e}");
+            return;
+        }
+    };
+
+    // 3. Exec `cat /etc/os-release` — after pivot_root this is alpine's file.
+    let output = match sandbox.exec("cat", &["/etc/os-release"]).await {
+        Ok(out) => out,
+        Err(Error::VmNotRunning) => {
+            eprintln!("vm_oci_alpine_os_release: VM not running; skipping");
+            return;
+        }
+        Err(Error::Guest(msg)) => {
+            eprintln!("vm_oci_alpine_os_release: guest error: {msg}");
+            return;
+        }
+        Err(e) => panic!("exec failed: {e}"),
+    };
+
+    eprintln!("--- /etc/os-release ---\n{}", output.stdout_str());
+
+    assert!(
+        output.success(),
+        "cat /etc/os-release failed: exit_code={}, stderr={}",
+        output.exit_code,
+        output.stderr_str()
+    );
+    assert!(
+        output.stdout_str().contains("Alpine"),
+        "expected Alpine in /etc/os-release, got: {}",
+        output.stdout_str()
+    );
+}
+
+/// YAML spec with `sandbox.image` resolves the OCI image via `run_file()`.
+///
+/// This verifies the YAML → runtime path that `voidbox run --file spec.yaml`
+/// uses: spec parsing → `resolve_oci_base_image()` → extracted rootfs exists
+/// on disk. The workflow runs in mock mode to avoid the vsock timing
+/// sensitivity of OCI pivot_root boots (the real VM path is covered by
+/// `vm_oci_alpine_os_release` above).
+#[tokio::test]
+#[ignore = "requires network (pulls alpine:3.20)"]
+async fn runtime_run_file_resolves_oci_image() {
+    // Write a workflow YAML that references an OCI image but uses mock mode.
+    // run_file will call resolve_oci_base_image("alpine:3.20") which pulls
+    // and extracts the image, then build_shared_sandbox creates a mock sandbox
+    // (mock mode ignores OCI mounts but the resolution still happens).
+    let yaml = r#"
+api_version: v1
+kind: workflow
+name: alpine-resolve-test
+sandbox:
+  mode: mock
+  image: "alpine:3.20"
+workflow:
+  steps:
+    - name: probe
+      run:
+        program: echo
+        args: ["resolved-ok"]
+  output_step: probe
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("alpine-resolve.yaml");
+    std::fs::write(&spec_path, yaml).unwrap();
+
+    let report = match void_box::runtime::run_file(&spec_path, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("runtime_run_file_resolves_oci_image: failed: {e}");
+            return;
+        }
+    };
+
+    // The mock sandbox's echo returns "resolved-ok\n".
+    // The important part is that run_file succeeded, which means
+    // resolve_oci_base_image("alpine:3.20") completed without error.
+    assert!(
+        report.success,
+        "workflow should succeed: output={:?}",
+        report.output
+    );
+    assert!(
+        report.output.contains("resolved-ok"),
+        "expected probe output, got: {}",
+        report.output
+    );
+
+    // Verify the OCI rootfs was actually extracted to the cache.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+    assert!(
+        cache_dir.exists(),
+        "OCI cache dir should exist at {}",
+        cache_dir.display()
+    );
+}

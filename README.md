@@ -26,6 +26,7 @@
 <p align="center">
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#oci-container-support">OCI Support</a> ·
   <a href="#observability">Observability</a>
 </p>
 
@@ -282,6 +283,79 @@ VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 ```
+
+---
+
+## OCI Container Support
+
+VoidBox supports OCI container images in two ways:
+
+1. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
+2. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
+
+Images are pulled from Docker Hub (or any OCI-compliant registry), cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
+
+### Example: OCI skills
+
+Mount Python, Go, and Java into a single agent — no `sandbox.image` needed:
+
+```yaml
+# examples/specs/oci/skills.yaml
+api_version: v1
+kind: agent
+name: multi-tool-agent
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 2
+  network: true
+
+llm:
+  provider: ollama
+  model: "qwen2.5-coder:7b"
+
+agent:
+  prompt: >
+    You have Python, Go, and Java available as mounted skills.
+    Set up PATH to include the skill binaries:
+      export PATH=/skills/python/usr/local/bin:/skills/go/usr/local/go/bin:/skills/java/bin:$PATH
+
+    Write a "Hello from <language>" one-liner in each language and run all three.
+    Report which versions are installed.
+  skills:
+    - "agent:claude-code"
+    - image: "python:3.12-slim"
+      mount: "/skills/python"
+    - image: "golang:1.23-alpine"
+      mount: "/skills/go"
+    - image: "eclipse-temurin:21-jdk-alpine"
+      mount: "/skills/java"
+  timeout_secs: 300
+```
+
+Run it:
+
+```bash
+# Linux (KVM)
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
+
+# macOS (Virtualization.framework) — requires initramfs already built (see "macOS mode" above)
+VOID_BOX_KERNEL=target/vmlinuz-arm64 \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
+```
+
+More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
+
+| Spec | Description |
+|------|-------------|
+| `agent.yaml` | Single agent with `sandbox.image: python:3.12-slim` |
+| `workflow.yaml` | Workflow with `sandbox.image: alpine:3.20` (no LLM) |
+| `pipeline.yaml` | Multi-language pipeline: Python base + Go and Java OCI skills |
+| `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
 
 ---
 

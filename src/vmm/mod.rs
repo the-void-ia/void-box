@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::devices::serial::SerialDevice;
+use crate::devices::virtio_9p::Virtio9pDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
@@ -195,9 +196,29 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             None
         };
 
+        // Virtio-9p device for host directory sharing (if mounts are configured).
+        // All configured mounts share a single 9p device — the first mount's host
+        // path is used as the root. For multiple mounts, each is handled at the
+        // guest-agent level via mount commands.
+        let virtio_9p = if !config.mounts.is_empty() {
+            let first_mount = &config.mounts[0];
+            let mut dev =
+                Virtio9pDevice::new(&first_mount.host_path, "mount0", first_mount.read_only);
+            dev.set_mmio_base(0xd100_0000);
+            info!(
+                "virtio-9p MMIO at {:#x}, tag='mount0', root={}",
+                dev.mmio_base(),
+                first_mount.host_path,
+            );
+            Some(Arc::new(Mutex::new(dev)))
+        } else {
+            None
+        };
+
         let mmio_devices = MmioDevices {
             virtio_net,
             virtio_vsock: virtio_vsock_mmio,
+            virtio_9p,
         };
 
         // Create vCPUs (with MMIO dispatch to virtio-net and virtio-vsock)
@@ -213,6 +234,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                 MmioDevices {
                     virtio_net: mmio_devices.virtio_net.clone(),
                     virtio_vsock: mmio_devices.virtio_vsock.clone(),
+                    virtio_9p: mmio_devices.virtio_9p.clone(),
                 },
             )?;
             vcpu_handles.push(handle);

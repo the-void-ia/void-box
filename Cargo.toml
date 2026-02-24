@@ -46,6 +46,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 void-box-protocol = { path = "void-box-protocol" }
+voidbox-oci = { path = "voidbox-oci" }
 libc = "0.2"
 byteorder = "1"
 
@@ -86,6 +87,7 @@ dispatch2 = "0.3"
 regex-lite = "0.1.9"
 tempfile = "3"
 tokio-test = "0.4"
+voidbox-oci = { path = "voidbox-oci" }
 # OTel testing support (in-memory exporters for assertions)
 opentelemetry = { version = "0.31" }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
@@ -116,8 +118,12 @@ path = "tests/e2e/telemetry.rs"
 name = "conformance"
 path = "tests/conformance.rs"
 
+[[test]]
+name = "oci_integration"
+path = "tests/oci_integration.rs"
+
 [workspace]
-members = ["guest-agent", "void-box-protocol", "claudio"]
+members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci"]
 
 # guest-agent builds as a tiny static init binary for the guest initramfs.
 # Use `cargo build -p guest-agent --release` with these workspace-level settings.

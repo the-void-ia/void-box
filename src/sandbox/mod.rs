@@ -57,6 +57,10 @@ pub struct SandboxConfig {
     pub observe: Option<ObserveConfig>,
     /// Shared directory to mount in guest
     pub shared_dir: Option<PathBuf>,
+    /// Host directory mounts into the guest.
+    pub mounts: Vec<crate::backend::MountConfig>,
+    /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
+    pub oci_rootfs: Option<String>,
     /// Environment variables
     pub env: Vec<(String, String)>,
 }
@@ -73,6 +77,8 @@ impl Default for SandboxConfig {
             enable_vsock: true,
             observe: None,
             shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
             env: Vec::new(),
         }
     }
@@ -571,6 +577,18 @@ impl SandboxBuilder {
     /// Set a shared directory
     pub fn shared_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.shared_dir = Some(path.into());
+        self
+    }
+
+    /// Add a host directory mount.
+    pub fn mount(mut self, mount: crate::backend::MountConfig) -> Self {
+        self.config.mounts.push(mount);
+        self
+    }
+
+    /// Set the OCI rootfs guest path (triggers pivot_root in guest-agent).
+    pub fn oci_rootfs(mut self, guest_path: impl Into<String>) -> Self {
+        self.config.oci_rootfs = Some(guest_path.into());
         self
     }
 

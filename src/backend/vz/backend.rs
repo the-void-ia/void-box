@@ -256,8 +256,88 @@ impl VmmBackend for VzBackend {
                 vm_config.setSerialPorts(&serial_configs);
             }
 
-            // 6. Shared directory (virtiofs) — M6 enhancement
-            // TODO: implement VZVirtioFileSystemDeviceConfiguration when shared_dir is set
+            // 6. Shared directories (virtiofs)
+            {
+                let mut fs_configs: Vec<Retained<VZVirtioFileSystemDeviceConfiguration>> =
+                    Vec::new();
+
+                // Legacy single shared_dir
+                if let Some(ref shared_dir) = config.shared_dir {
+                    if let Some(path_str) = shared_dir.to_str() {
+                        let tag = NSString::from_str("shared");
+                        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+                        let share = unsafe {
+                            VZSharedDirectory::initWithURL_readOnly(
+                                VZSharedDirectory::alloc(),
+                                &url,
+                                false,
+                            )
+                        };
+                        let single = unsafe {
+                            VZSingleDirectoryShare::initWithDirectory(
+                                VZSingleDirectoryShare::alloc(),
+                                &share,
+                            )
+                        };
+                        let fs = unsafe {
+                            VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                                &tag,
+                            )
+                        };
+                        unsafe { fs.setShare(Some(&single)) };
+                        debug!("VzBackend: virtiofs share 'shared' -> {}", path_str);
+                        fs_configs.push(fs);
+                    }
+                }
+
+                // Named mounts from config.mounts
+                for (i, mount) in config.mounts.iter().enumerate() {
+                    let tag_str = format!("mount{}", i);
+                    let tag = NSString::from_str(&tag_str);
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(&mount.host_path));
+                    let share = unsafe {
+                        VZSharedDirectory::initWithURL_readOnly(
+                            VZSharedDirectory::alloc(),
+                            &url,
+                            mount.read_only,
+                        )
+                    };
+                    let single = unsafe {
+                        VZSingleDirectoryShare::initWithDirectory(
+                            VZSingleDirectoryShare::alloc(),
+                            &share,
+                        )
+                    };
+                    let fs = unsafe {
+                        VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                            VZVirtioFileSystemDeviceConfiguration::alloc(),
+                            &tag,
+                        )
+                    };
+                    unsafe { fs.setShare(Some(&single)) };
+                    debug!(
+                        "VzBackend: virtiofs share '{}' -> {} (ro={})",
+                        tag_str, mount.host_path, mount.read_only
+                    );
+                    fs_configs.push(fs);
+                }
+
+                if !fs_configs.is_empty() {
+                    // Build NSArray of VZDirectorySharingDeviceConfiguration
+                    let configs_refs: Vec<&VZDirectorySharingDeviceConfiguration> = fs_configs
+                        .iter()
+                        .map(|c| {
+                            // Safety: VZVirtioFileSystemDeviceConfiguration is a subclass of
+                            // VZDirectorySharingDeviceConfiguration
+                            let ptr: *const VZVirtioFileSystemDeviceConfiguration = &**c;
+                            unsafe { &*(ptr as *const VZDirectorySharingDeviceConfiguration) }
+                        })
+                        .collect();
+                    let arr = NSArray::from_slice(&configs_refs);
+                    unsafe { vm_config.setDirectorySharingDevices(&arr) };
+                }
+            }
 
             // 7. Validate configuration
             unsafe {

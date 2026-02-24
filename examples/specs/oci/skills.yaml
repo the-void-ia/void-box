@@ -1,0 +1,31 @@
+api_version: v1
+kind: agent
+name: multi-tool-agent
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 2
+  network: true
+
+llm:
+  provider: ollama
+  model: "phi4-mini:latest"
+
+agent:
+  prompt: >
+    You have Python, Go, and Java available as mounted skills.
+    Set up PATH to include the skill binaries:
+      export PATH=/skills/python/usr/local/bin:/skills/go/usr/local/go/bin:/skills/java/bin:$PATH
+
+    Write a "Hello from <language>" one-liner in each language and run all three.
+    Report which versions are installed.
+  skills:
+    - "agent:claude-code"
+    - image: "python:3.12-slim"
+      mount: "/skills/python"
+    - image: "golang:1.23-alpine"
+      mount: "/skills/go"
+    - image: "eclipse-temurin:21-jdk-alpine"
+      mount: "/skills/java"
+  timeout_secs: 300

@@ -438,14 +438,14 @@ fn plan_events_from_spec(run_id: &str, environment_id: &str, spec: &RunSpec) -> 
     match spec.kind {
         RunKind::Agent => {
             if let Some(agent) = &spec.agent {
-                for raw in &agent.skills {
-                    if let Some((skill_type, skill_id)) = split_skill(raw) {
+                for entry in &agent.skills {
+                    if let Some((skill_type, skill_id, display)) = skill_entry_info(entry) {
                         out.push(event_skill(
                             run_id,
                             "skill.mounted",
-                            format!("mounted skill {}", raw),
-                            skill_id,
-                            skill_type,
+                            format!("mounted skill {}", display),
+                            &skill_id,
+                            &skill_type,
                             environment_id,
                             mode,
                             Some(&spec.name),
@@ -465,14 +465,14 @@ fn plan_events_from_spec(run_id: &str, environment_id: &str, spec: &RunSpec) -> 
                         environment_id,
                         Some(mode),
                     ));
-                    for raw in &b.skills {
-                        if let Some((skill_type, skill_id)) = split_skill(raw) {
+                    for entry in &b.skills {
+                        if let Some((skill_type, skill_id, display)) = skill_entry_info(entry) {
                             out.push(event_skill(
                                 run_id,
                                 "skill.mounted",
-                                format!("mounted skill {}", raw),
-                                skill_id,
-                                skill_type,
+                                format!("mounted skill {}", display),
+                                &skill_id,
+                                &skill_type,
                                 environment_id,
                                 mode,
                                 Some(&b.name),
@@ -499,9 +499,19 @@ fn plan_events_from_spec(run_id: &str, environment_id: &str, spec: &RunSpec) -> 
     out
 }
 
-fn split_skill(raw: &str) -> Option<(&str, &str)> {
-    let (t, id) = raw.split_once(':')?;
-    Some((t, id))
+/// Extract skill type and id from a SkillEntry for telemetry events.
+fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, String)> {
+    match entry {
+        crate::spec::SkillEntry::Simple(raw) => {
+            let (t, id) = raw.split_once(':')?;
+            Some((t.to_string(), id.to_string(), raw.clone()))
+        }
+        crate::spec::SkillEntry::Oci { image, mount, .. } => Some((
+            "oci".to_string(),
+            image.clone(),
+            format!("oci:{}:{}", image, mount),
+        )),
+    }
 }
 
 fn kind_name(kind: &RunKind) -> &'static str {

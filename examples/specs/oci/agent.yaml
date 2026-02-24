@@ -1,0 +1,22 @@
+api_version: v1
+kind: agent
+name: python-data-agent
+
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  vcpus: 2
+  network: true
+  image: "python:3.12-slim"
+
+llm:
+  provider: ollama
+  model: "qwen2.5-coder:7b"
+
+agent:
+  prompt: >
+    You are running inside a Python 3.12 container.
+    Write a short Python script to /workspace/analysis.py that fetches
+    https://jsonplaceholder.typicode.com/posts, computes the average
+    title length, and prints a one-line summary. Then run it.
+  timeout_secs: 300

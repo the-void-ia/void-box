@@ -49,6 +49,28 @@ pub struct SandboxSpec {
     pub network: bool,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Host directory mounts into the guest VM.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+    /// OCI base image for the sandbox (e.g. "python:3.12").
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Specification for a host directory mount into the guest VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountSpec {
+    /// Host directory path.
+    pub host: String,
+    /// Guest mount point.
+    pub guest: String,
+    /// Mount mode: "ro" (default) or "rw".
+    #[serde(default = "default_mount_mode")]
+    pub mode: String,
+}
+
+fn default_mount_mode() -> String {
+    "ro".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +102,7 @@ pub struct ObserveSpec {
 pub struct AgentSpec {
     pub prompt: String,
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub skills: Vec<SkillEntry>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
@@ -104,6 +126,9 @@ pub struct BoxSandboxOverride {
     pub network: Option<bool>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Additional host directory mounts for this box.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,13 +136,73 @@ pub struct PipelineBoxSpec {
     pub name: String,
     pub prompt: String,
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub skills: Vec<SkillEntry>,
     #[serde(default)]
     pub llm: Option<LlmSpec>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub sandbox: Option<BoxSandboxOverride>,
+    /// Named outputs this stage produces (host directories mounted rw).
+    #[serde(default)]
+    pub outputs: Vec<PipelineOutputSpec>,
+    /// Named inputs this stage consumes (host directories mounted ro).
+    #[serde(default)]
+    pub inputs: Vec<PipelineInputSpec>,
+}
+
+/// A named output directory that a pipeline stage writes to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineOutputSpec {
+    /// Output name (used to reference from another stage's inputs).
+    pub name: String,
+    /// Guest path where the stage writes output.
+    #[serde(default = "default_output_guest_path")]
+    pub guest: String,
+}
+
+/// A named input directory that a pipeline stage reads from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineInputSpec {
+    /// Name of the output from a previous stage.
+    pub from: String,
+    /// Guest path where the input is mounted.
+    #[serde(default = "default_input_guest_path")]
+    pub guest: String,
+}
+
+fn default_output_guest_path() -> String {
+    "/workspace/output".to_string()
+}
+
+fn default_input_guest_path() -> String {
+    "/workspace/input".to_string()
+}
+
+/// A skill entry in YAML — either a simple string or an OCI image object.
+///
+/// ```yaml
+/// skills:
+///   - "agent:claude-code"               # Simple string
+///   - image: ghcr.io/voidbox/skill-jq   # OCI image object
+///     mount: /skills/jq
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SkillEntry {
+    /// Simple `<type>:<value>` string (e.g. "agent:claude-code").
+    Simple(String),
+    /// OCI image skill with mount configuration.
+    Oci {
+        image: String,
+        mount: String,
+        #[serde(default = "default_oci_readonly")]
+        readonly: bool,
+    },
+}
+
+fn default_oci_readonly() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +246,8 @@ impl Default for SandboxSpec {
             vcpus: default_vcpus(),
             network: false,
             env: HashMap::new(),
+            mounts: Vec::new(),
+            image: None,
         }
     }
 }
