@@ -1,29 +1,35 @@
-//! Pipeline: Compose Boxes into sequential data-flow pipelines.
+//! Pipelines compose [`VoidBox`] stages into a data-flow.
 //!
-//! A Pipeline chains multiple [`VoidBox`] instances so that the output of one
-//! becomes the input of the next.  Each Box boots a fresh, isolated VM, runs its
-//! agent with the provisioned skills, and produces structured output.
+//! ## Model
+//! - A pipeline is an ordered list of stages.
+//! - Each stage is either:
+//!   - **Single**: runs one `VoidBox` sequentially.
+//!   - **Parallel (fan-out)**: runs multiple `VoidBox` instances concurrently on the same input.
 //!
-//! # Example
+//! ## Data passing
+//! Each stage receives optional "carry" data from the previous stage:
+//! - If a stage produces `file_output`, that is forwarded.
+//! - Otherwise, if it produces non-empty `result_text`, that text is forwarded as bytes.
+//! - Otherwise, carry becomes `None`.
 //!
-//! ```no_run
-//! use void_box::pipeline::Pipeline;
-//! # use void_box::agent_box::VoidBox;
+//! Fan-out merges all stage `result_text` values into a JSON array (`["...","..."]`) for the next stage.
+//! Fan-out results are collected in completion order (not input order)
 //!
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! # let data_box: VoidBox = todo!();
-//! # let quant_box: VoidBox = todo!();
-//! # let strategy_box: VoidBox = todo!();
-//! let result = Pipeline::from(data_box)
-//!     .pipe(quant_box)
-//!     .pipe(strategy_box)
-//!     .run()
-//!     .await?;
+//! ## Failure semantics
+//! - The pipeline stops early on the first failing stage.
+//! - A fan-out stops the pipeline if **any** box in the group fails.
 //!
-//! println!("Final output: {}", result.output);
-//! # Ok(())
-//! # }
-//! ```
+//! ## Streaming vs non-streaming
+//! `run_streaming` delivers at least one output event per stage by emitting a synthetic
+//! `ExecOutputChunk` from the final `result_text` (in addition to any live output produced by the VM).
+//!
+//! ## Observability
+//! `Pipeline::observe` wraps execution with OTLP spans and metrics but shares the same core execution loop.
+//!
+//! ## Design notes (for contributors)
+//! - Keep execution semantics centralized in `run_pipeline_core`.
+//! - Avoid duplicating stage loops in `Pipeline` vs `ObservablePipeline`.
+//! - If you change carry semantics or fan-out merge format, update module docs and tests.
 
 use std::time::Instant;
 
@@ -38,7 +44,8 @@ use crate::observe::{ObserveConfig, ObservedResult, Observer};
 pub struct PipelineResult {
     /// Name of the pipeline
     pub name: String,
-    /// Results from each stage, in order
+    /// Results from each stage.
+    /// For fan-out groups, results are appended in completion order.
     pub stages: Vec<StageResult>,
     /// The final stage output text
     pub output: String,
@@ -132,11 +139,8 @@ impl Pipeline {
         self
     }
 
-    /// Fan out: run multiple Boxes in parallel on the same input.
-    ///
-    /// All Boxes in the group receive the same carry-forward data from the
-    /// previous stage. Their outputs are merged into a JSON array that becomes
-    /// the input for the next stage.
+    /// Run multiple Boxes concurrently on the same carry data.
+    /// Their `result_text` outputs are merged into a JSON array for the next stage.
     pub fn fan_out(mut self, boxes: Vec<VoidBox>) -> Self {
         self.stages.push(PipelineStage::Parallel(boxes));
         self
@@ -149,103 +153,8 @@ impl Pipeline {
     /// via a [`tokio::task::JoinSet`] and their outputs are merged as a JSON
     /// array for the next stage.
     pub async fn run(self) -> crate::Result<PipelineResult> {
-        let mut stages: Vec<StageResult> = Vec::new();
-        let mut carry_data: Option<Vec<u8>> = None;
-        let total_stages = self.stages.len();
-
-        for (i, stage) in self.stages.into_iter().enumerate() {
-            match stage {
-                PipelineStage::Single(agent_box) => {
-                    let box_name = agent_box.name.clone();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] starting ...",
-                        i + 1,
-                        total_stages,
-                        box_name
-                    );
-
-                    let stage_result = agent_box.run(carry_data.as_deref()).await?;
-
-                    carry_data = extract_carry_data(&stage_result);
-
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] complete | {} tokens, ${:.4}",
-                        i + 1,
-                        total_stages,
-                        box_name,
-                        stage_result.claude_result.input_tokens
-                            + stage_result.claude_result.output_tokens,
-                        stage_result.claude_result.total_cost_usd,
-                    );
-
-                    if stage_result.claude_result.is_error {
-                        log_stage_error(&box_name, &stage_result.claude_result);
-                        stages.push(stage_result);
-                        break;
-                    }
-
-                    stages.push(stage_result);
-                }
-                PipelineStage::Parallel(boxes) => {
-                    let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: fan-out [{}] ({} VMs in parallel)",
-                        i + 1,
-                        total_stages,
-                        names.join(" | "),
-                        boxes.len()
-                    );
-
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for agent_box in boxes {
-                        let input = carry_data.clone();
-                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
-                    }
-
-                    let mut parallel_results: Vec<StageResult> = Vec::new();
-                    let mut had_error = false;
-                    while let Some(result) = join_set.join_next().await {
-                        let stage_result = result
-                            .map_err(|e| crate::Error::Guest(format!("Join error: {}", e)))??;
-
-                        eprintln!(
-                            "[pipeline]   [vm:{}] fan-out complete | {} tokens, ${:.4}",
-                            stage_result.box_name,
-                            stage_result.claude_result.input_tokens
-                                + stage_result.claude_result.output_tokens,
-                            stage_result.claude_result.total_cost_usd,
-                        );
-
-                        if stage_result.claude_result.is_error {
-                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
-                            had_error = true;
-                        }
-
-                        parallel_results.push(stage_result);
-                    }
-
-                    // Merge outputs as a JSON array for the next stage
-                    carry_data = Some(merge_parallel_outputs(&parallel_results));
-                    stages.extend(parallel_results);
-
-                    if had_error {
-                        eprintln!("[pipeline] Fan-out stage had errors; stopping pipeline early.");
-                        break;
-                    }
-                }
-            }
-        }
-
-        let output = stages
-            .last()
-            .map(|s| s.claude_result.result_text.clone())
-            .unwrap_or_default();
-
-        Ok(PipelineResult {
-            name: self.name,
-            stages,
-            output,
-        })
+        let mut hook = NoopOutputHook;
+        run_pipeline_core(self.name, self.stages, &mut hook, None).await
     }
 
     /// Execute the pipeline with a streaming callback for output chunks.
@@ -255,108 +164,12 @@ impl Pipeline {
     /// argument is the stage (box) name, the second is the output chunk.
     ///
     /// The final `PipelineResult` is identical to what `run()` would return.
-    pub async fn run_streaming<F>(self, mut on_output: F) -> crate::Result<PipelineResult>
+    pub async fn run_streaming<F>(self, on_output: F) -> crate::Result<PipelineResult>
     where
-        F: FnMut(&str, &ExecOutputChunk),
+        F: FnMut(&str, &ExecOutputChunk) + Send,
     {
-        let mut stages: Vec<StageResult> = Vec::new();
-        let mut carry_data: Option<Vec<u8>> = None;
-        let total_stages = self.stages.len();
-
-        for (i, stage) in self.stages.into_iter().enumerate() {
-            match stage {
-                PipelineStage::Single(agent_box) => {
-                    let box_name = agent_box.name.clone();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] starting ...",
-                        i + 1,
-                        total_stages,
-                        box_name
-                    );
-
-                    // Tool events stream in real-time via AgentBox::run() → exec_claude_streaming().
-                    let stage_result = agent_box.run(carry_data.as_deref()).await?;
-
-                    // Emit a synthetic chunk with the full result text so
-                    // callers always see at least one output event per stage.
-                    emit_synthetic_chunk(&stage_result, &box_name, &mut on_output);
-
-                    carry_data = extract_carry_data(&stage_result);
-
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] complete | {} tokens, ${:.4}",
-                        i + 1,
-                        total_stages,
-                        box_name,
-                        stage_result.claude_result.input_tokens
-                            + stage_result.claude_result.output_tokens,
-                        stage_result.claude_result.total_cost_usd,
-                    );
-
-                    if stage_result.claude_result.is_error {
-                        log_stage_error(&box_name, &stage_result.claude_result);
-                        stages.push(stage_result);
-                        break;
-                    }
-
-                    stages.push(stage_result);
-                }
-                PipelineStage::Parallel(boxes) => {
-                    let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: fan-out [{}] ({} VMs in parallel)",
-                        i + 1,
-                        total_stages,
-                        names.join(" | "),
-                        boxes.len()
-                    );
-
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for agent_box in boxes {
-                        let input = carry_data.clone();
-                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
-                    }
-
-                    let mut parallel_results: Vec<StageResult> = Vec::new();
-                    let mut had_error = false;
-                    while let Some(result) = join_set.join_next().await {
-                        let stage_result = result
-                            .map_err(|e| crate::Error::Guest(format!("Join error: {}", e)))??;
-
-                        emit_synthetic_chunk(
-                            &stage_result,
-                            &stage_result.box_name.clone(),
-                            &mut on_output,
-                        );
-
-                        if stage_result.claude_result.is_error {
-                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
-                            had_error = true;
-                        }
-
-                        parallel_results.push(stage_result);
-                    }
-
-                    carry_data = Some(merge_parallel_outputs(&parallel_results));
-                    stages.extend(parallel_results);
-
-                    if had_error {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let output = stages
-            .last()
-            .map(|s| s.claude_result.result_text.clone())
-            .unwrap_or_default();
-
-        Ok(PipelineResult {
-            name: self.name,
-            stages,
-            output,
-        })
+        let mut hook = StreamingOutputHook(on_output);
+        run_pipeline_core(self.name, self.stages, &mut hook, None).await
     }
 
     /// Number of stages in the pipeline.
@@ -396,6 +209,280 @@ impl Pipeline {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Output hook trait — abstracts "streaming" vs "non-streaming"
+// ---------------------------------------------------------------------------
+
+/// Called after each stage result to optionally emit streaming output chunks.
+///
+/// Implementors must be `Send` so the pipeline future can be spawned on
+/// multi-threaded runtimes (e.g. `tokio::spawn`).
+trait OutputHook: Send {
+    fn on_stage_result(&mut self, box_name: &str, result: &StageResult);
+}
+
+/// No-op hook for `Pipeline::run()` (no streaming output).
+struct NoopOutputHook;
+
+impl OutputHook for NoopOutputHook {
+    fn on_stage_result(&mut self, _box_name: &str, _result: &StageResult) {}
+}
+
+/// Hook that emits synthetic `ExecOutputChunk`s for `run_streaming()`.
+struct StreamingOutputHook<F>(F);
+
+impl<F: FnMut(&str, &ExecOutputChunk) + Send> OutputHook for StreamingOutputHook<F> {
+    fn on_stage_result(&mut self, box_name: &str, result: &StageResult) {
+        emit_synthetic_chunk(result, box_name, &mut self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core pipeline execution — single implementation for all four public methods
+// ---------------------------------------------------------------------------
+
+/// Core pipeline loop used by both plain and observed execution.
+///
+/// Design: streaming and observability are orthogonal concerns injected via:
+/// - `OutputHook` for streaming callbacks
+/// - `Option<&Observer>` for tracing/metrics
+async fn run_pipeline_core(
+    pipeline_name: String,
+    pipeline_stages: Vec<PipelineStage>,
+    output_hook: &mut dyn OutputHook,
+    observer: Option<&Observer>,
+) -> crate::Result<PipelineResult> {
+    let total_stages = pipeline_stages.len();
+    let tracer = observer.map(|o| o.tracer().clone());
+
+    // Root span (only when observed)
+    let mut root_span: Option<(crate::observe::tracer::Span, Instant)> = None;
+    let mut root_ctx: Option<crate::observe::tracer::SpanContext> = None;
+
+    if let Some(t) = tracer.as_ref() {
+        let mut span = t.start_span(&format!("pipeline:{}", pipeline_name));
+        span.set_attribute("pipeline.name", &pipeline_name);
+        span.set_attribute("pipeline.stages", total_stages.to_string());
+
+        root_ctx = Some(span.context.clone());
+        root_span = Some((span, Instant::now()));
+    }
+
+    let mut stages: Vec<StageResult> = Vec::new();
+    let mut carry_data: Option<Vec<u8>> = None;
+    let mut had_pipeline_error = false;
+
+    for (i, stage) in pipeline_stages.into_iter().enumerate() {
+        match stage {
+            PipelineStage::Single(agent_box) => {
+                let box_name = agent_box.name.clone();
+                eprintln!(
+                    "[pipeline] Stage {}/{}: [vm:{}] starting ...",
+                    i + 1,
+                    total_stages,
+                    box_name
+                );
+
+                let stage_start = Instant::now();
+                let stage_result = agent_box.run(carry_data.as_deref()).await?;
+                let elapsed = stage_start.elapsed();
+
+                output_hook.on_stage_result(&box_name, &stage_result);
+
+                if let (Some(t), Some(obs), Some(root)) =
+                    (tracer.as_ref(), observer, root_ctx.as_ref())
+                {
+                    finish_single_stage_span(t, obs, root, &stage_result, elapsed);
+                }
+
+                carry_data = extract_carry_data(&stage_result);
+
+                log_stage_complete(i, total_stages, &box_name, &stage_result);
+
+                if stage_result.claude_result.is_error {
+                    log_stage_error(&box_name, &stage_result.claude_result);
+                    had_pipeline_error = true;
+                    stages.push(stage_result);
+                    break;
+                }
+
+                stages.push(stage_result);
+            }
+            PipelineStage::Parallel(boxes) => {
+                let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+                let names_pretty = names.join(" | ");
+                let names_compact = names.join("|"); // for span name
+
+                eprintln!(
+                    "[pipeline] Stage {}/{}: fan-out [{}] ({} VMs in parallel)",
+                    i + 1,
+                    total_stages,
+                    names_pretty,
+                    boxes.len()
+                );
+
+                // Optional fan-out parent span (only when observed)
+                let mut fan_out_span: Option<(crate::observe::tracer::Span, Instant)> = None;
+                let mut fan_out_ctx: Option<crate::observe::tracer::SpanContext> = None;
+
+                if let (Some(t), Some(root)) = (tracer.as_ref(), root_ctx.as_ref()) {
+                    let label = format!("fan_out:[{}]", names_compact);
+                    let span = t.start_span_with_parent(&label, root);
+                    fan_out_ctx = Some(span.context.clone());
+                    fan_out_span = Some((span, Instant::now()));
+                }
+
+                let mut join_set = tokio::task::JoinSet::new();
+                for agent_box in boxes {
+                    let input = carry_data.clone();
+                    join_set.spawn(async move { agent_box.run(input.as_deref()).await });
+                }
+
+                let mut parallel_results: Vec<StageResult> = Vec::new();
+                let mut had_error = false;
+
+                while let Some(result) = join_set.join_next().await {
+                    let stage_result =
+                        result.map_err(|e| crate::Error::Guest(format!("Join error: {}", e)))??;
+
+                    output_hook.on_stage_result(&stage_result.box_name, &stage_result);
+
+                    if let (Some(t), Some(obs), Some(fo_ctx)) =
+                        (tracer.as_ref(), observer, fan_out_ctx.as_ref())
+                    {
+                        finish_parallel_stage_span(t, obs, fo_ctx, &stage_result);
+                    }
+
+                    eprintln!(
+                        "[pipeline]   [vm:{}] fan-out complete | {} tokens, ${:.4}",
+                        stage_result.box_name,
+                        stage_result.claude_result.input_tokens
+                            + stage_result.claude_result.output_tokens,
+                        stage_result.claude_result.total_cost_usd,
+                    );
+
+                    if stage_result.claude_result.is_error {
+                        log_stage_error(&stage_result.box_name, &stage_result.claude_result);
+                        had_error = true;
+                    }
+
+                    parallel_results.push(stage_result);
+                }
+
+                // Finish fan-out parent span (only when observed)
+                if let (Some(t), Some((mut span, start))) = (tracer.as_ref(), fan_out_span.take()) {
+                    span.duration = Some(start.elapsed());
+                    span.status = if had_error {
+                        SpanStatus::Error("fan-out had errors".into())
+                    } else {
+                        SpanStatus::Ok
+                    };
+                    t.finish_span(span);
+                }
+
+                carry_data = Some(merge_parallel_outputs(&parallel_results));
+                stages.extend(parallel_results);
+
+                if had_error {
+                    eprintln!("[pipeline] Fan-out stage had errors; stopping pipeline early.");
+                    had_pipeline_error = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let output = stages
+        .last()
+        .map(|s| s.claude_result.result_text.clone())
+        .unwrap_or_default();
+
+    if let (Some(t), Some((mut span, start))) = (tracer.as_ref(), root_span.take()) {
+        span.duration = Some(start.elapsed());
+        span.status = if had_pipeline_error {
+            SpanStatus::Error("pipeline had errors".into())
+        } else {
+            SpanStatus::Ok
+        };
+        span.end();
+        t.finish_span(span);
+    }
+
+    if observer.is_some() {
+        if let Err(e) = crate::observe::flush_global_otel() {
+            eprintln!("[pipeline] WARN: failed to flush OTLP exporters: {e}");
+        }
+    }
+
+    Ok(PipelineResult {
+        name: pipeline_name,
+        stages,
+        output,
+    })
+}
+
+/// Create and finish the OTel span for a single (sequential) stage.
+fn finish_single_stage_span(
+    tracer: &crate::observe::tracer::Tracer,
+    observer: &Observer,
+    root_ctx: &crate::observe::tracer::SpanContext,
+    stage_result: &StageResult,
+    elapsed: std::time::Duration,
+) {
+    let mut span =
+        tracer.start_span_with_parent(&format!("stage:{}", stage_result.box_name), root_ctx);
+    let ctx = span.context.clone();
+    instrument_stage_result(stage_result, &ctx, observer);
+    set_stage_span_attrs(&mut span, stage_result);
+    span.duration = Some(elapsed);
+    span.status = stage_status(stage_result);
+    tracer.finish_span(span);
+}
+
+/// Create and finish the OTel span for one box within a fan-out stage.
+fn finish_parallel_stage_span(
+    tracer: &crate::observe::tracer::Tracer,
+    observer: &Observer,
+    fan_out_ctx: &crate::observe::tracer::SpanContext,
+    stage_result: &StageResult,
+) {
+    let mut span =
+        tracer.start_span_with_parent(&format!("stage:{}", stage_result.box_name), fan_out_ctx);
+    let ctx = span.context.clone();
+    instrument_stage_result(stage_result, &ctx, observer);
+    set_stage_span_attrs(&mut span, stage_result);
+    span.duration = Some(std::time::Duration::from_millis(
+        stage_result.claude_result.duration_ms,
+    ));
+    span.status = stage_status(stage_result);
+    tracer.finish_span(span);
+}
+
+fn stage_status(result: &StageResult) -> SpanStatus {
+    if result.claude_result.is_error {
+        SpanStatus::Error(
+            result
+                .claude_result
+                .error
+                .clone()
+                .unwrap_or_else(|| "stage error".into()),
+        )
+    } else {
+        SpanStatus::Ok
+    }
+}
+
+fn log_stage_complete(stage_idx: usize, total_stages: usize, box_name: &str, result: &StageResult) {
+    eprintln!(
+        "[pipeline] Stage {}/{}: [vm:{}] complete | {} tokens, ${:.4}",
+        stage_idx + 1,
+        total_stages,
+        box_name,
+        result.claude_result.input_tokens + result.claude_result.output_tokens,
+        result.claude_result.total_cost_usd,
+    );
+}
+
 /// A pipeline with observability attached.
 ///
 /// Created via [`Pipeline::observe()`]. Wraps every stage execution with OTLP
@@ -409,192 +496,15 @@ impl ObservablePipeline {
     /// Execute the observed pipeline, instrumenting each stage with spans and metrics.
     pub async fn run(self) -> crate::Result<ObservedResult<PipelineResult>> {
         let observer = self.observer;
-        let pipeline_name = self.pipeline.name;
-        let pipeline_stages = self.pipeline.stages;
-        let total_stages = pipeline_stages.len();
-        let tracer = observer.tracer().clone();
 
-        // Root span: pipeline:{name}
-        let mut root_span = tracer.start_span(&format!("pipeline:{}", pipeline_name));
-        root_span.set_attribute("pipeline.name", &pipeline_name);
-        root_span.set_attribute("pipeline.stages", total_stages.to_string());
-        let root_ctx = root_span.context.clone();
-
-        let mut stages: Vec<StageResult> = Vec::new();
-        let mut carry_data: Option<Vec<u8>> = None;
-        let mut had_pipeline_error = false;
-
-        for (i, stage) in pipeline_stages.into_iter().enumerate() {
-            match stage {
-                PipelineStage::Single(agent_box) => {
-                    let box_name = agent_box.name.clone();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] starting ...",
-                        i + 1,
-                        total_stages,
-                        box_name
-                    );
-
-                    let mut stage_span =
-                        tracer.start_span_with_parent(&format!("stage:{}", box_name), &root_ctx);
-                    let stage_ctx = stage_span.context.clone();
-                    let stage_start = Instant::now();
-
-                    let stage_result = agent_box.run(carry_data.as_deref()).await?;
-                    let elapsed = stage_start.elapsed();
-
-                    // Instrument: create claude.exec + tool spans, record metrics
-                    instrument_stage_result(&stage_result, &stage_ctx, &observer);
-
-                    // Set stage span attributes and status
-                    set_stage_span_attrs(&mut stage_span, &stage_result);
-                    stage_span.duration = Some(elapsed);
-                    if stage_result.claude_result.is_error {
-                        stage_span.status = SpanStatus::Error(
-                            stage_result
-                                .claude_result
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "stage error".into()),
-                        );
-                    } else {
-                        stage_span.status = SpanStatus::Ok;
-                    }
-                    tracer.finish_span(stage_span);
-
-                    carry_data = extract_carry_data(&stage_result);
-
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] complete | {} tokens, ${:.4}",
-                        i + 1,
-                        total_stages,
-                        box_name,
-                        stage_result.claude_result.input_tokens
-                            + stage_result.claude_result.output_tokens,
-                        stage_result.claude_result.total_cost_usd,
-                    );
-
-                    if stage_result.claude_result.is_error {
-                        log_stage_error(&box_name, &stage_result.claude_result);
-                        had_pipeline_error = true;
-                        stages.push(stage_result);
-                        break;
-                    }
-
-                    stages.push(stage_result);
-                }
-                PipelineStage::Parallel(boxes) => {
-                    let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
-                    let fan_out_label = format!("fan_out:[{}]", names.join("|"));
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: fan-out [{}] ({} VMs in parallel)",
-                        i + 1,
-                        total_stages,
-                        names.join(" | "),
-                        boxes.len()
-                    );
-
-                    let mut fan_out_span = tracer.start_span_with_parent(&fan_out_label, &root_ctx);
-                    let fan_out_ctx = fan_out_span.context.clone();
-                    let fan_out_start = Instant::now();
-
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for agent_box in boxes {
-                        let input = carry_data.clone();
-                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
-                    }
-
-                    let mut parallel_results: Vec<StageResult> = Vec::new();
-                    let mut had_error = false;
-                    while let Some(result) = join_set.join_next().await {
-                        let stage_result = result
-                            .map_err(|e| crate::Error::Guest(format!("Join error: {}", e)))??;
-
-                        // Create stage span under fan_out
-                        let mut stage_span = tracer.start_span_with_parent(
-                            &format!("stage:{}", stage_result.box_name),
-                            &fan_out_ctx,
-                        );
-                        let stage_ctx = stage_span.context.clone();
-
-                        instrument_stage_result(&stage_result, &stage_ctx, &observer);
-
-                        set_stage_span_attrs(&mut stage_span, &stage_result);
-                        let stage_duration = std::time::Duration::from_millis(
-                            stage_result.claude_result.duration_ms,
-                        );
-                        stage_span.duration = Some(stage_duration);
-                        if stage_result.claude_result.is_error {
-                            stage_span.status = SpanStatus::Error(
-                                stage_result
-                                    .claude_result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "stage error".into()),
-                            );
-                        } else {
-                            stage_span.status = SpanStatus::Ok;
-                        }
-                        tracer.finish_span(stage_span);
-
-                        eprintln!(
-                            "[pipeline]   [vm:{}] fan-out complete | {} tokens, ${:.4}",
-                            stage_result.box_name,
-                            stage_result.claude_result.input_tokens
-                                + stage_result.claude_result.output_tokens,
-                            stage_result.claude_result.total_cost_usd,
-                        );
-
-                        if stage_result.claude_result.is_error {
-                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
-                            had_error = true;
-                        }
-
-                        parallel_results.push(stage_result);
-                    }
-
-                    fan_out_span.duration = Some(fan_out_start.elapsed());
-                    fan_out_span.status = if had_error {
-                        SpanStatus::Error("fan-out had errors".into())
-                    } else {
-                        SpanStatus::Ok
-                    };
-                    tracer.finish_span(fan_out_span);
-
-                    carry_data = Some(merge_parallel_outputs(&parallel_results));
-                    stages.extend(parallel_results);
-
-                    if had_error {
-                        eprintln!("[pipeline] Fan-out stage had errors; stopping pipeline early.");
-                        had_pipeline_error = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        let output = stages
-            .last()
-            .map(|s| s.claude_result.result_text.clone())
-            .unwrap_or_default();
-
-        root_span.status = if had_pipeline_error {
-            SpanStatus::Error("pipeline had errors".into())
-        } else {
-            SpanStatus::Ok
-        };
-        root_span.end();
-        tracer.finish_span(root_span);
-
-        if let Err(e) = crate::observe::flush_global_otel() {
-            eprintln!("[pipeline] WARN: failed to flush OTLP exporters: {e}");
-        }
-
-        let result = PipelineResult {
-            name: pipeline_name,
-            stages,
-            output,
-        };
+        let mut hook = NoopOutputHook;
+        let result = run_pipeline_core(
+            self.pipeline.name,
+            self.pipeline.stages,
+            &mut hook,
+            Some(&observer),
+        )
+        .await?;
 
         Ok(ObservedResult::new(result, &observer))
     }
@@ -602,193 +512,21 @@ impl ObservablePipeline {
     /// Execute the observed pipeline with a streaming callback for output chunks.
     pub async fn run_streaming<F>(
         self,
-        mut on_output: F,
+        on_output: F,
     ) -> crate::Result<ObservedResult<PipelineResult>>
     where
-        F: FnMut(&str, &ExecOutputChunk),
+        F: FnMut(&str, &ExecOutputChunk) + Send,
     {
         let observer = self.observer;
-        let pipeline_name = self.pipeline.name;
-        let pipeline_stages = self.pipeline.stages;
-        let total_stages = pipeline_stages.len();
-        let tracer = observer.tracer().clone();
 
-        let mut root_span = tracer.start_span(&format!("pipeline:{}", pipeline_name));
-        root_span.set_attribute("pipeline.name", &pipeline_name);
-        root_span.set_attribute("pipeline.stages", total_stages.to_string());
-        let root_ctx = root_span.context.clone();
-
-        let mut stages: Vec<StageResult> = Vec::new();
-        let mut carry_data: Option<Vec<u8>> = None;
-        let mut had_pipeline_error = false;
-
-        for (i, stage) in pipeline_stages.into_iter().enumerate() {
-            match stage {
-                PipelineStage::Single(agent_box) => {
-                    let box_name = agent_box.name.clone();
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] starting ...",
-                        i + 1,
-                        total_stages,
-                        box_name
-                    );
-
-                    let mut stage_span =
-                        tracer.start_span_with_parent(&format!("stage:{}", box_name), &root_ctx);
-                    let stage_ctx = stage_span.context.clone();
-                    let stage_start = Instant::now();
-
-                    let stage_result = agent_box.run(carry_data.as_deref()).await?;
-                    let elapsed = stage_start.elapsed();
-
-                    emit_synthetic_chunk(&stage_result, &box_name, &mut on_output);
-
-                    instrument_stage_result(&stage_result, &stage_ctx, &observer);
-
-                    set_stage_span_attrs(&mut stage_span, &stage_result);
-                    stage_span.duration = Some(elapsed);
-                    if stage_result.claude_result.is_error {
-                        stage_span.status = SpanStatus::Error(
-                            stage_result
-                                .claude_result
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "stage error".into()),
-                        );
-                    } else {
-                        stage_span.status = SpanStatus::Ok;
-                    }
-                    tracer.finish_span(stage_span);
-
-                    carry_data = extract_carry_data(&stage_result);
-
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: [vm:{}] complete | {} tokens, ${:.4}",
-                        i + 1,
-                        total_stages,
-                        box_name,
-                        stage_result.claude_result.input_tokens
-                            + stage_result.claude_result.output_tokens,
-                        stage_result.claude_result.total_cost_usd,
-                    );
-
-                    if stage_result.claude_result.is_error {
-                        log_stage_error(&box_name, &stage_result.claude_result);
-                        had_pipeline_error = true;
-                        stages.push(stage_result);
-                        break;
-                    }
-
-                    stages.push(stage_result);
-                }
-                PipelineStage::Parallel(boxes) => {
-                    let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
-                    let fan_out_label = format!("fan_out:[{}]", names.join("|"));
-                    eprintln!(
-                        "[pipeline] Stage {}/{}: fan-out [{}] ({} VMs in parallel)",
-                        i + 1,
-                        total_stages,
-                        names.join(" | "),
-                        boxes.len()
-                    );
-
-                    let mut fan_out_span = tracer.start_span_with_parent(&fan_out_label, &root_ctx);
-                    let fan_out_ctx = fan_out_span.context.clone();
-                    let fan_out_start = Instant::now();
-
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for agent_box in boxes {
-                        let input = carry_data.clone();
-                        join_set.spawn(async move { agent_box.run(input.as_deref()).await });
-                    }
-
-                    let mut parallel_results: Vec<StageResult> = Vec::new();
-                    let mut had_error = false;
-                    while let Some(result) = join_set.join_next().await {
-                        let stage_result = result
-                            .map_err(|e| crate::Error::Guest(format!("Join error: {}", e)))??;
-
-                        emit_synthetic_chunk(
-                            &stage_result,
-                            &stage_result.box_name.clone(),
-                            &mut on_output,
-                        );
-
-                        let mut stage_span = tracer.start_span_with_parent(
-                            &format!("stage:{}", stage_result.box_name),
-                            &fan_out_ctx,
-                        );
-                        let stage_ctx = stage_span.context.clone();
-
-                        instrument_stage_result(&stage_result, &stage_ctx, &observer);
-
-                        set_stage_span_attrs(&mut stage_span, &stage_result);
-                        let stage_duration = std::time::Duration::from_millis(
-                            stage_result.claude_result.duration_ms,
-                        );
-                        stage_span.duration = Some(stage_duration);
-                        if stage_result.claude_result.is_error {
-                            stage_span.status = SpanStatus::Error(
-                                stage_result
-                                    .claude_result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "stage error".into()),
-                            );
-                        } else {
-                            stage_span.status = SpanStatus::Ok;
-                        }
-                        tracer.finish_span(stage_span);
-
-                        if stage_result.claude_result.is_error {
-                            log_stage_error(&stage_result.box_name, &stage_result.claude_result);
-                            had_error = true;
-                        }
-
-                        parallel_results.push(stage_result);
-                    }
-
-                    fan_out_span.duration = Some(fan_out_start.elapsed());
-                    fan_out_span.status = if had_error {
-                        SpanStatus::Error("fan-out had errors".into())
-                    } else {
-                        SpanStatus::Ok
-                    };
-                    tracer.finish_span(fan_out_span);
-
-                    carry_data = Some(merge_parallel_outputs(&parallel_results));
-                    stages.extend(parallel_results);
-
-                    if had_error {
-                        had_pipeline_error = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        let output = stages
-            .last()
-            .map(|s| s.claude_result.result_text.clone())
-            .unwrap_or_default();
-
-        root_span.status = if had_pipeline_error {
-            SpanStatus::Error("pipeline had errors".into())
-        } else {
-            SpanStatus::Ok
-        };
-        root_span.end();
-        tracer.finish_span(root_span);
-
-        if let Err(e) = crate::observe::flush_global_otel() {
-            eprintln!("[pipeline] WARN: failed to flush OTLP exporters: {e}");
-        }
-
-        let result = PipelineResult {
-            name: pipeline_name,
-            stages,
-            output,
-        };
+        let mut hook = StreamingOutputHook(on_output);
+        let result = run_pipeline_core(
+            self.pipeline.name,
+            self.pipeline.stages,
+            &mut hook,
+            Some(&observer),
+        )
+        .await?;
 
         Ok(ObservedResult::new(result, &observer))
     }
@@ -836,7 +574,9 @@ fn set_stage_span_attrs(span: &mut crate::observe::tracer::Span, stage_result: &
     }
 }
 
-/// Extract carry-forward data from a stage result.
+/// Computes carry-forward bytes for the next stage.
+///
+/// Precedence: `file_output` > non-empty `result_text` > `None`.
 fn extract_carry_data(result: &StageResult) -> Option<Vec<u8>> {
     if result.file_output.is_some() {
         result.file_output.clone()
@@ -864,7 +604,7 @@ Run `claude-code /login` in the guest image (or configure OLLAMA_MODEL) and retr
     }
 }
 
-/// Emit a synthetic ExecOutputChunk for callers that want at least one event per stage.
+/// Ensures streaming callers observe at least one event per stage even if the VM produced no chunks.
 fn emit_synthetic_chunk<F>(result: &StageResult, box_name: &str, on_output: &mut F)
 where
     F: FnMut(&str, &ExecOutputChunk),
@@ -881,7 +621,9 @@ where
     }
 }
 
-/// Merge parallel stage outputs into a JSON array.
+/// Fan-out carry format: JSON array of each stage's `result_text`.
+/// (File outputs are not merged.)
+/// If serialization fails, returns `[]`.
 fn merge_parallel_outputs(results: &[StageResult]) -> Vec<u8> {
     let texts: Vec<&str> = results
         .iter()
