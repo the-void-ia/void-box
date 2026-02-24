@@ -7,6 +7,7 @@
 //! - virtio-blk for block devices (optional)
 
 pub mod serial;
+pub mod virtio_9p;
 pub mod virtio_net;
 pub mod virtio_vsock;
 pub mod virtio_vsock_mmio;

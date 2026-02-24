@@ -23,12 +23,20 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  skills: [claude-code, financial-data.md, market-mcp]    │    │
 │  │  config: memory=1024MB, vcpus=1, network=true            │    │
 │  └─────────────────────┬────────────────────────────────────┘    │
-│                        │ .build() → .run()                       │
+│                        │ resolve_guest_image() → .build() → .run()
+│  ┌─────────────────────▼───────────────────────────────────┐     │
+│  │ OCI Client (voidbox-oci/)                               │     │
+│  │  guest image → kernel + initramfs  (auto-pull, cached)  │     │
+│  │  base image  → rootfs              (pivot_root)         │     │
+│  │  OCI skills  → read-only mounts    (/skills/...)        │     │
+│  │  cache: ~/.voidbox/oci/{blobs,rootfs,guest}/            │     │
+│  └─────────────────────┬───────────────────────────────────┘     │
+│                        │                                         │
 │  ┌─────────────────────▼───────────────────────────────────┐     │
 │  │ Sandbox (sandbox/)                                      │     │
 │  │  ┌─────────────┐  ┌──────────────┐                      │     │
 │  │  │ MockSandbox │  │ LocalSandbox │                      │     │
-│  │  │ (testing)   │  │ (KVM)        │                      │     │
+│  │  │ (testing)   │  │ (KVM / VZ)   │                      │     │
 │  │  └─────────────┘  └──────┬───────┘                      │     │
 │  └──────────────────────────┼──────────────────────────────┘     │
 │                             │                                    │
@@ -38,7 +46,9 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │     │
 │  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │     │
 │  │  └────────┘ └────────┘ └───────┬─────┘ └───────┬──────┘ │     │
-│  │  Seccomp-BPF on VMM thread     │               │        │     │
+│  │  9p/virtiofs: OCI rootfs +     │               │        │     │
+│  │    skill mounts                │               │        │     │
+│  │  Seccomp-BPF on VMM thread    │               │        │     │
 │  └────────────────────────────────┼───────────────┼────────┘     │
 │                                   │               │              │
 └═══════════════════════════════════╪═══════════════╪══════════════┘
@@ -55,6 +65,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  - Applies setrlimit + command allowlist                     │ │
 │  │  - Drops privileges to uid:1000                              │ │
 │  │  - Listens on vsock port 1234                                │ │
+│  │  - pivot_root to OCI rootfs (if sandbox.image set)           │ │
 │  └────────────────────────┬─────────────────────────────────────┘ │
 │                           │ fork+exec                             │
 │  ┌────────────────────────▼─────────────────────────────────────┐ │
@@ -63,6 +74,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  --dangerously-skip-permissions                              │ │
 │  │  Skills: ~/.claude/skills/*.md                               │ │
 │  │  MCP:    ~/.claude/mcp.json                                  │ │
+│  │  OCI skills: /skills/{python,go,...} (read-only mounts)      │ │
 │  │  LLM:    Claude API / Ollama (via SLIRP → host:11434)        │ │
 │  └──────────────────────────────────────────────────────────────┘ │
 │                                                                   │
@@ -77,9 +89,13 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 ```
 1. VoidBox::new("name")           User declares skills, prompt, config
        │
-2. .build()                       Creates Sandbox (mock or KVM MicroVm)
+2. resolve_guest_image()          Resolve kernel + initramfs (5-step chain)
+       │                          Pulls from GHCR if no local paths found
        │
-3. .run(input)                    Execution begins
+3. .build()                       Creates Sandbox (mock or KVM MicroVm)
+       │                          Mounts OCI rootfs + skill images if configured
+       │
+4. .run(input)                    Execution begins
        │
    ├─ provision_security()        Write resource limits + allowlist to /etc/voidbox/
    ├─ provision_skills()          Write SKILL.md files to ~/.claude/skills/
@@ -104,7 +120,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
    ├─ parse stream-json           Extract ClaudeExecResult (tokens, cost, tools)
    ├─ read output file            /workspace/output.json
    │
-4. StageResult                    box_name, claude_result, file_output
+5. StageResult                    box_name, claude_result, file_output
 ```
 
 ### Pipeline execution
@@ -261,6 +277,53 @@ The guest-agent periodically reads `/proc/stat`, `/proc/meminfo` and sends `Tele
 | `OTEL_SERVICE_NAME` | Service name for traces (default: `void-box`) |
 
 Enable at compile time: `cargo build --features opentelemetry`
+
+## OCI Image Support
+
+VoidBox uses OCI container images at three levels, all cached at `~/.voidbox/oci/`.
+
+### Guest image (`sandbox.guest_image`)
+
+Pre-built kernel + initramfs distributed as a `FROM scratch` OCI image containing two files: `vmlinuz` and `rootfs.cpio.gz`. Auto-pulled from GHCR on first run — no local toolchain needed.
+
+```
+Resolution order:
+  1. sandbox.kernel / sandbox.initramfs   (explicit paths in spec)
+  2. VOID_BOX_KERNEL / VOID_BOX_INITRAMFS (env vars)
+  3. sandbox.guest_image                  (explicit OCI ref)
+  4. ghcr.io/the-void-ia/voidbox-guest:v{version}  (default auto-pull)
+  5. None → mock fallback (mode: auto)
+```
+
+Cache layout: `~/.voidbox/oci/guest/<sha256>/vmlinuz` + `rootfs.cpio.gz` + `<sha256>.done` marker.
+
+### Base image (`sandbox.image`)
+
+Full container image (e.g. `python:3.12-slim`) used as the guest root filesystem. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the extracted OCI image layers. Mounted read-only via 9p (Linux) or virtiofs (macOS) at `/mnt/oci-rootfs`.
+
+Cache layout: `~/.voidbox/oci/rootfs/<sha256>/` (full layer extraction with whiteout handling).
+
+### OCI skills
+
+Container images mounted read-only at arbitrary guest paths (e.g. `/skills/python`). Each skill image is pulled, extracted, and mounted independently — no `sandbox.image` required. Declared in the spec:
+
+```yaml
+skills:
+  - image: "python:3.12-slim"
+    mount: "/skills/python"
+  - image: "golang:1.23-alpine"
+    mount: "/skills/go"
+```
+
+### OCI client internals (`voidbox-oci/`)
+
+| Module | Purpose |
+|---|---|
+| `registry.rs` | OCI Distribution HTTP client (anonymous + bearer auth, HTTP for localhost) |
+| `manifest.rs` | Manifest / image index parsing, platform selection |
+| `cache.rs` | Content-addressed blob cache + rootfs/guest done markers |
+| `unpack.rs` | Layer extraction (full rootfs with whiteouts, or selective guest file extraction) |
+| `lib.rs` | `OciClient`: `pull()`, `resolve_rootfs()`, `resolve_guest_files()` |
 
 ## Skill Types
 

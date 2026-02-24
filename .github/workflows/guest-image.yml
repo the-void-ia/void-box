@@ -1,0 +1,114 @@
+name: Guest Image
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-guest:
+    name: Build Guest (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cpio gzip xz-utils zstd
+
+      - name: Install aarch64 cross-compiler
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build initramfs
+        run: |
+          ARCH=${{ matrix.arch }} OUT_CPIO=/tmp/rootfs.cpio.gz \
+            scripts/build_guest_image.sh
+
+      - name: Download kernel
+        run: |
+          ARCH=${{ matrix.arch }} scripts/download_kernel.sh
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp /tmp/rootfs.cpio.gz artifacts/rootfs.cpio.gz
+          case "${{ matrix.arch }}" in
+            x86_64)  cp target/vmlinuz-amd64  artifacts/vmlinuz ;;
+            aarch64) cp target/vmlinuz-arm64   artifacts/vmlinuz ;;
+          esac
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-${{ matrix.arch }}
+          path: artifacts/
+
+  push-image:
+    name: Push Multi-Arch Image
+    needs: build-guest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download x86_64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-x86_64
+          path: staging/amd64/
+
+      - name: Download aarch64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-aarch64
+          path: staging/arm64/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tag
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Dockerfile
+        run: |
+          cat > staging/Dockerfile <<'EOF'
+          FROM scratch
+          ARG TARGETARCH
+          COPY ${TARGETARCH}/vmlinuz /vmlinuz
+          COPY ${TARGETARCH}/rootfs.cpio.gz /rootfs.cpio.gz
+          EOF
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: staging
+          file: staging/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/the-void-ia/voidbox-guest:${{ steps.tag.outputs.version }}
+            ghcr.io/the-void-ia/voidbox-guest:latest

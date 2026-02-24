@@ -76,6 +76,17 @@ pub enum SkillKind {
         /// Path to the SKILL.md file
         path: PathBuf,
     },
+    /// OCI image skill -- capabilities provided by a container image.
+    /// The image is pulled, extracted, and mounted read-only at the specified path.
+    /// The guest PATH is extended to include `<mount>/usr/bin` and `<mount>/usr/local/bin`.
+    Oci {
+        /// OCI image reference (e.g. "ghcr.io/voidbox/skill-jq:1.7")
+        image: String,
+        /// Guest mount point (e.g. "/skills/jq")
+        mount: String,
+        /// Whether the mount is read-only (default: true)
+        readonly: bool,
+    },
 }
 
 impl Skill {
@@ -130,6 +141,37 @@ impl Skill {
         let name = id.rsplit('/').next().unwrap_or(&id).to_string();
         Self {
             kind: SkillKind::Remote { id },
+            name,
+            description_text: None,
+        }
+    }
+
+    /// Create an OCI image skill.
+    ///
+    /// The image will be pulled, extracted, and mounted at the given path.
+    ///
+    /// ```no_run
+    /// use void_box::skill::Skill;
+    ///
+    /// let jq = Skill::oci("ghcr.io/voidbox/skill-jq:1.7", "/skills/jq");
+    /// ```
+    pub fn oci(image: impl Into<String>, mount: impl Into<String>) -> Self {
+        let image = image.into();
+        // Derive name from the last path segment of the image
+        let name = image
+            .rsplit('/')
+            .next()
+            .unwrap_or(&image)
+            .split(':')
+            .next()
+            .unwrap_or("oci-skill")
+            .to_string();
+        Self {
+            kind: SkillKind::Oci {
+                image,
+                mount: mount.into(),
+                readonly: true,
+            },
             name,
             description_text: None,
         }

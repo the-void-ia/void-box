@@ -26,6 +26,7 @@
 <p align="center">
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#oci-container-support">OCI Support</a> ·
   <a href="#observability">Observability</a>
 </p>
 
@@ -48,6 +49,7 @@
 - **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
 - **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude (default) or Ollama via Claude-compatible provider mode.
+- **OCI-native** — Auto-pulls guest images (kernel + initramfs) from GHCR on first run. Mount container images as base OS or as skill providers — no local build steps required.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
@@ -149,27 +151,35 @@ voidbox run --file hackernews_agent.yaml
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│ Host                                         │
-│  VoidBox Engine / Pipeline Orchestrator      │
-│                                              │
-│  ┌─────────────────────────────────────┐     │
-│  │ VMM (KVM)                           │     │
-│  │  vsock ←→ guest-agent (PID 1)       │     │
-│  │  SLIRP ←→ eth0 (10.0.2.15)          │     │
-│  └─────────────────────────────────────┘     │
-│                                              │
-│  Seccomp-BPF │ OTLP export                   │
-└──────────────┼───────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ Host                                                  │
+│  VoidBox Engine / Pipeline Orchestrator               │
+│                                                       │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │ OCI Client (~/.voidbox/oci/)                    │  │
+│  │  guest image → kernel + initramfs (auto-pull)   │  │
+│  │  base image  → rootfs (pivot_root)              │  │
+│  │  OCI skills  → read-only mounts                 │  │
+│  └─────────────────────┬───────────────────────────┘  │
+│                        │                              │
+│  ┌─────────────────────▼───────────────────────────┐  │
+│  │ VMM (KVM / Virtualization.framework)            │  │
+│  │  vsock ←→ guest-agent (PID 1)                   │  │
+│  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
+│  │  9p/virtiofs ←→ OCI rootfs + skill mounts       │  │
+│  └─────────────────────────────────────────────────┘  │
+│                                                       │
+│  Seccomp-BPF │ OTLP export                            │
+└──────────────┼────────────────────────────────────────┘
      Hardware  │  Isolation
-═══════════════╪════════════════════════════════
+═══════════════╪════════════════════════════════════════
                │
-┌──────────────▼──────────────────────────────────────┐
-│ Guest VM (Linux)                                    │
-│  guest-agent: auth, allowlist, rlimits              │
-│  claude-code runtime (Claude API or Ollama backend) │
-│  skills provisioned into isolated runtime           │
-└─────────────────────────────────────────────────────┘
+┌──────────────▼──────────────────────────────────────────┐
+│ Guest VM (Linux)                                        │
+│  guest-agent: auth, allowlist, rlimits                  │
+│  claude-code runtime (Claude API or Ollama backend)     │
+│  OCI rootfs (pivot_root) + skill mounts (/skills/...)   │
+└─────────────────────────────────────────────────────────┘
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full component diagram, wire protocol, and security model.
@@ -195,31 +205,64 @@ See the [playground](playground/) for a ready-to-run stack with Grafana, Tempo, 
 
 ## Running & Testing
 
+### KVM mode (zero-setup)
+
+On a Linux host with `/dev/kvm`, VoidBox auto-pulls a pre-built guest image (kernel + initramfs) from GHCR on first run. No manual build steps required:
+
+```bash
+# Just works — guest image is pulled and cached automatically
+ANTHROPIC_API_KEY=sk-ant-xxx \
+cargo run --bin voidbox -- run --file examples/specs/oci/agent.yaml
+
+# Or with Ollama
+cargo run --bin voidbox -- run --file examples/specs/oci/workflow.yaml
+```
+
+The guest image (`ghcr.io/the-void-ia/voidbox-guest`) contains the kernel and initramfs with guest-agent, busybox, and common tools. It's cached at `~/.voidbox/oci/guest/` after the first pull.
+
+**Resolution order** — VoidBox resolves the kernel/initramfs using:
+
+1. `sandbox.kernel` / `sandbox.initramfs` in the spec (explicit paths)
+2. `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` env vars
+3. `sandbox.guest_image` in the spec (explicit OCI ref)
+4. Default: `ghcr.io/the-void-ia/voidbox-guest:v{version}` (auto-pull)
+5. Mock fallback when `mode: auto`
+
+To use a custom guest image or disable auto-pull:
+
+```yaml
+sandbox:
+  # Use a specific guest image
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:latest"
+
+  # Or disable auto-pull (empty string)
+  # guest_image: ""
+```
+
+### KVM mode (manual build)
+
+If you prefer to build the guest image locally:
+
+```bash
+# Build guest initramfs (includes claude-code binary, busybox, CA certs)
+scripts/build_guest_image.sh
+
+# Download a kernel
+scripts/download_kernel.sh
+
+# Run with explicit paths
+ANTHROPIC_API_KEY=sk-ant-xxx \
+VOID_BOX_KERNEL=target/vmlinuz-amd64 \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline
+```
+
 ### Mock mode (no KVM required)
 
 ```bash
 cargo run --example quick_demo
 cargo run --example trading_pipeline
 cargo run --example parallel_pipeline
-```
-
-### KVM mode
-
-```bash
-# Build guest initramfs (includes claude-code binary, busybox, CA certs)
-scripts/build_claude_rootfs.sh
-
-# Run with Claude API
-ANTHROPIC_API_KEY=sk-ant-xxx \
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example trading_pipeline
-
-# Or with Ollama
-OLLAMA_MODEL=qwen3-coder \
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example trading_pipeline
 ```
 
 ### macOS mode (Apple Silicon)
@@ -285,6 +328,81 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
 ---
 
+## OCI Container Support
+
+VoidBox supports OCI container images in three ways:
+
+1. **`sandbox.guest_image`** — Pre-built kernel + initramfs distributed as an OCI image. Auto-pulled from GHCR on first run (no local build needed). See [KVM mode (zero-setup)](#kvm-mode-zero-setup).
+2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
+3. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
+
+Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry, cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
+
+### Example: OCI skills
+
+Mount Python, Go, and Java into a single agent — no `sandbox.image` needed:
+
+```yaml
+# examples/specs/oci/skills.yaml
+api_version: v1
+kind: agent
+name: multi-tool-agent
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 2
+  network: true
+
+llm:
+  provider: ollama
+  model: "qwen2.5-coder:7b"
+
+agent:
+  prompt: >
+    You have Python, Go, and Java available as mounted skills.
+    Set up PATH to include the skill binaries:
+      export PATH=/skills/python/usr/local/bin:/skills/go/usr/local/go/bin:/skills/java/bin:$PATH
+
+    Write a "Hello from <language>" one-liner in each language and run all three.
+    Report which versions are installed.
+  skills:
+    - "agent:claude-code"
+    - image: "python:3.12-slim"
+      mount: "/skills/python"
+    - image: "golang:1.23-alpine"
+      mount: "/skills/go"
+    - image: "eclipse-temurin:21-jdk-alpine"
+      mount: "/skills/java"
+  timeout_secs: 300
+```
+
+Run it:
+
+```bash
+# Linux (KVM)
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
+
+# macOS (Virtualization.framework) — requires initramfs already built (see "macOS mode" above)
+VOID_BOX_KERNEL=target/vmlinuz-arm64 \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
+```
+
+More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
+
+| Spec | Description |
+|------|-------------|
+| `agent.yaml` | Single agent with `sandbox.image: python:3.12-slim` |
+| `workflow.yaml` | Workflow with `sandbox.image: alpine:3.20` (no LLM) |
+| `pipeline.yaml` | Multi-language pipeline: Python base + Go and Java OCI skills |
+| `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
+| `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs |
+
+---
+
 ## Roadmap
 
 VoidBox is evolving toward a durable, capability-bound execution platform.
@@ -292,7 +410,6 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 - **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
 - **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
 - **Persistent block devices (virtio-blk)** — Stateful workloads across VM restarts.
-- **aarch64 support** — Native ARM64 builds with release pipeline cross-compilation.
 - **Codex-style backend support** — Optional execution backend for code-first workflows.
 - **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 

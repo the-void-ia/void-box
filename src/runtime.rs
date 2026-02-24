@@ -3,16 +3,25 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::agent_box::VoidBox;
+use crate::backend::MountConfig;
 use crate::llm::LlmProvider;
 use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
-use crate::skill::Skill;
+use crate::skill::{Skill, SkillKind};
 use crate::spec::{
-    load_spec, BoxSandboxOverride, LlmSpec, PipelineBoxSpec, PipelineStageSpec, RunKind, RunSpec,
+    load_spec, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec, PipelineStageSpec, RunKind,
+    RunSpec, SkillEntry,
 };
+
+/// Tracks host directories created for pipeline stage outputs.
+/// Maps output_name -> host_path.
+type OutputRegistry = HashMap<String, PathBuf>;
 use crate::workflow::Workflow;
 use crate::workflow::WorkflowExt;
 use crate::{Error, Result};
+
+/// Well-known guest path for OCI rootfs mounts.
+const OCI_ROOTFS_GUEST_PATH: &str = "/mnt/oci-rootfs";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunReport {
@@ -46,12 +55,28 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
         .as_ref()
         .ok_or_else(|| Error::Config("missing agent section".into()))?;
 
+    // Resolve guest image (kernel + initramfs) via the 5-step chain.
+    let guest = resolve_guest_image(spec).await;
+
+    // Resolve OCI base image before building the sandbox (async).
+    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+        eprintln!("[void-box] Resolving OCI base image: {}", image);
+        Some(resolve_oci_base_image(image).await?)
+    } else {
+        None
+    };
+
     let mut builder = VoidBox::new(&spec.name).prompt(&agent.prompt);
-    builder = apply_box_sandbox(builder, spec);
+    builder = apply_box_sandbox(builder, spec, guest.as_ref());
     builder = apply_box_llm(builder, spec.llm.as_ref());
 
+    // Wire OCI rootfs mount if resolved.
+    if let Some(ref rootfs_dir) = oci_rootfs_host {
+        builder = apply_oci_rootfs(builder, rootfs_dir);
+    }
+
     for s in &agent.skills {
-        builder = builder.skill(parse_skill(s)?);
+        builder = builder.skill(parse_skill_entry(s)?);
     }
 
     if let Some(timeout_secs) = agent.timeout_secs {
@@ -93,9 +118,44 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
         .as_ref()
         .ok_or_else(|| Error::Config("missing pipeline section".into()))?;
 
+    // Resolve guest image (kernel + initramfs) via the 5-step chain.
+    let guest = resolve_guest_image(spec).await;
+
+    // Resolve OCI base image before building the sandbox (async).
+    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+        eprintln!("[void-box] Resolving OCI base image: {}", image);
+        Some(resolve_oci_base_image(image).await?)
+    } else {
+        None
+    };
+
+    // Build output registry from all declared outputs across all boxes.
+    // We create host dirs eagerly so that input wiring can reference them.
+    let mut output_registry: OutputRegistry = HashMap::new();
+    for b in &pipeline.boxes {
+        for output in &b.outputs {
+            let host_dir =
+                std::env::temp_dir().join(format!("voidbox-pipeline-{}-{}", b.name, output.name,));
+            std::fs::create_dir_all(&host_dir).map_err(|e| {
+                crate::Error::Config(format!(
+                    "failed to create output dir {}: {}",
+                    host_dir.display(),
+                    e
+                ))
+            })?;
+            output_registry.insert(output.name.clone(), host_dir);
+        }
+    }
+
     let mut boxes_by_name: HashMap<String, VoidBox> = HashMap::new();
     for b in &pipeline.boxes {
-        let ab = build_pipeline_box(spec, b)?;
+        let ab = build_pipeline_box_with_io(
+            spec,
+            b,
+            &output_registry,
+            oci_rootfs_host.as_deref(),
+            guest.as_ref(),
+        )?;
         boxes_by_name.insert(b.name.clone(), ab);
     }
 
@@ -178,6 +238,17 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
         .as_ref()
         .ok_or_else(|| Error::Config("missing workflow section".into()))?;
 
+    // Resolve guest image (kernel + initramfs) via the 5-step chain.
+    let guest = resolve_guest_image(spec).await;
+
+    // Resolve OCI base image before building the sandbox (async).
+    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+        eprintln!("[void-box] Resolving OCI base image: {}", image);
+        Some(resolve_oci_base_image(image).await?)
+    } else {
+        None
+    };
+
     let mut builder = Workflow::define(&spec.name);
 
     for step in &w.steps {
@@ -218,7 +289,7 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 
     let workflow = builder.build();
 
-    let sandbox = build_shared_sandbox(spec)?;
+    let sandbox = build_shared_sandbox(spec, oci_rootfs_host.as_deref(), guest.as_ref())?;
 
     let observed = workflow
         .observe(crate::observe::ObserveConfig::from_env())
@@ -243,21 +314,93 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     })
 }
 
-fn build_pipeline_box(spec: &RunSpec, b: &PipelineBoxSpec) -> Result<VoidBox> {
+/// Build a pipeline box with mount-based I/O wiring.
+///
+/// `output_registry` maps output names from previous stages to host directories.
+/// This function:
+/// 1. For each `input` declared by the box, mounts the corresponding output host
+///    directory read-only at the specified guest path.
+/// 2. For each `output` declared by the box, creates a temp directory on the host
+///    and mounts it read-write at the specified guest path.
+/// 3. Returns the built VoidBox and the newly created output mappings.
+fn build_pipeline_box_with_io(
+    spec: &RunSpec,
+    b: &PipelineBoxSpec,
+    output_registry: &OutputRegistry,
+    oci_rootfs_host: Option<&Path>,
+    guest: Option<&GuestFiles>,
+) -> Result<VoidBox> {
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
-    builder = apply_box_sandbox(builder, spec);
+    builder = apply_box_sandbox(builder, spec, guest);
     builder = apply_box_overrides(builder, b.sandbox.as_ref());
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
     for s in &b.skills {
-        builder = builder.skill(parse_skill(s)?);
+        builder = builder.skill(parse_skill_entry(s)?);
     }
     if let Some(t) = b.timeout_secs {
         builder = builder.timeout_secs(t);
     }
+
+    // Wire inputs from previous stages' outputs
+    for input in &b.inputs {
+        if let Some(host_dir) = output_registry.get(&input.from) {
+            builder = builder.mount(MountConfig {
+                host_path: host_dir.to_string_lossy().into_owned(),
+                guest_path: input.guest.clone(),
+                read_only: true,
+            });
+            eprintln!(
+                "[pipeline:{}] Mounting input '{}' from {} at {}",
+                b.name,
+                input.from,
+                host_dir.display(),
+                input.guest,
+            );
+        } else {
+            return Err(crate::Error::Config(format!(
+                "box '{}' input '{}' references unknown output (available: {:?})",
+                b.name,
+                input.from,
+                output_registry.keys().collect::<Vec<_>>(),
+            )));
+        }
+    }
+
+    // Wire outputs: mount the pre-created host dirs from the output registry
+    for output in &b.outputs {
+        let host_dir = output_registry.get(&output.name).ok_or_else(|| {
+            crate::Error::Config(format!(
+                "box '{}' output '{}' not found in output registry",
+                b.name, output.name,
+            ))
+        })?;
+        builder = builder.mount(MountConfig {
+            host_path: host_dir.to_string_lossy().into_owned(),
+            guest_path: output.guest.clone(),
+            read_only: false,
+        });
+        eprintln!(
+            "[pipeline:{}] Mounting output '{}' at {} -> {}",
+            b.name,
+            output.name,
+            output.guest,
+            host_dir.display(),
+        );
+    }
+
+    // Wire OCI rootfs mount if resolved.
+    if let Some(rootfs_dir) = oci_rootfs_host {
+        builder = apply_oci_rootfs(builder, rootfs_dir);
+    }
+
     builder.build()
 }
 
-fn build_shared_sandbox(spec: &RunSpec) -> Result<std::sync::Arc<Sandbox>> {
+fn build_shared_sandbox(
+    spec: &RunSpec,
+    oci_rootfs_host: Option<&Path>,
+    guest: Option<&GuestFiles>,
+) -> Result<std::sync::Arc<Sandbox>> {
     let mode = spec.sandbox.mode.to_ascii_lowercase();
     if mode == "mock" {
         return Sandbox::mock().build();
@@ -268,26 +411,35 @@ fn build_shared_sandbox(spec: &RunSpec) -> Result<std::sync::Arc<Sandbox>> {
         .vcpus(spec.sandbox.vcpus)
         .network(spec.sandbox.network);
 
-    let kernel = resolve_kernel(spec);
-    let initramfs = resolve_initramfs(spec);
-
-    if let Some(k) = kernel {
-        builder = builder.kernel(k);
-    }
-    if let Some(i) = initramfs {
-        builder = builder.initramfs(i);
+    if let Some(g) = guest {
+        builder = builder.kernel(&g.kernel);
+        if let Some(ref i) = g.initramfs {
+            builder = builder.initramfs(i);
+        }
     }
 
     for (k, v) in &spec.sandbox.env {
         builder = builder.env(k, v);
     }
 
-    if mode == "local"
-        && spec.sandbox.kernel.is_none()
-        && std::env::var_os("VOID_BOX_KERNEL").is_none()
-    {
+    for m in &spec.sandbox.mounts {
+        builder = builder.mount(mount_spec_to_config(m));
+    }
+
+    // OCI rootfs mount + pivot_root flag
+    if let Some(rootfs_dir) = oci_rootfs_host {
+        builder = builder
+            .mount(MountConfig {
+                host_path: rootfs_dir.to_string_lossy().into_owned(),
+                guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
+                read_only: true,
+            })
+            .oci_rootfs(OCI_ROOTFS_GUEST_PATH);
+    }
+
+    if mode == "local" && guest.is_none() {
         return Err(Error::Config(
-            "sandbox.mode=local requires sandbox.kernel or VOID_BOX_KERNEL".into(),
+            "sandbox.mode=local requires a kernel (sandbox.kernel, VOID_BOX_KERNEL, or guest_image)".into(),
         ));
     }
 
@@ -301,7 +453,7 @@ fn build_shared_sandbox(spec: &RunSpec) -> Result<std::sync::Arc<Sandbox>> {
     })
 }
 
-fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec) -> VoidBox {
+fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec, guest: Option<&GuestFiles>) -> VoidBox {
     let mode = spec.sandbox.mode.to_ascii_lowercase();
     if mode == "mock" {
         return builder.mock();
@@ -312,28 +464,106 @@ fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec) -> VoidBox {
         .vcpus(spec.sandbox.vcpus)
         .network(spec.sandbox.network);
 
-    if let Some(k) = resolve_kernel(spec) {
-        builder = builder.kernel(k);
-    }
-    if let Some(i) = resolve_initramfs(spec) {
-        builder = builder.initramfs(i);
+    if let Some(g) = guest {
+        builder = builder.kernel(&g.kernel);
+        if let Some(ref i) = g.initramfs {
+            builder = builder.initramfs(i);
+        }
     }
 
     for (k, v) in &spec.sandbox.env {
         builder = builder.env(k, resolve_env_value(k, v));
     }
 
-    if mode == "auto" {
-        let has_kernel = resolve_kernel(spec).is_some();
-        if !has_kernel {
-            builder = builder.mock();
-        }
+    for m in &spec.sandbox.mounts {
+        builder = builder.mount(mount_spec_to_config(m));
+    }
+
+    if mode == "auto" && guest.is_none() {
+        builder = builder.mock();
     }
 
     builder
 }
 
-fn resolve_kernel(spec: &RunSpec) -> Option<PathBuf> {
+/// Pre-resolved guest files (kernel + optional initramfs).
+struct GuestFiles {
+    kernel: PathBuf,
+    initramfs: Option<PathBuf>,
+}
+
+/// Resolve guest image files following the 5-step resolution chain:
+///
+/// 1. `spec.sandbox.kernel` / `spec.sandbox.initramfs` (explicit paths)
+/// 2. `$VOID_BOX_KERNEL` / `$VOID_BOX_INITRAMFS` env vars
+/// 3. `spec.sandbox.guest_image` OCI ref (explicit)
+/// 4. Default: `ghcr.io/the-void-ia/voidbox-guest:v{CARGO_PKG_VERSION}`
+/// 5. `None` → mock fallback when `mode: auto`
+async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
+    // Steps 1-2: local kernel/initramfs paths (sync).
+    if let Some(kernel) = resolve_kernel_local(spec) {
+        return Some(GuestFiles {
+            kernel,
+            initramfs: resolve_initramfs_local(spec),
+        });
+    }
+
+    // Step 3: explicit guest_image in spec.
+    // An empty string means "disable auto-pull".
+    if let Some(ref guest_image) = spec.sandbox.guest_image {
+        if guest_image.is_empty() {
+            return None;
+        }
+        match resolve_oci_guest_image(guest_image).await {
+            Ok(files) => return Some(files),
+            Err(e) => {
+                eprintln!(
+                    "[void-box] Failed to resolve guest image '{}': {}",
+                    guest_image, e
+                );
+                if spec.sandbox.mode.eq_ignore_ascii_case("auto") {
+                    return None;
+                }
+                return None;
+            }
+        }
+    }
+
+    // Step 4: default OCI image reference.
+    let version = env!("CARGO_PKG_VERSION");
+    let default_ref = format!("ghcr.io/the-void-ia/voidbox-guest:v{}", version);
+    match resolve_oci_guest_image(&default_ref).await {
+        Ok(files) => Some(files),
+        Err(e) => {
+            eprintln!(
+                "[void-box] Failed to resolve default guest image '{}': {}",
+                default_ref, e
+            );
+            // Step 5: None → callers will fall back to mock when mode=auto.
+            None
+        }
+    }
+}
+
+/// Pull + extract guest files from an OCI image reference.
+async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
+    eprintln!("[void-box] Resolving guest image: {}", image_ref);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+    let client = voidbox_oci::OciClient::new(cache_dir);
+    let guest = client.resolve_guest_files(image_ref).await.map_err(|e| {
+        Error::Config(format!(
+            "failed to resolve guest image '{}': {}",
+            image_ref, e
+        ))
+    })?;
+    Ok(GuestFiles {
+        kernel: guest.kernel,
+        initramfs: Some(guest.initramfs),
+    })
+}
+
+fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {
     spec.sandbox
         .kernel
         .as_ref()
@@ -342,7 +572,7 @@ fn resolve_kernel(spec: &RunSpec) -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-fn resolve_initramfs(spec: &RunSpec) -> Option<PathBuf> {
+fn resolve_initramfs_local(spec: &RunSpec) -> Option<PathBuf> {
     spec.sandbox
         .initramfs
         .as_ref()
@@ -367,6 +597,9 @@ fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverri
     }
     for (k, v) in &ov.env {
         builder = builder.env(k, resolve_env_value(k, v));
+    }
+    for m in &ov.mounts {
+        builder = builder.mount(mount_spec_to_config(m));
     }
     builder
 }
@@ -450,6 +683,66 @@ fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
     }
 
     spec.llm = Some(llm);
+}
+
+/// Parse a `SkillEntry` (either a simple string or an OCI object) into a `Skill`.
+fn parse_skill_entry(entry: &SkillEntry) -> Result<Skill> {
+    match entry {
+        SkillEntry::Simple(raw) => parse_skill(raw),
+        SkillEntry::Oci {
+            image,
+            mount,
+            readonly,
+        } => {
+            let mut skill = Skill::oci(image, mount);
+            if let SkillKind::Oci {
+                readonly: ref mut ro,
+                ..
+            } = skill.kind
+            {
+                *ro = *readonly;
+            }
+            Ok(skill)
+        }
+    }
+}
+
+/// Convert a YAML `MountSpec` into a backend `MountConfig`.
+fn mount_spec_to_config(spec: &MountSpec) -> MountConfig {
+    MountConfig {
+        host_path: spec.host.clone(),
+        guest_path: spec.guest.clone(),
+        read_only: spec.mode != "rw",
+    }
+}
+
+/// Resolve an OCI base image to a host directory containing the extracted rootfs.
+///
+/// Uses `~/.voidbox/oci/` as the content-addressed cache directory.
+/// Returns the path to the extracted rootfs on the host.
+async fn resolve_oci_base_image(image_ref: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+    let client = voidbox_oci::OciClient::new(cache_dir);
+    client.resolve_rootfs(image_ref).await.map_err(|e| {
+        Error::Config(format!(
+            "failed to resolve OCI image '{}': {}",
+            image_ref, e
+        ))
+    })
+}
+
+/// Wire an OCI base image into a VoidBox builder: add a read-only mount at
+/// `/mnt/oci-rootfs` and set the `oci_rootfs` flag so the guest-agent does
+/// `pivot_root` after boot.
+fn apply_oci_rootfs(builder: VoidBox, rootfs_host_path: &Path) -> VoidBox {
+    builder
+        .mount(MountConfig {
+            host_path: rootfs_host_path.to_string_lossy().into_owned(),
+            guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
+            read_only: true,
+        })
+        .oci_rootfs(OCI_ROOTFS_GUEST_PATH)
 }
 
 fn parse_skill(raw: &str) -> Result<Skill> {

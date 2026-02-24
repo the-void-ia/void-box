@@ -46,6 +46,21 @@ pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
     // (same as KVM, since both use virtio)
     // Note: rootfs setup is handled by the caller if needed
 
+    // Mount config: tell the guest-agent which virtiofs tags to mount and where.
+    // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
+    for (i, mount) in config.mounts.iter().enumerate() {
+        let mode = if mount.read_only { "ro" } else { "rw" };
+        parts.push(format!(
+            "voidbox.mount{}=mount{}:{}:{}",
+            i, i, mount.guest_path, mode
+        ));
+    }
+
+    // OCI rootfs: tell the guest-agent to pivot_root to the mounted rootfs.
+    if let Some(ref oci_path) = config.oci_rootfs {
+        parts.push(format!("voidbox.oci_rootfs={}", oci_path));
+    }
+
     parts.join(" ")
 }
 
@@ -70,6 +85,8 @@ mod tests {
             network: true,
             enable_vsock: true,
             shared_dir: None,
+            mounts: vec![],
+            oci_rootfs: None,
             env: vec![],
             security: BackendSecurityConfig {
                 session_secret: [0xAB; 32],

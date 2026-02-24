@@ -28,6 +28,17 @@ use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
 use crate::ExecOutput;
 
+/// A single host→guest directory mount.
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    /// Absolute path on the host.
+    pub host_path: String,
+    /// Mount point inside the guest.
+    pub guest_path: String,
+    /// Read-only mount.
+    pub read_only: bool,
+}
+
 /// Configuration passed to [`VmmBackend::start`].
 ///
 /// This is a backend-agnostic description of what the caller wants.
@@ -50,6 +61,10 @@ pub struct BackendConfig {
     pub enable_vsock: bool,
     /// Host directory to share with guest (virtiofs on macOS, future on Linux).
     pub shared_dir: Option<PathBuf>,
+    /// Host directory mounts into the guest.
+    pub mounts: Vec<MountConfig>,
+    /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
+    pub oci_rootfs: Option<String>,
     /// Environment variables to inject into guest commands.
     pub env: Vec<(String, String)>,
     /// Security configuration.

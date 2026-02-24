@@ -11,6 +11,7 @@ use tracing::{debug, error, trace, warn};
 use vm_memory::Address;
 
 use crate::devices::serial::SerialDevice;
+use crate::devices::virtio_9p::Virtio9pDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::vmm::kvm::Vm;
@@ -58,6 +59,7 @@ impl VcpuHandle {
 pub struct MmioDevices {
     pub virtio_net: Option<Arc<Mutex<VirtioNetDevice>>>,
     pub virtio_vsock: Option<Arc<Mutex<VirtioVsockMmio>>>,
+    pub virtio_9p: Option<Arc<Mutex<Virtio9pDevice>>>,
 }
 
 /// Create and start a vCPU
@@ -234,6 +236,28 @@ fn vcpu_run_loop(
             }
         }
 
+        // Inject IRQ 12 (virtio-9p) if the device has a pending interrupt.
+        if let Some(ref dev) = mmio_devices.virtio_9p {
+            let guard = dev.lock().unwrap();
+            if guard.has_pending_interrupt() {
+                #[repr(C)]
+                struct KvmIrqLevel {
+                    irq: u32,
+                    level: u32,
+                }
+                const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+                let vm_fd = vm.vm_fd().as_raw_fd();
+                let assert = KvmIrqLevel { irq: 12, level: 1 };
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
+                }
+                let deassert = KvmIrqLevel { irq: 12, level: 0 };
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+                }
+            }
+        }
+
         match vcpu_fd.run() {
             Ok(exit_reason) => {
                 trace!("vCPU {} exit: {:?}", vcpu_id, exit_reason);
@@ -258,8 +282,21 @@ fn vcpu_run_loop(
                         } else {
                             false
                         };
+                        let handled = handled
+                            || if let Some(ref dev) = mmio_devices.virtio_vsock {
+                                let guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    guard.mmio_read(offset, data);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
                         if !handled {
-                            if let Some(ref dev) = mmio_devices.virtio_vsock {
+                            if let Some(ref dev) = mmio_devices.virtio_9p {
                                 let guard = dev.lock().unwrap();
                                 if guard.handles_mmio(addr) {
                                     let offset = addr - guard.mmio_base();
@@ -285,14 +322,27 @@ fn vcpu_run_loop(
                         } else {
                             false
                         };
-                        if !handled {
-                            if let Some(ref dev) = mmio_devices.virtio_vsock {
+                        let handled = handled
+                            || if let Some(ref dev) = mmio_devices.virtio_vsock {
                                 let mut guard = dev.lock().unwrap();
                                 if guard.handles_mmio(addr) {
                                     let offset = addr - guard.mmio_base();
                                     if let Err(e) = guard.mmio_write(offset, data, guest_memory) {
                                         debug!("virtio-vsock MMIO write error: {}", e);
                                     }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                        if !handled {
+                            if let Some(ref dev) = mmio_devices.virtio_9p {
+                                let mut guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    guard.mmio_write(offset, data, Some(guest_memory));
                                 }
                             }
                         }

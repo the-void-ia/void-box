@@ -68,6 +68,10 @@ pub struct VoidBoxConfig {
     pub tap_name: Option<String>,
     /// Host directory to share with guest
     pub shared_dir: Option<PathBuf>,
+    /// Host directory mounts (virtio-9p on Linux).
+    pub mounts: Vec<crate::backend::MountConfig>,
+    /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
+    pub oci_rootfs: Option<String>,
     /// Enable vsock for host-guest communication
     pub enable_vsock: bool,
     /// Vsock context ID (auto-generated if not specified)
@@ -89,6 +93,8 @@ impl Default for VoidBoxConfig {
             network: false,
             tap_name: None,
             shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
             enable_vsock: true,
             cid: None,
             extra_cmdline: Vec::new(),
@@ -197,6 +203,9 @@ impl VoidBoxConfig {
         if self.enable_vsock {
             cmdline.push("virtio_mmio.device=512@0xd0800000:11".to_string());
         }
+        if !self.mounts.is_empty() {
+            cmdline.push("virtio_mmio.device=512@0xd1000000:12".to_string());
+        }
 
         // Add root device if rootfs is specified
         if self.rootfs.is_some() {
@@ -222,6 +231,21 @@ impl VoidBoxConfig {
             .unwrap_or_default()
             .as_secs();
         cmdline.push(format!("voidbox.clock={}", epoch_secs));
+
+        // Mount config: tell the guest-agent which 9p tags to mount and where.
+        // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
+        for (i, mount) in self.mounts.iter().enumerate() {
+            let mode = if mount.read_only { "ro" } else { "rw" };
+            cmdline.push(format!(
+                "voidbox.mount{}=mount{}:{}:{}",
+                i, i, mount.guest_path, mode
+            ));
+        }
+
+        // OCI rootfs: tell the guest-agent to pivot_root to the mounted rootfs.
+        if let Some(ref oci_path) = self.oci_rootfs {
+            cmdline.push(format!("voidbox.oci_rootfs={}", oci_path));
+        }
 
         // Add extra arguments
         cmdline.extend(self.extra_cmdline.clone());

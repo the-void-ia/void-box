@@ -1,0 +1,59 @@
+api_version: v1
+kind: pipeline
+name: polyglot-pipeline
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 2
+  network: true
+  image: "python:3.12-slim"
+
+llm:
+  provider: ollama
+  model: "qwen2.5-coder:7b"
+
+pipeline:
+  boxes:
+    - name: python-gen
+      prompt: >
+        Write a Python script to /workspace/output.json that generates
+        a JSON object with fields: timestamp (ISO 8601), platform (uname),
+        and a random hex token (16 bytes). Run it and output the JSON.
+      skills:
+        - "agent:claude-code"
+      timeout_secs: 300
+
+    - name: go-validate
+      prompt: >
+        You have Go available at /skills/go. Set PATH to include
+        /skills/go/usr/local/go/bin. Read the JSON from
+        /workspace/input.json and write a Go program to /workspace/validate.go
+        that unmarshals it, checks all three fields are non-empty, and prints
+        "VALID" or "INVALID:<reason>". Run it with `go run`.
+      skills:
+        - "agent:claude-code"
+        - image: "golang:1.23-alpine"
+          mount: "/skills/go"
+      timeout_secs: 300
+
+    - name: java-report
+      prompt: >
+        You have Java available at /skills/java. Set JAVA_HOME=/skills/java
+        and PATH=$JAVA_HOME/bin:$PATH. Read the JSON from
+        /workspace/input.json and write a single-file Java program
+        /workspace/Report.java that prints a formatted summary. Compile
+        and run it with `javac` and `java`.
+      skills:
+        - "agent:claude-code"
+        - image: "eclipse-temurin:21-jdk-alpine"
+          mount: "/skills/java"
+      timeout_secs: 300
+
+  stages:
+    - type: box
+      name: python-gen
+    - type: box
+      name: go-validate
+    - type: box
+      name: java-report

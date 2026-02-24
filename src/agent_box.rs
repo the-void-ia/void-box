@@ -73,6 +73,10 @@ struct BoxConfig {
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
     env: Vec<(String, String)>,
+    /// Host directory mounts into the guest.
+    mounts: Vec<crate::backend::MountConfig>,
+    /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
+    oci_rootfs: Option<String>,
     /// Path where the agent should write its output (read after execution)
     output_file: String,
     /// Whether to use mock sandbox
@@ -93,6 +97,8 @@ impl Default for BoxConfig {
             kernel: None,
             initramfs: None,
             env: Vec::new(),
+            mounts: Vec::new(),
+            oci_rootfs: None,
             output_file: "/workspace/output.json".to_string(),
             mock: false,
             llm: LlmProvider::default(),
@@ -209,6 +215,18 @@ impl VoidBox {
         self
     }
 
+    /// Add a host directory mount.
+    pub fn mount(mut self, mount: crate::backend::MountConfig) -> Self {
+        self.config.mounts.push(mount);
+        self
+    }
+
+    /// Set the OCI rootfs guest path (triggers pivot_root in guest-agent).
+    pub fn oci_rootfs(mut self, guest_path: impl Into<String>) -> Self {
+        self.config.oci_rootfs = Some(guest_path.into());
+        self
+    }
+
     /// Use a mock sandbox (for testing without KVM).
     pub fn mock(mut self) -> Self {
         self.config.mock = true;
@@ -251,6 +269,16 @@ impl VoidBox {
         }
         for (k, v) in &self.config.env {
             builder = builder.env(k, v);
+        }
+
+        // Add host directory mounts
+        for m in &self.config.mounts {
+            builder = builder.mount(m.clone());
+        }
+
+        // OCI rootfs pivot_root
+        if let Some(ref path) = self.config.oci_rootfs {
+            builder = builder.oci_rootfs(path);
         }
 
         builder.build()
@@ -390,6 +418,33 @@ impl VoidBox {
                     eprintln!(
                         "[vm:{}] Reasoning engine: {} ({})",
                         tag, skill.name, command
+                    );
+                }
+                SkillKind::Oci {
+                    image,
+                    mount,
+                    readonly,
+                } => {
+                    eprintln!(
+                        "[vm:{}] OCI skill '{}': image={}, mount={}, readonly={}",
+                        tag, skill.name, image, mount, readonly
+                    );
+                    // OCI skill provisioning: the image is pulled and extracted
+                    // by the host, then mounted into the guest via virtiofs/9p.
+                    // The actual pull+extract is deferred to the pipeline/runtime
+                    // layer which adds mount configs before sandbox creation.
+                    // Here we just ensure the guest PATH includes the skill's bins.
+                    let path_extension = format!(
+                        "export PATH=\"{}/usr/local/bin:{}/usr/bin:$PATH\"",
+                        mount, mount
+                    );
+                    let profile_path = format!("{}/skills/{}_path.sh", CLAUDE_HOME, skill.name);
+                    sandbox
+                        .write_file(&profile_path, path_extension.as_bytes())
+                        .await?;
+                    eprintln!(
+                        "[vm:{}] OCI skill '{}' PATH extension -> {}",
+                        tag, skill.name, profile_path
                     );
                 }
             }

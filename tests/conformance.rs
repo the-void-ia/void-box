@@ -69,6 +69,8 @@ fn backend_config() -> Option<BackendConfig> {
         network: true,
         enable_vsock: true,
         shared_dir: None,
+        mounts: vec![],
+        oci_rootfs: None,
         env: vec![],
         security: BackendSecurityConfig {
             session_secret: secret,

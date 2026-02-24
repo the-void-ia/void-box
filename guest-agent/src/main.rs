@@ -176,6 +176,14 @@ fn main() {
     // so filesystems are mounted, but before network setup which needs the drivers.
     load_kernel_modules();
 
+    // Mount shared directories (virtiofs or 9p) specified via kernel cmdline.
+    // Must happen after module loading (9p needs 9pnet_virtio.ko).
+    mount_shared_dirs();
+
+    // If an OCI base image rootfs was mounted, pivot_root into it.
+    // Must happen after mount_shared_dirs() (the rootfs is one of the mounts).
+    setup_oci_rootfs();
+
     // Set up networking after modules are loaded (virtio_net.ko creates eth0)
     if std::process::id() == 1 {
         setup_network();
@@ -406,7 +414,7 @@ fn load_kernel_modules() {
     let modules: &[(&str, &str)] = &[
         (
             "virtio_mmio.ko",
-            "device=512@0xd0000000:10 device=512@0xd0800000:11",
+            "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12",
         ),
         // vsock modules
         ("vsock.ko", ""),
@@ -416,6 +424,9 @@ fn load_kernel_modules() {
         ("failover.ko", ""),
         ("net_failover.ko", ""),
         ("virtio_net.ko", ""),
+        // 9p filesystem modules (for host directory sharing)
+        ("9pnet.ko", ""),
+        ("9pnet_virtio.ko", ""),
     ];
 
     for (module_name, params) in modules {
@@ -481,6 +492,316 @@ fn load_module_file(path: &str, params: &str) -> Result<(), String> {
         return Err(format!("finit_module: {}", err));
     }
     Ok(())
+}
+
+/// Mount shared directories specified via kernel cmdline parameters.
+///
+/// The host encodes mount config as `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>`.
+/// On macOS/VZ the filesystem type is `virtiofs`; on Linux/KVM it's `9p`.
+/// We try virtiofs first and fall back to 9p.
+fn mount_shared_dirs() {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut mounts: Vec<(String, String, bool)> = Vec::new(); // (tag, guest_path, read_only)
+
+    for param in cmdline.split_whitespace() {
+        // Match voidbox.mount0=mount0:/workspace/output:rw
+        if let Some(rest) = param.strip_prefix("voidbox.mount") {
+            // rest = "0=mount0:/workspace/output:rw"
+            if let Some(eq_pos) = rest.find('=') {
+                let value = &rest[eq_pos + 1..];
+                let parts: Vec<&str> = value.splitn(3, ':').collect();
+                if parts.len() >= 2 {
+                    let tag = parts[0].to_string();
+                    let guest_path = parts[1].to_string();
+                    let read_only = parts.get(2).map(|&m| m != "rw").unwrap_or(true);
+                    mounts.push((tag, guest_path, read_only));
+                }
+            }
+        }
+    }
+
+    if mounts.is_empty() {
+        return;
+    }
+
+    kmsg(&format!(
+        "Mounting {} shared director{}",
+        mounts.len(),
+        if mounts.len() == 1 { "y" } else { "ies" }
+    ));
+
+    for (tag, guest_path, read_only) in &mounts {
+        // Create the mount point
+        if let Err(e) = std::fs::create_dir_all(guest_path) {
+            kmsg(&format!(
+                "WARNING: failed to create mount point {}: {}",
+                guest_path, e
+            ));
+            continue;
+        }
+
+        let mode = if *read_only { "ro" } else { "rw" };
+
+        // Try virtiofs first (macOS/VZ), then 9p (Linux/KVM)
+        let tag_cstr = std::ffi::CString::new(tag.as_str()).unwrap();
+        let path_cstr = std::ffi::CString::new(guest_path.as_str()).unwrap();
+        let virtiofs_type = std::ffi::CString::new("virtiofs").unwrap();
+        let p9_type = std::ffi::CString::new("9p").unwrap();
+
+        let ro_flag: libc::c_ulong = if *read_only {
+            libc::MS_RDONLY as libc::c_ulong
+        } else {
+            0
+        };
+
+        // Try virtiofs
+        let ret = unsafe {
+            libc::mount(
+                tag_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                virtiofs_type.as_ptr(),
+                ro_flag,
+                std::ptr::null(),
+            )
+        };
+
+        if ret == 0 {
+            kmsg(&format!(
+                "Mounted virtiofs '{}' at {} ({})",
+                tag, guest_path, mode
+            ));
+            continue;
+        }
+
+        // Try 9p with trans=virtio
+        let p9_opts = std::ffi::CString::new(format!(
+            "trans=virtio,version=9p2000.L{}",
+            if *read_only { ",ro" } else { "" }
+        ))
+        .unwrap();
+
+        let ret = unsafe {
+            libc::mount(
+                tag_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                p9_type.as_ptr(),
+                ro_flag,
+                p9_opts.as_ptr() as *const libc::c_void,
+            )
+        };
+
+        if ret == 0 {
+            kmsg(&format!(
+                "Mounted 9p '{}' at {} ({})",
+                tag, guest_path, mode
+            ));
+        } else {
+            let err = std::io::Error::last_os_error();
+            kmsg(&format!(
+                "WARNING: failed to mount '{}' at {}: {} (tried virtiofs and 9p)",
+                tag, guest_path, err
+            ));
+        }
+    }
+}
+
+/// Set up an OCI base image rootfs via overlayfs + pivot_root.
+///
+/// When the host sets `voidbox.oci_rootfs=<path>` on the kernel cmdline,
+/// the guest-agent will:
+/// 1. Mount a tmpfs for the overlay upper/work directories
+/// 2. Mount overlayfs (OCI rootfs as lower, tmpfs as upper) at a staging point
+/// 3. Move /proc, /sys, /dev into the new root
+/// 4. pivot_root to switch the root filesystem
+/// 5. Unmount the old root
+///
+/// This gives a writable root filesystem based on the OCI image.
+fn setup_oci_rootfs() {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let oci_rootfs = cmdline
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("voidbox.oci_rootfs="))
+        .map(String::from);
+
+    let Some(rootfs_path) = oci_rootfs else {
+        return;
+    };
+
+    // Verify the rootfs mount exists (should have been set up by mount_shared_dirs)
+    if !std::path::Path::new(&rootfs_path).is_dir() {
+        kmsg(&format!(
+            "WARNING: OCI rootfs {} not found, skipping pivot_root",
+            rootfs_path
+        ));
+        return;
+    }
+
+    kmsg(&format!("Setting up OCI rootfs from {}", rootfs_path));
+
+    let newroot = "/mnt/newroot";
+    let upper = "/mnt/overlay-upper";
+    let work = "/mnt/overlay-work";
+
+    // Create staging directories
+    for dir in [newroot, upper, work] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
+            return;
+        }
+    }
+
+    // Mount tmpfs for overlay upper and work directories
+    let tmpfs_type = std::ffi::CString::new("tmpfs").unwrap();
+    for dir in [upper, work] {
+        let dir_c = std::ffi::CString::new(dir).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                tmpfs_type.as_ptr(),
+                dir_c.as_ptr(),
+                tmpfs_type.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            kmsg(&format!(
+                "WARNING: failed to mount tmpfs at {}: {}",
+                dir,
+                std::io::Error::last_os_error()
+            ));
+            return;
+        }
+    }
+
+    // Mount overlayfs: lower=OCI rootfs (read-only), upper=tmpfs (writable)
+    let overlay_type = std::ffi::CString::new("overlay").unwrap();
+    let newroot_c = std::ffi::CString::new(newroot).unwrap();
+    let overlay_opts = std::ffi::CString::new(format!(
+        "lowerdir={},upperdir={},workdir={}",
+        rootfs_path, upper, work
+    ))
+    .unwrap();
+
+    let ret = unsafe {
+        libc::mount(
+            overlay_type.as_ptr(),
+            newroot_c.as_ptr(),
+            overlay_type.as_ptr(),
+            0,
+            overlay_opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if ret != 0 {
+        kmsg(&format!(
+            "WARNING: overlayfs mount failed: {} (kernel may lack CONFIG_OVERLAY_FS)",
+            std::io::Error::last_os_error()
+        ));
+        return;
+    }
+
+    kmsg("Overlayfs mounted, preparing pivot_root...");
+
+    // Create mount points in the new root
+    for dir in [
+        "/proc",
+        "/sys",
+        "/dev",
+        "/tmp",
+        "/workspace",
+        "/home/sandbox",
+        "/etc/voidbox",
+        "/lib/modules",
+        "/mnt/oldroot",
+    ] {
+        let full = format!("{}{}", newroot, dir);
+        let _ = std::fs::create_dir_all(&full);
+    }
+
+    // Move existing mounts into the new root
+    for mount_point in ["/proc", "/sys", "/dev"] {
+        let src = std::ffi::CString::new(mount_point).unwrap();
+        let dst = std::ffi::CString::new(format!("{}{}", newroot, mount_point)).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            kmsg(&format!(
+                "WARNING: failed to move mount {} -> {}{}: {}",
+                mount_point,
+                newroot,
+                mount_point,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    // Mount tmpfs on /tmp in the new root
+    let tmp_path = std::ffi::CString::new(format!("{}/tmp", newroot)).unwrap();
+    let tmp_opts = std::ffi::CString::new("mode=1777").unwrap();
+    unsafe {
+        libc::mount(
+            tmpfs_type.as_ptr(),
+            tmp_path.as_ptr(),
+            tmpfs_type.as_ptr(),
+            0,
+            tmp_opts.as_ptr() as *const libc::c_void,
+        );
+    }
+
+    // pivot_root: switch root to the overlay
+    let oldroot_path = format!("{}/mnt/oldroot", newroot);
+    let oldroot_c = std::ffi::CString::new(oldroot_path.as_str()).unwrap();
+
+    let ret =
+        unsafe { libc::syscall(libc::SYS_pivot_root, newroot_c.as_ptr(), oldroot_c.as_ptr()) };
+    if ret != 0 {
+        kmsg(&format!(
+            "WARNING: pivot_root failed: {}",
+            std::io::Error::last_os_error()
+        ));
+        return;
+    }
+
+    // Change to new root
+    let root = std::ffi::CString::new("/").unwrap();
+    unsafe {
+        libc::chdir(root.as_ptr());
+    }
+
+    // Unmount the old root (lazy unmount — allows running binary to keep its inode)
+    let oldroot_after = std::ffi::CString::new("/mnt/oldroot").unwrap();
+    unsafe {
+        libc::umount2(oldroot_after.as_ptr(), libc::MNT_DETACH);
+    }
+
+    // Recreate essential directories (may already exist from the OCI image)
+    let _ = std::fs::create_dir_all("/workspace");
+    let _ = std::fs::create_dir_all("/home/sandbox");
+    let _ = std::fs::create_dir_all("/etc/voidbox");
+
+    // Chown workspace and home to sandbox user (uid 1000)
+    unsafe {
+        let workspace = std::ffi::CString::new("/workspace").unwrap();
+        libc::chown(workspace.as_ptr(), 1000, 1000);
+        let home = std::ffi::CString::new("/home/sandbox").unwrap();
+        libc::chown(home.as_ptr(), 1000, 1000);
+    }
+
+    kmsg("OCI rootfs pivot_root complete — running on overlay filesystem");
 }
 
 /// Set up network interface.

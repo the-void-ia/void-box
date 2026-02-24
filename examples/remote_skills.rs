@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             void_box::skill::SkillKind::File { .. } => "file",
             void_box::skill::SkillKind::Mcp { .. } => "mcp",
             void_box::skill::SkillKind::Cli { .. } => "cli",
+            void_box::skill::SkillKind::Oci { .. } => "oci",
         };
         println!(
             "    - {} [{}] {}",

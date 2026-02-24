@@ -83,6 +83,10 @@ impl VmmBackend for KvmBackend {
             vm_config = vm_config.shared_dir(shared_dir);
         }
 
+        // Apply mounts
+        vm_config.mounts = config.mounts.clone();
+        vm_config.oci_rootfs = config.oci_rootfs.clone();
+
         // Apply security config
         vm_config.security = SecurityConfig {
             session_secret: config.security.session_secret,

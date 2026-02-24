@@ -1,6 +1,6 @@
 [package]
 name = "void-box-protocol"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Shared wire-format types for host ↔ guest communication in void-box"
 
