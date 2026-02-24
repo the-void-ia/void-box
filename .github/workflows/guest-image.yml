@@ -40,7 +40,12 @@ jobs:
 
       - name: Build initramfs
         run: |
-          ARCH=${{ matrix.arch }} OUT_CPIO=/tmp/rootfs.cpio.gz \
+          # Must match the kernel version in scripts/download_kernel.sh
+          # so that the packaged modules are compatible with the VM kernel.
+          ARCH=${{ matrix.arch }} \
+          VOID_BOX_KMOD_VERSION=6.8.0-51 \
+          VOID_BOX_KMOD_UPLOAD=52 \
+          OUT_CPIO=/tmp/rootfs.cpio.gz \
             scripts/build_guest_image.sh
 
       - name: Download kernel
