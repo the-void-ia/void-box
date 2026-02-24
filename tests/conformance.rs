@@ -110,7 +110,7 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
 // ===========================================================================
 
 /// Backend can execute a simple command and return stdout.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_echo() {
     let backend = match create_started_backend().await {
@@ -133,7 +133,7 @@ async fn conformance_exec_echo() {
 }
 
 /// Backend reports non-zero exit codes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_nonzero_exit() {
     let backend = match create_started_backend().await {
@@ -154,7 +154,7 @@ async fn conformance_exec_nonzero_exit() {
 // ===========================================================================
 
 /// Backend can write a file and read it back via exec.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_write_file() {
     let backend = match create_started_backend().await {
@@ -194,7 +194,7 @@ async fn conformance_write_file() {
 // ===========================================================================
 
 /// Backend can create nested directories.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_mkdir_p() {
     let backend = match create_started_backend().await {
@@ -228,7 +228,7 @@ async fn conformance_mkdir_p() {
 // ===========================================================================
 
 /// Backend can stream output chunks during execution.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_streaming() {
     let backend = match create_started_backend().await {
@@ -270,7 +270,7 @@ async fn conformance_exec_streaming() {
 // ===========================================================================
 
 /// Backend enforces execution timeouts.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_timeout() {
     let backend = match create_started_backend().await {
@@ -296,7 +296,7 @@ async fn conformance_exec_timeout() {
 // ===========================================================================
 
 /// Backend reports running state correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_lifecycle() {
     let mut backend = match create_started_backend().await {
