@@ -366,15 +366,12 @@ fn build_pipeline_box_with_io(
         }
     }
 
-    // Wire outputs: create temp dirs on host, mount rw
+    // Wire outputs: mount the pre-created host dirs from the output registry
     for output in &b.outputs {
-        let host_dir =
-            std::env::temp_dir().join(format!("voidbox-pipeline-{}-{}", b.name, output.name,));
-        std::fs::create_dir_all(&host_dir).map_err(|e| {
+        let host_dir = output_registry.get(&output.name).ok_or_else(|| {
             crate::Error::Config(format!(
-                "failed to create output dir {}: {}",
-                host_dir.display(),
-                e
+                "box '{}' output '{}' not found in output registry",
+                b.name, output.name,
             ))
         })?;
         builder = builder.mount(MountConfig {
