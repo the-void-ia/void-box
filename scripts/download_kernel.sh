@@ -116,11 +116,12 @@ trap 'rm -rf "$EXTRACT_DIR" "$DEB_PATH"' EXIT
         ar x "$ROOT_DIR/$DEB_PATH"
     fi
 
-    # Step 2: Find and extract boot/ from data.tar.*
-    # Modern Ubuntu packages use data.tar.zst; older ones use .xz or .gz.
-    DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1)
+    # Step 2: Find and extract boot/ from data.tar (may be uncompressed
+    # or compressed as .zst, .xz, .gz depending on the Ubuntu version).
+    DATA_TAR=$(find . -maxdepth 1 -name 'data.tar*' -print | head -1)
+    DATA_TAR="${DATA_TAR#./}"
     if [[ -z "$DATA_TAR" ]]; then
-        echo "[kernel] ERROR: no data.tar.* found after extracting .deb"
+        echo "[kernel] ERROR: no data.tar found after extracting .deb"
         ls -la
         exit 1
     fi
