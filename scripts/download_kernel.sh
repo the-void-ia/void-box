@@ -103,7 +103,27 @@ trap 'rm -rf "$EXTRACT_DIR" "$DEB_PATH"' EXIT
 (
     cd "$EXTRACT_DIR"
     ar x "$ROOT_DIR/$DEB_PATH"
-    tar xf data.tar.* ./boot/
+
+    # Modern Ubuntu .deb packages use zstd-compressed data archives
+    # (data.tar.zst). Handle each format explicitly because macOS tar
+    # and older GNU tar don't always support zstd natively.
+    DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1)
+    if [[ -z "$DATA_TAR" ]]; then
+        echo "[kernel] ERROR: no data.tar.* found in .deb"
+        ls -la
+        exit 1
+    fi
+    echo "[kernel] Found: $DATA_TAR"
+
+    case "$DATA_TAR" in
+        data.tar.zst)
+            zstd -dq "$DATA_TAR"
+            tar xf data.tar ./boot/
+            ;;
+        *)
+            tar xf "$DATA_TAR" ./boot/
+            ;;
+    esac
 )
 
 cp "$EXTRACT_DIR"/boot/vmlinuz-* "$OUT_FILE"
