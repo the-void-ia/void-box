@@ -47,6 +47,14 @@ use void_box::skill::Skill;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     // -- Configuration --
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3-coder".into());
 
@@ -55,8 +63,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // -- Build the VoidBox --
+    // On macOS (VZ NAT), the guest reaches the host via 192.168.64.1.
+    // On Linux (KVM/SLIRP), the guest reaches the host via 10.0.2.2.
+    let ollama_host = if cfg!(target_os = "macos") {
+        "http://192.168.64.1:11434"
+    } else {
+        "http://10.0.2.2:11434"
+    };
+
     let mut builder = VoidBox::new("ollama_demo")
-        .llm(LlmProvider::ollama(&model))
+        .llm(LlmProvider::ollama_with_host(&model, ollama_host))
         .skill(Skill::agent("claude-code"))
         .memory_mb(2048)
         .prompt("Write a short Python script that prints the first 10 Fibonacci numbers. Save it to /workspace/fib.py");

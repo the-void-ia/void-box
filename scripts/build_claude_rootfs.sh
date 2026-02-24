@@ -38,31 +38,69 @@ OUT_CPIO="${OUT_CPIO:-target/void-box-rootfs.cpio.gz}"
 # ── Step 1: Locate or download the native claude binary ──────────────────────
 CLAUDE_BIN="${CLAUDE_BIN:-}"
 
-if [[ -z "$CLAUDE_BIN" ]]; then
-  # Try locally installed binary
+# Determine guest architecture (matches build_guest_image.sh logic).
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64) HOST_ARCH="aarch64" ;;
+esac
+GUEST_ARCH="${ARCH:-$HOST_ARCH}"
+
+# Map guest arch to claude-code download platform string.
+case "$GUEST_ARCH" in
+  x86_64)  CLAUDE_PLATFORM="linux-x64" ;;
+  aarch64) CLAUDE_PLATFORM="linux-arm64" ;;
+  *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; exit 1 ;;
+esac
+
+# On macOS the locally installed claude binary is a Mach-O executable that
+# cannot run inside the Linux guest VM. We must obtain a Linux build.
+IS_CROSS_BUILD=false
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  IS_CROSS_BUILD=true
+fi
+
+if [[ -z "$CLAUDE_BIN" && "$IS_CROSS_BUILD" == "false" ]]; then
+  # Try locally installed binary (only useful when host == guest OS)
   for candidate in \
     "$HOME/.local/bin/claude" \
     "$(command -v claude 2>/dev/null || true)" \
     ; do
     if [[ -n "$candidate" && -f "$candidate" ]]; then
-      # Resolve symlinks to get the actual binary
       CLAUDE_BIN="$(readlink -f "$candidate")"
       break
     fi
   done
 fi
 
+# Auto-detect version from local install for downloading the Linux build.
+if [[ -z "$CLAUDE_BIN" && -z "${CLAUDE_CODE_VERSION:-}" && "$IS_CROSS_BUILD" == "true" ]]; then
+  LOCAL_CLAUDE="$(command -v claude 2>/dev/null || true)"
+  if [[ -n "$LOCAL_CLAUDE" ]]; then
+    # Extract bare version number (e.g. "2.0.76" from "2.0.76 (Claude Code)")
+    DETECTED_VER="$("$LOCAL_CLAUDE" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [[ -n "$DETECTED_VER" ]]; then
+      echo "[claude-rootfs] macOS detected — will download Linux build of claude-code v${DETECTED_VER}"
+      CLAUDE_CODE_VERSION="$DETECTED_VER"
+    fi
+  fi
+fi
+
 if [[ -z "$CLAUDE_BIN" && -n "${CLAUDE_CODE_VERSION:-}" ]]; then
-  # Download from GCS
+  # Download the Linux build from GCS
   GCS_BASE="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
-  DOWNLOAD_URL="$GCS_BASE/$CLAUDE_CODE_VERSION/linux-x64/claude"
+  DOWNLOAD_URL="$GCS_BASE/$CLAUDE_CODE_VERSION/$CLAUDE_PLATFORM/claude"
   DOWNLOAD_DIR="$ROOT_DIR/target/claude-download"
   mkdir -p "$DOWNLOAD_DIR"
-  CLAUDE_BIN="$DOWNLOAD_DIR/claude-$CLAUDE_CODE_VERSION"
+  CLAUDE_BIN="$DOWNLOAD_DIR/claude-${CLAUDE_CODE_VERSION}-${CLAUDE_PLATFORM}"
 
   if [[ ! -f "$CLAUDE_BIN" ]]; then
-    echo "[claude-rootfs] Downloading claude-code v${CLAUDE_CODE_VERSION}..."
-    curl -fSL --progress-bar -o "$CLAUDE_BIN" "$DOWNLOAD_URL"
+    echo "[claude-rootfs] Downloading claude-code v${CLAUDE_CODE_VERSION} (${CLAUDE_PLATFORM})..."
+    if ! curl -fSL --progress-bar -o "$CLAUDE_BIN" "$DOWNLOAD_URL"; then
+      echo "ERROR: Failed to download claude-code from $DOWNLOAD_URL" >&2
+      echo "  Check that version $CLAUDE_CODE_VERSION exists for $CLAUDE_PLATFORM." >&2
+      rm -f "$CLAUDE_BIN"
+      exit 1
+    fi
     chmod +x "$CLAUDE_BIN"
   else
     echo "[claude-rootfs] Using cached download: $CLAUDE_BIN"
@@ -74,15 +112,22 @@ if [[ -z "$CLAUDE_BIN" || ! -f "$CLAUDE_BIN" ]]; then
   echo "" >&2
   echo "Options:" >&2
   echo "  1. Install claude:  curl -fsSL https://claude.ai/install.sh | sh" >&2
-  echo "  2. Set CLAUDE_BIN=/path/to/claude" >&2
+  echo "     (on macOS, the Linux binary will be auto-downloaded)" >&2
+  echo "  2. Set CLAUDE_BIN=/path/to/linux/claude (must be a Linux ELF binary)" >&2
   echo "  3. Set CLAUDE_CODE_VERSION=2.1.45 for automatic download" >&2
   exit 1
 fi
 
-# Verify it's an ELF binary (not a shell script or symlink to npm)
+# Verify it's an ELF binary (not a Mach-O or shell script)
 if ! file -L "$CLAUDE_BIN" | grep -q "ELF.*executable"; then
-  echo "ERROR: $CLAUDE_BIN is not a native ELF binary." >&2
-  echo "Make sure you have the native claude-code binary (not the npm wrapper)." >&2
+  echo "ERROR: $CLAUDE_BIN is not a native Linux ELF binary." >&2
+  echo "  file: $(file -L "$CLAUDE_BIN")" >&2
+  if [[ "$IS_CROSS_BUILD" == "true" ]]; then
+    echo "  On macOS, set CLAUDE_CODE_VERSION to download the Linux build:" >&2
+    echo "    CLAUDE_CODE_VERSION=2.0.76 scripts/build_claude_rootfs.sh" >&2
+  else
+    echo "  Make sure you have the native claude-code binary (not the npm wrapper)." >&2
+  fi
   exit 1
 fi
 
@@ -91,10 +136,14 @@ CLAUDE_SIZE="$(du -sh "$CLAUDE_BIN" | awk '{print $1}')"
 echo "[claude-rootfs] Using native claude binary: $CLAUDE_BIN ($CLAUDE_SIZE, $CLAUDE_VERSION)"
 
 # ── Step 2: Build base image (guest-agent, busybox, kernel modules) ──────────
-export BUSYBOX="${BUSYBOX:-/usr/bin/busybox}"
-if [[ ! -f "$BUSYBOX" ]]; then
-  echo "[claude-rootfs] WARNING: busybox not found at $BUSYBOX; guest will have no /bin/sh"
-  unset BUSYBOX
+# On Linux, default to the system busybox. On macOS, build_guest_image.sh
+# auto-downloads a static ARM64 busybox via ensure_busybox_macos().
+if [[ "$IS_CROSS_BUILD" == "false" ]]; then
+  export BUSYBOX="${BUSYBOX:-/usr/bin/busybox}"
+  if [[ ! -f "$BUSYBOX" ]]; then
+    echo "[claude-rootfs] WARNING: busybox not found at $BUSYBOX; guest will have no /bin/sh"
+    unset BUSYBOX
+  fi
 fi
 
 # Pass the claude binary to the base script via CLAUDE_CODE_BIN.

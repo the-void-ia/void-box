@@ -78,8 +78,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSArray", "NSString", "NSURL", "NSError", "NSRunLoop", "NSDate",
 ] }
-objc2-virtualization = "0.3"
+objc2-virtualization = { version = "0.3", features = ["dispatch2"] }
 block2 = "0.6"
+dispatch2 = "0.3"
 
 [dev-dependencies]
 regex-lite = "0.1.9"

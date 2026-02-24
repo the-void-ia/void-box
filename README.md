@@ -222,6 +222,46 @@ VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --example trading_pipeline
 ```
 
+### macOS mode (Apple Silicon)
+
+VoidBox runs natively on Apple Silicon Macs using Apple's Virtualization.framework — no Docker or Linux VM required.
+
+**Prerequisites:**
+
+```bash
+# 1. Install the musl cross-compilation toolchain
+brew install filosottile/musl-cross/musl-cross
+
+# 2. Add the Rust target for Linux ARM64
+rustup target add aarch64-unknown-linux-musl
+
+# 3. Download an ARM64 Linux kernel
+curl -fSL -o target/vmlinuz-ubuntu-arm64 \
+  https://cloud-images.ubuntu.com/minimal/releases/noble/release/unpacked/ubuntu-noble-minimal-cloudimg-arm64-vmlinuz-generic
+gunzip -f target/vmlinuz-ubuntu-arm64 2>/dev/null || true
+
+# 4. Build the guest initramfs (cross-compiles guest-agent, downloads claude-code + busybox)
+scripts/build_claude_rootfs.sh
+
+# 5. Build the example and sign it with the virtualization entitlement
+cargo build --example ollama_local
+codesign --force --sign - --entitlements voidbox.entitlements target/debug/examples/ollama_local
+```
+
+**Run with Ollama:**
+
+```bash
+# Make sure Ollama listens on all interfaces (required for VM networking)
+OLLAMA_HOST=0.0.0.0:11434 ollama serve  # in a separate terminal
+
+OLLAMA_MODEL=qwen3-coder \
+VOID_BOX_KERNEL=target/vmlinuz-ubuntu-arm64 \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+target/debug/examples/ollama_local
+```
+
+> **Note:** Every `cargo build` invalidates the code signature. Re-run the `codesign` command after each rebuild.
+
 ### Parallel pipeline with per-box models
 
 ```bash

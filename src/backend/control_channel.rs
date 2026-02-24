@@ -160,6 +160,59 @@ impl ControlChannel {
         }
     }
 
+    /// Async-friendly streaming exec: connects asynchronously, then moves the
+    /// synchronous read loop to a blocking task. Chunks are sent via the mpsc
+    /// channel directly.
+    pub async fn send_exec_request_streaming_async(
+        &self,
+        request: &ExecRequest,
+        chunk_tx: tokio::sync::mpsc::Sender<ExecOutputChunk>,
+    ) -> Result<ExecResponse> {
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "exec-streaming")
+            .await?;
+
+        let timeout = request
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(1200));
+        let _ = stream.set_read_timeout(Some(timeout));
+
+        let message = Message {
+            msg_type: MessageType::ExecRequest,
+            payload: serde_json::to_vec(request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
+
+        info!("control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
+
+        tokio::task::spawn_blocking(move || loop {
+            let msg = Message::read_from_sync(&mut *stream)?;
+            match msg.msg_type {
+                MessageType::ExecOutputChunk => {
+                    if let Ok(chunk) = serde_json::from_slice::<ExecOutputChunk>(&msg.payload) {
+                        let _ = chunk_tx.blocking_send(chunk);
+                    }
+                }
+                MessageType::ExecResponse => {
+                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
+                    info!(
+                        "control_channel: ExecResponse received (streaming) exit_code={}",
+                        response.exit_code
+                    );
+                    return Ok(response);
+                }
+                other => {
+                    warn!("Unexpected message type during streaming exec: {:?}", other);
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("Streaming task panicked: {}", e)))?
+    }
+
     /// Write a file to the guest filesystem using the native WriteFile protocol.
     pub async fn send_write_file(&self, path: &str, content: &[u8]) -> Result<WriteFileResponse> {
         let request = WriteFileRequest {

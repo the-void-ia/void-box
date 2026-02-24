@@ -15,26 +15,27 @@ use std::time::Duration;
 
 use crate::backend::control_channel::GuestStream;
 
-/// A stream wrapping a raw file descriptor from `VZVirtioSocketConnection`.
+/// A stream wrapping an owned (dup'd) file descriptor from a VZ vsock connection.
 ///
 /// Implements `Read`, `Write`, and [`GuestStream`] for use with
 /// `ControlChannel`.
 ///
-/// The fd is owned by the ObjC `VZVirtioSocketConnection` object.
-/// Callers must ensure the connection outlives this stream.
+/// The fd is dup'd from the VZVirtioSocketConnection so it remains valid
+/// even after the ObjC connection object is released.
 pub struct VzSocketStream {
     fd: RawFd,
 }
 
 impl VzSocketStream {
-    /// Wrap an existing fd from `VZVirtioSocketConnection.fileDescriptor()`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure `fd` is a valid, open file descriptor that
-    /// remains valid for the lifetime of this struct.
-    pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+    /// Wrap an owned fd (already dup'd from the VZ connection).
+    pub fn from_fd(fd: RawFd) -> Self {
         Self { fd }
+    }
+}
+
+impl Drop for VzSocketStream {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
     }
 }
 

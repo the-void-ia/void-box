@@ -43,6 +43,7 @@ use super::vsock::VzSocketStream;
 
 // ObjC imports for Virtualization.framework
 use block2::RcBlock;
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSString, NSURL};
@@ -70,6 +71,8 @@ pub struct VzBackend {
     socket_device: Option<SendSyncDevice>,
     /// Transport-agnostic control channel for guest communication.
     control_channel: Option<Arc<ControlChannel>>,
+    /// Dedicated serial dispatch queue for VZ operations.
+    vz_queue: DispatchRetained<DispatchQueue>,
     /// Whether the VM is currently running.
     running: Arc<AtomicBool>,
     /// The assigned CID.
@@ -94,10 +97,12 @@ impl Default for VzBackend {
 impl VzBackend {
     /// Create a new, unstarted VzBackend.
     pub fn new() -> Self {
+        let vz_queue = DispatchQueue::new("com.voidbox.vz", DispatchQueueAttr::SERIAL);
         Self {
             vm: None,
             socket_device: None,
             control_channel: None,
+            vz_queue,
             running: Arc::new(AtomicBool::new(false)),
             cid: 3, // default; overridden in start()
             span_context: None,
@@ -109,41 +114,59 @@ impl VzBackend {
     /// Uses `VZVirtioSocketDevice.connectToPort:completionHandler:` which
     /// calls the completion handler with a `VZVirtioSocketConnection`.
     /// The connection's `fileDescriptor()` gives us a raw fd for I/O.
-    fn build_connector(socket_device: &SendSyncDevice) -> GuestConnector {
+    fn build_connector(
+        socket_device: &SendSyncDevice,
+        vz_queue: &DispatchRetained<DispatchQueue>,
+    ) -> GuestConnector {
         let device = Arc::new(SendSyncDevice(socket_device.0.clone()));
+        let queue = vz_queue.clone();
         Box::new(move || {
-            // Bridge the ObjC completion handler to a blocking Rust call.
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
 
-            let tx_clone = tx.clone();
-            let handler = RcBlock::new(
-                move |connection: *mut VZVirtioSocketConnection,
-                      err: *mut objc2_foundation::NSError| {
-                    if !err.is_null() {
-                        let desc = unsafe { &*err }.localizedDescription().to_string();
-                        let _ = tx_clone.send(Err(desc));
-                        return;
-                    }
-                    if connection.is_null() {
-                        let _ = tx_clone.send(Err("null connection".into()));
-                        return;
-                    }
-                    let fd = unsafe { (*connection).fileDescriptor() };
-                    let _ = tx_clone.send(Ok(fd));
-                },
-            );
+            // Dispatch connectToPort onto the VZ queue (required by Apple).
+            let device_ptr = Arc::as_ptr(&device) as usize;
+            let tx_clone = tx;
+            queue.exec_async(move || {
+                let device = unsafe { &*(device_ptr as *const SendSyncDevice) };
+                let tx = tx_clone;
+                let handler = RcBlock::new(
+                    move |connection: *mut VZVirtioSocketConnection,
+                          err: *mut objc2_foundation::NSError| {
+                        if !err.is_null() {
+                            let desc = unsafe { &*err }.localizedDescription().to_string();
+                            debug!("VZ vsock connectToPort: error = {}", desc);
+                            let _ = tx.send(Err(desc));
+                            return;
+                        }
+                        if connection.is_null() {
+                            debug!("VZ vsock connectToPort: null connection");
+                            let _ = tx.send(Err("null connection".into()));
+                            return;
+                        }
+                        let raw_fd = unsafe { (*connection).fileDescriptor() };
+                        let duped_fd = unsafe { libc::dup(raw_fd) };
+                        if duped_fd < 0 {
+                            let _ = tx.send(Err(format!(
+                                "dup fd failed: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                            return;
+                        }
+                        debug!("VZ vsock connectToPort: success (fd={})", duped_fd);
+                        let _ = tx.send(Ok(duped_fd));
+                    },
+                );
+                unsafe {
+                    device.0.connectToPort_completionHandler(1234, &handler);
+                }
+            });
 
-            unsafe {
-                device.0.connectToPort_completionHandler(1234, &handler);
-            }
-
-            // Wait for the completion handler (with timeout)
             let fd = rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .map_err(|_| crate::Error::Backend("VZ vsock connect timeout".into()))?
                 .map_err(|e| crate::Error::Backend(format!("VZ vsock connect: {}", e)))?;
 
-            let stream = unsafe { VzSocketStream::from_raw_fd(fd) };
+            let stream = VzSocketStream::from_fd(fd);
             Ok(Box::new(stream) as Box<dyn crate::backend::control_channel::GuestStream>)
         })
     }
@@ -212,43 +235,82 @@ impl VmmBackend for VzBackend {
                 }
             }
 
-            // 5. Shared directory (virtiofs) — M6 enhancement
+            // 5. Serial console for guest kernel/init output.
+            // Attaches to the host process's stdout/stderr for debugging.
+            let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+            let stdio_attachment = unsafe {
+                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                    VZFileHandleSerialPortAttachment::alloc(),
+                    None,
+                    Some(&objc2_foundation::NSFileHandle::fileHandleWithStandardError()),
+                )
+            };
+            unsafe {
+                serial_config.setAttachment(Some(&stdio_attachment));
+            }
+            let serial_configs: Retained<NSArray<VZSerialPortConfiguration>> =
+                NSArray::arrayWithObject(&serial_config);
+            unsafe {
+                vm_config.setSerialPorts(&serial_configs);
+            }
+
+            // 6. Shared directory (virtiofs) — M6 enhancement
             // TODO: implement VZVirtioFileSystemDeviceConfiguration when shared_dir is set
 
-            // 6. Validate configuration
+            // 7. Validate configuration
             unsafe {
                 vm_config
                     .validateWithError()
                     .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
             }
 
-            // 7. Create and start the VM
+            // 7. Create and start the VM on a dedicated serial dispatch queue.
+            //
+            // VZVirtualMachine requires all operations (start, stop,
+            // connectToPort) to happen on the queue it was created on.
+            // Using a dedicated GCD serial queue means completion handlers
+            // fire on GCD-managed threads without needing to pump any run
+            // loop — essential for tokio-based CLI apps.
+            //
+            // We must also dispatch startWithCompletionHandler onto the
+            // VZ queue since "every operation on the virtual machine must
+            // be done on that queue."
             let vm = unsafe {
-                VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vm_config)
+                VZVirtualMachine::initWithConfiguration_queue(
+                    VZVirtualMachine::alloc(),
+                    &vm_config,
+                    &self.vz_queue,
+                )
             };
 
-            // Start VM with completion handler (blocking wait)
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
-            let tx = std::sync::Mutex::new(Some(tx));
 
-            let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                let result = if err.is_null() {
-                    Ok(())
-                } else {
-                    let desc = unsafe { &*err }.localizedDescription().to_string();
-                    Err(desc)
-                };
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(result);
+            // Dispatch the start call onto the VZ queue.
+            // Safety: we pass the VM as a raw pointer to avoid the !Send
+            // constraint. This is safe because the VM was created on this
+            // queue and we only access it from this queue.
+            let vm_ptr = Retained::as_ptr(&vm) as usize;
+            self.vz_queue.exec_async(move || {
+                let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
+                let tx = std::sync::Mutex::new(Some(tx));
+                let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                    let result = if err.is_null() {
+                        Ok(())
+                    } else {
+                        let desc = unsafe { &*err }.localizedDescription().to_string();
+                        Err(desc)
+                    };
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(result);
+                    }
+                });
+                unsafe {
+                    vm_ref.startWithCompletionHandler(&handler);
                 }
             });
 
-            unsafe {
-                vm.startWithCompletionHandler(&handler);
-            }
-
-            rx.recv()
-                .map_err(|_| crate::Error::Backend("VM start: channel closed".into()))?
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| crate::Error::Backend("VM start: timed out (30s)".into()))?
                 .map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))?;
 
             info!("VzBackend: VM started successfully");
@@ -261,7 +323,7 @@ impl VmmBackend for VzBackend {
             let socket_device = SendSyncDevice(socket_device);
 
             // 9. Build the control channel
-            let connector = Self::build_connector(&socket_device);
+            let connector = Self::build_connector(&socket_device, &self.vz_queue);
             let control_channel = Arc::new(ControlChannel::new(
                 connector,
                 config.security.session_secret,
@@ -337,11 +399,10 @@ impl VmmBackend for VzBackend {
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(256);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let result = rt.block_on(cc.send_exec_request_streaming(&request, |chunk| {
-                let _ = chunk_tx.blocking_send(chunk);
-            }));
+        tokio::task::spawn(async move {
+            let result = cc
+                .send_exec_request_streaming_async(&request, chunk_tx)
+                .await;
             let _ = done_tx.send(result);
         });
 
@@ -418,28 +479,31 @@ impl VmmBackend for VzBackend {
                 info!("VzBackend: stopping VM");
 
                 let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
-                let tx = std::sync::Mutex::new(Some(tx));
 
-                let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                    let result = if err.is_null() {
-                        Ok(())
-                    } else {
-                        let desc = unsafe { &*err }.localizedDescription().to_string();
-                        Err(desc)
-                    };
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(result);
+                let vm_ptr = Retained::as_ptr(vm) as usize;
+                self.vz_queue.exec_async(move || {
+                    let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
+                    let tx = std::sync::Mutex::new(Some(tx));
+                    let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                        let result = if err.is_null() {
+                            Ok(())
+                        } else {
+                            let desc = unsafe { &*err }.localizedDescription().to_string();
+                            Err(desc)
+                        };
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(result);
+                        }
+                    });
+                    unsafe {
+                        vm_ref.stopWithCompletionHandler(&handler);
                     }
                 });
 
-                unsafe {
-                    vm.stopWithCompletionHandler(&handler);
-                }
-
-                match rx.recv() {
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
                     Ok(Ok(())) => info!("VzBackend: VM stopped"),
                     Ok(Err(e)) => error!("VzBackend: VM stop error: {}", e),
-                    Err(_) => error!("VzBackend: VM stop channel closed"),
+                    Err(_) => error!("VzBackend: VM stop timed out or channel closed"),
                 }
             }
 
