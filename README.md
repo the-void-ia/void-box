@@ -151,27 +151,35 @@ voidbox run --file hackernews_agent.yaml
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│ Host                                         │
-│  VoidBox Engine / Pipeline Orchestrator      │
-│                                              │
-│  ┌─────────────────────────────────────┐     │
-│  │ VMM (KVM)                           │     │
-│  │  vsock ←→ guest-agent (PID 1)       │     │
-│  │  SLIRP ←→ eth0 (10.0.2.15)          │     │
-│  └─────────────────────────────────────┘     │
-│                                              │
-│  Seccomp-BPF │ OTLP export                   │
-└──────────────┼───────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ Host                                                  │
+│  VoidBox Engine / Pipeline Orchestrator               │
+│                                                       │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │ OCI Client (~/.voidbox/oci/)                    │  │
+│  │  guest image → kernel + initramfs (auto-pull)   │  │
+│  │  base image  → rootfs (pivot_root)              │  │
+│  │  OCI skills  → read-only mounts                 │  │
+│  └─────────────────────┬───────────────────────────┘  │
+│                        │                              │
+│  ┌─────────────────────▼───────────────────────────┐  │
+│  │ VMM (KVM / Virtualization.framework)            │  │
+│  │  vsock ←→ guest-agent (PID 1)                   │  │
+│  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
+│  │  9p/virtiofs ←→ OCI rootfs + skill mounts       │  │
+│  └─────────────────────────────────────────────────┘  │
+│                                                       │
+│  Seccomp-BPF │ OTLP export                            │
+└──────────────┼────────────────────────────────────────┘
      Hardware  │  Isolation
-═══════════════╪════════════════════════════════
+═══════════════╪════════════════════════════════════════
                │
-┌──────────────▼──────────────────────────────────────┐
-│ Guest VM (Linux)                                    │
-│  guest-agent: auth, allowlist, rlimits              │
-│  claude-code runtime (Claude API or Ollama backend) │
-│  skills provisioned into isolated runtime           │
-└─────────────────────────────────────────────────────┘
+┌──────────────▼──────────────────────────────────────────┐
+│ Guest VM (Linux)                                        │
+│  guest-agent: auth, allowlist, rlimits                  │
+│  claude-code runtime (Claude API or Ollama backend)     │
+│  OCI rootfs (pivot_root) + skill mounts (/skills/...)   │
+└─────────────────────────────────────────────────────────┘
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full component diagram, wire protocol, and security model.
@@ -402,7 +410,6 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 - **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
 - **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
 - **Persistent block devices (virtio-blk)** — Stateful workloads across VM restarts.
-- **aarch64 support** — Native ARM64 builds with release pipeline cross-compilation.
 - **Codex-style backend support** — Optional execution backend for code-first workflows.
 - **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 
