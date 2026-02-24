@@ -45,6 +45,7 @@ use super::vsock::VzSocketStream;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
+use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization::*;
 
