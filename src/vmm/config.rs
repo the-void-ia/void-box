@@ -2,74 +2,10 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::{Error, Result};
 
-/// Default command allowlist for guest execution.
-pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
-    "sh",
-    "bash",
-    "claude-code",
-    "claude",
-    "python3",
-    "pip",
-    "git",
-    "gh",
-    "curl",
-    "wget",
-    "jq",
-    "cat",
-    "ls",
-    "mkdir",
-    "cp",
-    "mv",
-    "rm",
-    "chmod",
-    "find",
-    "grep",
-    "sed",
-    "awk",
-    "tr",
-    "head",
-    "tail",
-    "wc",
-    "sort",
-    "uniq",
-    "env",
-    "echo",
-    "printf",
-    "date",
-    "touch",
-    "tar",
-    "gzip",
-    "ip",
-    "test",
-];
-
-/// Per-process resource limits applied in the guest via `setrlimit`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceLimits {
-    /// Maximum virtual memory per process in bytes (RLIMIT_AS).
-    pub max_virtual_memory: u64,
-    /// Maximum number of open file descriptors (RLIMIT_NOFILE).
-    pub max_open_files: u64,
-    /// Maximum number of processes per user (RLIMIT_NPROC).
-    pub max_processes: u64,
-    /// Maximum file size in bytes (RLIMIT_FSIZE).
-    pub max_file_size: u64,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_virtual_memory: 4 * 1024 * 1024 * 1024, // 4 GB — Bun/JSC needs ~640MB for startup, more for JIT at runtime
-            max_open_files: 1024,
-            max_processes: 512, // Bun worker threads count towards NPROC on Linux
-            max_file_size: 100 * 1024 * 1024, // 100 MB
-        }
-    }
-}
+// Re-export from the cross-platform backend module for backward compatibility.
+pub use crate::backend::{ResourceLimits, DEFAULT_COMMAND_ALLOWLIST};
 
 /// Security configuration for VoidBox VMs.
 ///

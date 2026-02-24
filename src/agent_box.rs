@@ -264,7 +264,7 @@ impl VoidBox {
         let tag = &self.name;
 
         // Write resource limits (use defaults from SecurityConfig)
-        let rl = crate::vmm::config::ResourceLimits::default();
+        let rl = crate::backend::ResourceLimits::default();
         let limits = serde_json::json!({
             "max_virtual_memory": rl.max_virtual_memory,
             "max_open_files": rl.max_open_files,
@@ -284,7 +284,7 @@ impl VoidBox {
         );
 
         // Write command allowlist
-        let allowlist: Vec<&str> = crate::vmm::config::DEFAULT_COMMAND_ALLOWLIST.to_vec();
+        let allowlist: Vec<&str> = crate::backend::DEFAULT_COMMAND_ALLOWLIST.to_vec();
         let allowlist_json = serde_json::to_string_pretty(&allowlist).map_err(|e| {
             crate::Error::Config(format!("Failed to serialize command allowlist: {}", e))
         })?;

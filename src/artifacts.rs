@@ -132,5 +132,7 @@ mod tests {
         // Should work on Linux systems
         #[cfg(target_os = "linux")]
         assert!(version.is_ok());
+        #[cfg(not(target_os = "linux"))]
+        let _ = version;
     }
 }

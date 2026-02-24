@@ -496,7 +496,7 @@ impl VsockStream {
     }
 
     /// Set read timeout (e.g. for handshake). Pass `None` for blocking.
-    fn set_read_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_read_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
         let tv = match duration {
             None => libc::timeval {
                 tv_sec: 0,

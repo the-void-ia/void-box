@@ -6,6 +6,9 @@
 //! - File transfers
 //! - Process management
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("guest-agent is Linux-only (runs as PID 1 inside the micro-VM)");
+
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
@@ -347,8 +350,20 @@ fn init_system() {
         );
     }
 
-    // Create /tmp
+    // Mount tmpfs on /tmp so all users can write temp files
     let _ = std::fs::create_dir_all("/tmp");
+    let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
+    let tmp_path = std::ffi::CString::new("/tmp").unwrap();
+    let tmp_opts = std::ffi::CString::new("mode=1777").unwrap();
+    unsafe {
+        libc::mount(
+            tmpfs.as_ptr(),
+            tmp_path.as_ptr(),
+            tmpfs.as_ptr(),
+            0,
+            tmp_opts.as_ptr() as *const _,
+        );
+    }
 
     // Create /workspace for user projects and /home/sandbox for the sandbox user
     let _ = std::fs::create_dir_all("/workspace");
@@ -420,16 +435,41 @@ fn load_kernel_modules() {
 }
 
 /// Load a single kernel module using finit_module(2), with optional parameters.
+///
+/// Returns `Ok(())` if the module was loaded, is already loaded, or is built
+/// into the kernel (no .ko file on disk). This makes the function resilient
+/// to aarch64/VZ environments where virtio modules are compiled in (`=y`)
+/// and no .ko files exist.
 fn load_module_file(path: &str, params: &str) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::io::AsRawFd;
+
+    // If the .ko file doesn't exist, check if the module is already built
+    // into the kernel. Built-in modules appear in /sys/module/<name>.
+    if !std::path::Path::new(path).exists() {
+        let mod_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // Kernel uses underscores internally even if the .ko has hyphens
+        let sys_name = mod_name.replace('-', "_");
+        let sys_path = format!("/sys/module/{}", sys_name);
+        if std::path::Path::new(&sys_path).exists() {
+            kmsg(&format!(
+                "Module {} built-in (found {})",
+                mod_name, sys_path
+            ));
+            return Ok(());
+        }
+        return Err(format!("file not found: {}", path));
+    }
 
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
 
     let fd = file.as_raw_fd();
     let params_c = CString::new(params).unwrap();
 
-    // finit_module(fd, params, flags) - syscall 313 on x86_64
+    // finit_module(fd, params, flags)
     let ret = unsafe { libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32) };
 
     if ret < 0 {
@@ -443,42 +483,59 @@ fn load_module_file(path: &str, params: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Set up network interface for SLIRP networking
-/// SLIRP network layout:
-/// - Guest IP:  10.0.2.15/24
-/// - Gateway:   10.0.2.2
-/// - DNS:       10.0.2.3
+/// Set up network interface.
+///
+/// Tries DHCP first (for VZ NAT on macOS), falls back to static SLIRP
+/// addressing (for KVM/SLIRP on Linux).
 fn setup_network() {
-    eprintln!("Setting up network...");
+    kmsg("Setting up network...");
 
-    // Wait briefly for eth0 to appear (virtio-net driver initialization)
     for i in 0..10 {
         if std::path::Path::new("/sys/class/net/eth0").exists() {
-            eprintln!("eth0 detected after {} attempts", i + 1);
+            kmsg(&format!("eth0 detected after {} attempts", i + 1));
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Check if eth0 exists
     if !std::path::Path::new("/sys/class/net/eth0").exists() {
-        eprintln!("Warning: eth0 not found, networking may not be available");
+        kmsg("Warning: eth0 not found, networking may not be available");
         return;
     }
 
-    // Bring up loopback interface
     run_cmd("ip", &["link", "set", "lo", "up"]);
-
-    // Bring up eth0
     run_cmd("ip", &["link", "set", "eth0", "up"]);
 
-    // Configure IP address (SLIRP guest IP: 10.0.2.15/24)
-    run_cmd("ip", &["addr", "add", "10.0.2.15/24", "dev", "eth0"]);
+    // Try DHCP first (works with VZ NAT on macOS), fall back to static below.
+    let dhcp_result = Command::new("udhcpc")
+        .args(["-i", "eth0", "-n", "-q", "-t", "3", "-T", "2"])
+        .output();
 
-    // Add default route via SLIRP gateway (10.0.2.2)
+    if let Err(e) = &dhcp_result {
+        kmsg(&format!("udhcpc failed to run: {}", e));
+    }
+
+    let dhcp_ok = dhcp_result.map(|o| o.status.success()).unwrap_or(false);
+
+    if dhcp_ok {
+        kmsg("Network configured via DHCP (VZ NAT)");
+        // Ensure resolv.conf has a fallback DNS
+        if !std::path::Path::new("/etc/resolv.conf").exists()
+            || std::fs::read_to_string("/etc/resolv.conf")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            let _ = std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\n");
+        }
+        return;
+    }
+
+    // Fallback: static SLIRP addressing (KVM)
+    kmsg("DHCP failed, falling back to static SLIRP addressing");
+    run_cmd("ip", &["addr", "add", "10.0.2.15/24", "dev", "eth0"]);
     run_cmd("ip", &["route", "add", "default", "via", "10.0.2.2"]);
 
-    // Configure DNS resolver (SLIRP DNS: 10.0.2.3)
     match std::fs::write(
         "/etc/resolv.conf",
         "nameserver 10.0.2.3\nnameserver 8.8.8.8\n",
@@ -616,11 +673,29 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
             3 => {
-                // Ping -- payload must carry the 32-byte session secret.
+                // Ping -- payload carries the 32-byte session secret, optionally
+                // followed by a 4-byte LE protocol version (36 bytes total).
+                // Old hosts send 32 bytes (version 0); new hosts send 36.
                 match SESSION_SECRET.get() {
-                    Some(secret) if payload.len() == 32 && payload[..] == secret[..] => {
+                    Some(secret) if payload.len() >= 32 && payload[..32] == secret[..] => {
                         AUTHENTICATED.with(|a| a.set(true));
-                        send_response(fd, MessageType::Pong, &())?;
+
+                        // Parse optional protocol version from bytes 32..36.
+                        let peer_version = if payload.len() >= 36 {
+                            u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
+                        } else {
+                            0 // legacy host, no version field
+                        };
+
+                        // Reply with our protocol version in the Pong payload.
+                        let version_bytes = void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
+                        send_raw_message(fd, MessageType::Pong, &version_bytes)?;
+
+                        kmsg(&format!(
+                            "Authenticated (peer_version={}, our_version={})",
+                            peer_version,
+                            void_box_protocol::PROTOCOL_VERSION
+                        ));
                     }
                     Some(_) => {
                         eprintln!("Authentication failed: invalid secret");
@@ -770,18 +845,10 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // Apply resource limits.
             if let Some(limits) = RESOURCE_LIMITS.get() {
-                // RLIMIT_AS: virtual address space (defense-in-depth).
-                // Bun/JSC needs ~640MB virtual minimum. Default is 1GB which
-                // gives headroom. Set to 0 to disable.
-                if limits.max_virtual_memory > 0 {
-                    let rlim_as = libc::rlimit {
-                        rlim_cur: limits.max_virtual_memory,
-                        rlim_max: limits.max_virtual_memory,
-                    };
-                    libc::setrlimit(libc::RLIMIT_AS, &rlim_as);
-                }
+                // RLIMIT_AS intentionally omitted: Bun (claude-code runtime)
+                // requires large virtual address space for mmap and will abort
+                // if constrained. The VM memory limit is the effective bound.
 
                 // RLIMIT_NOFILE: open file descriptors
                 let rlim_nofile = libc::rlimit {
@@ -881,9 +948,20 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     // Wait for process to exit
     let exit_code = match child.wait() {
-        Ok(status) => status.code().unwrap_or(-1),
+        Ok(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    kmsg(&format!(
+                        "Process '{}' killed by signal {} (exit_status={:?})",
+                        request.program, sig, status,
+                    ));
+                }
+            }
+            status.code().unwrap_or(-1)
+        }
         Err(e) => {
-            // Still join threads to get whatever output was collected
             let stdout_bytes = stdout_handle.join().unwrap_or_default();
             let stderr_bytes = stderr_handle.join().unwrap_or_default();
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -909,18 +987,22 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     let was_timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
 
+    let error_msg = if was_timed_out {
+        Some(format!(
+            "Process killed after {}s timeout",
+            request.timeout_secs.unwrap_or(0)
+        ))
+    } else if exit_code == -1 {
+        Some("Process killed by signal (exit_code mapped to -1)".to_string())
+    } else {
+        None
+    };
+
     ExecResponse {
         stdout: stdout_bytes,
         stderr: stderr_bytes,
         exit_code,
-        error: if was_timed_out {
-            Some(format!(
-                "Process killed after {}s timeout",
-                request.timeout_secs.unwrap_or(0)
-            ))
-        } else {
-            None
-        },
+        error: error_msg,
         duration_ms: Some(duration_ms),
     }
 }
@@ -990,6 +1072,36 @@ fn send_response<T: Serialize>(
     msg.extend_from_slice(&length.to_le_bytes());
     msg.push(msg_type as u8);
     msg.extend_from_slice(&payload_bytes);
+
+    let mut total_written = 0;
+    while total_written < msg.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                msg[total_written..].as_ptr() as *const libc::c_void,
+                msg.len() - total_written,
+            )
+        };
+        if n <= 0 {
+            return Err("Write failed".into());
+        }
+        total_written += n as usize;
+    }
+
+    Ok(())
+}
+
+/// Send a raw (non-JSON) message to the host over the vsock fd.
+///
+/// Unlike [`send_response`] which JSON-serializes a `T`, this writes the
+/// payload bytes verbatim. Used for the Pong reply that carries raw
+/// protocol-version bytes instead of JSON.
+fn send_raw_message(fd: RawFd, msg_type: MessageType, payload: &[u8]) -> Result<(), String> {
+    let length = payload.len() as u32;
+    let mut msg = Vec::with_capacity(5 + payload.len());
+    msg.extend_from_slice(&length.to_le_bytes());
+    msg.push(msg_type as u8);
+    msg.extend_from_slice(payload);
 
     let mut total_written = 0;
     while total_written < msg.len() {

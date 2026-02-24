@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-End Telemetry Tests
 //!
 //! These tests use a real KVM micro-VM with `claudio` (mock claude-code) installed

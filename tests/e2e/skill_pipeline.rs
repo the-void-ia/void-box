@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! E2E tests for Skill + VoidBox + Pipeline with real KVM VMs and claudio.
 //!
 //! These tests verify that:

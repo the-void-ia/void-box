@@ -43,9 +43,9 @@
 //! }
 //! ```
 //!
-//! # Example: Low-Level VM Access
+//! # Example: Low-Level VM Access (Linux only)
 //!
-//! ```no_run
+//! ```no_run,ignore
 //! use void_box::{MicroVm, VoidBoxConfig};
 //!
 //! #[tokio::main]
@@ -65,12 +65,17 @@
 //! }
 //! ```
 
-// Core modules
-pub mod artifacts;
+// Backend abstraction (cross-platform)
+pub mod backend;
+
+// Core modules (Linux-only: KVM VMM, device emulation, SLIRP networking)
+#[cfg(target_os = "linux")]
 pub mod devices;
 pub mod error;
 pub mod guest;
+#[cfg(target_os = "linux")]
 pub mod network;
+#[cfg(target_os = "linux")]
 pub mod vmm;
 
 // Composable workflows
@@ -80,6 +85,7 @@ pub mod workflow;
 
 // Agent(Skills) + Isolation = VoidBox
 pub mod agent_box;
+pub mod artifacts;
 pub mod daemon;
 pub mod llm;
 pub mod persistence;
@@ -90,7 +96,9 @@ pub mod spec;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
+#[cfg(target_os = "linux")]
 pub use vmm::config::VoidBoxConfig;
+#[cfg(target_os = "linux")]
 pub use vmm::MicroVm;
 
 // Prelude for common imports

@@ -1,20 +1,20 @@
-//! Local KVM Sandbox Implementation
+//! Local Sandbox Implementation
 //!
-//! Wraps the existing VMM code to provide a sandbox interface.
+//! Uses the platform-appropriate VM backend (KVM on Linux, VZ on macOS)
+//! via the `VmmBackend` trait.
 
 use tokio::sync::Mutex;
 
 use super::SandboxConfig;
-use crate::vmm::config::VoidBoxConfig;
-use crate::vmm::MicroVm;
+use crate::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
 use crate::{Error, ExecOutput, Result};
 
-/// Local sandbox using KVM
+/// Local sandbox backed by a real VM.
 pub struct LocalSandbox {
     /// Sandbox configuration
     config: SandboxConfig,
-    /// The underlying VM (lazily initialized)
-    vm: Mutex<Option<MicroVm>>,
+    /// The underlying VM backend (lazily initialized)
+    backend: Mutex<Option<Box<dyn VmmBackend>>>,
     /// Whether the sandbox is started
     started: std::sync::atomic::AtomicBool,
 }
@@ -24,7 +24,7 @@ impl LocalSandbox {
     pub fn new(config: SandboxConfig) -> Result<Self> {
         Ok(Self {
             config,
-            vm: Mutex::new(None),
+            backend: Mutex::new(None),
             started: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -37,43 +37,51 @@ impl LocalSandbox {
             return Ok(());
         }
 
-        let mut vm_lock = self.vm.lock().await;
+        let mut backend_lock = self.backend.lock().await;
 
         // Double-check after acquiring lock
-        if vm_lock.is_some() {
+        if backend_lock.is_some() {
             self.started.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
-        // Build VM config
+        // Build backend config
         let kernel = self
             .config
             .kernel
             .clone()
             .ok_or_else(|| Error::Config("Kernel path required for local sandbox".into()))?;
 
-        let mut vm_config = VoidBoxConfig::new()
-            .memory_mb(self.config.memory_mb)
-            .vcpus(self.config.vcpus)
-            .kernel(kernel)
-            .network(self.config.network)
-            .enable_vsock(self.config.enable_vsock);
+        // Generate session secret
+        let mut session_secret = [0u8; 32];
+        getrandom::fill(&mut session_secret)
+            .map_err(|e| Error::Config(format!("Failed to generate session secret: {}", e)))?;
 
-        if let Some(ref initramfs) = self.config.initramfs {
-            vm_config = vm_config.initramfs(initramfs);
-        }
+        let backend_config = BackendConfig {
+            memory_mb: self.config.memory_mb,
+            vcpus: self.config.vcpus,
+            kernel,
+            initramfs: self.config.initramfs.clone(),
+            rootfs: self.config.rootfs.clone(),
+            network: self.config.network,
+            enable_vsock: self.config.enable_vsock,
+            shared_dir: self.config.shared_dir.clone(),
+            env: self.config.env.clone(),
+            security: BackendSecurityConfig {
+                session_secret,
+                command_allowlist: Vec::new(), // Set via provisioning
+                network_deny_list: vec!["169.254.0.0/16".to_string()],
+                max_connections_per_second: 50,
+                max_concurrent_connections: 64,
+                seccomp: true,
+            },
+        };
 
-        if let Some(ref rootfs) = self.config.rootfs {
-            vm_config = vm_config.rootfs(rootfs);
-        }
+        // Create platform-appropriate backend
+        let mut backend = crate::backend::create_backend();
+        backend.start(backend_config).await?;
 
-        if let Some(ref shared_dir) = self.config.shared_dir {
-            vm_config = vm_config.shared_dir(shared_dir);
-        }
-
-        // Create and start VM
-        let vm = MicroVm::new(vm_config).await?;
-        *vm_lock = Some(vm);
+        *backend_lock = Some(backend);
         self.started.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -99,11 +107,11 @@ impl LocalSandbox {
 
         self.ensure_started().await?;
 
-        let vm_lock = self.vm.lock().await;
-        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
 
         let env: Vec<(String, String)> = self.config.env.clone();
-        vm.exec_with_env(program, args, stdin, &env, None).await
+        backend.exec(program, args, stdin, &env, None, None).await
     }
 
     /// Simulate command execution (for testing without a real VM)
@@ -204,9 +212,9 @@ impl LocalSandbox {
 
         self.ensure_started().await?;
 
-        let vm_lock = self.vm.lock().await;
-        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
-        vm.write_file(path, content).await
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        backend.write_file(path, content).await
     }
 
     /// Create directories in the guest filesystem (mkdir -p).
@@ -218,9 +226,9 @@ impl LocalSandbox {
 
         self.ensure_started().await?;
 
-        let vm_lock = self.vm.lock().await;
-        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
-        vm.mkdir_p(path).await
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        backend.mkdir_p(path).await
     }
 
     /// Internal helper for `exec_claude` -- runs claude-code with extra env and optional timeout.
@@ -236,12 +244,13 @@ impl LocalSandbox {
 
         self.ensure_started().await?;
 
-        let vm_lock = self.vm.lock().await;
-        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
-        vm.exec_with_env_timeout("claude-code", args, &[], &env, None, timeout_secs)
+        backend
+            .exec("claude-code", args, &[], &env, None, timeout_secs)
             .await
     }
 
@@ -287,12 +296,13 @@ impl LocalSandbox {
 
         self.ensure_started().await?;
 
-        let vm_lock = self.vm.lock().await;
-        let vm = vm_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
-        vm.exec_streaming("claude-code", args, &env, None, timeout_secs)
+        backend
+            .exec_streaming("claude-code", args, &env, None, timeout_secs)
             .await
     }
 
@@ -300,9 +310,9 @@ impl LocalSandbox {
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
 
-        let mut vm_lock = self.vm.lock().await;
-        if let Some(mut vm) = vm_lock.take() {
-            vm.stop().await?;
+        let mut backend_lock = self.backend.lock().await;
+        if let Some(mut backend) = backend_lock.take() {
+            backend.stop().await?;
         }
         self.started.store(false, Ordering::SeqCst);
 
@@ -312,13 +322,14 @@ impl LocalSandbox {
 
 impl Drop for LocalSandbox {
     fn drop(&mut self) {
-        // VM will be stopped when dropped through MicroVm's Drop impl
+        // Backend will be stopped when dropped through its Drop impl
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::SandboxConfig;
 
     #[tokio::test]
     async fn test_simulate_echo() {

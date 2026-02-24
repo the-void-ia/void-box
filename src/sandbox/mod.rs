@@ -415,21 +415,19 @@ impl Sandbox {
                     && !state.is_error;
 
                 if no_stream_output {
-                    let (stderr_str, exit_code) = match &response {
+                    let (stderr_str, exit_code, error_str) = match &response {
                         Ok(resp) => (
                             String::from_utf8_lossy(&resp.stderr).to_string(),
                             resp.exit_code,
+                            resp.error.clone().unwrap_or_default(),
                         ),
-                        Err(e) => (format!("{}", e), -1),
+                        Err(e) => (format!("{}", e), -1, String::new()),
                     };
                     return Err(Error::Guest(format!(
-                        "claude-code returned no stream-json events (exit_code={}). stderr: {}",
+                        "claude-code returned no stream-json events (exit_code={}). stderr: {}. error: {}",
                         exit_code,
-                        if stderr_str.trim().is_empty() {
-                            "(empty)"
-                        } else {
-                            stderr_str.trim()
-                        }
+                        if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
+                        if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
                     )));
                 }
 

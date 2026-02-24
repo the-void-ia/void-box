@@ -8,9 +8,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors that can occur in void-box operations
 #[derive(Error, Debug)]
 pub enum Error {
-    /// KVM-related errors
+    /// KVM-related errors (Linux only)
+    #[cfg(target_os = "linux")]
     #[error("KVM error: {0}")]
     Kvm(#[from] kvm_ioctls::Error),
+
+    /// Backend-related errors (cross-platform)
+    #[error("Backend error: {0}")]
+    Backend(String),
 
     /// Memory-related errors
     #[error("Memory error: {0}")]
@@ -60,7 +65,8 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// System call errors
+    /// System call errors (Linux only — nix crate)
+    #[cfg(target_os = "linux")]
     #[error("System error: {0}")]
     System(#[from] nix::Error),
 
