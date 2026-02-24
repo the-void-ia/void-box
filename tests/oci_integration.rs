@@ -817,16 +817,40 @@ async fn guest_image_pull_and_extract() {
         .await
         .expect("resolve_guest_files should succeed");
 
-    assert!(guest.kernel.exists(), "kernel should exist at {}", guest.kernel.display());
-    assert!(guest.initramfs.exists(), "initramfs should exist at {}", guest.initramfs.display());
+    assert!(
+        guest.kernel.exists(),
+        "kernel should exist at {}",
+        guest.kernel.display()
+    );
+    assert!(
+        guest.initramfs.exists(),
+        "initramfs should exist at {}",
+        guest.initramfs.display()
+    );
 
     let kernel_size = std::fs::metadata(&guest.kernel).unwrap().len();
     let initramfs_size = std::fs::metadata(&guest.initramfs).unwrap().len();
-    eprintln!("kernel:    {} ({} bytes)", guest.kernel.display(), kernel_size);
-    eprintln!("initramfs: {} ({} bytes)", guest.initramfs.display(), initramfs_size);
+    eprintln!(
+        "kernel:    {} ({} bytes)",
+        guest.kernel.display(),
+        kernel_size
+    );
+    eprintln!(
+        "initramfs: {} ({} bytes)",
+        guest.initramfs.display(),
+        initramfs_size
+    );
 
-    assert!(kernel_size > 1_000_000, "kernel too small: {} bytes", kernel_size);
-    assert!(initramfs_size > 1_000_000, "initramfs too small: {} bytes", initramfs_size);
+    assert!(
+        kernel_size > 1_000_000,
+        "kernel too small: {} bytes",
+        kernel_size
+    );
+    assert!(
+        initramfs_size > 1_000_000,
+        "initramfs too small: {} bytes",
+        initramfs_size
+    );
 
     // Second call: should use cache (no network).
     eprintln!("=== Second call (cache hit) ===");
