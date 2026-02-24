@@ -16,16 +16,34 @@ jobs:
   e2e-macos:
     name: E2E VZ (macOS Apple Silicon)
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
       # ---- System dependencies ----
+      - name: Cache musl-cross toolchain
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/musl-cross
+            /opt/homebrew/opt/musl-cross
+            /opt/homebrew/bin/aarch64-linux-musl-*
+          key: ${{ runner.os }}-musl-cross-1
+
       - name: Install musl cross-compilation toolchain
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         run: |
           brew install filosottile/musl-cross/musl-cross
-          # Verify the cross-compiler is available
+
+      - name: Relink musl-cross from cache
+        if: steps.cache-musl.outputs.cache-hit == 'true'
+        run: |
+          brew link musl-cross 2>/dev/null || true
+
+      - name: Verify musl-cross
+        run: |
           which aarch64-linux-musl-gcc
           aarch64-linux-musl-gcc --version
 
