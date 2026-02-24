@@ -9,7 +9,7 @@ sandbox:
   # Pull kernel + initramfs from this OCI image (no local build needed).
   # For local testing: localhost:5555/voidbox-guest:v0.1.0
   # For production:    ghcr.io/the-void-ia/voidbox-guest:v0.1.0
-  guest_image: "localhost:5555/voidbox-guest:v0.1.0"
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:v0.1.1"
 
 workflow:
   steps:
