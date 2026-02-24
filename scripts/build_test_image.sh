@@ -43,7 +43,9 @@ esac
 # On macOS, set up the musl cross-compiler for building Linux guest binaries
 if [[ "$HOST_OS" == "Darwin" ]]; then
     echo "[test-image] macOS detected — using musl cross-compilation for $GUEST_TARGET"
-    export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+    CROSS_GCC="${ARCH}-linux-musl-gcc"
+    export CC_aarch64_unknown_linux_musl="$CROSS_GCC"
+    export "CARGO_TARGET_$(echo "$GUEST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=$CROSS_GCC"
 fi
 
 # ---- Build guest-agent (static musl) ----

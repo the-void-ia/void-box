@@ -226,41 +226,37 @@ cargo run --example trading_pipeline
 
 VoidBox runs natively on Apple Silicon Macs using Apple's Virtualization.framework — no Docker or Linux VM required.
 
-**Prerequisites:**
+**One-time setup:**
 
 ```bash
-# 1. Install the musl cross-compilation toolchain
+# Install the musl cross-compilation toolchain (compiles from source, ~30 min first time)
 brew install filosottile/musl-cross/musl-cross
 
-# 2. Add the Rust target for Linux ARM64
+# Add the Rust target for Linux ARM64
 rustup target add aarch64-unknown-linux-musl
-
-# 3. Download an ARM64 Linux kernel
-curl -fSL -o target/vmlinuz-ubuntu-arm64 \
-  https://cloud-images.ubuntu.com/minimal/releases/noble/release/unpacked/ubuntu-noble-minimal-cloudimg-arm64-vmlinuz-generic
-gunzip -f target/vmlinuz-ubuntu-arm64 2>/dev/null || true
-
-# 4. Build the guest initramfs (cross-compiles guest-agent, downloads claude-code + busybox)
-scripts/build_claude_rootfs.sh
-
-# 5. Build the example and sign it with the virtualization entitlement
-cargo build --example ollama_local
-codesign --force --sign - --entitlements voidbox.entitlements target/debug/examples/ollama_local
 ```
 
-**Run with Ollama:**
+**Build and run:**
 
 ```bash
-# Make sure Ollama listens on all interfaces (required for VM networking)
-OLLAMA_HOST=0.0.0.0:11434 ollama serve  # in a separate terminal
+# Download an ARM64 Linux kernel (cached in target/)
+scripts/download_kernel.sh
 
+# Build the guest initramfs (cross-compiles guest-agent, downloads claude-code + busybox)
+scripts/build_claude_rootfs.sh
+
+# Build the example and sign it with the virtualization entitlement
+cargo build --example ollama_local
+codesign --force --sign - --entitlements voidbox.entitlements target/debug/examples/ollama_local
+
+# Run (Ollama must be listening on 0.0.0.0:11434)
 OLLAMA_MODEL=qwen3-coder \
-VOID_BOX_KERNEL=target/vmlinuz-ubuntu-arm64 \
+VOID_BOX_KERNEL=target/vmlinuz-arm64 \
 VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 target/debug/examples/ollama_local
 ```
 
-> **Note:** Every `cargo build` invalidates the code signature. Re-run the `codesign` command after each rebuild.
+> **Note:** Every `cargo build` invalidates the code signature. Re-run `codesign` after each rebuild.
 
 ### Parallel pipeline with per-box models
 

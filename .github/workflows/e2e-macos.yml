@@ -9,8 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pinned Ubuntu arm64 kernel version for reproducibility
-  KERNEL_VER: "6.8.0-51"
 
 jobs:
   e2e-macos:
@@ -72,19 +70,8 @@ jobs:
       # ---- Download prebuilt arm64 Linux kernel ----
       - name: Download arm64 Linux kernel
         run: |
-          KERNEL_DEB="linux-image-${KERNEL_VER}-generic_${KERNEL_VER}.0_arm64.deb"
-          KERNEL_URL="http://ports.ubuntu.com/pool/main/l/linux/${KERNEL_DEB}"
-          echo "Downloading kernel: ${KERNEL_URL}"
-          curl -LO "${KERNEL_URL}"
-
-          # Extract vmlinuz from the .deb (macOS has no dpkg-deb, use ar + tar)
-          ar x "${KERNEL_DEB}"
-          tar xf data.tar.* ./boot/
-          cp ./boot/vmlinuz-* /tmp/void-box-kernel
-          chmod 644 /tmp/void-box-kernel
-
-          echo "Kernel extracted to /tmp/void-box-kernel"
-          ls -la /tmp/void-box-kernel
+          scripts/download_kernel.sh
+          cp target/vmlinuz-arm64 /tmp/void-box-kernel
 
       # ---- Run conformance tests ----
       - name: Run conformance E2E tests
