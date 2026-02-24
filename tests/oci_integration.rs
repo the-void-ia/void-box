@@ -291,6 +291,106 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Group 1b: guest_image spec parsing tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// YAML with `sandbox.guest_image` deserializes correctly.
+#[test]
+fn spec_parses_guest_image() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:v0.1.0"
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert_eq!(
+        spec.sandbox.guest_image.as_deref(),
+        Some("ghcr.io/the-void-ia/voidbox-guest:v0.1.0")
+    );
+}
+
+/// YAML without `sandbox.guest_image` has `None`.
+#[test]
+fn spec_guest_image_default_none() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert!(spec.sandbox.guest_image.is_none());
+}
+
+/// Empty string `guest_image: ""` parses as `Some("")` — used to disable auto-pull.
+#[test]
+fn spec_guest_image_empty_string_disables() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  guest_image: ""
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert_eq!(spec.sandbox.guest_image.as_deref(), Some(""));
+}
+
+/// Both `image` and `guest_image` can coexist (base image + guest kernel image).
+#[test]
+fn spec_both_image_and_guest_image() {
+    let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  image: "python:3.12-slim"
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:latest"
+agent:
+  prompt: "hello"
+"#;
+    let spec: RunSpec = serde_yaml::from_str(yaml).expect("failed to parse YAML");
+    assert_eq!(spec.sandbox.image.as_deref(), Some("python:3.12-slim"));
+    assert_eq!(
+        spec.sandbox.guest_image.as_deref(),
+        Some("ghcr.io/the-void-ia/voidbox-guest:latest")
+    );
+}
+
+/// `load_spec` validates a spec with `guest_image` successfully.
+#[test]
+fn spec_load_with_guest_image() {
+    let yaml = r#"
+api_version: v1
+kind: workflow
+name: guest-test
+sandbox:
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:v0.1.0"
+workflow:
+  steps:
+    - name: probe
+      run:
+        program: echo
+        args: ["ok"]
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("guest.yaml");
+    std::fs::write(&spec_path, yaml).unwrap();
+    let spec = load_spec(&spec_path).expect("spec with guest_image should load");
+    assert_eq!(
+        spec.sandbox.guest_image.as_deref(),
+        Some("ghcr.io/the-void-ia/voidbox-guest:v0.1.0")
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Group 3: VM E2E tests (require hardware, `#[ignore]`)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -681,4 +781,60 @@ workflow:
         "OCI cache dir should exist at {}",
         cache_dir.display()
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group 5: Guest image OCI pull + extract tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pull a guest image from a registry, extract vmlinuz + rootfs.cpio.gz, verify cache.
+///
+/// Requires a registry with `voidbox-guest:v0.1.0`.
+/// Default: `localhost:5555` — override with `VOIDBOX_TEST_GUEST_IMAGE`.
+///
+/// ```bash
+/// # Start local registry + push image:
+/// docker run -d --name voidbox-test-registry -p 5555:5000 registry:2
+/// docker tag ghcr.io/the-void-ia/voidbox-guest:latest localhost:5555/voidbox-guest:v0.1.0
+/// docker push localhost:5555/voidbox-guest:v0.1.0
+///
+/// # Run this test:
+/// cargo test --test oci_integration -- --ignored guest_image_pull_and_extract
+/// ```
+#[tokio::test]
+#[ignore = "requires a registry with voidbox-guest image (see docstring)"]
+async fn guest_image_pull_and_extract() {
+    let image_ref = std::env::var("VOIDBOX_TEST_GUEST_IMAGE")
+        .unwrap_or_else(|_| "localhost:5555/voidbox-guest:v0.1.0".to_string());
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let client = voidbox_oci::OciClient::new(cache_dir.path().to_path_buf());
+
+    // First pull: should download and extract.
+    eprintln!("=== Pulling guest image: {} ===", image_ref);
+    let guest = client
+        .resolve_guest_files(&image_ref)
+        .await
+        .expect("resolve_guest_files should succeed");
+
+    assert!(guest.kernel.exists(), "kernel should exist at {}", guest.kernel.display());
+    assert!(guest.initramfs.exists(), "initramfs should exist at {}", guest.initramfs.display());
+
+    let kernel_size = std::fs::metadata(&guest.kernel).unwrap().len();
+    let initramfs_size = std::fs::metadata(&guest.initramfs).unwrap().len();
+    eprintln!("kernel:    {} ({} bytes)", guest.kernel.display(), kernel_size);
+    eprintln!("initramfs: {} ({} bytes)", guest.initramfs.display(), initramfs_size);
+
+    assert!(kernel_size > 1_000_000, "kernel too small: {} bytes", kernel_size);
+    assert!(initramfs_size > 1_000_000, "initramfs too small: {} bytes", initramfs_size);
+
+    // Second call: should use cache (no network).
+    eprintln!("=== Second call (cache hit) ===");
+    let guest2 = client
+        .resolve_guest_files(&image_ref)
+        .await
+        .expect("cached resolve should succeed");
+
+    assert_eq!(guest.kernel, guest2.kernel);
+    assert_eq!(guest.initramfs, guest2.initramfs);
 }

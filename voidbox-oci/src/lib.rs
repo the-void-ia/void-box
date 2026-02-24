@@ -167,11 +167,10 @@ impl OciClient {
         // Selective extraction — only vmlinuz + rootfs.cpio.gz.
         let layers = image.layers.clone();
         let dest = guest_dir.clone();
-        let guest = tokio::task::spawn_blocking(move || {
-            unpack::extract_guest_files(&layers, &dest)
-        })
-        .await
-        .map_err(|e| OciError::Layer(format!("guest extract task panicked: {}", e)))??;
+        let guest =
+            tokio::task::spawn_blocking(move || unpack::extract_guest_files(&layers, &dest))
+                .await
+                .map_err(|e| OciError::Layer(format!("guest extract task panicked: {}", e)))??;
 
         blob_cache.mark_guest_done(&cache_key).await?;
 

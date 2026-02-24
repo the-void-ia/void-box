@@ -149,7 +149,13 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 
     let mut boxes_by_name: HashMap<String, VoidBox> = HashMap::new();
     for b in &pipeline.boxes {
-        let ab = build_pipeline_box_with_io(spec, b, &output_registry, oci_rootfs_host.as_deref(), guest.as_ref())?;
+        let ab = build_pipeline_box_with_io(
+            spec,
+            b,
+            &output_registry,
+            oci_rootfs_host.as_deref(),
+            guest.as_ref(),
+        )?;
         boxes_by_name.insert(b.name.clone(), ab);
     }
 
@@ -450,11 +456,7 @@ fn build_shared_sandbox(
     })
 }
 
-fn apply_box_sandbox(
-    mut builder: VoidBox,
-    spec: &RunSpec,
-    guest: Option<&GuestFiles>,
-) -> VoidBox {
+fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec, guest: Option<&GuestFiles>) -> VoidBox {
     let mode = spec.sandbox.mode.to_ascii_lowercase();
     if mode == "mock" {
         return builder.mock();
@@ -518,7 +520,10 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
         match resolve_oci_guest_image(guest_image).await {
             Ok(files) => return Some(files),
             Err(e) => {
-                eprintln!("[void-box] Failed to resolve guest image '{}': {}", guest_image, e);
+                eprintln!(
+                    "[void-box] Failed to resolve guest image '{}': {}",
+                    guest_image, e
+                );
                 if spec.sandbox.mode.eq_ignore_ascii_case("auto") {
                     return None;
                 }

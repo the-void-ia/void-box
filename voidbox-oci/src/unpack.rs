@@ -30,6 +30,7 @@ pub fn unpack_layers(layers: &[LayerInfo], dest: &Path) -> Result<PathBuf> {
 }
 
 /// Paths to the extracted guest files (kernel + initramfs).
+#[derive(Debug)]
 pub struct GuestFiles {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -84,9 +85,7 @@ pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFil
     }
 
     if !found_kernel {
-        return Err(OciError::Layer(
-            "guest image missing vmlinuz".to_string(),
-        ));
+        return Err(OciError::Layer("guest image missing vmlinuz".to_string()));
     }
     if !found_initramfs {
         return Err(OciError::Layer(
@@ -328,5 +327,132 @@ mod tests {
         // Directory itself still exists but is empty.
         assert!(dir.exists());
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    /// Build a gzip-compressed tar containing the given file entries.
+    /// Returns the compressed bytes.
+    fn build_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            for &(name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(name).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    /// Helper: create a LayerInfo pointing at a temp file with given bytes.
+    fn layer_from_bytes(dir: &Path, name: &str, data: &[u8]) -> LayerInfo {
+        let path = dir.join(name);
+        fs::write(&path, data).unwrap();
+        LayerInfo {
+            digest: format!("sha256:{}", name),
+            size: data.len() as u64,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            local_path: path,
+        }
+    }
+
+    #[test]
+    fn extract_guest_files_both_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&layer_dir).unwrap();
+
+        let tar_data = build_tar_gz(&[
+            ("vmlinuz", b"KERNEL_DATA"),
+            ("rootfs.cpio.gz", b"INITRAMFS_DATA"),
+            ("extra-file.txt", b"ignored"),
+        ]);
+        let layer = layer_from_bytes(&layer_dir, "layer0.tar.gz", &tar_data);
+
+        let dest = tmp.path().join("guest");
+        let result = extract_guest_files(&[layer], &dest).unwrap();
+
+        assert_eq!(fs::read(&result.kernel).unwrap(), b"KERNEL_DATA");
+        assert_eq!(fs::read(&result.initramfs).unwrap(), b"INITRAMFS_DATA");
+    }
+
+    #[test]
+    fn extract_guest_files_missing_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&layer_dir).unwrap();
+
+        let tar_data = build_tar_gz(&[("rootfs.cpio.gz", b"INITRAMFS_DATA")]);
+        let layer = layer_from_bytes(&layer_dir, "layer0.tar.gz", &tar_data);
+
+        let dest = tmp.path().join("guest");
+        let err = extract_guest_files(&[layer], &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("vmlinuz"),
+            "error should mention vmlinuz: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_guest_files_missing_initramfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&layer_dir).unwrap();
+
+        let tar_data = build_tar_gz(&[("vmlinuz", b"KERNEL_DATA")]);
+        let layer = layer_from_bytes(&layer_dir, "layer0.tar.gz", &tar_data);
+
+        let dest = tmp.path().join("guest");
+        let err = extract_guest_files(&[layer], &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("rootfs.cpio.gz"),
+            "error should mention rootfs.cpio.gz: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_guest_files_across_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&layer_dir).unwrap();
+
+        // Kernel in layer 0, initramfs in layer 1.
+        let tar0 = build_tar_gz(&[("vmlinuz", b"K")]);
+        let tar1 = build_tar_gz(&[("rootfs.cpio.gz", b"I")]);
+        let l0 = layer_from_bytes(&layer_dir, "l0.tar.gz", &tar0);
+        let l1 = layer_from_bytes(&layer_dir, "l1.tar.gz", &tar1);
+
+        let dest = tmp.path().join("guest");
+        let result = extract_guest_files(&[l0, l1], &dest).unwrap();
+
+        assert_eq!(fs::read(&result.kernel).unwrap(), b"K");
+        assert_eq!(fs::read(&result.initramfs).unwrap(), b"I");
+    }
+
+    #[test]
+    fn extract_guest_files_nested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&layer_dir).unwrap();
+
+        // Files at nested paths — should still match by filename.
+        let tar_data = build_tar_gz(&[
+            ("boot/vmlinuz", b"NESTED_KERNEL"),
+            ("images/rootfs.cpio.gz", b"NESTED_INITRAMFS"),
+        ]);
+        let layer = layer_from_bytes(&layer_dir, "layer0.tar.gz", &tar_data);
+
+        let dest = tmp.path().join("guest");
+        let result = extract_guest_files(&[layer], &dest).unwrap();
+
+        assert_eq!(fs::read(&result.kernel).unwrap(), b"NESTED_KERNEL");
+        assert_eq!(fs::read(&result.initramfs).unwrap(), b"NESTED_INITRAMFS");
     }
 }

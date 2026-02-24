@@ -49,6 +49,7 @@
 - **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
 - **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude (default) or Ollama via Claude-compatible provider mode.
+- **OCI-native** — Auto-pulls guest images (kernel + initramfs) from GHCR on first run. Mount container images as base OS or as skill providers — no local build steps required.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
@@ -196,31 +197,64 @@ See the [playground](playground/) for a ready-to-run stack with Grafana, Tempo, 
 
 ## Running & Testing
 
+### KVM mode (zero-setup)
+
+On a Linux host with `/dev/kvm`, VoidBox auto-pulls a pre-built guest image (kernel + initramfs) from GHCR on first run. No manual build steps required:
+
+```bash
+# Just works — guest image is pulled and cached automatically
+ANTHROPIC_API_KEY=sk-ant-xxx \
+cargo run --bin voidbox -- run --file examples/specs/oci/agent.yaml
+
+# Or with Ollama
+cargo run --bin voidbox -- run --file examples/specs/oci/workflow.yaml
+```
+
+The guest image (`ghcr.io/the-void-ia/voidbox-guest`) contains the kernel and initramfs with guest-agent, busybox, and common tools. It's cached at `~/.voidbox/oci/guest/` after the first pull.
+
+**Resolution order** — VoidBox resolves the kernel/initramfs using:
+
+1. `sandbox.kernel` / `sandbox.initramfs` in the spec (explicit paths)
+2. `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` env vars
+3. `sandbox.guest_image` in the spec (explicit OCI ref)
+4. Default: `ghcr.io/the-void-ia/voidbox-guest:v{version}` (auto-pull)
+5. Mock fallback when `mode: auto`
+
+To use a custom guest image or disable auto-pull:
+
+```yaml
+sandbox:
+  # Use a specific guest image
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:latest"
+
+  # Or disable auto-pull (empty string)
+  # guest_image: ""
+```
+
+### KVM mode (manual build)
+
+If you prefer to build the guest image locally:
+
+```bash
+# Build guest initramfs (includes claude-code binary, busybox, CA certs)
+scripts/build_guest_image.sh
+
+# Download a kernel
+scripts/download_kernel.sh
+
+# Run with explicit paths
+ANTHROPIC_API_KEY=sk-ant-xxx \
+VOID_BOX_KERNEL=target/vmlinuz-amd64 \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline
+```
+
 ### Mock mode (no KVM required)
 
 ```bash
 cargo run --example quick_demo
 cargo run --example trading_pipeline
 cargo run --example parallel_pipeline
-```
-
-### KVM mode
-
-```bash
-# Build guest initramfs (includes claude-code binary, busybox, CA certs)
-scripts/build_claude_rootfs.sh
-
-# Run with Claude API
-ANTHROPIC_API_KEY=sk-ant-xxx \
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example trading_pipeline
-
-# Or with Ollama
-OLLAMA_MODEL=qwen3-coder \
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example trading_pipeline
 ```
 
 ### macOS mode (Apple Silicon)
@@ -288,12 +322,13 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
 ## OCI Container Support
 
-VoidBox supports OCI container images in two ways:
+VoidBox supports OCI container images in three ways:
 
-1. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
-2. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
+1. **`sandbox.guest_image`** — Pre-built kernel + initramfs distributed as an OCI image. Auto-pulled from GHCR on first run (no local build needed). See [KVM mode (zero-setup)](#kvm-mode-zero-setup).
+2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
+3. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
 
-Images are pulled from Docker Hub (or any OCI-compliant registry), cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
+Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry, cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
 
 ### Example: OCI skills
 
@@ -356,6 +391,7 @@ More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
 | `workflow.yaml` | Workflow with `sandbox.image: alpine:3.20` (no LLM) |
 | `pipeline.yaml` | Multi-language pipeline: Python base + Go and Java OCI skills |
 | `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
+| `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs |
 
 ---
 

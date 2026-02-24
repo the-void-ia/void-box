@@ -98,6 +98,17 @@ pub struct RegistryClient {
     client: reqwest::Client,
 }
 
+/// Return the base URL scheme for a registry host.
+/// Localhost and loopback registries default to HTTP; everything else to HTTPS.
+fn registry_scheme(registry: &str) -> &'static str {
+    let host = registry.split(':').next().unwrap_or(registry);
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        "http"
+    } else {
+        "https"
+    }
+}
+
 impl RegistryClient {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
@@ -115,9 +126,10 @@ impl RegistryClient {
     /// `ManifestResponse::Index`; for a single manifest it receives
     /// `ManifestResponse::Manifest`.
     pub async fn fetch_manifest(&self, image_ref: &ImageRef) -> Result<ManifestResponse> {
+        let scheme = registry_scheme(&image_ref.registry);
         let url = format!(
-            "https://{}/v2/{}/manifests/{}",
-            image_ref.registry, image_ref.repository, image_ref.reference,
+            "{}://{}/v2/{}/manifests/{}",
+            scheme, image_ref.registry, image_ref.repository, image_ref.reference,
         );
 
         let accept = [
@@ -151,9 +163,10 @@ impl RegistryClient {
         image_ref: &ImageRef,
         digest: &str,
     ) -> Result<OciManifest> {
+        let scheme = registry_scheme(&image_ref.registry);
         let url = format!(
-            "https://{}/v2/{}/manifests/{}",
-            image_ref.registry, image_ref.repository, digest,
+            "{}://{}/v2/{}/manifests/{}",
+            scheme, image_ref.registry, image_ref.repository, digest,
         );
 
         let accept = [MEDIA_TYPE_OCI_MANIFEST, MEDIA_TYPE_DOCKER_MANIFEST].join(", ");
@@ -168,9 +181,10 @@ impl RegistryClient {
 
     /// Download a blob by digest.  Returns the raw bytes.
     pub async fn fetch_blob(&self, image_ref: &ImageRef, digest: &str) -> Result<Vec<u8>> {
+        let scheme = registry_scheme(&image_ref.registry);
         let url = format!(
-            "https://{}/v2/{}/blobs/{}",
-            image_ref.registry, image_ref.repository, digest,
+            "{}://{}/v2/{}/blobs/{}",
+            scheme, image_ref.registry, image_ref.repository, digest,
         );
 
         self.authenticated_get(&url, image_ref, None).await
@@ -430,6 +444,21 @@ mod tests {
     #[test]
     fn parse_empty_returns_error() {
         assert!(ImageRef::parse("").is_err());
+    }
+
+    #[test]
+    fn registry_scheme_localhost_is_http() {
+        assert_eq!(registry_scheme("localhost:5555"), "http");
+        assert_eq!(registry_scheme("localhost:5000"), "http");
+        assert_eq!(registry_scheme("localhost"), "http");
+        assert_eq!(registry_scheme("127.0.0.1:5000"), "http");
+    }
+
+    #[test]
+    fn registry_scheme_remote_is_https() {
+        assert_eq!(registry_scheme("ghcr.io"), "https");
+        assert_eq!(registry_scheme("registry-1.docker.io"), "https");
+        assert_eq!(registry_scheme("my.registry.io:443"), "https");
     }
 
     #[test]

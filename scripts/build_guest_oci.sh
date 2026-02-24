@@ -17,8 +17,13 @@ TAG="${TAG:-latest}"
 IMAGE="${IMAGE:-ghcr.io/the-void-ia/voidbox-guest}"
 PUSH="${1:-}"
 
-# Architectures to build.
-ARCHS=("x86_64" "aarch64")
+# Architectures to build (override with ARCHS="x86_64" for single-arch).
+if [[ -z "${ARCHS:-}" ]]; then
+    ARCHS=("x86_64" "aarch64")
+else
+    # shellcheck disable=SC2206
+    ARCHS=($ARCHS)
+fi
 
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voidbox-guest-oci.XXXXXX")"
 trap 'rm -rf "$STAGING_DIR"' EXIT
@@ -58,8 +63,18 @@ DOCKERFILE
 mv "${STAGING_DIR}/x86_64"  "${STAGING_DIR}/amd64"  2>/dev/null || true
 mv "${STAGING_DIR}/aarch64" "${STAGING_DIR}/arm64"   2>/dev/null || true
 
+# Build platform list from ARCHS.
+PLATFORMS=()
+for arch in "${ARCHS[@]}"; do
+    case "$arch" in
+        x86_64)  PLATFORMS+=("linux/amd64") ;;
+        aarch64) PLATFORMS+=("linux/arm64") ;;
+    esac
+done
+PLATFORM_LIST=$(IFS=,; echo "${PLATFORMS[*]}")
+
 BUILDX_ARGS=(
-    --platform linux/amd64,linux/arm64
+    --platform "$PLATFORM_LIST"
     -t "${IMAGE}:${TAG}"
     -f "${STAGING_DIR}/Dockerfile"
     "${STAGING_DIR}"
