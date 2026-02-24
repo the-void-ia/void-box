@@ -95,21 +95,32 @@ if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
 fi
 echo "[kernel] Checksum OK"
 
-# ---- Extract vmlinuz from .deb (ar + tar, no dpkg needed) ----
+# ---- Extract vmlinuz from .deb ----
+# A .deb is an ar archive containing debian-binary, control.tar.*, and
+# data.tar.*. We extract data.tar.* then pull ./boot/vmlinuz-* from it.
+#
+# macOS: Apple's ar (cctools) doesn't handle .deb reliably, but bsdtar
+#        (which IS tar on macOS, from libarchive) reads ar format natively.
+# Linux: GNU tar doesn't support ar format, so we use ar(1) instead.
 echo "[kernel] Extracting vmlinuz from .deb..."
 EXTRACT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/void-box-kernel-extract.XXXXXX")
 trap 'rm -rf "$EXTRACT_DIR" "$DEB_PATH"' EXIT
 
 (
     cd "$EXTRACT_DIR"
-    ar x "$ROOT_DIR/$DEB_PATH"
 
-    # Modern Ubuntu .deb packages use zstd-compressed data archives
-    # (data.tar.zst). Handle each format explicitly because macOS tar
-    # and older GNU tar don't always support zstd natively.
+    # Step 1: Extract .deb (ar archive) members
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        tar xf "$ROOT_DIR/$DEB_PATH"
+    else
+        ar x "$ROOT_DIR/$DEB_PATH"
+    fi
+
+    # Step 2: Find and extract boot/ from data.tar.*
+    # Modern Ubuntu packages use data.tar.zst; older ones use .xz or .gz.
     DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1)
     if [[ -z "$DATA_TAR" ]]; then
-        echo "[kernel] ERROR: no data.tar.* found in .deb"
+        echo "[kernel] ERROR: no data.tar.* found after extracting .deb"
         ls -la
         exit 1
     fi

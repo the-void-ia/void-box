@@ -9,7 +9,7 @@ CLIPPY_EXCLUDE=""
 if [[ "$(uname -s)" == "Darwin" ]]; then
     CLIPPY_EXCLUDE="--exclude guest-agent"
 fi
-if ! cargo clippy --workspace --all-targets --all-features $CLIPPY_EXCLUDE -- -D warnings 2>/dev/null; then
+if ! cargo clippy --workspace --all-targets --all-features $CLIPPY_EXCLUDE -- -D warnings; then
     echo "clippy check failed. Fix warnings and re-commit."
     exit 1
 fi
