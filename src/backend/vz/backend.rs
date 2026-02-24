@@ -124,10 +124,12 @@ impl VzBackend {
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
 
             // Dispatch connectToPort onto the VZ queue (required by Apple).
-            let device_ptr = Arc::as_ptr(&device) as usize;
+            // Clone the Arc so the device stays alive even if the outer
+            // scope is dropped on timeout.
+            let device_clone = Arc::clone(&device);
             let tx_clone = tx;
             queue.exec_async(move || {
-                let device = unsafe { &*(device_ptr as *const SendSyncDevice) };
+                let device = &*device_clone;
                 let tx = tx_clone;
                 let handler = RcBlock::new(
                     move |connection: *mut VZVirtioSocketConnection,
@@ -283,13 +285,20 @@ impl VmmBackend for VzBackend {
                 )
             };
 
+            // Store VM in self *before* dispatching the async start so that
+            // the Retained keeps the ObjC object alive even if we hit the
+            // recv_timeout below. Without this, a timeout would drop the
+            // local `vm`, leaving the async closure with a dangling pointer.
+            self.vm = Some(vm);
+
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
             // Dispatch the start call onto the VZ queue.
             // Safety: we pass the VM as a raw pointer to avoid the !Send
             // constraint. This is safe because the VM was created on this
-            // queue and we only access it from this queue.
-            let vm_ptr = Retained::as_ptr(&vm) as usize;
+            // queue, we only access it from this queue, and the Retained in
+            // self.vm keeps the object alive for the duration.
+            let vm_ptr = Retained::as_ptr(self.vm.as_ref().unwrap()) as usize;
             self.vz_queue.exec_async(move || {
                 let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
                 let tx = std::sync::Mutex::new(Some(tx));
@@ -309,14 +318,24 @@ impl VmmBackend for VzBackend {
                 }
             });
 
-            rx.recv_timeout(std::time::Duration::from_secs(30))
-                .map_err(|_| crate::Error::Backend("VM start: timed out (30s)".into()))?
-                .map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))?;
+            if let Err(e) = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| crate::Error::Backend("VM start: timed out (30s)".into()))
+                .and_then(|r| {
+                    r.map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))
+                })
+            {
+                // Start failed — clear the stored VM so stop() doesn't
+                // try to use a half-started machine.
+                self.vm = None;
+                return Err(e);
+            }
 
             info!("VzBackend: VM started successfully");
 
             // 8. Get the socket device for vsock connections
-            let socket_devices = unsafe { vm.socketDevices() };
+            let vm_ref = self.vm.as_ref().unwrap();
+            let socket_devices = unsafe { vm_ref.socketDevices() };
             let socket_device = socket_devices.objectAtIndex(0);
             let socket_device: Retained<VZVirtioSocketDevice> =
                 unsafe { Retained::cast_unchecked(socket_device) };
@@ -329,7 +348,6 @@ impl VmmBackend for VzBackend {
                 config.security.session_secret,
             ));
 
-            self.vm = Some(vm);
             self.socket_device = Some(socket_device);
             self.control_channel = Some(control_channel);
             self.running.store(true, Ordering::SeqCst);
@@ -352,11 +370,18 @@ impl VmmBackend for VzBackend {
             .as_ref()
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?;
 
+        let mut exec_env = env.to_vec();
+        if let Some(ref ctx) = self.span_context {
+            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
+                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
+            }
+        }
+
         let request = crate::guest::protocol::ExecRequest {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             stdin: stdin.to_vec(),
-            env: env.to_vec(),
+            env: exec_env,
             working_dir: working_dir.map(|s| s.to_string()),
             timeout_secs,
         };
@@ -387,11 +412,18 @@ impl VmmBackend for VzBackend {
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?
             .clone();
 
+        let mut exec_env = env.to_vec();
+        if let Some(ref ctx) = self.span_context {
+            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
+                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
+            }
+        }
+
         let request = crate::guest::protocol::ExecRequest {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             stdin: Vec::new(),
-            env: env.to_vec(),
+            env: exec_env,
             working_dir: working_dir.map(|s| s.to_string()),
             timeout_secs,
         };

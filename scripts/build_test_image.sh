@@ -44,7 +44,8 @@ esac
 if [[ "$HOST_OS" == "Darwin" ]]; then
     echo "[test-image] macOS detected — using musl cross-compilation for $GUEST_TARGET"
     CROSS_GCC="${ARCH}-linux-musl-gcc"
-    export CC_aarch64_unknown_linux_musl="$CROSS_GCC"
+    CC_VAR_NAME="CC_${GUEST_TARGET//-/_}"
+    export "$CC_VAR_NAME=$CROSS_GCC"
     export "CARGO_TARGET_$(echo "$GUEST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=$CROSS_GCC"
 fi
 

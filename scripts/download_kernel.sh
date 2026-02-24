@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Usage:
 #   scripts/download_kernel.sh
-#   KERNEL_VER=6.8.0-51 scripts/download_kernel.sh
+#   KERNEL_VER=6.8.0-51 KERNEL_UPLOAD=52 scripts/download_kernel.sh
 #   ARCH=x86_64 scripts/download_kernel.sh
 #
 # The kernel is cached under target/ and reused on subsequent runs.
@@ -16,8 +16,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Pinned kernel version — override with KERNEL_VER env var
+# Pinned kernel version — override with KERNEL_VER / KERNEL_UPLOAD env vars.
+# Ubuntu package versions look like: 6.8.0-51.52  (base.upload)
 KERNEL_VER="${KERNEL_VER:-6.8.0-51}"
+KERNEL_UPLOAD="${KERNEL_UPLOAD:-52}"
+KERNEL_FULL_VER="${KERNEL_VER}.${KERNEL_UPLOAD}"
 
 # Detect or override architecture
 ARCH="${ARCH:-$(uname -m)}"
@@ -27,14 +30,21 @@ if [[ "$ARCH" == "arm64" ]]; then
     ARCH="aarch64"
 fi
 
+# Expected SHA256 checksums for the pinned version.
+# Update these when bumping the kernel version.
+SHA256_ARM64="939693785d4a09c49e4e2edeef9b97b8cf7cd04af2ed40245acd7ba4962ee143"
+SHA256_AMD64="6b5ba8fd5bfb3ab4d5430db830a1600f09416fa8e4ace6b99d1bd8b7b79de43a"
+
 case "$ARCH" in
   aarch64)
     DEB_ARCH="arm64"
-    KERNEL_URL_BASE="http://ports.ubuntu.com/pool/main/l/linux"
+    KERNEL_URL_BASE="https://ports.ubuntu.com/pool/main/l/linux"
+    EXPECTED_SHA256="$SHA256_ARM64"
     ;;
   x86_64)
     DEB_ARCH="amd64"
-    KERNEL_URL_BASE="http://archive.ubuntu.com/ubuntu/pool/main/l/linux"
+    KERNEL_URL_BASE="https://archive.ubuntu.com/ubuntu/pool/main/l/linux"
+    EXPECTED_SHA256="$SHA256_AMD64"
     ;;
   *)
     echo "[kernel] ERROR: unsupported architecture: $ARCH"
@@ -57,13 +67,33 @@ fi
 # ---- Download .deb ----
 mkdir -p target
 
-KERNEL_DEB="linux-image-${KERNEL_VER}-generic_${KERNEL_VER}.0_${DEB_ARCH}.deb"
+KERNEL_DEB="linux-image-unsigned-${KERNEL_VER}-generic_${KERNEL_FULL_VER}_${DEB_ARCH}.deb"
 KERNEL_URL="${KERNEL_URL_BASE}/${KERNEL_DEB}"
 DEB_PATH="target/${KERNEL_DEB}"
 
-echo "[kernel] Downloading kernel ${KERNEL_VER} (${DEB_ARCH})..."
+echo "[kernel] Downloading kernel ${KERNEL_FULL_VER} (${DEB_ARCH})..."
 echo "[kernel] URL: ${KERNEL_URL}"
 curl -fSL -o "$DEB_PATH" "$KERNEL_URL"
+
+# ---- Verify SHA256 checksum ----
+echo "[kernel] Verifying SHA256 checksum..."
+if command -v sha256sum &>/dev/null; then
+    ACTUAL_SHA256=$(sha256sum "$DEB_PATH" | cut -d' ' -f1)
+elif command -v shasum &>/dev/null; then
+    ACTUAL_SHA256=$(shasum -a 256 "$DEB_PATH" | cut -d' ' -f1)
+else
+    echo "[kernel] WARNING: no sha256sum or shasum found, skipping checksum verification"
+    ACTUAL_SHA256="$EXPECTED_SHA256"
+fi
+
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+    echo "[kernel] ERROR: SHA256 checksum mismatch!"
+    echo "[kernel]   expected: $EXPECTED_SHA256"
+    echo "[kernel]   actual:   $ACTUAL_SHA256"
+    rm -f "$DEB_PATH"
+    exit 1
+fi
+echo "[kernel] Checksum OK"
 
 # ---- Extract vmlinuz from .deb (ar + tar, no dpkg needed) ----
 echo "[kernel] Extracting vmlinuz from .deb..."

@@ -88,8 +88,8 @@ pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// - **Ping payload**: `[secret: 32 bytes][version: 4 bytes LE]` (36 bytes total)
 /// - **Pong payload**: `[version: 4 bytes LE]` (4 bytes)
 ///
-/// Backward compatibility: old agents that send a 32-byte Ping (no version)
-/// are treated as version 0. New agents check `payload.len() >= 36` to detect
+/// Backward compatibility: old hosts that send a 32-byte Ping (no version)
+/// are treated as version 0. New hosts check `payload.len() >= 36` to detect
 /// the version extension.
 pub const PROTOCOL_VERSION: u32 = 1;
 
