@@ -68,6 +68,30 @@ impl BlobCache {
         self.rootfs_path(image_digest).with_extension("done")
     }
 
+    /// Path where extracted guest files (kernel + initramfs) for `image_digest` will reside.
+    pub fn guest_path(&self, image_digest: &str) -> PathBuf {
+        self.cache_dir
+            .join("guest")
+            .join(Self::hex_from_digest(image_digest))
+    }
+
+    /// Check whether guest files have already been fully extracted for `image_digest`.
+    pub fn has_guest(&self, image_digest: &str) -> bool {
+        self.guest_done_marker(image_digest).exists()
+    }
+
+    /// Mark a guest extraction as complete.
+    pub async fn mark_guest_done(&self, image_digest: &str) -> Result<()> {
+        let marker = self.guest_done_marker(image_digest);
+        fs::write(&marker, b"done").await?;
+        Ok(())
+    }
+
+    /// Path to the completion marker for guest files.
+    fn guest_done_marker(&self, image_digest: &str) -> PathBuf {
+        self.guest_path(image_digest).with_extension("done")
+    }
+
     /// Return a reference to the underlying cache directory.
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
@@ -101,6 +125,19 @@ mod tests {
         let cache = BlobCache::new(PathBuf::from("/tmp/oci-cache"));
         let p = cache.rootfs_path("sha256:abcd1234");
         assert_eq!(p, PathBuf::from("/tmp/oci-cache/rootfs/abcd1234"));
+    }
+
+    #[test]
+    fn guest_path_structure() {
+        let cache = BlobCache::new(PathBuf::from("/tmp/oci-cache"));
+        let p = cache.guest_path("sha256:abcd1234");
+        assert_eq!(p, PathBuf::from("/tmp/oci-cache/guest/abcd1234"));
+    }
+
+    #[test]
+    fn has_guest_returns_false_for_missing() {
+        let cache = BlobCache::new(PathBuf::from("/tmp/nonexistent-oci-cache-test"));
+        assert!(!cache.has_guest("sha256:000000"));
     }
 
     #[test]

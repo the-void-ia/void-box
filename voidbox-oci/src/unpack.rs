@@ -29,6 +29,77 @@ pub fn unpack_layers(layers: &[LayerInfo], dest: &Path) -> Result<PathBuf> {
     Ok(dest.to_path_buf())
 }
 
+/// Paths to the extracted guest files (kernel + initramfs).
+pub struct GuestFiles {
+    pub kernel: PathBuf,
+    pub initramfs: PathBuf,
+}
+
+/// Selectively extract `vmlinuz` and `rootfs.cpio.gz` from OCI layer tarballs
+/// into `dest`.  Much simpler than `unpack_layers()`: no whiteout handling, no
+/// hard link deferral.  Stops as soon as both files are found.  Returns error
+/// if either file is missing after scanning all layers.
+pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFiles> {
+    fs::create_dir_all(dest)?;
+
+    let kernel_path = dest.join("vmlinuz");
+    let initramfs_path = dest.join("rootfs.cpio.gz");
+
+    let mut found_kernel = false;
+    let mut found_initramfs = false;
+
+    for layer in layers {
+        if found_kernel && found_initramfs {
+            break;
+        }
+
+        let compressed = fs::read(&layer.local_path)?;
+        let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed)?;
+        let mut archive = Archive::new(reader);
+        archive.set_preserve_permissions(false);
+
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            let rel_path = entry.path()?.into_owned();
+
+            let file_name = match rel_path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+
+            if file_name == "vmlinuz" && !found_kernel {
+                entry.unpack(&kernel_path)?;
+                found_kernel = true;
+                info!(path = %kernel_path.display(), "extracted kernel");
+            } else if file_name == "rootfs.cpio.gz" && !found_initramfs {
+                entry.unpack(&initramfs_path)?;
+                found_initramfs = true;
+                info!(path = %initramfs_path.display(), "extracted initramfs");
+            }
+
+            if found_kernel && found_initramfs {
+                break;
+            }
+        }
+    }
+
+    if !found_kernel {
+        return Err(OciError::Layer(
+            "guest image missing vmlinuz".to_string(),
+        ));
+    }
+    if !found_initramfs {
+        return Err(OciError::Layer(
+            "guest image missing rootfs.cpio.gz".to_string(),
+        ));
+    }
+
+    Ok(GuestFiles {
+        kernel: kernel_path,
+        initramfs: initramfs_path,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Single layer extraction
 // ---------------------------------------------------------------------------

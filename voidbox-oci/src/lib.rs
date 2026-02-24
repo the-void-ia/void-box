@@ -17,6 +17,12 @@ pub struct OciClient {
     platform: manifest::Platform,
 }
 
+/// Resolved guest image files (kernel + initramfs) on disk.
+pub struct GuestImageFiles {
+    pub kernel: PathBuf,
+    pub initramfs: PathBuf,
+}
+
 /// A fully-pulled OCI image: manifest, layer metadata, and container config.
 pub struct PulledImage {
     pub manifest: manifest::OciManifest,
@@ -129,6 +135,56 @@ impl OciClient {
 
         info!(path = %rootfs.display(), "rootfs ready");
         Ok(rootfs)
+    }
+
+    /// Pull a guest image (kernel + initramfs) and extract to the cache.
+    ///
+    /// Returns paths to the `vmlinuz` and `rootfs.cpio.gz` files on disk.
+    /// If the guest image has already been cached the pull/extract are skipped.
+    pub async fn resolve_guest_files(&self, image_ref: &str) -> Result<GuestImageFiles> {
+        let blob_cache = cache::BlobCache::new(self.cache_dir.clone());
+
+        let cache_key = format!("sha256:{}", simple_hash(image_ref));
+
+        if blob_cache.has_guest(&cache_key) {
+            let guest_dir = blob_cache.guest_path(&cache_key);
+            info!(path = %guest_dir.display(), "using cached guest files");
+            return Ok(GuestImageFiles {
+                kernel: guest_dir.join("vmlinuz"),
+                initramfs: guest_dir.join("rootfs.cpio.gz"),
+            });
+        }
+
+        // Remove any leftover partial extraction from a previous failed run.
+        let guest_dir = blob_cache.guest_path(&cache_key);
+        if guest_dir.exists() {
+            info!(path = %guest_dir.display(), "removing incomplete guest extraction");
+            let _ = tokio::fs::remove_dir_all(&guest_dir).await;
+        }
+
+        let image = self.pull(image_ref).await?;
+
+        // Selective extraction — only vmlinuz + rootfs.cpio.gz.
+        let layers = image.layers.clone();
+        let dest = guest_dir.clone();
+        let guest = tokio::task::spawn_blocking(move || {
+            unpack::extract_guest_files(&layers, &dest)
+        })
+        .await
+        .map_err(|e| OciError::Layer(format!("guest extract task panicked: {}", e)))??;
+
+        blob_cache.mark_guest_done(&cache_key).await?;
+
+        info!(
+            kernel = %guest.kernel.display(),
+            initramfs = %guest.initramfs.display(),
+            "guest files ready",
+        );
+
+        Ok(GuestImageFiles {
+            kernel: guest.kernel,
+            initramfs: guest.initramfs,
+        })
     }
 }
 

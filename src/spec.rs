@@ -55,6 +55,10 @@ pub struct SandboxSpec {
     /// OCI base image for the sandbox (e.g. "python:3.12").
     #[serde(default)]
     pub image: Option<String>,
+    /// OCI image containing kernel + initramfs (e.g. "ghcr.io/the-void-ia/voidbox-guest:v0.1.0").
+    /// Set to "" to disable auto-pull.
+    #[serde(default)]
+    pub guest_image: Option<String>,
 }
 
 /// Specification for a host directory mount into the guest VM.
@@ -248,6 +252,7 @@ impl Default for SandboxSpec {
             env: HashMap::new(),
             mounts: Vec::new(),
             image: None,
+            guest_image: None,
         }
     }
 }
