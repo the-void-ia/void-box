@@ -2,7 +2,7 @@ use crate::error::{OciError, Result};
 use crate::layer::LayerInfo;
 use flate2::read::GzDecoder;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tracing::{debug, info, warn};
@@ -99,9 +99,6 @@ pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFil
     })
 }
 
-/// Gzip magic bytes (1f 8b).
-const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
-
 /// If the kernel is gzip-compressed and we're on macOS ARM64 (VZ backend),
 /// decompress it to vmlinux. Apple's Virtualization.framework requires
 /// uncompressed ARM64 kernels. Returns the path to use for the kernel.
@@ -110,7 +107,8 @@ pub fn ensure_kernel_uncompressed_for_vz(guest: &GuestFiles) -> Result<GuestFile
     let kernel_bytes =
         fs::read(&guest.kernel).map_err(|e| OciError::Layer(format!("read kernel: {}", e)))?;
 
-    if kernel_bytes.len() < 2 || kernel_bytes[..2] != GZIP_MAGIC {
+    // Gzip magic bytes (RFC 1952): 0x1f 0x8b
+    if kernel_bytes.len() < 2 || kernel_bytes[..2] != [0x1f, 0x8b] {
         return Ok(guest.clone());
     }
 
@@ -126,9 +124,7 @@ pub fn ensure_kernel_uncompressed_for_vz(guest: &GuestFiles) -> Result<GuestFile
         .read_to_end(&mut decompressed)
         .map_err(|e| OciError::Layer(format!("decompress kernel: {}", e)))?;
 
-    let mut out = fs::File::create(&decompressed_path)
-        .map_err(|e| OciError::Layer(format!("create vmlinux: {}", e)))?;
-    out.write_all(&decompressed)
+    fs::write(&decompressed_path, &decompressed)
         .map_err(|e| OciError::Layer(format!("write vmlinux: {}", e)))?;
 
     info!(path = %decompressed_path.display(), "decompressed kernel ready");
