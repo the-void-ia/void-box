@@ -411,32 +411,34 @@ fn load_kernel_modules() {
     // Load order matters: dependencies must be loaded first.
     // virtio_mmio needs explicit device= params since the cmdline params may not
     // be forwarded when loading as a module.
-    let modules: &[(&str, &str)] = &[
+    let modules: &[(&str, &str, bool)] = &[
         (
             "virtio_mmio.ko",
             "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12",
+            true,
         ),
         // vsock modules
-        ("vsock.ko", ""),
-        ("vmw_vsock_virtio_transport_common.ko", ""),
-        ("vmw_vsock_virtio_transport.ko", ""),
-        // Network modules (for SLIRP networking)
-        ("failover.ko", ""),
-        ("net_failover.ko", ""),
-        ("virtio_net.ko", ""),
-        // 9p filesystem modules (for host directory sharing)
-        ("9pnet.ko", ""),
-        ("9pnet_virtio.ko", ""),
+        ("vsock.ko", "", true),
+        ("vmw_vsock_virtio_transport_common.ko", "", true),
+        ("vmw_vsock_virtio_transport.ko", "", true),
+        // Network modules (for SLIRP networking — optional, missing on macOS)
+        ("failover.ko", "", false),
+        ("net_failover.ko", "", false),
+        ("virtio_net.ko", "", false),
+        // 9p filesystem modules (for host directory sharing — optional, missing on macOS)
+        ("9pnet.ko", "", false),
+        ("9pnet_virtio.ko", "", false),
     ];
 
-    for (module_name, params) in modules {
+    for (module_name, params, required) in modules {
         let path = format!("/lib/modules/{}", module_name);
         match load_module_file(&path, params) {
             Ok(()) => kmsg(&format!(
                 "Loaded module: {} (params='{}')",
                 module_name, params
             )),
-            Err(e) => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
+            Err(e) if *required => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
+            Err(_) => {} // Optional module — silently skip (expected on macOS/VZ)
         }
     }
 

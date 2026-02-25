@@ -114,6 +114,8 @@ install_kernel_modules_from_deb() {
     "lib/modules/${kmod_version}-generic/kernel/net/core/failover.ko"
     "lib/modules/${kmod_version}-generic/kernel/drivers/net/net_failover.ko"
     "lib/modules/${kmod_version}-generic/kernel/drivers/net/virtio_net.ko"
+    "lib/modules/${kmod_version}-generic/kernel/net/9p/9pnet.ko"
+    "lib/modules/${kmod_version}-generic/kernel/net/9p/9pnet_virtio.ko"
   )
 
   # Data tarball may be compressed as .zst, .xz, or .gz
@@ -209,4 +211,6 @@ install_kernel_modules_linux() {
   _install_kmod "$moddir/net/core/failover"                               "$dest"
   _install_kmod "$moddir/drivers/net/net_failover"                        "$dest"
   _install_kmod "$moddir/drivers/net/virtio_net"                          "$dest"
+  _install_kmod "$moddir/net/9p/9pnet"                                   "$dest"
+  _install_kmod "$moddir/net/9p/9pnet_virtio"                            "$dest"
 }
