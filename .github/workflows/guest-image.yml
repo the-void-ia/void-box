@@ -38,11 +38,26 @@ jobs:
           # but the GNU cross-linker works fine for static musl builds.
           sudo ln -s /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
 
+      - name: Download static busybox
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_amd64.deb"
+              ;;
+            aarch64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb"
+              ;;
+          esac
+          curl -fsSL "$DEB_URL" -o /tmp/busybox-static.deb
+          cd /tmp && ar x busybox-static.deb && tar xf data.tar* ./usr/bin/busybox
+          chmod +x /tmp/usr/bin/busybox
+
       - name: Build initramfs
         run: |
           # Must match the kernel version in scripts/download_kernel.sh
           # so that the packaged modules are compatible with the VM kernel.
           ARCH=${{ matrix.arch }} \
+          BUSYBOX=/tmp/usr/bin/busybox \
           VOID_BOX_KMOD_VERSION=6.8.0-51 \
           VOID_BOX_KMOD_UPLOAD=52 \
           OUT_CPIO=/tmp/rootfs.cpio.gz \
