@@ -301,6 +301,18 @@ target/debug/examples/ollama_local
 
 > **Note:** Every `cargo build` invalidates the code signature. Re-run `codesign` after each rebuild.
 
+When using the `voidbox` CLI, `cargo run` automatically codesigns before executing (via `.cargo/config.toml` runner). Just run:
+
+```bash
+cargo run --bin voidbox -- run --file examples/specs/oci/guest-image-workflow.yaml
+```
+
+If running the binary directly (e.g. `./target/debug/voidbox`), codesign manually first:
+
+```bash
+codesign --force --sign - --entitlements voidbox.entitlements target/debug/voidbox
+```
+
 ### Parallel pipeline with per-box models
 
 ```bash
@@ -399,7 +411,7 @@ More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
 | `workflow.yaml` | Workflow with `sandbox.image: alpine:3.20` (no LLM) |
 | `pipeline.yaml` | Multi-language pipeline: Python base + Go and Java OCI skills |
 | `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
-| `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs |
+| `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs (on macOS, codesign required; gzip kernel is auto-decompressed for VZ) |
 
 ---
 

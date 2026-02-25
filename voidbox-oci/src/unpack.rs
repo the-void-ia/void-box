@@ -30,7 +30,7 @@ pub fn unpack_layers(layers: &[LayerInfo], dest: &Path) -> Result<PathBuf> {
 }
 
 /// Paths to the extracted guest files (kernel + initramfs).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GuestFiles {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -97,6 +97,47 @@ pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFil
         kernel: kernel_path,
         initramfs: initramfs_path,
     })
+}
+
+/// If the kernel is gzip-compressed and we're on macOS ARM64 (VZ backend),
+/// decompress it to vmlinux. Apple's Virtualization.framework requires
+/// uncompressed ARM64 kernels. Returns the path to use for the kernel.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn ensure_kernel_uncompressed_for_vz(guest: &GuestFiles) -> Result<GuestFiles> {
+    let kernel_bytes =
+        fs::read(&guest.kernel).map_err(|e| OciError::Layer(format!("read kernel: {}", e)))?;
+
+    // Gzip magic bytes (RFC 1952): 0x1f 0x8b
+    if kernel_bytes.len() < 2 || kernel_bytes[..2] != [0x1f, 0x8b] {
+        return Ok(guest.clone());
+    }
+
+    info!(
+        path = %guest.kernel.display(),
+        "kernel is gzip-compressed; decompressing for VZ (required on macOS ARM64)",
+    );
+
+    let decompressed_path = guest.kernel.parent().unwrap().join("vmlinux");
+    let mut decoder = GzDecoder::new(&kernel_bytes[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| OciError::Layer(format!("decompress kernel: {}", e)))?;
+
+    fs::write(&decompressed_path, &decompressed)
+        .map_err(|e| OciError::Layer(format!("write vmlinux: {}", e)))?;
+
+    info!(path = %decompressed_path.display(), "decompressed kernel ready");
+
+    Ok(GuestFiles {
+        kernel: decompressed_path,
+        initramfs: guest.initramfs.clone(),
+    })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn ensure_kernel_uncompressed_for_vz(guest: &GuestFiles) -> Result<GuestFiles> {
+    Ok(guest.clone())
 }
 
 // ---------------------------------------------------------------------------
