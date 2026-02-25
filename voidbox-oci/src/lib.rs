@@ -148,10 +148,16 @@ impl OciClient {
 
         if blob_cache.has_guest(&cache_key) {
             let guest_dir = blob_cache.guest_path(&cache_key);
-            info!(path = %guest_dir.display(), "using cached guest files");
-            return Ok(GuestImageFiles {
+            let cached = unpack::GuestFiles {
                 kernel: guest_dir.join("vmlinuz"),
                 initramfs: guest_dir.join("rootfs.cpio.gz"),
+            };
+            // On macOS ARM64, decompress gzip kernel if vmlinux not yet present.
+            let guest = unpack::ensure_kernel_uncompressed_for_vz(&cached)?;
+            info!(path = %guest_dir.display(), "using cached guest files");
+            return Ok(GuestImageFiles {
+                kernel: guest.kernel,
+                initramfs: guest.initramfs,
             });
         }
 
@@ -171,6 +177,14 @@ impl OciClient {
             tokio::task::spawn_blocking(move || unpack::extract_guest_files(&layers, &dest))
                 .await
                 .map_err(|e| OciError::Layer(format!("guest extract task panicked: {}", e)))??;
+
+        // On macOS ARM64, VZ requires uncompressed kernel; decompress if gzip.
+        let guest =
+            tokio::task::spawn_blocking(move || unpack::ensure_kernel_uncompressed_for_vz(&guest))
+                .await
+                .map_err(|e| {
+                    OciError::Layer(format!("kernel decompress task panicked: {}", e))
+                })??;
 
         blob_cache.mark_guest_done(&cache_key).await?;
 
