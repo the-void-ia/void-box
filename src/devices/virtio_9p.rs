@@ -1006,11 +1006,11 @@ impl Virtio9pDevice {
         let fs_type: u32 = 0;
         resp.extend_from_slice(&fs_type.to_le_bytes());
         resp.extend_from_slice(&(st.f_bsize as u32).to_le_bytes());
-        resp.extend_from_slice(&(st.f_blocks as u64).to_le_bytes());
-        resp.extend_from_slice(&(st.f_bfree as u64).to_le_bytes());
-        resp.extend_from_slice(&(st.f_bavail as u64).to_le_bytes());
-        resp.extend_from_slice(&(st.f_files as u64).to_le_bytes());
-        resp.extend_from_slice(&(st.f_ffree as u64).to_le_bytes());
+        resp.extend_from_slice(&st.f_blocks.to_le_bytes());
+        resp.extend_from_slice(&st.f_bfree.to_le_bytes());
+        resp.extend_from_slice(&st.f_bavail.to_le_bytes());
+        resp.extend_from_slice(&st.f_files.to_le_bytes());
+        resp.extend_from_slice(&st.f_ffree.to_le_bytes());
         resp.extend_from_slice(&0u64.to_le_bytes()); // fsid not provided by statvfs
         resp.extend_from_slice(&(st.f_namemax as u32).to_le_bytes());
 

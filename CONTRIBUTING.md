@@ -20,9 +20,17 @@ Thank you for your interest in contributing to void-box! This document provides 
 ### Prerequisites
 
 - Rust 1.83 or later
-- Linux with KVM support (for testing KVM features)
-- `musl-tools` for building guest-agent
 - `cpio` and `gzip` for initramfs creation
+
+Linux (KVM/E2E):
+- `/dev/kvm` available for VM-backed tests
+- `musl-tools` for building guest binaries
+- Optional but recommended for full E2E parity: `/dev/vhost-vsock`
+
+macOS (Apple Silicon / VZ):
+- `filosottile/musl-cross/musl-cross` toolchain
+- Rust target: `aarch64-unknown-linux-musl`
+- Codesign support for binaries that use Virtualization.framework
 
 ### Git Hooks
 
@@ -46,42 +54,71 @@ cargo build --bin voidbox
 # Build guest-agent
 cargo build -p guest-agent --target x86_64-unknown-linux-musl
 
-# Build initramfs (requires Linux)
+# Build a general guest initramfs
 ./scripts/build_guest_image.sh
+
+# Build a deterministic test initramfs (guest-agent + claudio mock)
+./scripts/build_test_image.sh
+
+# Build a claude-capable guest rootfs/initramfs
+./scripts/build_claude_rootfs.sh
 ```
+
+Use these scripts based on purpose:
+- `build_guest_image.sh`: general runtime guest image.
+- `build_test_image.sh`: test/E2E image with deterministic `claudio`.
+- `build_claude_rootfs.sh`: includes native `claude-code`, CA certs, and sandbox user.
 
 ### Running Tests
 
 ```bash
-# Run all tests
-cargo test --workspace
+# Keep rustc/link temp artifacts in repo-local tmp if /tmp is constrained
+export TMPDIR=$PWD/target/tmp
+mkdir -p "$TMPDIR"
 
-# Run tests with output
-cargo test --workspace -- --nocapture
+# Fast local checks
+cargo test --workspace --all-features
+cargo test --doc --workspace --all-features
 
-# Run specific test
-cargo test test_name
+# macOS parity with CI (guest-agent excluded in some jobs)
+cargo test --workspace --exclude guest-agent --all-features
+cargo test --doc --workspace --exclude guest-agent --all-features
 
-# Run tests for a specific package
-cargo test -p void-box
+# Include ignored/VM tests (Linux or macOS with artifacts available)
+export VOID_BOX_KERNEL=/path/to/vmlinuz
+export VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz
+cargo test --workspace --all-targets -- --include-ignored
+
+# Targeted VM suites
+cargo test --test conformance -- --ignored --test-threads=1
+cargo test --test oci_integration -- --ignored --test-threads=1
+cargo test --test e2e_telemetry -- --ignored --test-threads=1
+cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 ```
+
+For runtime setup examples and platform-specific details, see:
+- `README.md` (KVM zero-setup, macOS/VZ, OCI examples)
+- `docs/architecture.md` (backend, OCI, and security model)
 
 ### Code Quality
 
 Before submitting a PR, ensure your code passes all checks:
 
 ```bash
-# Format code
-cargo fmt --all
-
 # Check formatting
 cargo fmt --all -- --check
 
-# Run clippy
+# Run clippy (Linux / CI parity)
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Run clippy (macOS / CI parity)
+cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
 
 # Build documentation
 cargo doc --no-deps --all-features
+
+# Build docs on macOS with CI parity
+cargo doc --workspace --no-deps --all-features --exclude guest-agent
 ```
 
 ## Coding Standards
@@ -114,16 +151,17 @@ cargo doc --no-deps --all-features
 2. **Add tests** for new functionality
 3. **Run all checks** locally before pushing:
    ```bash
-   cargo test --workspace
-   cargo fmt --all
-   cargo clippy --workspace --all-targets --all-features
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo test --workspace --all-features
    ```
 4. **Write a clear PR description** explaining:
    - What problem does this solve?
    - How does it work?
    - Are there any breaking changes?
 5. **Link related issues** in the PR description
-6. **Respond to review feedback** promptly
+6. **Run relevant ignored suites** when touching VM/OCI/runtime behavior, and mention results in the PR
+7. **Respond to review feedback** promptly
 
 ## Commit Messages
 
@@ -196,13 +234,11 @@ void-box/
 Looking for ideas? Here are some areas that need work:
 
 ### High Priority
-- [ ] aarch64 support and testing
 - [ ] Improved error messages and diagnostics
 - [ ] Performance benchmarks and optimizations
 - [ ] More comprehensive integration tests
 
 ### Medium Priority
-- [ ] Windows and macOS support (mock sandbox)
 - [ ] Additional workflow composition patterns
 - [ ] REST API server
 - [ ] Language bindings (Python, Node.js)

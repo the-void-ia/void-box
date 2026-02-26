@@ -1,7 +1,10 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
+
+#[cfg(target_os = "linux")]
+use std::hash::{Hash, Hasher};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 use crate::agent_box::VoidBox;
@@ -24,6 +27,7 @@ use crate::{Error, Result};
 
 /// Well-known guest path for OCI rootfs mounts.
 const OCI_ROOTFS_GUEST_PATH: &str = "/mnt/oci-rootfs";
+#[cfg(target_os = "linux")]
 const OCI_ROOTFS_BLOCK_DEV: &str = "/dev/vda";
 
 #[derive(Debug, Clone)]
@@ -771,10 +775,10 @@ fn apply_oci_rootfs_sandbox(
     }
 }
 
-async fn resolve_oci_rootfs_plan(image_ref: &str, host_rootfs: PathBuf) -> Result<OciRootfsPlan> {
+async fn resolve_oci_rootfs_plan(_image_ref: &str, host_rootfs: PathBuf) -> Result<OciRootfsPlan> {
     #[cfg(target_os = "linux")]
     {
-        let host_disk = build_oci_rootfs_disk(image_ref, &host_rootfs).await?;
+        let host_disk = build_oci_rootfs_disk(_image_ref, &host_rootfs).await?;
         Ok(OciRootfsPlan {
             host_rootfs,
             host_disk: Some(host_disk),
@@ -873,6 +877,7 @@ fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+#[cfg(target_os = "linux")]
 fn stable_cache_key<T: Hash>(value: &T) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut h);

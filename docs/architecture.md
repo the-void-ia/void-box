@@ -2,7 +2,7 @@
 
 ## Overview
 
-void-box is a composable agent runtime where each agent runs in a hardware-isolated KVM micro-VM. The core equation is:
+void-box is a composable agent runtime where each agent runs in a hardware-isolated micro-VM. On Linux this uses KVM; on macOS (Apple Silicon) it uses Virtualization.framework (VZ). The core equation is:
 
 ```
 VoidBox = Agent(Skills) + Isolation
@@ -92,7 +92,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 2. resolve_guest_image()          Resolve kernel + initramfs (5-step chain)
        │                          Pulls from GHCR if no local paths found
        │
-3. .build()                       Creates Sandbox (mock or KVM MicroVm)
+3. .build()                       Creates Sandbox (mock or local VM backend: KVM/VZ)
        │                          Mounts OCI rootfs + skill images if configured
        │
 4. .run(input)                    Execution begins
@@ -333,6 +333,13 @@ skills:
 | `cache.rs` | Content-addressed blob cache + rootfs/guest done markers |
 | `unpack.rs` | Layer extraction (full rootfs with whiteouts, or selective guest file extraction) |
 | `lib.rs` | `OciClient`: `pull()`, `resolve_rootfs()`, `resolve_guest_files()` |
+
+## Developer Notes
+
+For contributor setup, lint/test parity commands, and script usage, see
+`CONTRIBUTING.md`.
+
+For runtime setup commands and end-user usage examples, see `README.md`.
 
 ## Skill Types
 
