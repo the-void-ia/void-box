@@ -87,11 +87,17 @@ impl VsockDevice {
         // Use the per-request timeout if provided, otherwise default to 20 minutes.
         // LLM inference (especially with local models via Ollama on CPU) can take
         // 10+ minutes per turn for complex prompts with tool definitions.
-        let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1200));
-        let _ = stream.set_read_timeout(Some(timeout));
+        // timeout_secs == Some(0) means service mode: wait forever (no timeout).
+        if request.timeout_secs == Some(0) {
+            let _ = stream.set_read_timeout(None); // Service mode: wait forever
+        } else {
+            let timeout = request
+                .timeout_secs
+                .filter(|&s| s > 0)
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(1200));
+            let _ = stream.set_read_timeout(Some(timeout));
+        }
 
         // Serialize and send request
         let message = Message {
@@ -150,11 +156,17 @@ impl VsockDevice {
             .connect_with_handshake(Duration::from_secs(3), "exec-streaming")
             .await?;
 
-        let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1200));
-        let _ = stream.set_read_timeout(Some(timeout));
+        // timeout_secs == Some(0) means service mode: wait forever (no timeout).
+        if request.timeout_secs == Some(0) {
+            let _ = stream.set_read_timeout(None); // Service mode: wait forever
+        } else {
+            let timeout = request
+                .timeout_secs
+                .filter(|&s| s > 0)
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(1200));
+            let _ = stream.set_read_timeout(Some(timeout));
+        }
 
         let message = Message {
             msg_type: MessageType::ExecRequest,

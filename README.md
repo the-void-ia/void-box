@@ -166,7 +166,8 @@ voidbox run --file hackernews_agent.yaml
 │  │ VMM (KVM / Virtualization.framework)            │  │
 │  │  vsock ←→ guest-agent (PID 1)                   │  │
 │  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
-│  │  9p/virtiofs ←→ OCI rootfs + skill mounts       │  │
+│  │  Linux/KVM: virtio-blk ←→ OCI base rootfs       │  │
+│  │  9p/virtiofs ←→ skills + host mounts            │  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                       │
 │  Seccomp-BPF │ OTLP export                            │
@@ -244,7 +245,7 @@ sandbox:
 If you prefer to build the guest image locally:
 
 ```bash
-# Build guest initramfs (includes claude-code binary, busybox, CA certs)
+# Build base guest initramfs (guest-agent + tools; no required Claude bundle)
 scripts/build_guest_image.sh
 
 # Download a kernel
@@ -256,6 +257,19 @@ VOID_BOX_KERNEL=target/vmlinuz-amd64 \
 VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
 cargo run --example trading_pipeline
 ```
+
+For a production Claude-capable initramfs, use:
+
+```bash
+# Build production rootfs/initramfs with native claude-code + CA certs + sandbox user
+scripts/build_claude_rootfs.sh
+```
+
+Script intent summary:
+
+- `scripts/build_guest_image.sh`: base runtime image for general VM/OCI work.
+- `scripts/build_claude_rootfs.sh`: production image for direct Claude runtime in guest.
+- `scripts/build_test_image.sh`: deterministic test image with `claudio` mock.
 
 ### Mock mode (no KVM required)
 
@@ -345,10 +359,10 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 VoidBox supports OCI container images in three ways:
 
 1. **`sandbox.guest_image`** — Pre-built kernel + initramfs distributed as an OCI image. Auto-pulled from GHCR on first run (no local build needed). See [KVM mode (zero-setup)](#kvm-mode-zero-setup).
-2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
+2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image. On Linux/KVM, VoidBox builds a cached ext4 disk artifact from the extracted OCI rootfs and attaches it as `virtio-blk` (`/dev/vda` in guest). On macOS/VZ, the OCI rootfs remains directory-mounted via virtiofs.
 3. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
 
-Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry, cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
+Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry and cached locally at `~/.voidbox/oci/`. OCI base rootfs transport is platform-specific (`virtio-blk` on Linux/KVM, virtiofs directory mount on macOS/VZ), while OCI skills and host mounts use `9p/virtiofs` shares.
 
 ### Example: OCI skills
 
@@ -413,6 +427,10 @@ More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
 | `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
 | `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs (on macOS, codesign required; gzip kernel is auto-decompressed for VZ) |
 
+OpenClaw examples and runbook:
+
+- [`examples/openclaw/README.md`](examples/openclaw/README.md)
+
 ---
 
 ## Roadmap
@@ -428,4 +446,3 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 ## License
 
 Apache-2.0 · [The Void Platform](LICENSE)
-

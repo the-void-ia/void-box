@@ -23,7 +23,12 @@ pub fn unpack_layers(layers: &[LayerInfo], dest: &Path) -> Result<PathBuf> {
             media_type = %layer.media_type,
             "unpacking layer",
         );
-        unpack_single_layer(layer, dest)?;
+        unpack_single_layer(layer, dest).map_err(|e| {
+            OciError::Layer(format!(
+                "layer {} ({}) unpack failed: {}",
+                i, layer.digest, e
+            ))
+        })?;
     }
 
     Ok(dest.to_path_buf())
@@ -58,6 +63,7 @@ pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFil
         let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed)?;
         let mut archive = Archive::new(reader);
         archive.set_preserve_permissions(false);
+        archive.set_unpack_xattrs(false);
 
         for entry_result in archive.entries()? {
             let mut entry = entry_result?;
@@ -145,20 +151,50 @@ pub fn ensure_kernel_uncompressed_for_vz(guest: &GuestFiles) -> Result<GuestFile
 // ---------------------------------------------------------------------------
 
 fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
-    let compressed = fs::read(&layer.local_path)?;
-    let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed)?;
+    let compressed = fs::read(&layer.local_path).map_err(|e| {
+        OciError::Layer(format!(
+            "failed to read layer blob {}: {}",
+            layer.local_path.display(),
+            e
+        ))
+    })?;
+    let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed).map_err(|e| {
+        OciError::Layer(format!(
+            "failed to create decompressor for {} ({}): {}",
+            layer.digest, layer.media_type, e
+        ))
+    })?;
     let mut archive = Archive::new(reader);
-    // Do not preserve permissions bits that could block later access.
+    // Do not preserve permissions bits/xattrs that can cause host-side unpack failures.
     archive.set_preserve_permissions(false);
+    archive.set_unpack_xattrs(false);
 
-    // Hard links whose target hasn't been extracted yet — retry after the
-    // main pass.
+    // Hard links whose target hasn't been extracted yet — retry after the main pass.
     let mut deferred_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     // We need to handle whiteouts ourselves, so iterate entries manually.
-    for entry_result in archive.entries()? {
-        let mut entry = entry_result?;
-        let rel_path = entry.path()?.into_owned();
+    let entries = archive.entries().map_err(|e| {
+        OciError::Layer(format!(
+            "failed to enumerate tar entries for {}: {}",
+            layer.digest, e
+        ))
+    })?;
+    for entry_result in entries {
+        let mut entry = entry_result
+            .map_err(|e| OciError::Layer(format!("failed to read tar entry: {}", e)))?;
+        let rel_path = match entry.path() {
+            Ok(p) => p.into_owned(),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1) =>
+            {
+                warn!("skipping tar entry: path read failed with EPERM");
+                continue;
+            }
+            Err(e) => {
+                return Err(OciError::Layer(format!("failed to read entry path: {}", e)));
+            }
+        };
 
         let file_name = match rel_path.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
@@ -166,70 +202,253 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
                 // A root-level entry (e.g. "./") – just ensure the dir exists.
                 let target = dest.join(&rel_path);
                 if entry.header().entry_type().is_dir() {
-                    fs::create_dir_all(&target)?;
+                    fs::create_dir_all(&target).map_err(|e| {
+                        OciError::Layer(format!(
+                            "mkdir failed for root entry {}: {}",
+                            target.display(),
+                            e
+                        ))
+                    })?;
                 }
                 continue;
             }
         };
 
-        // --- Opaque whiteout: delete everything in the parent directory that
-        //     was placed by *earlier* layers. ---
+        // Opaque whiteout: delete everything in the parent directory from earlier layers.
         if file_name == ".wh..wh..opq" {
             let parent = dest.join(rel_path.parent().unwrap_or_else(|| Path::new("")));
             if parent.exists() {
-                clear_directory(&parent)?;
+                if let Err(e) = clear_directory(&parent) {
+                    match &e {
+                        OciError::Io(ioe)
+                            if ioe.kind() == std::io::ErrorKind::PermissionDenied
+                                || ioe.raw_os_error() == Some(1) =>
+                        {
+                            warn!(
+                                path = %parent.display(),
+                                "opaque whiteout clear skipped due to permission denied",
+                            );
+                        }
+                        _ => return Err(e),
+                    }
+                }
             }
             continue;
         }
 
-        // --- Regular whiteout: delete the named entry. ---
+        // Regular whiteout: delete the named entry.
         if let Some(hidden) = file_name.strip_prefix(".wh.") {
             let target = dest
                 .join(rel_path.parent().unwrap_or_else(|| Path::new("")))
                 .join(hidden);
             if target.exists() {
-                if target.is_dir() {
-                    fs::remove_dir_all(&target)?;
-                } else {
-                    fs::remove_file(&target)?;
+                if let Err(e) = remove_path(&target) {
+                    match &e {
+                        OciError::Io(ioe)
+                            if ioe.kind() == std::io::ErrorKind::PermissionDenied
+                                || ioe.raw_os_error() == Some(1) =>
+                        {
+                            warn!(
+                                path = %target.display(),
+                                "whiteout delete skipped due to permission denied",
+                            );
+                        }
+                        _ => return Err(e),
+                    }
                 }
                 debug!(path = %target.display(), "applied whiteout");
             }
             continue;
         }
 
-        // --- Hard links: the target may not be extracted yet. ---
+        // Hard links: the target may not be extracted yet.
         if entry.header().entry_type() == tar::EntryType::Link {
-            if let Ok(Some(link_name)) = entry.header().link_name() {
+            if let Ok(Some(link_name)) = entry.link_name() {
                 let link_target = dest.join(link_name);
                 let link_path = dest.join(&rel_path);
                 if link_target.exists() {
                     if let Some(parent) = link_path.parent() {
-                        fs::create_dir_all(parent)?;
+                        fs::create_dir_all(parent).map_err(|e| {
+                            OciError::Layer(format!(
+                                "mkdir parent failed for hardlink {}: {}",
+                                parent.display(),
+                                e
+                            ))
+                        })?;
                     }
-                    // Remove stale entry if present.
                     let _ = fs::remove_file(&link_path);
-                    fs::hard_link(&link_target, &link_path)?;
+                    create_hardlink_or_copy(&link_target, &link_path)?;
                 } else {
                     deferred_hardlinks.push((link_path, link_target));
                 }
-                continue;
             }
+            continue;
         }
 
-        // --- Normal file / directory / symlink ---
+        // Device nodes/FIFO entries often require mknod privileges.
+        let entry_type = entry.header().entry_type();
+        if entry_type == tar::EntryType::Block
+            || entry_type == tar::EntryType::Char
+            || entry_type == tar::EntryType::Fifo
+        {
+            debug!(
+                path = %rel_path.display(),
+                ?entry_type,
+                "skipping special filesystem node during OCI unpack",
+            );
+            continue;
+        }
+
+        // Normal file / directory / symlink. Avoid `entry.unpack()` here:
+        // some images carry metadata combinations that can trigger host-side
+        // EPERM during unpack (e.g. ownership/permission application).
         let target = dest.join(&rel_path);
-        entry.unpack(&target)?;
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target).map_err(|e| {
+                OciError::Layer(format!("mkdir failed for {}: {}", rel_path.display(), e))
+            })?;
+            continue;
+        }
+
+        if entry_type.is_symlink() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    OciError::Layer(format!(
+                        "mkdir parent failed for symlink {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+            // Use symlink_metadata so dangling symlinks are treated as existing.
+            if fs::symlink_metadata(&target).is_ok() {
+                remove_path(&target)?;
+            }
+            let link_name = entry
+                .link_name()
+                .map_err(|e| OciError::Layer(format!("invalid symlink header: {}", e)))?
+                .ok_or_else(|| OciError::Layer("symlink missing link_name".into()))?;
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(&link_name, &target) {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        warn!(
+                            path = %rel_path.display(),
+                            target = %link_name.display(),
+                            "skipping symlink entry due to EPERM",
+                        );
+                        continue;
+                    }
+                    return Err(OciError::Layer(format!(
+                        "symlink create failed for {} -> {}: {}",
+                        rel_path.display(),
+                        link_name.display(),
+                        e
+                    )));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // Fallback path for non-unix targets.
+                entry.unpack(&target).map_err(|e| {
+                    OciError::Layer(format!(
+                        "unpack failed for {} ({:?}): {}",
+                        rel_path.display(),
+                        entry_type,
+                        e
+                    ))
+                })?;
+            }
+            continue;
+        }
+
+        if entry_type.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    OciError::Layer(format!(
+                        "mkdir parent failed for file {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+            let mut out = fs::File::create(&target).map_err(|e| {
+                OciError::Layer(format!("create failed for {}: {}", rel_path.display(), e))
+            })?;
+            if let Err(e) = std::io::copy(&mut entry, &mut out) {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    warn!(
+                        path = %rel_path.display(),
+                        "skipping file entry due to EPERM during copy",
+                    );
+                    continue;
+                }
+                return Err(OciError::Layer(format!(
+                    "write failed for {}: {}",
+                    rel_path.display(),
+                    e
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(mode) = entry.header().mode() {
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode));
+                }
+                // Some OCI layers carry executables via metadata combinations that can
+                // degrade to 0644 in host-side extraction. Normalize common binary paths.
+                let rel = rel_path.to_string_lossy();
+                let in_bin_path = rel.starts_with("bin/")
+                    || rel.starts_with("sbin/")
+                    || rel.starts_with("usr/bin/")
+                    || rel.starts_with("usr/sbin/")
+                    || rel.starts_with("usr/local/bin/");
+                if in_bin_path {
+                    if let Ok(meta) = fs::metadata(&target) {
+                        let mut mode = meta.permissions().mode();
+                        if (mode & 0o111) == 0 {
+                            mode |= 0o755;
+                            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Fallback for remaining entry types.
+        if let Err(e) = entry.unpack(&target) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                warn!(
+                    path = %rel_path.display(),
+                    ?entry_type,
+                    "skipping fallback entry due to EPERM",
+                );
+                continue;
+            }
+            return Err(OciError::Layer(format!(
+                "unpack failed for {} ({:?}): {}",
+                rel_path.display(),
+                entry_type,
+                e
+            )));
+        }
     }
 
     // Retry deferred hard links now that all regular entries are on disk.
     for (link_path, link_target) in &deferred_hardlinks {
         if link_target.exists() {
             if let Some(parent) = link_path.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    OciError::Layer(format!(
+                        "mkdir parent failed for deferred hardlink {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
             }
             let _ = fs::remove_file(link_path);
-            fs::hard_link(link_target, link_path)?;
+            create_hardlink_or_copy(link_target, link_path)?;
             debug!(
                 link = %link_path.display(),
                 target = %link_target.display(),
@@ -245,6 +464,46 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn create_hardlink_or_copy(target: &Path, link_path: &Path) -> Result<()> {
+    match fs::hard_link(target, link_path) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::Unsupported =>
+        {
+            if target.is_file() {
+                fs::copy(target, link_path).map_err(|err| {
+                    OciError::Layer(format!(
+                        "hardlink fallback copy failed {} -> {}: {}",
+                        target.display(),
+                        link_path.display(),
+                        err
+                    ))
+                })?;
+                debug!(
+                    link = %link_path.display(),
+                    target = %target.display(),
+                    "hard link denied; copied file instead",
+                );
+                Ok(())
+            } else {
+                warn!(
+                    target = %target.display(),
+                    link = %link_path.display(),
+                    "hardlink denied for non-file target; skipping entry",
+                );
+                Ok(())
+            }
+        }
+        Err(e) => Err(OciError::Layer(format!(
+            "hardlink create failed {} -> {}: {}",
+            target.display(),
+            link_path.display(),
+            e
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,14 +530,60 @@ fn decompressor<'a>(media_type: &str, data: &'a [u8]) -> Result<Box<dyn Read + '
 
 /// Remove all entries inside `dir` but keep the directory itself.
 fn clear_directory(dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) =>
+        {
+            warn!(path = %dir.display(), "read_dir skipped due to permission denied");
+            return Ok(());
         }
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1) =>
+            {
+                warn!(path = %dir.display(), "directory entry skipped due to permission denied");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let path = entry.path();
+        remove_path(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) =>
+        {
+            warn!(path = %path.display(), "symlink_metadata skipped due to permission denied");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        if let Err(e) = fs::remove_dir_all(path) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                warn!(path = %path.display(), "remove_dir_all skipped due to permission denied");
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+    } else if let Err(e) = fs::remove_file(path) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            warn!(path = %path.display(), "remove_file skipped due to permission denied");
+            return Ok(());
+        }
+        return Err(e.into());
     }
     Ok(())
 }

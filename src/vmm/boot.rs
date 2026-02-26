@@ -17,6 +17,7 @@ use crate::{Error, Result};
 
 /// Magic number for bzImage
 const BZIMAGE_MAGIC: u32 = 0x53726448; // "HdrS"
+const EARLY_IDENTITY_MAP_LIMIT: u64 = 0x4000_0000; // first 1 GiB
 
 /// Load kernel and optionally initramfs into guest memory
 pub fn load_kernel(
@@ -32,10 +33,9 @@ pub fn load_kernel(
     let mut kernel_file = File::open(kernel_path)
         .map_err(|e| Error::Boot(format!("Failed to open kernel: {}", e)))?;
 
-    // Read init_size from the kernel header BEFORE loading, so we know
-    // where it's safe to place the initramfs (must be outside
-    // [kernel_load, kernel_load + init_size)).
+    // Read setup-header limits before loading.
     let _init_size = read_bzimage_init_size(&mut kernel_file).unwrap_or(0);
+    let initrd_addr_max = read_bzimage_initrd_addr_max(&mut kernel_file).unwrap_or(u32::MAX);
 
     // Detect kernel format and load it
     let (kernel_load_addr, kernel_entry) = load_kernel_image(guest_memory, &mut kernel_file)?;
@@ -44,17 +44,32 @@ pub fn load_kernel(
         kernel_load_addr, kernel_entry
     );
 
-    // Place the initramfs near the TOP of guest memory so it's well clear of
-    // the kernel's decompression zone. Align down to 2 MB boundary.
+    // Place the initramfs under constraints:
+    // 1) Linux setup-header initrd_addr_max
+    // 2) our early boot identity mapping window (first 1 GiB)
+    // 3) guest RAM end
+    // Align down to 2 MiB boundary.
     let initramfs_file_size = initramfs_path
         .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .unwrap_or(0);
     let safe_initramfs_addr = if initramfs_file_size > 0 {
-        // Place at end of memory minus initramfs size, aligned down to 2MB
-        let addr = (memory_size - initramfs_file_size) & !0x1F_FFFF;
+        let max_end = (memory_size.saturating_sub(1))
+            .min(initrd_addr_max as u64)
+            .min(EARLY_IDENTITY_MAP_LIMIT.saturating_sub(1));
+        if initramfs_file_size > max_end.saturating_add(1) {
+            return Err(Error::Boot(format!(
+                "initramfs too large ({} bytes) for placement window end={:#x}",
+                initramfs_file_size, max_end
+            )));
+        }
+        let addr = (max_end + 1 - initramfs_file_size) & !0x1F_FFFF;
         debug!(
-            "Placing initramfs at {:#x} (top of {:#x} memory, size {:#x})",
-            addr, memory_size, initramfs_file_size
+            "Placing initramfs at {:#x} (ram_end={:#x}, initrd_addr_max={:#x}, early_map_limit={:#x}, size={:#x})",
+            addr,
+            memory_size.saturating_sub(1),
+            initrd_addr_max,
+            EARLY_IDENTITY_MAP_LIMIT - 1,
+            initramfs_file_size
         );
         addr
     } else {
@@ -102,6 +117,23 @@ fn read_bzimage_init_size(kernel_file: &mut File) -> Result<u32> {
     kernel_file
         .read_exact(&mut buf)
         .map_err(|e| Error::Boot(format!("Failed to read init_size: {}", e)))?;
+    kernel_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Boot(format!("Failed to rewind kernel file: {}", e)))?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+/// Read the initrd_addr_max field from a bzImage setup header.
+/// Returns error if unreadable.
+fn read_bzimage_initrd_addr_max(kernel_file: &mut File) -> Result<u32> {
+    // setup_header.initrd_addr_max lives at file offset 0x22c.
+    kernel_file
+        .seek(SeekFrom::Start(0x22c))
+        .map_err(|e| Error::Boot(format!("Failed to seek to initrd_addr_max: {}", e)))?;
+    let mut buf = [0u8; 4];
+    kernel_file
+        .read_exact(&mut buf)
+        .map_err(|e| Error::Boot(format!("Failed to read initrd_addr_max: {}", e)))?;
     kernel_file
         .seek(SeekFrom::Start(0))
         .map_err(|e| Error::Boot(format!("Failed to rewind kernel file: {}", e)))?;

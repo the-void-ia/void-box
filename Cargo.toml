@@ -67,6 +67,9 @@ event-manager = "0.4"
 # SLIRP networking (smoltcp-based user-mode networking)
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
 
+# Stable hashing for OCI disk cache keys
+sha2 = "0.10"
+
 # Security (Linux-specific)
 seccompiler = "0.4"
 ipnet = "2"

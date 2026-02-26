@@ -42,9 +42,9 @@ pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
         parts.push("ipv6.disable=1".to_string());
     }
 
-    // Root device: VZ presents the disk as /dev/vda via virtio-blk
-    // (same as KVM, since both use virtio)
-    // Note: rootfs setup is handled by the caller if needed
+    // OCI rootfs: VZ uses virtiofs (not virtio-blk) for OCI rootfs delivery.
+    // The host shares the extracted rootfs directory read-only; the guest
+    // overlays it with a tmpfs upper layer. See docs/AGENT.md for details.
 
     // Mount config: tell the guest-agent which virtiofs tags to mount and where.
     // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
@@ -87,6 +87,8 @@ mod tests {
             shared_dir: None,
             mounts: vec![],
             oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
             env: vec![],
             security: BackendSecurityConfig {
                 session_secret: [0xAB; 32],

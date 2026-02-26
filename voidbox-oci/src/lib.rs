@@ -127,11 +127,24 @@ impl OciClient {
             let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
         }
 
-        let image = self.pull(image_ref).await?;
-        let rootfs = self.unpack(&image, &rootfs_dir).await?;
+        let image = self
+            .pull(image_ref)
+            .await
+            .map_err(|e| OciError::Layer(format!("pull failed for '{}': {}", image_ref, e)))?;
+        let rootfs = self
+            .unpack(&image, &rootfs_dir)
+            .await
+            .map_err(|e| OciError::Layer(format!("unpack failed for '{}': {}", image_ref, e)))?;
 
         // Mark as successfully completed so future runs use the cache.
-        blob_cache.mark_rootfs_done(&cache_key).await?;
+        blob_cache.mark_rootfs_done(&cache_key).await.map_err(|e| {
+            OciError::Layer(format!(
+                "mark_rootfs_done failed for '{}' at {}: {}",
+                image_ref,
+                rootfs_dir.display(),
+                e
+            ))
+        })?;
 
         info!(path = %rootfs.display(), "rootfs ready");
         Ok(rootfs)

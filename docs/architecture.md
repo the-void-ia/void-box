@@ -2,7 +2,7 @@
 
 ## Overview
 
-void-box is a composable agent runtime where each agent runs in a hardware-isolated KVM micro-VM. The core equation is:
+void-box is a composable agent runtime where each agent runs in a hardware-isolated micro-VM. On Linux this uses KVM; on macOS (Apple Silicon) it uses Virtualization.framework (VZ). The core equation is:
 
 ```
 VoidBox = Agent(Skills) + Isolation
@@ -46,8 +46,8 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │     │
 │  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │     │
 │  │  └────────┘ └────────┘ └───────┬─────┘ └───────┬──────┘ │     │
-│  │  9p/virtiofs: OCI rootfs +     │               │        │     │
-│  │    skill mounts                │               │        │     │
+│  │  Linux/KVM: virtio-blk (OCI rootfs)            │        │     │
+│  │  9p/virtiofs: skills + host mounts             │        │     │
 │  │  Seccomp-BPF on VMM thread    │               │        │     │
 │  └────────────────────────────────┼───────────────┼────────┘     │
 │                                   │               │              │
@@ -92,7 +92,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 2. resolve_guest_image()          Resolve kernel + initramfs (5-step chain)
        │                          Pulls from GHCR if no local paths found
        │
-3. .build()                       Creates Sandbox (mock or KVM MicroVm)
+3. .build()                       Creates Sandbox (mock or local VM backend: KVM/VZ)
        │                          Mounts OCI rootfs + skill images if configured
        │
 4. .run(input)                    Execution begins
@@ -299,7 +299,16 @@ Cache layout: `~/.voidbox/oci/guest/<sha256>/vmlinuz` + `rootfs.cpio.gz` + `<sha
 
 ### Base image (`sandbox.image`)
 
-Full container image (e.g. `python:3.12-slim`) used as the guest root filesystem. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the extracted OCI image layers. Mounted read-only via 9p (Linux) or virtiofs (macOS) at `/mnt/oci-rootfs`.
+Full container image (e.g. `python:3.12-slim`) used as the guest root filesystem.
+
+- Linux/KVM: host builds a cached ext4 disk artifact from the extracted OCI rootfs and attaches it as `virtio-blk` (guest sees `/dev/vda`).
+- macOS/VZ: rootfs remains directory-mounted (virtiofs path).
+- Guest-agent switches root with overlayfs + `pivot_root` (or secure switch-root fallback when kernel returns `EINVAL` for initramfs root).
+
+Security properties are preserved across both paths:
+- OCI root switch is driven only by kernel cmdline flags set by the trusted host.
+- command allowlist + authenticated vsock control channel still gate execution.
+- writable layer is tmpfs-backed; base OCI lowerdir remains read-only.
 
 Cache layout: `~/.voidbox/oci/rootfs/<sha256>/` (full layer extraction with whiteout handling).
 
@@ -324,6 +333,13 @@ skills:
 | `cache.rs` | Content-addressed blob cache + rootfs/guest done markers |
 | `unpack.rs` | Layer extraction (full rootfs with whiteouts, or selective guest file extraction) |
 | `lib.rs` | `OciClient`: `pull()`, `resolve_rootfs()`, `resolve_guest_files()` |
+
+## Developer Notes
+
+For contributor setup, lint/test parity commands, and script usage, see
+`CONTRIBUTING.md`.
+
+For runtime setup commands and end-user usage examples, see `README.md`.
 
 ## Skill Types
 

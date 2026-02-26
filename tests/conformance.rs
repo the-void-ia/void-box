@@ -21,6 +21,9 @@
 
 use std::path::PathBuf;
 
+#[path = "common/vm_preflight.rs"]
+mod vm_preflight;
+
 use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
 
 // ---------------------------------------------------------------------------
@@ -31,8 +34,7 @@ use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
 fn backend_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::path::Path::new("/dev/kvm").exists()
-            && std::path::Path::new("/dev/vhost-vsock").exists()
+        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
     }
     #[cfg(target_os = "macos")]
     {
@@ -47,13 +49,16 @@ fn backend_available() -> bool {
 fn backend_config() -> Option<BackendConfig> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() || !kernel.exists() {
+    if kernel.as_os_str().is_empty() {
         return None;
     }
 
     let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
     let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() || !initramfs.exists() {
+    if initramfs.as_os_str().is_empty() {
+        return None;
+    }
+    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
         return None;
     }
 
@@ -71,6 +76,8 @@ fn backend_config() -> Option<BackendConfig> {
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,
+        oci_rootfs_dev: None,
+        oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
             session_secret: secret,

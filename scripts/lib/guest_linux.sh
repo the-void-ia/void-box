@@ -107,6 +107,8 @@ install_kernel_modules_from_deb() {
   (cd "$tmp" && ar x modules.deb)
 
   local mod_paths=(
+    "lib/modules/${kmod_version}-generic/kernel/drivers/virtio/virtio.ko"
+    "lib/modules/${kmod_version}-generic/kernel/drivers/virtio/virtio_ring.ko"
     "lib/modules/${kmod_version}-generic/kernel/drivers/virtio/virtio_mmio.ko"
     "lib/modules/${kmod_version}-generic/kernel/net/vmw_vsock/vsock.ko"
     "lib/modules/${kmod_version}-generic/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko"
@@ -114,8 +116,11 @@ install_kernel_modules_from_deb() {
     "lib/modules/${kmod_version}-generic/kernel/net/core/failover.ko"
     "lib/modules/${kmod_version}-generic/kernel/drivers/net/net_failover.ko"
     "lib/modules/${kmod_version}-generic/kernel/drivers/net/virtio_net.ko"
+    "lib/modules/${kmod_version}-generic/kernel/fs/netfs/netfs.ko"
+    "lib/modules/${kmod_version}-generic/kernel/fs/9p/9p.ko"
     "lib/modules/${kmod_version}-generic/kernel/net/9p/9pnet.ko"
     "lib/modules/${kmod_version}-generic/kernel/net/9p/9pnet_virtio.ko"
+    "lib/modules/${kmod_version}-generic/kernel/fs/overlayfs/overlay.ko"
   )
 
   # Data tarball may be compressed as .zst, .xz, or .gz
@@ -204,6 +209,8 @@ install_kernel_modules_linux() {
   }
 
   echo "[void-box] Adding kernel modules for virtio-mmio, vsock, and networking (kernel $kver)..."
+  _install_kmod "$moddir/drivers/virtio/virtio"                           "$dest"
+  _install_kmod "$moddir/drivers/virtio/virtio_ring"                      "$dest"
   _install_kmod "$moddir/drivers/virtio/virtio_mmio"                      "$dest"
   _install_kmod "$moddir/net/vmw_vsock/vsock"                             "$dest"
   _install_kmod "$moddir/net/vmw_vsock/vmw_vsock_virtio_transport_common" "$dest"
@@ -211,6 +218,9 @@ install_kernel_modules_linux() {
   _install_kmod "$moddir/net/core/failover"                               "$dest"
   _install_kmod "$moddir/drivers/net/net_failover"                        "$dest"
   _install_kmod "$moddir/drivers/net/virtio_net"                          "$dest"
+  _install_kmod "$moddir/fs/netfs/netfs"                                 "$dest"
+  _install_kmod "$moddir/fs/9p/9p"                                       "$dest"
   _install_kmod "$moddir/net/9p/9pnet"                                   "$dest"
   _install_kmod "$moddir/net/9p/9pnet_virtio"                            "$dest"
+  _install_kmod "$moddir/fs/overlayfs/overlay"                           "$dest"
 }

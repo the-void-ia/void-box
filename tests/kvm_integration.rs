@@ -21,8 +21,11 @@
 //! cargo test --test kvm_integration -- --ignored
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[path = "common/vm_preflight.rs"]
+mod vm_preflight;
 
 use void_box::observe::ObserveConfig;
 use void_box::sandbox::Sandbox;
@@ -30,11 +33,6 @@ use void_box::vmm::config::VoidBoxConfig;
 use void_box::vmm::MicroVm;
 use void_box::workflow::{Workflow, WorkflowExt};
 use void_box::Error;
-
-/// Return true if /dev/kvm looks available.
-fn kvm_available() -> bool {
-    Path::new("/dev/kvm").exists()
-}
 
 /// Load kernel + initramfs paths from environment.
 ///
@@ -54,8 +52,12 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
 /// Returns `None` if KVM or artifacts are not available, printing a reason
 /// to stderr so the caller test can early-return without failing.
 fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
-    if !kvm_available() {
-        eprintln!("skipping KVM sandbox test: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping KVM sandbox test: {e}");
+        return None;
+    }
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping KVM sandbox test: {e}");
         return None;
     }
 
@@ -67,22 +69,9 @@ fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
         return None;
     };
 
-    if !kernel.exists() {
-        eprintln!(
-            "skipping KVM sandbox test: kernel path does not exist: {}",
-            kernel.display()
-        );
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping KVM sandbox test: {e}");
         return None;
-    }
-
-    if let Some(ref initramfs_path) = initramfs {
-        if !initramfs_path.exists() {
-            eprintln!(
-                "skipping KVM sandbox test: initramfs path does not exist: {}",
-                initramfs_path.display()
-            );
-            return None;
-        }
     }
 
     let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);

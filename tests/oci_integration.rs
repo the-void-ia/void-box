@@ -32,6 +32,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "common/vm_preflight.rs"]
+mod vm_preflight;
+
 use void_box::agent_box::VoidBox;
 use void_box::backend::MountConfig;
 use void_box::sandbox::Sandbox;
@@ -197,6 +200,38 @@ fn kernel_cmdline_no_oci_rootfs_when_none() {
     );
 }
 
+/// `VoidBoxConfig` with `oci_rootfs_dev` emits the device token used by
+/// guest-agent block-rootfs pivot flow.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_cmdline_includes_oci_rootfs_dev() {
+    let config = void_box::vmm::config::VoidBoxConfig {
+        oci_rootfs_dev: Some("/dev/vda".to_string()),
+        ..Default::default()
+    };
+    let cmdline = config.kernel_cmdline();
+    assert!(
+        cmdline.contains("voidbox.oci_rootfs_dev=/dev/vda"),
+        "kernel cmdline should contain voidbox.oci_rootfs_dev: {cmdline}"
+    );
+}
+
+/// `VoidBoxConfig` with `oci_rootfs_disk` emits the virtio-mmio declaration for
+/// virtio-blk (IRQ 13, MMIO base 0xd1800000).
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_cmdline_includes_virtio_blk_mmio_for_oci_disk() {
+    let config = void_box::vmm::config::VoidBoxConfig {
+        oci_rootfs_disk: Some(PathBuf::from("/tmp/oci-rootfs.img")),
+        ..Default::default()
+    };
+    let cmdline = config.kernel_cmdline();
+    assert!(
+        cmdline.contains("virtio_mmio.device=512@0xd1800000:13"),
+        "kernel cmdline should contain virtio-blk MMIO declaration: {cmdline}"
+    );
+}
+
 // --- macOS: vz::config::build_kernel_cmdline ---
 
 /// `build_kernel_cmdline` with `oci_rootfs` produces `voidbox.oci_rootfs=...`
@@ -278,6 +313,8 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,
+        oci_rootfs_dev: None,
+        oci_rootfs_disk: None,
         env: vec![],
         security: void_box::backend::BackendSecurityConfig {
             session_secret: [0xAB; 32],
@@ -415,12 +452,16 @@ fn create_fake_oci_rootfs() -> tempfile::TempDir {
 /// macOS (VZ) — the `Sandbox::local()` builder picks the right backend.
 fn build_sandbox_with_oci_mount(
     oci_dir: &std::path::Path,
-    read_only: bool,
+    _read_only: bool,
 ) -> Option<Arc<Sandbox>> {
-    // Linux: require /dev/kvm
     #[cfg(target_os = "linux")]
-    if !std::path::Path::new("/dev/kvm").exists() {
-        eprintln!("skipping VM OCI test: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping VM OCI test: {e}");
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping VM OCI test: {e}");
         return None;
     }
 
@@ -435,26 +476,34 @@ fn build_sandbox_with_oci_mount(
         }
     };
 
-    if !kernel.exists() {
-        eprintln!(
-            "skipping VM OCI test: kernel path does not exist: {}",
-            kernel.display()
-        );
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping VM OCI test: {e}");
         return None;
     }
 
-    let mount = MountConfig {
-        host_path: oci_dir.to_string_lossy().into_owned(),
-        guest_path: "/mnt/oci-rootfs".to_string(),
-        read_only,
-    };
+    let mut builder = Sandbox::local().memory_mb(1536).vcpus(1).kernel(&kernel);
 
-    let mut builder = Sandbox::local()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel)
-        .mount(mount)
-        .oci_rootfs("/mnt/oci-rootfs");
+    #[cfg(target_os = "linux")]
+    {
+        let disk = match build_test_oci_rootfs_disk(oci_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping VM OCI test: failed to build OCI disk: {e}");
+                return None;
+            }
+        };
+        builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mount = MountConfig {
+            host_path: oci_dir.to_string_lossy().into_owned(),
+            guest_path: "/mnt/oci-rootfs".to_string(),
+            read_only: _read_only,
+        };
+        builder = builder.mount(mount).oci_rootfs("/mnt/oci-rootfs");
+    }
 
     if let Some(ref p) = initramfs {
         if p.exists() {
@@ -471,6 +520,65 @@ fn build_sandbox_with_oci_mount(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, String> {
+    fn dir_size_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+        fn walk(path: &std::path::Path, total: &mut u64) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    walk(&entry.path(), total)?;
+                } else if meta.is_file() {
+                    *total = total.saturating_add(meta.len());
+                }
+            }
+            Ok(())
+        }
+        let mut total = 0u64;
+        walk(path, &mut total)?;
+        Ok(total)
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base_tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let disk_path = PathBuf::from(base_tmp).join(format!(
+        "voidbox-oci-test-{}-{}.img",
+        std::process::id(),
+        ts
+    ));
+    let content_size = dir_size_bytes(rootfs_dir).unwrap_or(64 * 1024 * 1024);
+    let disk_size = (content_size.saturating_mul(2)).saturating_add(256 * 1024 * 1024);
+    let disk_size = disk_size.max(512 * 1024 * 1024);
+
+    let truncate_status = std::process::Command::new("truncate")
+        .arg("-s")
+        .arg(disk_size.to_string())
+        .arg(&disk_path)
+        .status()
+        .map_err(|e| format!("failed to run truncate: {e}"))?;
+    if !truncate_status.success() {
+        return Err("truncate failed".to_string());
+    }
+
+    let mkfs_status = std::process::Command::new("mkfs.ext4")
+        .arg("-q")
+        .arg("-F")
+        .arg("-d")
+        .arg(rootfs_dir)
+        .arg(&disk_path)
+        .status()
+        .map_err(|e| format!("failed to run mkfs.ext4: {e}"))?;
+    if !mkfs_status.success() {
+        return Err("mkfs.ext4 failed".to_string());
+    }
+
+    Ok(disk_path)
+}
+
 /// Mount a host directory as OCI rootfs and verify the guest can read its files.
 ///
 /// Linux: requires `/dev/kvm` + kernel/initramfs artifacts.
@@ -483,18 +591,12 @@ async fn vm_oci_rootfs_mount_visible() {
         return;
     };
 
-    let output = match sandbox
-        .exec("cat", &["/mnt/oci-rootfs/oci-marker.txt"])
-        .await
-    {
+    // After OCI setup, guest-agent pivots into the OCI rootfs.
+    let output = match sandbox.exec("/bin/cat", &["/oci-marker.txt"]).await {
         Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("vm_oci_rootfs_mount_visible: VM not running; skipping");
-            return;
-        }
+        Err(Error::VmNotRunning) => panic!("vm_oci_rootfs_mount_visible: VM not running"),
         Err(Error::Guest(msg)) => {
-            eprintln!("vm_oci_rootfs_mount_visible: guest communication error: {msg}");
-            return;
+            panic!("vm_oci_rootfs_mount_visible: guest communication error: {msg}")
         }
         Err(e) => panic!("failed to exec cat in sandbox: {e}"),
     };
@@ -508,7 +610,7 @@ async fn vm_oci_rootfs_mount_visible() {
     assert_eq!(output.stdout_str().trim(), "oci-rootfs-present");
 }
 
-/// Write to a read-only OCI rootfs mount and expect failure.
+/// Verify OCI lowerdir immutability from inside the guest.
 ///
 /// Linux: requires `/dev/kvm` + kernel/initramfs artifacts.
 /// macOS: requires kernel/initramfs artifacts (VZ).
@@ -520,26 +622,23 @@ async fn vm_oci_rootfs_readonly() {
         return;
     };
 
-    let output = match sandbox
-        .exec("touch", &["/mnt/oci-rootfs/should-fail.txt"])
-        .await
-    {
+    let output = match sandbox.exec("/bin/touch", &["/should-write.txt"]).await {
         Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("vm_oci_rootfs_readonly: VM not running; skipping");
-            return;
-        }
+        Err(Error::VmNotRunning) => panic!("vm_oci_rootfs_readonly: VM not running"),
         Err(Error::Guest(msg)) => {
-            eprintln!("vm_oci_rootfs_readonly: guest communication error: {msg}");
-            return;
+            panic!("vm_oci_rootfs_readonly: guest communication error: {msg}")
         }
         Err(e) => panic!("failed to exec touch in sandbox: {e}"),
     };
 
     assert!(
         !output.success(),
-        "writing to read-only OCI rootfs mount should fail, but got exit_code={}",
+        "writing to OCI-backed root unexpectedly succeeded, exit_code={}",
         output.exit_code
+    );
+    assert!(
+        !oci_dir.path().join("should-write.txt").exists(),
+        "host lowerdir must remain unchanged after guest write"
     );
 }
 
@@ -628,8 +727,13 @@ fn example_spec_oci_skills() {
 #[ignore = "requires VM backend + kernel/initramfs + network (pulls alpine:3.20)"]
 async fn vm_oci_alpine_os_release() {
     #[cfg(target_os = "linux")]
-    if !std::path::Path::new("/dev/kvm").exists() {
-        eprintln!("skipping: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: {e}");
         return;
     }
 
@@ -641,8 +745,8 @@ async fn vm_oci_alpine_os_release() {
         }
     };
 
-    if !kernel.exists() {
-        eprintln!("skipping: kernel not found: {}", kernel.display());
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping: {e}");
         return;
     }
 
@@ -659,20 +763,30 @@ async fn vm_oci_alpine_os_release() {
     };
     eprintln!("OCI rootfs extracted to: {}", rootfs_path.display());
 
-    // 2. Build sandbox: mount the extracted rootfs ro at /mnt/oci-rootfs,
-    //    set oci_rootfs so guest-agent performs pivot_root.
-    let mount = MountConfig {
-        host_path: rootfs_path.to_string_lossy().into_owned(),
-        guest_path: "/mnt/oci-rootfs".to_string(),
-        read_only: true,
-    };
-
-    let mut builder = Sandbox::local()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel)
-        .mount(mount)
-        .oci_rootfs("/mnt/oci-rootfs");
+    // 2. Build sandbox:
+    //    - Linux/KVM: attach OCI rootfs as virtio-blk + /dev/vda pivot.
+    //    - Non-Linux: legacy mount-based path.
+    let mut builder = Sandbox::local().memory_mb(1536).vcpus(1).kernel(&kernel);
+    #[cfg(target_os = "linux")]
+    {
+        let disk = match build_test_oci_rootfs_disk(&rootfs_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: failed to build OCI disk for alpine rootfs: {e}");
+                return;
+            }
+        };
+        builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mount = MountConfig {
+            host_path: rootfs_path.to_string_lossy().into_owned(),
+            guest_path: "/mnt/oci-rootfs".to_string(),
+            read_only: true,
+        };
+        builder = builder.mount(mount).oci_rootfs("/mnt/oci-rootfs");
+    }
 
     if let Some(ref p) = initramfs {
         if p.exists() {
@@ -689,16 +803,10 @@ async fn vm_oci_alpine_os_release() {
     };
 
     // 3. Exec `cat /etc/os-release` — after pivot_root this is alpine's file.
-    let output = match sandbox.exec("cat", &["/etc/os-release"]).await {
+    let output = match sandbox.exec("/bin/cat", &["/etc/os-release"]).await {
         Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("vm_oci_alpine_os_release: VM not running; skipping");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("vm_oci_alpine_os_release: guest error: {msg}");
-            return;
-        }
+        Err(Error::VmNotRunning) => panic!("vm_oci_alpine_os_release: VM not running"),
+        Err(Error::Guest(msg)) => panic!("vm_oci_alpine_os_release: guest error: {msg}"),
         Err(e) => panic!("exec failed: {e}"),
     };
 
@@ -804,18 +912,28 @@ workflow:
 #[tokio::test]
 #[ignore = "requires a registry with voidbox-guest image (see docstring)"]
 async fn guest_image_pull_and_extract() {
-    let image_ref = std::env::var("VOIDBOX_TEST_GUEST_IMAGE")
-        .unwrap_or_else(|_| "localhost:5555/voidbox-guest:v0.1.0".to_string());
+    let image_ref_env = std::env::var("VOIDBOX_TEST_GUEST_IMAGE").ok();
+    let image_ref = image_ref_env
+        .clone()
+        .unwrap_or_else(|| "localhost:5555/voidbox-guest:v0.1.0".to_string());
 
     let cache_dir = tempfile::tempdir().unwrap();
     let client = voidbox_oci::OciClient::new(cache_dir.path().to_path_buf());
 
     // First pull: should download and extract.
     eprintln!("=== Pulling guest image: {} ===", image_ref);
-    let guest = client
-        .resolve_guest_files(&image_ref)
-        .await
-        .expect("resolve_guest_files should succeed");
+    let guest = match client.resolve_guest_files(&image_ref).await {
+        Ok(guest) => guest,
+        Err(e) => {
+            // If caller did not explicitly configure a registry/image, treat an
+            // unavailable localhost test registry as "not configured" and skip.
+            if image_ref_env.is_none() && image_ref.starts_with("localhost:5555/") {
+                eprintln!("skipping: test registry not available at localhost:5555 ({e})");
+                return;
+            }
+            panic!("resolve_guest_files should succeed: {e}");
+        }
+    };
 
     assert!(
         guest.kernel.exists(),

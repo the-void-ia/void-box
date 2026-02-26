@@ -61,6 +61,10 @@ pub struct SandboxConfig {
     pub mounts: Vec<crate::backend::MountConfig>,
     /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
     pub oci_rootfs: Option<String>,
+    /// OCI rootfs block device in guest (e.g. /dev/vda).
+    pub oci_rootfs_dev: Option<String>,
+    /// Host path to OCI rootfs disk image for virtio-blk (KVM).
+    pub oci_rootfs_disk: Option<PathBuf>,
     /// Environment variables
     pub env: Vec<(String, String)>,
 }
@@ -79,6 +83,8 @@ impl Default for SandboxConfig {
             shared_dir: None,
             mounts: Vec::new(),
             oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
             env: Vec::new(),
         }
     }
@@ -589,6 +595,18 @@ impl SandboxBuilder {
     /// Set the OCI rootfs guest path (triggers pivot_root in guest-agent).
     pub fn oci_rootfs(mut self, guest_path: impl Into<String>) -> Self {
         self.config.oci_rootfs = Some(guest_path.into());
+        self
+    }
+
+    /// Set the OCI rootfs block device path in guest (e.g. `/dev/vda`).
+    pub fn oci_rootfs_dev(mut self, dev_path: impl Into<String>) -> Self {
+        self.config.oci_rootfs_dev = Some(dev_path.into());
+        self
+    }
+
+    /// Set the host OCI rootfs disk image path for virtio-blk.
+    pub fn oci_rootfs_disk(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.oci_rootfs_disk = Some(path.into());
         self
     }
 

@@ -52,16 +52,20 @@ jobs:
           cd /tmp && ar x busybox-static.deb && tar xf data.tar* ./usr/bin/busybox
           chmod +x /tmp/usr/bin/busybox
 
-      - name: Build initramfs
+      - name: Build initramfs (with claude-code)
         run: |
           # Must match the kernel version in scripts/download_kernel.sh
           # so that the packaged modules are compatible with the VM kernel.
+          # CLAUDE_CODE_VERSION triggers auto-download of the native Linux
+          # binary from GCS for the target architecture.
           ARCH=${{ matrix.arch }} \
           BUSYBOX=/tmp/usr/bin/busybox \
+          CLAUDE_CODE_VERSION=${{ vars.CLAUDE_CODE_VERSION || '2.1.53' }} \
           VOID_BOX_KMOD_VERSION=6.8.0-51 \
           VOID_BOX_KMOD_UPLOAD=52 \
           OUT_CPIO=/tmp/rootfs.cpio.gz \
-            scripts/build_guest_image.sh
+          OUT_DIR=/tmp/void-box-rootfs \
+            scripts/build_claude_rootfs.sh
 
       - name: Download kernel
         run: |

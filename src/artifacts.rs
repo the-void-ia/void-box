@@ -119,11 +119,34 @@ fn get_kernel_version() -> Result<String, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_artifact_cache_dir() {
+        let original_home = std::env::var_os("HOME");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let test_home = std::env::temp_dir().join(format!(
+            "voidbox-artifacts-home-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&test_home).expect("create test HOME");
+        std::env::set_var("HOME", &test_home);
+
         let cache_dir = artifact_cache_dir();
         assert!(cache_dir.is_ok());
+        let cache_dir = cache_dir.unwrap();
+        assert!(cache_dir.ends_with(".cache/void-box/artifacts"));
+        assert!(cache_dir.exists());
+
+        if let Some(prev) = original_home {
+            std::env::set_var("HOME", prev);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]

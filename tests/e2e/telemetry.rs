@@ -24,6 +24,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "../common/vm_preflight.rs"]
+mod vm_preflight;
+
 use void_box::observe::claude::{parse_stream_json, ClaudeExecOpts};
 use void_box::observe::tracer::{SpanContext, Tracer, TracerConfig};
 use void_box::sandbox::Sandbox;
@@ -34,24 +37,6 @@ use void_box::vmm::MicroVm;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn kvm_available() -> bool {
-    std::path::Path::new("/dev/kvm").exists()
-}
-
-fn vsock_available() -> bool {
-    let path = std::path::Path::new("/dev/vhost-vsock");
-    // Check existence and that we can actually open it (not just EACCES)
-    match std::fs::File::open(path) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
-            eprintln!("skipping: /dev/vhost-vsock exists but is not accessible: {e}");
-            false
-        }
-        Err(_) => false,
-    }
-}
-
 fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
     let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
     let kernel = PathBuf::from(kernel);
@@ -61,12 +46,12 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
 
 /// Try to build a VoidBoxConfig. Returns `None` if KVM or artifacts are unavailable.
 fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
-    if !kvm_available() {
-        eprintln!("skipping: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
-    if !vsock_available() {
-        eprintln!("skipping: /dev/vhost-vsock not available");
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
 
@@ -81,16 +66,9 @@ fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
         }
     };
 
-    if !kernel.exists() {
-        eprintln!("skipping: kernel not found at {}", kernel.display());
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping: {e}");
         return None;
-    }
-
-    if let Some(ref p) = initramfs {
-        if !p.exists() {
-            eprintln!("skipping: initramfs not found at {}", p.display());
-            return None;
-        }
     }
 
     let mut cfg = VoidBoxConfig::new()
@@ -108,12 +86,12 @@ fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
 
 /// Build a Sandbox::local() backed by a real KVM VM.
 fn build_test_sandbox() -> Option<Arc<Sandbox>> {
-    if !kvm_available() {
-        eprintln!("skipping: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
-    if !vsock_available() {
-        eprintln!("skipping: /dev/vhost-vsock not available");
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
 
@@ -125,16 +103,14 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
         }
     };
 
-    if !kernel.exists() {
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping: {e}");
         return None;
     }
 
     let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
 
     if let Some(ref p) = initramfs {
-        if !p.exists() {
-            return None;
-        }
         builder = builder.initramfs(p);
     }
 
@@ -149,26 +125,25 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
 
 /// Build a Sandbox::local() with custom env vars for claudio configuration.
 fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
-    if !kvm_available() {
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
-    if !vsock_available() {
-        eprintln!("skipping: /dev/vhost-vsock not available");
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: {e}");
         return None;
     }
 
     let (kernel, initramfs) = kvm_artifacts_from_env()?;
 
-    if !kernel.exists() {
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping: {e}");
         return None;
     }
 
     let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
 
     if let Some(ref p) = initramfs {
-        if !p.exists() {
-            return None;
-        }
         builder = builder.initramfs(p);
     }
 
@@ -302,20 +277,26 @@ async fn test_default_scenario() {
         dangerously_skip_permissions: true,
         ..Default::default()
     };
-    let result2 = sandbox
-        .exec_claude("exec_claude test", opts)
-        .await
-        .expect("exec_claude failed");
-    assert!(!result2.is_error, "exec_claude should not error");
-    assert!(
-        !result2.session_id.is_empty(),
-        "exec_claude should have session_id"
-    );
-    assert!(
-        !result2.tool_calls.is_empty(),
-        "exec_claude should have tool calls"
-    );
-    eprintln!("  [C] exec_claude() works correctly");
+    match sandbox.exec_claude("exec_claude test", opts).await {
+        Ok(result2) => {
+            assert!(!result2.is_error, "exec_claude should not error");
+            assert!(
+                !result2.session_id.is_empty(),
+                "exec_claude should have session_id"
+            );
+            assert!(
+                !result2.tool_calls.is_empty(),
+                "exec_claude should have tool calls"
+            );
+            eprintln!("  [C] exec_claude() works correctly");
+        }
+        Err(void_box::Error::Guest(msg))
+            if msg.contains("guest does not have `claude-code` in PATH") =>
+        {
+            eprintln!("  [C] skipped exec_claude() check: {}", msg);
+        }
+        Err(e) => panic!("exec_claude failed: {e}"),
+    }
 
     // Note: we don't call sandbox.stop() -- vCPU threads are blocked in KVM_RUN
     // and won't exit until the process ends. The Drop impl handles cleanup.

@@ -12,6 +12,7 @@ use vm_memory::Address;
 
 use crate::devices::serial::SerialDevice;
 use crate::devices::virtio_9p::Virtio9pDevice;
+use crate::devices::virtio_blk::VirtioBlkDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
 use crate::vmm::kvm::Vm;
@@ -60,6 +61,7 @@ pub struct MmioDevices {
     pub virtio_net: Option<Arc<Mutex<VirtioNetDevice>>>,
     pub virtio_vsock: Option<Arc<Mutex<VirtioVsockMmio>>>,
     pub virtio_9p: Option<Arc<Mutex<Virtio9pDevice>>>,
+    pub virtio_blk: Option<Arc<Mutex<VirtioBlkDevice>>>,
 }
 
 /// Create and start a vCPU
@@ -209,51 +211,34 @@ fn vcpu_run_loop(
 ) {
     debug!("vCPU {} entering run loop", vcpu_id);
     let guest_memory = vm.guest_memory();
+    let mut p9_irq_notified = false;
+    let mut blk_irq_notified = false;
 
     while running.load(Ordering::SeqCst) {
-        // Poll virtio-net RX: inject any frames from SLIRP into guest buffers,
-        // then inject IRQ 10 if the device has a pending interrupt.
-        if let Some(ref dev) = mmio_devices.virtio_net {
-            let mut guard = dev.lock().unwrap();
-            let _ = guard.try_inject_rx(guest_memory);
-            if guard.has_pending_interrupt() {
-                // Inject IRQ 10 (virtio-net) into the guest via KVM_IRQ_LINE
-                #[repr(C)]
-                struct KvmIrqLevel {
-                    irq: u32,
-                    level: u32,
-                }
-                const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
-                let vm_fd = vm.vm_fd().as_raw_fd();
-                let assert = KvmIrqLevel { irq: 10, level: 1 };
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
-                }
-                let deassert = KvmIrqLevel { irq: 10, level: 0 };
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+        // Device polling/IRQ injection is handled by vCPU0 only to avoid
+        // duplicate IRQ storms from multiple vCPU threads.
+        if vcpu_id == 0 {
+            // Edge-inject IRQ 12 for virtio-9p.
+            if let Some(ref dev) = mmio_devices.virtio_9p {
+                let guard = dev.lock().unwrap();
+                let pending = guard.has_pending_interrupt();
+                if pending && !p9_irq_notified {
+                    inject_irq(vm.vm_fd().as_raw_fd(), 12);
+                    p9_irq_notified = true;
+                } else if !pending {
+                    p9_irq_notified = false;
                 }
             }
-        }
 
-        // Inject IRQ 12 (virtio-9p) if the device has a pending interrupt.
-        if let Some(ref dev) = mmio_devices.virtio_9p {
-            let guard = dev.lock().unwrap();
-            if guard.has_pending_interrupt() {
-                #[repr(C)]
-                struct KvmIrqLevel {
-                    irq: u32,
-                    level: u32,
-                }
-                const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
-                let vm_fd = vm.vm_fd().as_raw_fd();
-                let assert = KvmIrqLevel { irq: 12, level: 1 };
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
-                }
-                let deassert = KvmIrqLevel { irq: 12, level: 0 };
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+            // Edge-inject IRQ 13 for virtio-blk.
+            if let Some(ref dev) = mmio_devices.virtio_blk {
+                let guard = dev.lock().unwrap();
+                let pending = guard.has_pending_interrupt();
+                if pending && !blk_irq_notified {
+                    inject_irq(vm.vm_fd().as_raw_fd(), 13);
+                    blk_irq_notified = true;
+                } else if !pending {
+                    blk_irq_notified = false;
                 }
             }
         }
@@ -295,6 +280,20 @@ fn vcpu_run_loop(
                             } else {
                                 false
                             };
+                        let handled = handled
+                            || if let Some(ref dev) = mmio_devices.virtio_blk {
+                                let guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    guard.mmio_read(offset, data);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
                         if !handled {
                             if let Some(ref dev) = mmio_devices.virtio_9p {
                                 let guard = dev.lock().unwrap();
@@ -337,12 +336,35 @@ fn vcpu_run_loop(
                             } else {
                                 false
                             };
+                        let handled = handled
+                            || if let Some(ref dev) = mmio_devices.virtio_blk {
+                                let mut guard = dev.lock().unwrap();
+                                if guard.handles_mmio(addr) {
+                                    let offset = addr - guard.mmio_base();
+                                    guard.mmio_write(offset, data, Some(guest_memory));
+                                    if guard.has_pending_interrupt() {
+                                        inject_irq(vm.vm_fd().as_raw_fd(), 13);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
                         if !handled {
                             if let Some(ref dev) = mmio_devices.virtio_9p {
                                 let mut guard = dev.lock().unwrap();
                                 if guard.handles_mmio(addr) {
                                     let offset = addr - guard.mmio_base();
                                     guard.mmio_write(offset, data, Some(guest_memory));
+
+                                    // Inject IRQ 12 (virtio-9p) if the device has
+                                    // a pending interrupt after processing the request.
+                                    if guard.has_pending_interrupt() {
+                                        inject_irq(vm.vm_fd().as_raw_fd(), 12);
+                                    }
                                 }
                             }
                         }
@@ -390,6 +412,23 @@ fn vcpu_run_loop(
     }
 
     debug!("vCPU {} exiting run loop", vcpu_id);
+}
+
+fn inject_irq(vm_fd: i32, irq: u32) {
+    #[repr(C)]
+    struct KvmIrqLevel {
+        irq: u32,
+        level: u32,
+    }
+    const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+    let assert = KvmIrqLevel { irq, level: 1 };
+    unsafe {
+        libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
+    }
+    let deassert = KvmIrqLevel { irq, level: 0 };
+    unsafe {
+        libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+    }
 }
 
 /// Handle I/O port output (guest writing to port)

@@ -561,7 +561,7 @@ impl VirtioVsockMmio {
                         .ok_or_else(|| Error::Device("no kick eventfd".into()))?;
                     let call_fd = self._call_eventfds[idx as usize]
                         .ok_or_else(|| Error::Device("no call eventfd".into()))?;
-                    self.set_vring(
+                    let set_vring_result = self.set_vring(
                         idx,
                         num,
                         desc,
@@ -570,7 +570,17 @@ impl VirtioVsockMmio {
                         guest_memory,
                         kick_fd,
                         call_fd,
-                    )?;
+                    );
+                    if let Err(e) = set_vring_result {
+                        // Some host kernels reject programming queue 2 (EVENT)
+                        // in vhost-vsock even though the virtio spec advertises it.
+                        // Keep RX/TX online and continue so guest-agent can boot.
+                        if idx == 2 {
+                            debug!("virtio-vsock: ignoring event queue setup failure: {}", e);
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 }
             }
             mmio::QUEUE_NOTIFY => {

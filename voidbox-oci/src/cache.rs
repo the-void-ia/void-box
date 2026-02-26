@@ -53,7 +53,8 @@ impl BlobCache {
 
     /// Check whether a rootfs has already been fully unpacked for `image_digest`.
     pub fn has_rootfs(&self, image_digest: &str) -> bool {
-        self.rootfs_done_marker(image_digest).exists()
+        let rootfs = self.rootfs_path(image_digest);
+        rootfs.is_dir() && self.rootfs_done_marker(image_digest).is_file()
     }
 
     /// Mark a rootfs extraction as complete.
@@ -77,7 +78,8 @@ impl BlobCache {
 
     /// Check whether guest files have already been fully extracted for `image_digest`.
     pub fn has_guest(&self, image_digest: &str) -> bool {
-        self.guest_done_marker(image_digest).exists()
+        let guest = self.guest_path(image_digest);
+        guest.is_dir() && self.guest_done_marker(image_digest).is_file()
     }
 
     /// Mark a guest extraction as complete.

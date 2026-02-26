@@ -77,6 +77,10 @@ struct BoxConfig {
     mounts: Vec<crate::backend::MountConfig>,
     /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
     oci_rootfs: Option<String>,
+    /// OCI rootfs block device in guest (e.g. /dev/vda).
+    oci_rootfs_dev: Option<String>,
+    /// Host path to OCI rootfs disk image for virtio-blk.
+    oci_rootfs_disk: Option<PathBuf>,
     /// Path where the agent should write its output (read after execution)
     output_file: String,
     /// Whether to use mock sandbox
@@ -99,6 +103,8 @@ impl Default for BoxConfig {
             env: Vec::new(),
             mounts: Vec::new(),
             oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
             output_file: "/workspace/output.json".to_string(),
             mock: false,
             llm: LlmProvider::default(),
@@ -227,6 +233,18 @@ impl VoidBox {
         self
     }
 
+    /// Set the OCI rootfs block device path in guest (e.g. `/dev/vda`).
+    pub fn oci_rootfs_dev(mut self, dev_path: impl Into<String>) -> Self {
+        self.config.oci_rootfs_dev = Some(dev_path.into());
+        self
+    }
+
+    /// Set the host OCI rootfs disk image path for virtio-blk.
+    pub fn oci_rootfs_disk(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.oci_rootfs_disk = Some(path.into());
+        self
+    }
+
     /// Use a mock sandbox (for testing without KVM).
     pub fn mock(mut self) -> Self {
         self.config.mock = true;
@@ -279,6 +297,12 @@ impl VoidBox {
         // OCI rootfs pivot_root
         if let Some(ref path) = self.config.oci_rootfs {
             builder = builder.oci_rootfs(path);
+        }
+        if let Some(ref dev) = self.config.oci_rootfs_dev {
+            builder = builder.oci_rootfs_dev(dev);
+        }
+        if let Some(ref disk) = self.config.oci_rootfs_disk {
+            builder = builder.oci_rootfs_disk(disk);
         }
 
         builder.build()

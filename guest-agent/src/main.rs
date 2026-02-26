@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -36,6 +37,110 @@ const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
 
 /// Parsed session secret from kernel cmdline (set once at startup).
 static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+static OCI_ROOTFS_SETUP_ONCE: std::sync::Once = std::sync::Once::new();
+
+// OCI setup status — lock-free, panic-safe.
+const OCI_NOT_RUN: u8 = 0;
+const OCI_STARTING: u8 = 1;
+const OCI_OK: u8 = 2;
+const OCI_OK_SWITCH_ROOT: u8 = 3;
+const OCI_FAIL_CMDLINE_READ: u8 = 10;
+const OCI_FAIL_BLOCK_MOUNT: u8 = 11;
+const OCI_FAIL_NO_OCI_ROOTFS: u8 = 12;
+const OCI_FAIL_ROOTFS_MISSING: u8 = 13;
+const OCI_FAIL_ROOTFS_EMPTY: u8 = 14;
+const OCI_FAIL_MKDIR: u8 = 15;
+const OCI_FAIL_OVERLAY_TMPFS: u8 = 16;
+const OCI_FAIL_OVERLAY_DIR: u8 = 17;
+const OCI_FAIL_OVERLAY_MOUNT: u8 = 18;
+const OCI_FAIL_SWITCH_ROOT_CHROOT: u8 = 19;
+const OCI_FAIL_SWITCH_ROOT_MOVE: u8 = 20;
+const OCI_FAIL_PIVOT_ROOT_EBUSY: u8 = 21;
+const OCI_FAIL_PIVOT_ROOT_EPERM: u8 = 22;
+const OCI_FAIL_PIVOT_ROOT_ENOENT: u8 = 23;
+const OCI_FAIL_PIVOT_ROOT: u8 = 24;
+
+static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
+
+fn oci_status_str(code: u8) -> &'static str {
+    match code {
+        OCI_NOT_RUN => "not-run",
+        OCI_STARTING => "starting",
+        OCI_OK => "ok",
+        OCI_OK_SWITCH_ROOT => "ok-switch-root",
+        OCI_FAIL_CMDLINE_READ => "cmdline-read-failed",
+        OCI_FAIL_BLOCK_MOUNT => "block-mount-failed",
+        OCI_FAIL_NO_OCI_ROOTFS => "no-oci-rootfs",
+        OCI_FAIL_ROOTFS_MISSING => "rootfs-path-missing",
+        OCI_FAIL_ROOTFS_EMPTY => "rootfs-path-empty",
+        OCI_FAIL_MKDIR => "mkdir-failed",
+        OCI_FAIL_OVERLAY_TMPFS => "overlay-tmpfs-mount-failed",
+        OCI_FAIL_OVERLAY_DIR => "overlay-dir-create-failed",
+        OCI_FAIL_OVERLAY_MOUNT => "overlay-mount-failed",
+        OCI_FAIL_SWITCH_ROOT_CHROOT => "switch-root-chroot-failed",
+        OCI_FAIL_SWITCH_ROOT_MOVE => "switch-root-move-failed",
+        OCI_FAIL_PIVOT_ROOT_EBUSY => "pivot-root-ebusy",
+        OCI_FAIL_PIVOT_ROOT_EPERM => "pivot-root-eperm",
+        OCI_FAIL_PIVOT_ROOT_ENOENT => "pivot-root-enoent",
+        OCI_FAIL_PIVOT_ROOT => "pivot-root-failed",
+        _ => "unknown",
+    }
+}
+
+fn oci_rootfs_requested() -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .map(|cmdline| {
+            cmdline.contains("voidbox.oci_rootfs_dev=") || cmdline.contains("voidbox.oci_rootfs=")
+        })
+        .unwrap_or(false)
+}
+
+fn trigger_oci_rootfs_setup_async() {
+    if !oci_rootfs_requested() {
+        return;
+    }
+    OCI_ROOTFS_SETUP_ONCE.call_once(|| {
+        kmsg("OCI setup: spawning async rootfs setup thread");
+        std::thread::spawn(|| {
+            kmsg("OCI setup: async rootfs setup thread started");
+            setup_oci_rootfs();
+            let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+            kmsg(&format!(
+                "OCI setup: async rootfs setup thread finished status={}",
+                status
+            ));
+        });
+    });
+}
+
+fn wait_for_oci_setup_ready(timeout: std::time::Duration) -> Result<(), String> {
+    if !oci_rootfs_requested() {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let code = OCI_SETUP_STATUS.load(Ordering::Acquire);
+        match code {
+            OCI_OK | OCI_OK_SWITCH_ROOT => return Ok(()),
+            OCI_NOT_RUN | OCI_STARTING => {
+                if start.elapsed() > timeout {
+                    return Err(format!(
+                        "OCI rootfs setup timeout (status={})",
+                        oci_status_str(code)
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                return Err(format!(
+                    "OCI rootfs setup failed (status={})",
+                    oci_status_str(code)
+                ))
+            }
+        }
+    }
+}
 
 // Whether the current connection has been authenticated.
 // Each connection thread gets its own copy.
@@ -180,13 +285,14 @@ fn main() {
     // Must happen after module loading (9p needs 9pnet_virtio.ko).
     mount_shared_dirs();
 
-    // If an OCI base image rootfs was mounted, pivot_root into it.
-    // Must happen after mount_shared_dirs() (the rootfs is one of the mounts).
-    setup_oci_rootfs();
-
-    // Set up networking after modules are loaded (virtio_net.ko creates eth0)
+    // Set up networking after modules are loaded (virtio_net.ko creates eth0).
+    // Skip when host did not configure a net virtio-mmio device.
     if std::process::id() == 1 {
-        setup_network();
+        if network_enabled_from_cmdline() {
+            setup_network();
+        } else {
+            kmsg("Network disabled by host config; skipping setup_network()");
+        }
     }
 
     // Parse session secret from kernel cmdline for vsock authentication.
@@ -408,43 +514,66 @@ fn init_system() {
 /// Modules are expected in /lib/modules/ as .ko.xz files.
 /// Uses the finit_module(2) syscall which handles compressed modules.
 fn load_kernel_modules() {
+    let virtio_mmio_params = virtio_mmio_params_from_cmdline();
+
     // Load order matters: dependencies must be loaded first.
     // virtio_mmio needs explicit device= params since the cmdline params may not
     // be forwarded when loading as a module.
-    let modules: &[(&str, &str, bool)] = &[
-        (
-            "virtio_mmio.ko",
-            "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12",
-            true,
-        ),
+    let modules: Vec<(&str, String, bool)> = vec![
+        // virtio core modules (required when not built-in).
+        ("virtio.ko", String::new(), false),
+        ("virtio_ring.ko", String::new(), false),
+        ("virtio_mmio.ko", virtio_mmio_params, true),
         // vsock modules
-        ("vsock.ko", "", true),
-        ("vmw_vsock_virtio_transport_common.ko", "", true),
-        ("vmw_vsock_virtio_transport.ko", "", true),
+        ("vsock.ko", String::new(), true),
+        ("vmw_vsock_virtio_transport_common.ko", String::new(), true),
+        ("vmw_vsock_virtio_transport.ko", String::new(), true),
         // Network modules (for SLIRP networking — optional, missing on macOS)
-        ("failover.ko", "", false),
-        ("net_failover.ko", "", false),
-        ("virtio_net.ko", "", false),
+        ("failover.ko", String::new(), false),
+        ("net_failover.ko", String::new(), false),
+        ("virtio_net.ko", String::new(), false),
         // 9p filesystem modules (for host directory sharing — optional, missing on macOS)
-        ("9pnet.ko", "", false),
-        ("9pnet_virtio.ko", "", false),
+        ("9pnet.ko", String::new(), false),
+        ("netfs.ko", String::new(), false),
+        ("9p.ko", String::new(), false),
+        ("9pnet_virtio.ko", String::new(), false),
+        // overlayfs module (required for OCI rootfs writable overlay + pivot_root)
+        ("overlay.ko", String::new(), false),
     ];
 
     for (module_name, params, required) in modules {
         let path = format!("/lib/modules/{}", module_name);
-        match load_module_file(&path, params) {
+        match load_module_file(&path, &params) {
             Ok(()) => kmsg(&format!(
                 "Loaded module: {} (params='{}')",
                 module_name, params
             )),
-            Err(e) if *required => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
-            Err(_) => {} // Optional module — silently skip (expected on macOS/VZ)
+            Err(e) if required => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
+            Err(e) => kmsg(&format!(
+                "Optional module {} not loaded: {}",
+                module_name, e
+            )),
         }
     }
 
     // Give the kernel a moment to probe devices after module loading
     kmsg("Modules loaded, waiting 1s for device probe...");
     std::thread::sleep(std::time::Duration::from_secs(1));
+}
+
+fn virtio_mmio_params_from_cmdline() -> String {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let mut params = Vec::new();
+    for token in cmdline.split_whitespace() {
+        if let Some(dev) = token.strip_prefix("virtio_mmio.device=") {
+            params.push(format!("device={}", dev));
+        }
+    }
+    if params.is_empty() {
+        "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12".to_string()
+    } else {
+        params.join(" ")
+    }
 }
 
 /// Load a single kernel module using finit_module(2), with optional parameters.
@@ -623,62 +752,106 @@ fn mount_shared_dirs() {
 ///
 /// This gives a writable root filesystem based on the OCI image.
 fn setup_oci_rootfs() {
+    OCI_SETUP_STATUS.store(OCI_STARTING, Ordering::Release);
     let cmdline = match std::fs::read_to_string("/proc/cmdline") {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            OCI_SETUP_STATUS.store(OCI_FAIL_CMDLINE_READ, Ordering::Release);
+            return;
+        }
     };
 
+    let oci_rootfs_dev = cmdline
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("voidbox.oci_rootfs_dev="))
+        .map(String::from);
     let oci_rootfs = cmdline
         .split_whitespace()
         .find_map(|p| p.strip_prefix("voidbox.oci_rootfs="))
         .map(String::from);
 
-    let Some(rootfs_path) = oci_rootfs else {
-        return;
+    let lowerdir = if let Some(dev) = oci_rootfs_dev {
+        match mount_oci_block_lowerdir(&dev) {
+            Ok(path) => path,
+            Err(e) => {
+                let msg = format!("WARNING: OCI rootfs device {} mount failed: {}", dev, e);
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_BLOCK_MOUNT, Ordering::Release);
+                return;
+            }
+        }
+    } else {
+        let Some(rootfs_path) = oci_rootfs else {
+            OCI_SETUP_STATUS.store(OCI_FAIL_NO_OCI_ROOTFS, Ordering::Release);
+            return;
+        };
+
+        // Legacy mount-based OCI path for virtiofs/9p backends.
+        if !std::path::Path::new(&rootfs_path).is_dir() {
+            kmsg(&format!(
+                "WARNING: OCI rootfs {} not found, skipping pivot_root",
+                rootfs_path
+            ));
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_MISSING, Ordering::Release);
+            return;
+        }
+        let has_content = std::fs::read_dir(&rootfs_path)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if !has_content {
+            kmsg(&format!(
+                "WARNING: OCI rootfs {} is empty (mount may have failed), skipping pivot_root",
+                rootfs_path
+            ));
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_EMPTY, Ordering::Release);
+            return;
+        }
+        rootfs_path
     };
-
-    // Verify the rootfs mount exists (should have been set up by mount_shared_dirs)
-    if !std::path::Path::new(&rootfs_path).is_dir() {
-        kmsg(&format!(
-            "WARNING: OCI rootfs {} not found, skipping pivot_root",
-            rootfs_path
-        ));
-        return;
-    }
-
-    kmsg(&format!("Setting up OCI rootfs from {}", rootfs_path));
+    kmsg(&format!("Setting up OCI rootfs from {}", lowerdir));
 
     let newroot = "/mnt/newroot";
-    let upper = "/mnt/overlay-upper";
-    let work = "/mnt/overlay-work";
+    // Overlay requires upperdir and workdir to be on the same filesystem.
+    // Use one tmpfs parent and create both subdirs inside it.
+    let overlay_base = "/mnt/overlay-tmp";
+    let upper = "/mnt/overlay-tmp/upper";
+    let work = "/mnt/overlay-tmp/work";
 
     // Create staging directories
-    for dir in [newroot, upper, work] {
+    for dir in [newroot, overlay_base] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
+            OCI_SETUP_STATUS.store(OCI_FAIL_MKDIR, Ordering::Release);
             return;
         }
     }
 
-    // Mount tmpfs for overlay upper and work directories
+    // Mount a single tmpfs that will hold both upper and work directories.
     let tmpfs_type = std::ffi::CString::new("tmpfs").unwrap();
+    let overlay_base_c = std::ffi::CString::new(overlay_base).unwrap();
+    let ret = unsafe {
+        libc::mount(
+            tmpfs_type.as_ptr(),
+            overlay_base_c.as_ptr(),
+            tmpfs_type.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        kmsg(&format!(
+            "WARNING: failed to mount tmpfs at {}: {}",
+            overlay_base,
+            std::io::Error::last_os_error()
+        ));
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_TMPFS, Ordering::Release);
+        return;
+    }
     for dir in [upper, work] {
-        let dir_c = std::ffi::CString::new(dir).unwrap();
-        let ret = unsafe {
-            libc::mount(
-                tmpfs_type.as_ptr(),
-                dir_c.as_ptr(),
-                tmpfs_type.as_ptr(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if ret != 0 {
-            kmsg(&format!(
-                "WARNING: failed to mount tmpfs at {}: {}",
-                dir,
-                std::io::Error::last_os_error()
-            ));
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
+            OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_DIR, Ordering::Release);
             return;
         }
     }
@@ -688,7 +861,7 @@ fn setup_oci_rootfs() {
     let newroot_c = std::ffi::CString::new(newroot).unwrap();
     let overlay_opts = std::ffi::CString::new(format!(
         "lowerdir={},upperdir={},workdir={}",
-        rootfs_path, upper, work
+        lowerdir, upper, work
     ))
     .unwrap();
 
@@ -702,10 +875,13 @@ fn setup_oci_rootfs() {
         )
     };
     if ret != 0 {
-        kmsg(&format!(
+        let msg = format!(
             "WARNING: overlayfs mount failed: {} (kernel may lack CONFIG_OVERLAY_FS)",
             std::io::Error::last_os_error()
-        ));
+        );
+        kmsg(&msg);
+        eprintln!("{}", msg);
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_MOUNT, Ordering::Release);
         return;
     }
 
@@ -720,12 +896,21 @@ fn setup_oci_rootfs() {
         "/workspace",
         "/home/sandbox",
         "/etc/voidbox",
+        "/usr/local/bin",
         "/lib/modules",
         "/mnt/oldroot",
     ] {
         let full = format!("{}{}", newroot, dir);
         let _ = std::fs::create_dir_all(&full);
     }
+
+    // Stage essential host-provided tools from initramfs into the new root.
+    // This keeps control-plane commands functional even for minimal OCI roots.
+    stage_bootstrap_tools_into_newroot(newroot);
+
+    // If the initramfs has claude-code, stage it into the OCI overlay root so
+    // agent-mode runs keep working after root switch.
+    stage_claude_into_newroot(newroot);
 
     // Move existing mounts into the new root
     for mount_point in ["/proc", "/sys", "/dev"] {
@@ -751,8 +936,104 @@ fn setup_oci_rootfs() {
         }
     }
 
-    // Mount tmpfs on /tmp in the new root
-    let tmp_path = std::ffi::CString::new(format!("{}/tmp", newroot)).unwrap();
+    // Switch to overlay root via pivot_root.
+    // pivot_root requires mount propagation to be private.
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            std::ffi::CString::new("/").unwrap().as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        );
+    }
+
+    let cwd_newroot = std::ffi::CString::new(newroot).unwrap();
+    unsafe {
+        libc::chdir(cwd_newroot.as_ptr());
+    }
+    let put_old_c = std::ffi::CString::new("mnt/oldroot").unwrap();
+    let dot_c = std::ffi::CString::new(".").unwrap();
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pivot_root as libc::c_long,
+            dot_c.as_ptr(),
+            put_old_c.as_ptr(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error().unwrap_or_default();
+        if code == libc::EINVAL {
+            // Initramfs rootfs cannot be pivot_root'ed. Fallback to switch-root.
+            let root_c = std::ffi::CString::new("/").unwrap();
+            let move_ret = unsafe {
+                libc::mount(
+                    dot_c.as_ptr(),
+                    root_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_MOVE as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            };
+            if move_ret == 0 {
+                let chroot_ret = unsafe { libc::chroot(dot_c.as_ptr()) };
+                if chroot_ret == 0 {
+                    unsafe {
+                        libc::chdir(root_c.as_ptr());
+                    }
+                    OCI_SETUP_STATUS.store(OCI_OK_SWITCH_ROOT, Ordering::Release);
+                } else {
+                    OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_CHROOT, Ordering::Release);
+                }
+            } else {
+                OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_MOVE, Ordering::Release);
+            }
+            if OCI_SETUP_STATUS.load(Ordering::Acquire) == OCI_OK_SWITCH_ROOT {
+                kmsg("OCI rootfs switch-root fallback complete");
+                eprintln!("OCI rootfs switch-root fallback complete");
+                // Continue with post-switch setup.
+            } else {
+                let msg = format!(
+                    "WARNING: pivot_root EINVAL and switch-root fallback failed: {}",
+                    oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                return;
+            }
+        } else {
+            let msg = format!("WARNING: pivot_root failed (errno={}): {}", code, err);
+            kmsg(&msg);
+            eprintln!("{}", msg);
+            OCI_SETUP_STATUS.store(
+                match code {
+                    libc::EBUSY => OCI_FAIL_PIVOT_ROOT_EBUSY,
+                    libc::EPERM => OCI_FAIL_PIVOT_ROOT_EPERM,
+                    libc::ENOENT => OCI_FAIL_PIVOT_ROOT_ENOENT,
+                    _ => OCI_FAIL_PIVOT_ROOT,
+                },
+                Ordering::Release,
+            );
+            return;
+        }
+    }
+
+    let root = std::ffi::CString::new("/").unwrap();
+    unsafe {
+        libc::chdir(root.as_ptr());
+    }
+
+    // Detach old root so it is no longer reachable.
+    let oldroot_c = std::ffi::CString::new("/mnt/oldroot").unwrap();
+    unsafe {
+        libc::umount2(oldroot_c.as_ptr(), libc::MNT_DETACH);
+    }
+    let _ = std::fs::remove_dir_all("/mnt/oldroot");
+
+    // Mount tmpfs on /tmp in the new root.
+    let tmpfs_type = std::ffi::CString::new("tmpfs").unwrap();
+    let tmp_path = std::ffi::CString::new("/tmp").unwrap();
     let tmp_opts = std::ffi::CString::new("mode=1777").unwrap();
     unsafe {
         libc::mount(
@@ -764,36 +1045,14 @@ fn setup_oci_rootfs() {
         );
     }
 
-    // pivot_root: switch root to the overlay
-    let oldroot_path = format!("{}/mnt/oldroot", newroot);
-    let oldroot_c = std::ffi::CString::new(oldroot_path.as_str()).unwrap();
-
-    let ret =
-        unsafe { libc::syscall(libc::SYS_pivot_root, newroot_c.as_ptr(), oldroot_c.as_ptr()) };
-    if ret != 0 {
-        kmsg(&format!(
-            "WARNING: pivot_root failed: {}",
-            std::io::Error::last_os_error()
-        ));
-        return;
-    }
-
-    // Change to new root
-    let root = std::ffi::CString::new("/").unwrap();
-    unsafe {
-        libc::chdir(root.as_ptr());
-    }
-
-    // Unmount the old root (lazy unmount — allows running binary to keep its inode)
-    let oldroot_after = std::ffi::CString::new("/mnt/oldroot").unwrap();
-    unsafe {
-        libc::umount2(oldroot_after.as_ptr(), libc::MNT_DETACH);
-    }
-
     // Recreate essential directories (may already exist from the OCI image)
     let _ = std::fs::create_dir_all("/workspace");
     let _ = std::fs::create_dir_all("/home/sandbox");
     let _ = std::fs::create_dir_all("/etc/voidbox");
+
+    // Preserve DNS inside the new root. Network setup happened before root switch.
+    // Force a regular resolv.conf (not a dangling symlink from base image layers).
+    ensure_resolv_conf("nameserver 10.0.2.3\n");
 
     // Chown workspace and home to sandbox user (uid 1000)
     unsafe {
@@ -804,6 +1063,110 @@ fn setup_oci_rootfs() {
     }
 
     kmsg("OCI rootfs pivot_root complete — running on overlay filesystem");
+    eprintln!("OCI rootfs pivot_root complete");
+    OCI_SETUP_STATUS.store(OCI_OK, Ordering::Release);
+}
+
+fn stage_claude_into_newroot(newroot: &str) {
+    let src = "/usr/local/bin/claude-code";
+    if !std::path::Path::new(src).exists() {
+        return;
+    }
+
+    let dst = format!("{}/usr/local/bin/claude-code", newroot);
+    let dst_path = std::path::Path::new(&dst);
+    if !dst_path.exists() {
+        match std::fs::copy(src, dst_path) {
+            Ok(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dst_path, std::fs::Permissions::from_mode(0o755));
+                kmsg("Staged claude-code into OCI overlay root");
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: failed to stage claude-code into OCI root: {}",
+                    e
+                ));
+                return;
+            }
+        }
+    }
+
+    // Keep the convenience alias.
+    let claude_link = format!("{}/usr/local/bin/claude", newroot);
+    let _ = std::fs::remove_file(&claude_link);
+    let _ = std::os::unix::fs::symlink("claude-code", &claude_link);
+}
+
+fn stage_bootstrap_tools_into_newroot(newroot: &str) {
+    let src_busybox = "/bin/busybox";
+    if !std::path::Path::new(src_busybox).exists() {
+        return;
+    }
+
+    let dst_busybox = format!("{}/bin/busybox", newroot);
+    let dst_busybox_path = std::path::Path::new(&dst_busybox);
+    if let Some(parent) = dst_busybox_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !dst_busybox_path.exists() {
+        if let Err(e) = std::fs::copy(src_busybox, dst_busybox_path) {
+            kmsg(&format!(
+                "WARNING: failed to stage busybox into OCI root: {}",
+                e
+            ));
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst_busybox_path, std::fs::Permissions::from_mode(0o755));
+        kmsg("Staged busybox into OCI overlay root");
+    }
+
+    // Provide the minimal applets used by tests and bootstrap commands.
+    for applet in ["sh", "cat", "touch", "test", "ls", "mkdir", "rm"] {
+        let link = format!("{}/bin/{}", newroot, applet);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::os::unix::fs::symlink("busybox", &link);
+    }
+}
+
+fn mount_oci_block_lowerdir(dev: &str) -> Result<String, String> {
+    let dev_path = std::path::Path::new(dev);
+    for _ in 0..40 {
+        if dev_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !dev_path.exists() {
+        return Err(format!("device not found: {}", dev));
+    }
+
+    let lowerdir = "/mnt/oci-lower";
+    std::fs::create_dir_all(lowerdir).map_err(|e| e.to_string())?;
+    let dev_c = std::ffi::CString::new(dev).unwrap();
+    let lower_c = std::ffi::CString::new(lowerdir).unwrap();
+    let ext4_c = std::ffi::CString::new("ext4").unwrap();
+    let ret = unsafe {
+        libc::mount(
+            dev_c.as_ptr(),
+            lower_c.as_ptr(),
+            ext4_c.as_ptr(),
+            libc::MS_RDONLY as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let has_content = std::fs::read_dir(lowerdir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !has_content {
+        return Err("mounted OCI block rootfs is empty".to_string());
+    }
+    Ok(lowerdir.to_string())
 }
 
 /// Set up network interface.
@@ -813,12 +1176,12 @@ fn setup_oci_rootfs() {
 fn setup_network() {
     kmsg("Setting up network...");
 
-    for i in 0..10 {
+    for i in 0..300 {
         if std::path::Path::new("/sys/class/net/eth0").exists() {
             kmsg(&format!("eth0 detected after {} attempts", i + 1));
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     if !std::path::Path::new("/sys/class/net/eth0").exists() {
@@ -826,8 +1189,8 @@ fn setup_network() {
         return;
     }
 
-    run_cmd("ip", &["link", "set", "lo", "up"]);
-    run_cmd("ip", &["link", "set", "eth0", "up"]);
+    let _ = run_cmd("ip", &["link", "set", "lo", "up"]);
+    let _ = run_cmd("ip", &["link", "set", "eth0", "up"]);
 
     // Try DHCP first (works with VZ NAT on macOS), fall back to static below.
     let dhcp_result = Command::new("udhcpc")
@@ -842,36 +1205,57 @@ fn setup_network() {
 
     if dhcp_ok {
         kmsg("Network configured via DHCP (VZ NAT)");
-        // Ensure resolv.conf has a fallback DNS
-        if !std::path::Path::new("/etc/resolv.conf").exists()
-            || std::fs::read_to_string("/etc/resolv.conf")
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            let _ = std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\n");
-        }
+        ensure_resolv_conf("nameserver 8.8.8.8\n");
         return;
     }
 
     // Fallback: static SLIRP addressing (KVM)
     kmsg("DHCP failed, falling back to static SLIRP addressing");
-    run_cmd("ip", &["addr", "add", "10.0.2.15/24", "dev", "eth0"]);
-    run_cmd("ip", &["route", "add", "default", "via", "10.0.2.2"]);
+    let mut routed = false;
+    for _ in 0..20 {
+        let _ = run_cmd("ip", &["link", "set", "eth0", "up"]);
+        let _ = run_cmd("ip", &["addr", "replace", "10.0.2.15/24", "dev", "eth0"]);
+        let _ = run_cmd("ip", &["route", "replace", "default", "via", "10.0.2.2"]);
+        if has_default_route() {
+            routed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 
-    match std::fs::write(
-        "/etc/resolv.conf",
-        "nameserver 10.0.2.3\nnameserver 8.8.8.8\n",
-    ) {
-        Ok(()) => kmsg("Wrote /etc/resolv.conf"),
-        Err(e) => kmsg(&format!("Failed to write /etc/resolv.conf: {}", e)),
+    ensure_resolv_conf("nameserver 10.0.2.3\n");
+    if !routed {
+        kmsg("WARNING: default route not visible after static network setup");
     }
 
     kmsg("Network configured: 10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3");
 }
 
+fn network_enabled_from_cmdline() -> bool {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    cmdline
+        .split_whitespace()
+        .any(|t| t == "virtio_mmio.device=512@0xd0000000:10")
+}
+
+fn ensure_resolv_conf(contents: &str) {
+    let _ = std::fs::create_dir_all("/etc");
+    if let Ok(meta) = std::fs::symlink_metadata("/etc/resolv.conf") {
+        if meta.file_type().is_symlink() {
+            if let Err(e) = std::fs::remove_file("/etc/resolv.conf") {
+                kmsg(&format!("Failed to remove symlink /etc/resolv.conf: {}", e));
+            }
+        }
+    }
+
+    match std::fs::write("/etc/resolv.conf", contents) {
+        Ok(()) => kmsg("Wrote /etc/resolv.conf"),
+        Err(e) => kmsg(&format!("Failed to write /etc/resolv.conf: {}", e)),
+    }
+}
+
 /// Run a command and log the result
-fn run_cmd(program: &str, args: &[&str]) {
+fn run_cmd(program: &str, args: &[&str]) -> bool {
     match Command::new(program).args(args).output() {
         Ok(output) => {
             if !output.status.success() {
@@ -881,12 +1265,29 @@ fn run_cmd(program: &str, args: &[&str]) {
                     args,
                     String::from_utf8_lossy(&output.stderr)
                 );
+                return false;
             }
+            true
         }
         Err(e) => {
             eprintln!("Warning: failed to run {} {:?}: {}", program, args, e);
+            false
         }
     }
+}
+
+fn has_default_route() -> bool {
+    let routes = match std::fs::read_to_string("/proc/net/route") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in routes.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() > 1 && cols[0] == "eth0" && cols[1] == "00000000" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Create a vsock listener socket
@@ -1019,6 +1420,10 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                             peer_version,
                             void_box_protocol::PROTOCOL_VERSION
                         ));
+
+                        // Kick OCI setup asynchronously after auth so we never block
+                        // Ping/Pong handling on expensive rootfs preparation.
+                        trigger_oci_rootfs_setup_async();
                     }
                     Some(_) => {
                         eprintln!("Authentication failed: invalid secret");
@@ -1095,10 +1500,40 @@ fn is_command_allowed(program: &str) -> bool {
 /// messages, then return the final ExecResponse with full accumulated output.
 fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        kmsg(&format!(
+            "Exec start: program='{}' args={} oci_status={}",
+            request.program,
+            request.args.len(),
+            status
+        ));
+    }
+
+    // Ensure OCI rootfs setup is started and reaches a terminal state before
+    // executing guest commands. Bound the wait so host calls fail fast instead
+    // of hanging if root switch gets stuck.
+    trigger_oci_rootfs_setup_async();
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        let msg = format!("OCI rootfs not ready: {}", e);
+        kmsg(&msg);
+        return ExecResponse {
+            stdout: Vec::new(),
+            stderr: msg.clone().into_bytes(),
+            exit_code: -1,
+            error: Some(msg),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+    }
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        kmsg(&format!("Exec gate passed: oci_status={}", status));
+    }
 
     // Check command allowlist before spawning
     if !is_command_allowed(&request.program) {
         eprintln!("Command not allowed: {}", request.program);
+        kmsg(&format!("Command not allowed: {}", request.program));
         return ExecResponse {
             stdout: Vec::new(),
             stderr: format!(
@@ -1158,15 +1593,13 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| {
-            // Set supplementary groups to empty
-            libc::setgroups(0, std::ptr::null());
-            // Drop to gid 1000, uid 1000
-            if libc::setgid(1000) != 0 {
+            // Always run child processes as sandbox user.
+            if libc::setgid(1000) != 0 || libc::setuid(1000) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::setuid(1000) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+
+            // Create a new process group so the watchdog can killpg().
+            libc::setpgid(0, 0);
 
             if let Some(limits) = RESOURCE_LIMITS.get() {
                 // RLIMIT_AS intentionally omitted: Bun (claude-code runtime)
@@ -1193,9 +1626,6 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
                     rlim_max: limits.max_file_size,
                 };
                 libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
-
-                // Create a new process group so the watchdog can killpg()
-                libc::setpgid(0, 0);
             }
 
             Ok(())
@@ -1206,11 +1636,78 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
+            let path_env = std::env::var("PATH").unwrap_or_default();
+            let mut msg = format!("Failed to spawn process '{}': {}", request.program, e);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let mut checks: Vec<String> = Vec::new();
+                if request.program.contains('/') {
+                    let p = Path::new(&request.program);
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        use std::os::unix::fs::PermissionsExt;
+                        checks.push(format!(
+                            "{} exists mode={:o}",
+                            p.display(),
+                            meta.permissions().mode()
+                        ));
+                    }
+                } else {
+                    for dir in path_env.split(':') {
+                        if dir.is_empty() {
+                            continue;
+                        }
+                        let candidate = Path::new(dir).join(&request.program);
+                        if let Ok(meta) = std::fs::metadata(&candidate) {
+                            use std::os::unix::fs::PermissionsExt;
+                            checks.push(format!(
+                                "{} exists mode={:o}",
+                                candidate.display(),
+                                meta.permissions().mode()
+                            ));
+                        }
+                    }
+                }
+                if !checks.is_empty() {
+                    msg.push_str(&format!(
+                        "; found candidate binaries [{}] (ENOENT may indicate missing ELF interpreter or loader path)",
+                        checks.join(", ")
+                    ));
+                }
+            }
+            let diag_paths = [
+                "/bin/sh",
+                "/usr/bin/bash",
+                "/usr/bin/npm",
+                "/lib64/ld-linux-x86-64.so.2",
+            ];
+            let mut diag = Vec::new();
+            for p in diag_paths {
+                let exists = Path::new(p).exists();
+                diag.push(format!("{}={}", p, exists));
+            }
+            if let Ok(mounts) = std::fs::read_to_string("/proc/1/mounts") {
+                if let Some(root_line) = mounts.lines().find(|l| l.contains(" / ")) {
+                    diag.push(format!("root_mount={}", root_line));
+                }
+            }
+            diag.push(format!(
+                "oci_setup={}",
+                oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+            ));
+            msg.push_str(&format!("; diag [{}]", diag.join(", ")));
+            kmsg(&format!(
+                "Failed to spawn '{}': {} (cwd={:?})",
+                request.program, e, request.working_dir
+            ));
             return ExecResponse {
                 stdout: Vec::new(),
-                stderr: Vec::new(),
+                stderr: format!(
+                    "{} (cwd={:?}, agent_path={})",
+                    msg, request.working_dir, path_env
+                )
+                .as_bytes()
+                .to_vec(),
                 exit_code: -1,
-                error: Some(format!("Failed to spawn process: {}", e)),
+                error: Some(msg),
                 duration_ms: None,
             };
         }
@@ -1229,26 +1726,30 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let child_pid = child.id() as i32;
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog_handle = if let Some(timeout_secs) = request.timeout_secs {
-        let timed_out_flag = timed_out.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("watchdog".into())
-                .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-                    eprintln!(
-                        "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
-                        timeout_secs, child_pid
-                    );
-                    timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Kill the entire process group (negative PID)
-                    unsafe {
-                        libc::kill(-child_pid, libc::SIGKILL);
-                        // Also kill the specific process in case setpgid wasn't called
-                        libc::kill(child_pid, libc::SIGKILL);
-                    }
-                })
-                .ok(),
-        )
+        if timeout_secs == 0 {
+            None // Service mode: no timeout
+        } else {
+            let timed_out_flag = timed_out.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("watchdog".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+                        eprintln!(
+                            "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
+                            timeout_secs, child_pid
+                        );
+                        timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Kill the entire process group (negative PID)
+                        unsafe {
+                            libc::kill(-child_pid, libc::SIGKILL);
+                            // Also kill the specific process in case setpgid wasn't called
+                            libc::kill(child_pid, libc::SIGKILL);
+                        }
+                    })
+                    .ok(),
+            )
+        }
     } else {
         None
     };
@@ -1300,7 +1801,7 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     // Collect accumulated output from streaming threads
     let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let mut stderr_bytes = stderr_handle.join().unwrap_or_default();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1320,6 +1821,14 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     } else {
         None
     };
+
+    // Surface OCI rootfs setup state on non-zero exits so host-side logs can
+    // distinguish command errors from root-switch/setup failures.
+    if exit_code != 0 {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        let mut suffix = format!("\n[voidbox] oci_setup_status={}\n", status).into_bytes();
+        stderr_bytes.append(&mut suffix);
+    }
 
     ExecResponse {
         stdout: stdout_bytes,

@@ -146,6 +146,23 @@ if [[ "$IS_CROSS_BUILD" == "false" ]]; then
   fi
 fi
 
+# Kernel module source policy:
+# - Local/dev default: use host modules (VOID_BOX_KMOD_VERSION unset).
+# - CI/pinned-kernel flows: opt in via VOID_BOX_PINNED_KMODS=1 (or GITHUB_ACTIONS=true).
+if [[ -z "${VOID_BOX_KMOD_VERSION:-}" ]]; then
+  if [[ "${VOID_BOX_PINNED_KMODS:-0}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    # Extract pinned KERNEL_VER and KERNEL_UPLOAD from download_kernel.sh.
+    _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
+    _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
+    export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
+    echo "[claude-rootfs] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
+  else
+    echo "[claude-rootfs] Using host kernel modules for local build (uname -r=$(uname -r))"
+  fi
+fi
+
 # Pass the claude binary to the base script via CLAUDE_CODE_BIN.
 # The base script handles copying it to /usr/local/bin/claude-code and
 # running ldd to install shared libraries into the initramfs.
