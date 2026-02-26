@@ -69,6 +69,14 @@ Use these scripts based on purpose:
 - `build_test_image.sh`: test/E2E image with deterministic `claudio`.
 - `build_claude_rootfs.sh`: includes native `claude-code`, CA certs, and sandbox user.
 
+### Guest image script differences
+
+| Script | Primary use | Includes Claude runtime | Kernel module policy |
+| --- | --- | --- | --- |
+| `scripts/build_guest_image.sh` | Base/initramfs for normal VM runs and OCI-rootfs workflows | Optional (`CLAUDE_CODE_BIN` if provided), otherwise no Claude binary requirement | Host modules by default; downloads modules only when `VOID_BOX_KMOD_VERSION` is set |
+| `scripts/build_claude_rootfs.sh` | Production Claude-capable image | Yes (native `claude-code` + `/usr/local/bin/claude` symlink + CA certs + sandbox user) | Local default uses host modules; pinned/downloaded modules only when `VOID_BOX_PINNED_KMODS=1` (or CI) |
+| `scripts/build_test_image.sh` | Deterministic tests | No real Claude; bundles `claudio` mock | Host modules on Linux (test path) |
+
 ### Running Tests
 
 ```bash

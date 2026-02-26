@@ -779,6 +779,9 @@ impl Virtio9pDevice {
                     Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
                 };
             }
+            if metadata.file_type().is_symlink() {
+                return Self::build_error(tag, libc::ELOOP as u32);
+            }
 
             qids.push(Self::build_qid(&metadata));
             current = resolved;

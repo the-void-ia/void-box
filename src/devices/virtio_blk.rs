@@ -367,7 +367,15 @@ impl VirtioBlkDevice {
                         return Ok((VIRTIO_BLK_S_IOERR, total_written));
                     }
                     let mut buf = vec![0u8; d.len as usize];
-                    let n = self.disk.read_at(&mut buf, file_off).unwrap_or(0);
+                    let mut n = 0usize;
+                    while n < buf.len() {
+                        match self.disk.read_at(&mut buf[n..], file_off.saturating_add(n as u64)) {
+                            Ok(0) => break, // EOF: keep remaining bytes zero-filled
+                            Ok(read_now) => n += read_now,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => return Ok((VIRTIO_BLK_S_IOERR, total_written)),
+                        }
+                    }
                     if n < buf.len() {
                         for b in &mut buf[n..] {
                             *b = 0;

@@ -146,19 +146,21 @@ if [[ "$IS_CROSS_BUILD" == "false" ]]; then
   fi
 fi
 
-# Auto-detect kernel module version when not explicitly set.
-# The GHCR kernel is pinned in download_kernel.sh; if we're building on a host
-# with a different kernel (e.g. 6.17.7), copying host modules into the initramfs
-# causes version mismatches → 9p modules fail to load → no OCI rootfs.
-# Parse the pinned version so modules always match the VM kernel.
+# Kernel module source policy:
+# - Local/dev default: use host modules (VOID_BOX_KMOD_VERSION unset).
+# - CI/pinned-kernel flows: opt in via VOID_BOX_PINNED_KMODS=1 (or GITHUB_ACTIONS=true).
 if [[ -z "${VOID_BOX_KMOD_VERSION:-}" ]]; then
-  # Extract pinned KERNEL_VER and KERNEL_UPLOAD from download_kernel.sh
-  _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
-  _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
-  _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
-  export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
-  export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
-  echo "[claude-rootfs] Auto-detected kernel module version: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
+  if [[ "${VOID_BOX_PINNED_KMODS:-0}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    # Extract pinned KERNEL_VER and KERNEL_UPLOAD from download_kernel.sh.
+    _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
+    _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
+    export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
+    echo "[claude-rootfs] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
+  else
+    echo "[claude-rootfs] Using host kernel modules for local build (uname -r=$(uname -r))"
+  fi
 fi
 
 # Pass the claude binary to the base script via CLAUDE_CODE_BIN.

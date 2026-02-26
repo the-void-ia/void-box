@@ -39,6 +39,54 @@ static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new(
 static OCI_ROOTFS_SETUP_ONCE: std::sync::Once = std::sync::Once::new();
 static OCI_SETUP_STATUS: Mutex<&'static str> = Mutex::new("not-run");
 
+fn oci_rootfs_requested() -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .map(|cmdline| {
+            cmdline.contains("voidbox.oci_rootfs_dev=") || cmdline.contains("voidbox.oci_rootfs=")
+        })
+        .unwrap_or(false)
+}
+
+fn trigger_oci_rootfs_setup_async() {
+    if !oci_rootfs_requested() {
+        return;
+    }
+    OCI_ROOTFS_SETUP_ONCE.call_once(|| {
+        kmsg("OCI setup: spawning async rootfs setup thread");
+        std::thread::spawn(|| {
+            kmsg("OCI setup: async rootfs setup thread started");
+            setup_oci_rootfs();
+            if let Ok(status) = OCI_SETUP_STATUS.lock() {
+                kmsg(&format!("OCI setup: async rootfs setup thread finished status={}", *status));
+            }
+        });
+    });
+}
+
+fn wait_for_oci_setup_ready(timeout: std::time::Duration) -> Result<(), String> {
+    if !oci_rootfs_requested() {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let status = OCI_SETUP_STATUS
+            .lock()
+            .map(|s| (*s).to_string())
+            .unwrap_or_else(|_| "lock-poisoned".to_string());
+        match status.as_str() {
+            "ok" | "ok-switch-root" => return Ok(()),
+            "not-run" | "starting" => {
+                if start.elapsed() > timeout {
+                    return Err(format!("OCI rootfs setup timeout (status={})", status));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => return Err(format!("OCI rootfs setup failed (status={})", status)),
+        }
+    }
+}
+
 // Whether the current connection has been authenticated.
 // Each connection thread gets its own copy.
 thread_local! {
@@ -1343,12 +1391,9 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                             void_box_protocol::PROTOCOL_VERSION
                         ));
 
-                        // Defer OCI pivot_root until after at least one authenticated control
-                        // channel exists. This avoids startup deadlocks where OCI mount/pivot
-                        // work races the initial host handshake.
-                        OCI_ROOTFS_SETUP_ONCE.call_once(|| {
-                            setup_oci_rootfs();
-                        });
+                        // Kick OCI setup asynchronously after auth so we never block
+                        // Ping/Pong handling on expensive rootfs preparation.
+                        trigger_oci_rootfs_setup_async();
                     }
                     Some(_) => {
                         eprintln!("Authentication failed: invalid secret");
@@ -1425,6 +1470,33 @@ fn is_command_allowed(program: &str) -> bool {
 /// messages, then return the final ExecResponse with full accumulated output.
 fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
+    if let Ok(status) = OCI_SETUP_STATUS.lock() {
+        kmsg(&format!(
+            "Exec start: program='{}' args={} oci_status={}",
+            request.program,
+            request.args.len(),
+            *status
+        ));
+    }
+
+    // Ensure OCI rootfs setup is started and reaches a terminal state before
+    // executing guest commands. Bound the wait so host calls fail fast instead
+    // of hanging if root switch gets stuck.
+    trigger_oci_rootfs_setup_async();
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        let msg = format!("OCI rootfs not ready: {}", e);
+        kmsg(&msg);
+        return ExecResponse {
+            stdout: Vec::new(),
+            stderr: msg.clone().into_bytes(),
+            exit_code: -1,
+            error: Some(msg),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+    }
+    if let Ok(status) = OCI_SETUP_STATUS.lock() {
+        kmsg(&format!("Exec gate passed: oci_status={}", *status));
+    }
 
     // Check command allowlist before spawning
     if !is_command_allowed(&request.program) {
@@ -1696,7 +1768,7 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     // Collect accumulated output from streaming threads
     let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let mut stderr_bytes = stderr_handle.join().unwrap_or_default();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1716,6 +1788,15 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     } else {
         None
     };
+
+    // Surface OCI rootfs setup state on non-zero exits so host-side logs can
+    // distinguish command errors from root-switch/setup failures.
+    if exit_code != 0 {
+        if let Ok(status) = OCI_SETUP_STATUS.lock() {
+            let mut suffix = format!("\n[voidbox] oci_setup_status={}\n", *status).into_bytes();
+            stderr_bytes.append(&mut suffix);
+        }
+    }
 
     ExecResponse {
         stdout: stdout_bytes,

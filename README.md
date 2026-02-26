@@ -245,7 +245,7 @@ sandbox:
 If you prefer to build the guest image locally:
 
 ```bash
-# Build guest initramfs (includes claude-code binary, busybox, CA certs)
+# Build base guest initramfs (guest-agent + tools; no required Claude bundle)
 scripts/build_guest_image.sh
 
 # Download a kernel
@@ -257,6 +257,19 @@ VOID_BOX_KERNEL=target/vmlinuz-amd64 \
 VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
 cargo run --example trading_pipeline
 ```
+
+For a production Claude-capable initramfs, use:
+
+```bash
+# Build production rootfs/initramfs with native claude-code + CA certs + sandbox user
+scripts/build_claude_rootfs.sh
+```
+
+Script intent summary:
+
+- `scripts/build_guest_image.sh`: base runtime image for general VM/OCI work.
+- `scripts/build_claude_rootfs.sh`: production image for direct Claude runtime in guest.
+- `scripts/build_test_image.sh`: deterministic test image with `claudio` mock.
 
 ### Mock mode (no KVM required)
 
