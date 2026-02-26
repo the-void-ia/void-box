@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -37,7 +38,54 @@ const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
 /// Parsed session secret from kernel cmdline (set once at startup).
 static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 static OCI_ROOTFS_SETUP_ONCE: std::sync::Once = std::sync::Once::new();
-static OCI_SETUP_STATUS: Mutex<&'static str> = Mutex::new("not-run");
+
+// OCI setup status — lock-free, panic-safe.
+const OCI_NOT_RUN: u8 = 0;
+const OCI_STARTING: u8 = 1;
+const OCI_OK: u8 = 2;
+const OCI_OK_SWITCH_ROOT: u8 = 3;
+const OCI_FAIL_CMDLINE_READ: u8 = 10;
+const OCI_FAIL_BLOCK_MOUNT: u8 = 11;
+const OCI_FAIL_NO_OCI_ROOTFS: u8 = 12;
+const OCI_FAIL_ROOTFS_MISSING: u8 = 13;
+const OCI_FAIL_ROOTFS_EMPTY: u8 = 14;
+const OCI_FAIL_MKDIR: u8 = 15;
+const OCI_FAIL_OVERLAY_TMPFS: u8 = 16;
+const OCI_FAIL_OVERLAY_DIR: u8 = 17;
+const OCI_FAIL_OVERLAY_MOUNT: u8 = 18;
+const OCI_FAIL_SWITCH_ROOT_CHROOT: u8 = 19;
+const OCI_FAIL_SWITCH_ROOT_MOVE: u8 = 20;
+const OCI_FAIL_PIVOT_ROOT_EBUSY: u8 = 21;
+const OCI_FAIL_PIVOT_ROOT_EPERM: u8 = 22;
+const OCI_FAIL_PIVOT_ROOT_ENOENT: u8 = 23;
+const OCI_FAIL_PIVOT_ROOT: u8 = 24;
+
+static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
+
+fn oci_status_str(code: u8) -> &'static str {
+    match code {
+        OCI_NOT_RUN => "not-run",
+        OCI_STARTING => "starting",
+        OCI_OK => "ok",
+        OCI_OK_SWITCH_ROOT => "ok-switch-root",
+        OCI_FAIL_CMDLINE_READ => "cmdline-read-failed",
+        OCI_FAIL_BLOCK_MOUNT => "block-mount-failed",
+        OCI_FAIL_NO_OCI_ROOTFS => "no-oci-rootfs",
+        OCI_FAIL_ROOTFS_MISSING => "rootfs-path-missing",
+        OCI_FAIL_ROOTFS_EMPTY => "rootfs-path-empty",
+        OCI_FAIL_MKDIR => "mkdir-failed",
+        OCI_FAIL_OVERLAY_TMPFS => "overlay-tmpfs-mount-failed",
+        OCI_FAIL_OVERLAY_DIR => "overlay-dir-create-failed",
+        OCI_FAIL_OVERLAY_MOUNT => "overlay-mount-failed",
+        OCI_FAIL_SWITCH_ROOT_CHROOT => "switch-root-chroot-failed",
+        OCI_FAIL_SWITCH_ROOT_MOVE => "switch-root-move-failed",
+        OCI_FAIL_PIVOT_ROOT_EBUSY => "pivot-root-ebusy",
+        OCI_FAIL_PIVOT_ROOT_EPERM => "pivot-root-eperm",
+        OCI_FAIL_PIVOT_ROOT_ENOENT => "pivot-root-enoent",
+        OCI_FAIL_PIVOT_ROOT => "pivot-root-failed",
+        _ => "unknown",
+    }
+}
 
 fn oci_rootfs_requested() -> bool {
     std::fs::read_to_string("/proc/cmdline")
@@ -57,12 +105,11 @@ fn trigger_oci_rootfs_setup_async() {
         std::thread::spawn(|| {
             kmsg("OCI setup: async rootfs setup thread started");
             setup_oci_rootfs();
-            if let Ok(status) = OCI_SETUP_STATUS.lock() {
-                kmsg(&format!(
-                    "OCI setup: async rootfs setup thread finished status={}",
-                    *status
-                ));
-            }
+            let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+            kmsg(&format!(
+                "OCI setup: async rootfs setup thread finished status={}",
+                status
+            ));
         });
     });
 }
@@ -73,19 +120,24 @@ fn wait_for_oci_setup_ready(timeout: std::time::Duration) -> Result<(), String> 
     }
     let start = std::time::Instant::now();
     loop {
-        let status = OCI_SETUP_STATUS
-            .lock()
-            .map(|s| (*s).to_string())
-            .unwrap_or_else(|_| "lock-poisoned".to_string());
-        match status.as_str() {
-            "ok" | "ok-switch-root" => return Ok(()),
-            "not-run" | "starting" => {
+        let code = OCI_SETUP_STATUS.load(Ordering::Acquire);
+        match code {
+            OCI_OK | OCI_OK_SWITCH_ROOT => return Ok(()),
+            OCI_NOT_RUN | OCI_STARTING => {
                 if start.elapsed() > timeout {
-                    return Err(format!("OCI rootfs setup timeout (status={})", status));
+                    return Err(format!(
+                        "OCI rootfs setup timeout (status={})",
+                        oci_status_str(code)
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            _ => return Err(format!("OCI rootfs setup failed (status={})", status)),
+            _ => {
+                return Err(format!(
+                    "OCI rootfs setup failed (status={})",
+                    oci_status_str(code)
+                ))
+            }
         }
     }
 }
@@ -700,15 +752,11 @@ fn mount_shared_dirs() {
 ///
 /// This gives a writable root filesystem based on the OCI image.
 fn setup_oci_rootfs() {
-    if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-        *s = "starting";
-    }
+    OCI_SETUP_STATUS.store(OCI_STARTING, Ordering::Release);
     let cmdline = match std::fs::read_to_string("/proc/cmdline") {
         Ok(c) => c,
         Err(_) => {
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "cmdline-read-failed";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_CMDLINE_READ, Ordering::Release);
             return;
         }
     };
@@ -729,17 +777,13 @@ fn setup_oci_rootfs() {
                 let msg = format!("WARNING: OCI rootfs device {} mount failed: {}", dev, e);
                 kmsg(&msg);
                 eprintln!("{}", msg);
-                if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                    *s = "block-mount-failed";
-                }
+                OCI_SETUP_STATUS.store(OCI_FAIL_BLOCK_MOUNT, Ordering::Release);
                 return;
             }
         }
     } else {
         let Some(rootfs_path) = oci_rootfs else {
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "no-oci-rootfs";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_NO_OCI_ROOTFS, Ordering::Release);
             return;
         };
 
@@ -749,9 +793,7 @@ fn setup_oci_rootfs() {
                 "WARNING: OCI rootfs {} not found, skipping pivot_root",
                 rootfs_path
             ));
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "rootfs-path-missing";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_MISSING, Ordering::Release);
             return;
         }
         let has_content = std::fs::read_dir(&rootfs_path)
@@ -762,9 +804,7 @@ fn setup_oci_rootfs() {
                 "WARNING: OCI rootfs {} is empty (mount may have failed), skipping pivot_root",
                 rootfs_path
             ));
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "rootfs-path-empty";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_EMPTY, Ordering::Release);
             return;
         }
         rootfs_path
@@ -782,9 +822,7 @@ fn setup_oci_rootfs() {
     for dir in [newroot, overlay_base] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "mkdir-failed";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_MKDIR, Ordering::Release);
             return;
         }
     }
@@ -807,17 +845,13 @@ fn setup_oci_rootfs() {
             overlay_base,
             std::io::Error::last_os_error()
         ));
-        if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-            *s = "overlay-tmpfs-mount-failed";
-        }
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_TMPFS, Ordering::Release);
         return;
     }
     for dir in [upper, work] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "overlay-dir-create-failed";
-            }
+            OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_DIR, Ordering::Release);
             return;
         }
     }
@@ -847,9 +881,7 @@ fn setup_oci_rootfs() {
         );
         kmsg(&msg);
         eprintln!("{}", msg);
-        if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-            *s = "overlay-mount-failed";
-        }
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_MOUNT, Ordering::Release);
         return;
     }
 
@@ -950,42 +982,39 @@ fn setup_oci_rootfs() {
                     unsafe {
                         libc::chdir(root_c.as_ptr());
                     }
-                    if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                        *s = "ok-switch-root";
-                    }
-                } else if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                    *s = "switch-root-chroot-failed";
-                }
-            } else if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = "switch-root-move-failed";
-            }
-            if let Ok(s) = OCI_SETUP_STATUS.lock() {
-                if *s == "ok-switch-root" {
-                    kmsg("OCI rootfs switch-root fallback complete");
-                    eprintln!("OCI rootfs switch-root fallback complete");
-                    // Continue with post-switch setup.
+                    OCI_SETUP_STATUS.store(OCI_OK_SWITCH_ROOT, Ordering::Release);
                 } else {
-                    let msg = format!(
-                        "WARNING: pivot_root EINVAL and switch-root fallback failed: {}",
-                        *s
-                    );
-                    kmsg(&msg);
-                    eprintln!("{}", msg);
-                    return;
+                    OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_CHROOT, Ordering::Release);
                 }
+            } else {
+                OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_MOVE, Ordering::Release);
+            }
+            if OCI_SETUP_STATUS.load(Ordering::Acquire) == OCI_OK_SWITCH_ROOT {
+                kmsg("OCI rootfs switch-root fallback complete");
+                eprintln!("OCI rootfs switch-root fallback complete");
+                // Continue with post-switch setup.
+            } else {
+                let msg = format!(
+                    "WARNING: pivot_root EINVAL and switch-root fallback failed: {}",
+                    oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                return;
             }
         } else {
             let msg = format!("WARNING: pivot_root failed (errno={}): {}", code, err);
             kmsg(&msg);
             eprintln!("{}", msg);
-            if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-                *s = match code {
-                    libc::EBUSY => "pivot-root-ebusy",
-                    libc::EPERM => "pivot-root-eperm",
-                    libc::ENOENT => "pivot-root-enoent",
-                    _ => "pivot-root-failed",
-                };
-            }
+            OCI_SETUP_STATUS.store(
+                match code {
+                    libc::EBUSY => OCI_FAIL_PIVOT_ROOT_EBUSY,
+                    libc::EPERM => OCI_FAIL_PIVOT_ROOT_EPERM,
+                    libc::ENOENT => OCI_FAIL_PIVOT_ROOT_ENOENT,
+                    _ => OCI_FAIL_PIVOT_ROOT,
+                },
+                Ordering::Release,
+            );
             return;
         }
     }
@@ -1035,9 +1064,7 @@ fn setup_oci_rootfs() {
 
     kmsg("OCI rootfs pivot_root complete — running on overlay filesystem");
     eprintln!("OCI rootfs pivot_root complete");
-    if let Ok(mut s) = OCI_SETUP_STATUS.lock() {
-        *s = "ok";
-    }
+    OCI_SETUP_STATUS.store(OCI_OK, Ordering::Release);
 }
 
 fn stage_claude_into_newroot(newroot: &str) {
@@ -1473,12 +1500,13 @@ fn is_command_allowed(program: &str) -> bool {
 /// messages, then return the final ExecResponse with full accumulated output.
 fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
-    if let Ok(status) = OCI_SETUP_STATUS.lock() {
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
         kmsg(&format!(
             "Exec start: program='{}' args={} oci_status={}",
             request.program,
             request.args.len(),
-            *status
+            status
         ));
     }
 
@@ -1497,8 +1525,9 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
             duration_ms: Some(start.elapsed().as_millis() as u64),
         };
     }
-    if let Ok(status) = OCI_SETUP_STATUS.lock() {
-        kmsg(&format!("Exec gate passed: oci_status={}", *status));
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        kmsg(&format!("Exec gate passed: oci_status={}", status));
     }
 
     // Check command allowlist before spawning
@@ -1660,9 +1689,10 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
                     diag.push(format!("root_mount={}", root_line));
                 }
             }
-            if let Ok(status) = OCI_SETUP_STATUS.lock() {
-                diag.push(format!("oci_setup={}", *status));
-            }
+            diag.push(format!(
+                "oci_setup={}",
+                oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+            ));
             msg.push_str(&format!("; diag [{}]", diag.join(", ")));
             kmsg(&format!(
                 "Failed to spawn '{}': {} (cwd={:?})",
@@ -1795,10 +1825,9 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     // Surface OCI rootfs setup state on non-zero exits so host-side logs can
     // distinguish command errors from root-switch/setup failures.
     if exit_code != 0 {
-        if let Ok(status) = OCI_SETUP_STATUS.lock() {
-            let mut suffix = format!("\n[voidbox] oci_setup_status={}\n", *status).into_bytes();
-            stderr_bytes.append(&mut suffix);
-        }
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        let mut suffix = format!("\n[voidbox] oci_setup_status={}\n", status).into_bytes();
+        stderr_bytes.append(&mut suffix);
     }
 
     ExecResponse {

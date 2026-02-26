@@ -182,7 +182,19 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
     for entry_result in entries {
         let mut entry = entry_result
             .map_err(|e| OciError::Layer(format!("failed to read tar entry: {}", e)))?;
-        let rel_path = entry.path()?.into_owned();
+        let rel_path = match entry.path() {
+            Ok(p) => p.into_owned(),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1) =>
+            {
+                warn!("skipping tar entry: path read failed with EPERM");
+                continue;
+            }
+            Err(e) => {
+                return Err(OciError::Layer(format!("failed to read entry path: {}", e)));
+            }
+        };
 
         let file_name = match rel_path.file_name() {
             Some(n) => n.to_string_lossy().to_string(),

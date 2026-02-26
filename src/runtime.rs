@@ -3,8 +3,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
-use std::hash::{Hash, Hasher};
-#[cfg(target_os = "linux")]
 use std::process::Command;
 
 use crate::agent_box::VoidBox;
@@ -797,7 +795,26 @@ async fn resolve_oci_rootfs_plan(_image_ref: &str, host_rootfs: PathBuf) -> Resu
 }
 
 #[cfg(target_os = "linux")]
+fn check_ext4_tools() -> Result<()> {
+    for tool in ["mkfs.ext4", "truncate"] {
+        if Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return Err(Error::Config(format!(
+                "'{}' not found; install e2fsprogs and coreutils for OCI block-device rootfs",
+                tool
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 async fn build_oci_rootfs_disk(image_ref: &str, rootfs_dir: &Path) -> Result<PathBuf> {
+    check_ext4_tools()?;
     let disks_dir = oci_cache_dir().join("disks");
     std::fs::create_dir_all(&disks_dir).map_err(|e| {
         Error::Config(format!(
@@ -808,7 +825,7 @@ async fn build_oci_rootfs_disk(image_ref: &str, rootfs_dir: &Path) -> Result<Pat
     })?;
 
     let cache_key =
-        stable_cache_key(&(image_ref, rootfs_dir.to_string_lossy().as_ref(), "ext4-v1"));
+        stable_cache_key(&[image_ref, rootfs_dir.to_string_lossy().as_ref(), "ext4-v1"]);
     let disk_path = disks_dir.join(format!("{cache_key}.img"));
     if disk_path.exists() {
         return Ok(disk_path);
@@ -819,7 +836,7 @@ async fn build_oci_rootfs_disk(image_ref: &str, rootfs_dir: &Path) -> Result<Pat
 
     let content_size = directory_size_bytes(rootfs_dir).unwrap_or(512 * 1024 * 1024);
     let disk_size = ((content_size as f64) * 1.35) as u64 + 512 * 1024 * 1024;
-    let disk_size = disk_size.max(2 * 1024 * 1024 * 1024);
+    let disk_size = disk_size.max(256 * 1024 * 1024);
 
     let truncate_status = Command::new("truncate")
         .arg("-s")
@@ -878,10 +895,14 @@ fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn stable_cache_key<T: Hash>(value: &T) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut h);
-    format!("{:016x}", h.finish())
+fn stable_cache_key(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for p in parts {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
 fn oci_cache_dir() -> PathBuf {

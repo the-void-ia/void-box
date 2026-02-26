@@ -48,6 +48,11 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 /// Maximum virtqueue size for the request queue
 const QUEUE_MAX_SIZE: u16 = 128;
 
+/// Maximum number of symlink follows during Twalk path resolution.
+/// Linux MAXSYMLINKS is 40; 20 is sufficient for container images with
+/// deep alternative-system chains (e.g. Debian update-alternatives).
+const MAX_SYMLINK_FOLLOWS: usize = 20;
+
 // ---------------------------------------------------------------------------
 // 9P2000.L message types
 // ---------------------------------------------------------------------------
@@ -751,7 +756,7 @@ impl Virtio9pDevice {
 
             // Follow symlinks with container-root semantics:
             // absolute targets stay within root_path.
-            for _ in 0..8 {
+            for _ in 0..MAX_SYMLINK_FOLLOWS {
                 if !metadata.file_type().is_symlink() {
                     break;
                 }

@@ -175,6 +175,18 @@ Do **not** use `target/void-box-rootfs.cpio.gz` for these deterministic e2e suit
 That production image is for real Claude/OpenClaw runtime paths.
 These suites are Linux/KVM only.
 
+## Known issues / debugging
+
+### EPERM during OCI layer unpack
+
+Container images (especially multi-layer ones like `alpine/openclaw`) can trigger
+`Operation not permitted (os error 1)` during tar extraction. The EPERM-resilient
+unpack code in `voidbox-oci/src/unpack.rs` handles files, symlinks, dirs, and
+hardlinks — but any bare `?` on tar entry operations (e.g. `entry.path()?`) will
+bypass the EPERM handling and surface as an `OciError::Io`. When debugging OCI
+unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
+`entry.unpack()` calls that don't go through the EPERM catch-and-skip pattern.
+
 ## OCI-focused conformance expectations
 
 - `conformance`: command execution, lifecycle, streaming, filesystem primitives.
