@@ -59,6 +59,41 @@ share is host-enforced RO and the guest adds `MS_RDONLY`. Both platforms use the
 overlayfs upper layer (tmpfs) to absorb writes, so the guest has a writable root
 without modifying the base rootfs.
 
+### Host directory mounts
+
+VoidBox supports mounting host directories into the guest VM with explicit
+read-only or read-write access. RW mounts write directly to the host directory,
+so changes persist across VM restarts.
+
+**Data flow:**
+
+```
+YAML spec (MountSpec)
+  → runtime (MountConfig)
+    → kernel cmdline: voidbox.mount0=mount0:/data:rw
+      → guest-agent: mount 9p/virtiofs tag at /data
+```
+
+**Spec-level:** `MountSpec` in `src/spec.rs` defines the user-facing YAML
+fields: `host` (host directory path), `guest` (guest mount point), `mode`
+(`"ro"` default, `"rw"`).
+
+**Backend-level:** `MountConfig` in `src/backend/mod.rs` carries `host_path`,
+`guest_path`, and `read_only` (boolean). `VmConfig.mounts` (`src/vmm/config.rs`)
+holds the list of mount configs for the VM.
+
+**Linux/KVM transport:** Each mount becomes a virtio-9p device
+(`src/backend/kvm.rs`). The kernel cmdline receives
+`voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>` parameters
+(`src/vmm/config.rs:244-248`).
+
+**macOS/VZ transport:** Each mount becomes a virtiofs share
+(`src/backend/vz/backend.rs`). The same kernel cmdline convention is used
+(`src/backend/vz/config.rs`).
+
+**Guest-agent:** Parses `voidbox.mount*` params from `/proc/cmdline` and mounts
+each tag at the specified guest path with the declared mode.
+
 ### Key source files
 
 - `guest-agent/src/main.rs` — `setup_oci_rootfs` (~line 754), `mount_oci_block_lowerdir` (~line 1133)

@@ -27,6 +27,7 @@
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#oci-container-support">OCI Support</a> ·
+  <a href="#host-mounts">Host Mounts</a> ·
   <a href="#observability">Observability</a>
 </p>
 
@@ -51,6 +52,7 @@
 - **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude (default) or Ollama via Claude-compatible provider mode.
 - **OCI-native** — Auto-pulls guest images (kernel + initramfs) from GHCR on first run. Mount container images as base OS or as skill providers — no local build steps required.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
+- **Persistent host mounts** — Share host directories into guest VMs via 9p/virtiofs with explicit read-only or read-write mode. Data in `mode: rw` mounts persists across VM restarts.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
 > Isolation is the primitive. Pipelines are compositions of bounded execution environments.
@@ -431,6 +433,25 @@ OpenClaw examples and runbook:
 
 - [`examples/openclaw/README.md`](examples/openclaw/README.md)
 
+## Host Mounts
+
+VoidBox can mount host directories into the guest VM using `sandbox.mounts`. Each mount specifies a `host` path, a `guest` mount point, and a `mode` (`"ro"` or `"rw"`, default `"ro"`).
+
+Read-write mounts write directly to the host directory — data persists across VM restarts since the host directory survives. This is the primary mechanism for stateful workloads.
+
+Transport is platform-specific: **9p** (virtio-9p) on Linux/KVM, **virtiofs** on macOS/VZ.
+
+```yaml
+sandbox:
+  mounts:
+    - host: ./data
+      guest: /data
+      mode: rw        # persistent — host directory survives VM restarts
+    - host: ./config
+      guest: /config
+      mode: ro        # read-only (default)
+```
+
 ---
 
 ## Roadmap
@@ -439,7 +460,6 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 
 - **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
 - **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
-- **Persistent block devices (virtio-blk)** — Stateful workloads across VM restarts.
 - **Codex-style backend support** — Optional execution backend for code-first workflows.
 - **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 
