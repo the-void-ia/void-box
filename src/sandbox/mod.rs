@@ -139,6 +139,29 @@ impl Sandbox {
         }
     }
 
+    /// Execute a command with stdin input and an explicit timeout.
+    ///
+    /// `timeout_secs` is passed through to the VM backend:
+    /// - `Some(0)` → infinite wait (service mode)
+    /// - `Some(n)` → n-second timeout
+    /// - `None`    → backend default (20 min)
+    pub async fn exec_with_options(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecOutput> {
+        match &self.inner {
+            SandboxInner::Local(local) => {
+                local
+                    .exec_with_options(program, args, stdin, timeout_secs)
+                    .await
+            }
+            SandboxInner::Mock(mock) => mock.exec_with_stdin(program, args, stdin).await,
+        }
+    }
+
     /// Check if a file exists in the sandbox
     pub async fn file_exists(&self, path: &str) -> Result<bool> {
         let output = self.exec("test", &["-e", path]).await?;
