@@ -1233,9 +1233,17 @@ fn setup_network() {
 
 fn network_enabled_from_cmdline() -> bool {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    cmdline
-        .split_whitespace()
-        .any(|t| t == "virtio_mmio.device=512@0xd0000000:10")
+    for t in cmdline.split_whitespace() {
+        // KVM: virtio_mmio device 10 is the network device
+        if t == "virtio_mmio.device=512@0xd0000000:10" {
+            return true;
+        }
+        // VZ: explicit flag (VZ uses PCI, no virtio_mmio in cmdline)
+        if t == "voidbox.network=1" {
+            return true;
+        }
+    }
+    false
 }
 
 fn ensure_resolv_conf(contents: &str) {

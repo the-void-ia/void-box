@@ -5,13 +5,14 @@ set -euo pipefail
 # Extracts the vmlinuz image from an Ubuntu arm64/amd64 .deb package
 # using ar + tar (works on both macOS and Linux — no dpkg required).
 #
+# On macOS: Apple's Virtualization.framework requires an UNCOMPRESSED kernel.
+# The script decompresses vmlinuz → vmlinux using extract-vmlinux.
+# Output: target/vmlinux-arm64 (macOS) or target/vmlinuz-arm64 (Linux)
+#
 # Usage:
 #   scripts/download_kernel.sh
 #   KERNEL_VER=6.8.0-51 KERNEL_UPLOAD=52 scripts/download_kernel.sh
 #   ARCH=x86_64 scripts/download_kernel.sh
-#
-# The kernel is cached under target/ and reused on subsequent runs.
-# Output: target/vmlinuz-arm64  or  target/vmlinuz-x86_64
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -52,7 +53,12 @@ case "$ARCH" in
     ;;
 esac
 
-OUT_FILE="target/vmlinuz-${DEB_ARCH}"
+# macOS VZ requires uncompressed kernel; Linux KVM accepts compressed.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  OUT_FILE="target/vmlinux-${DEB_ARCH}"
+else
+  OUT_FILE="target/vmlinuz-${DEB_ARCH}"
+fi
 
 # ---- Check cache ----
 if [[ -f "$OUT_FILE" ]]; then
@@ -138,8 +144,31 @@ trap 'rm -rf "$EXTRACT_DIR" "$DEB_PATH"' EXIT
     esac
 )
 
-cp "$EXTRACT_DIR"/boot/vmlinuz-* "$OUT_FILE"
-chmod 644 "$OUT_FILE"
+# Copy extracted vmlinuz (compressed) to target
+RAW_VMLINUZ="target/vmlinuz-${DEB_ARCH}.raw"
+cp "$EXTRACT_DIR"/boot/vmlinuz-* "$RAW_VMLINUZ"
+chmod 644 "$RAW_VMLINUZ"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # Apple Virtualization.framework requires uncompressed kernel
+  echo "[kernel] Decompressing kernel for Apple Virtualization.framework..."
+  EXTRACT_VMLINUX="$ROOT_DIR/scripts/extract-vmlinux"
+  if [[ ! -x "$EXTRACT_VMLINUX" ]]; then
+    chmod +x "$EXTRACT_VMLINUX" 2>/dev/null || true
+  fi
+  EXTRACT_ERR=$(mktemp)
+  # LC_ALL=C required: extract-vmlinux uses tr on binary data; macOS tr rejects invalid UTF-8
+  if ! LC_ALL=C "$EXTRACT_VMLINUX" "$RAW_VMLINUZ" > "$OUT_FILE" 2>"$EXTRACT_ERR"; then
+    echo "[kernel] ERROR: extract-vmlinux failed (VZ requires uncompressed kernel)" >&2
+    cat "$EXTRACT_ERR" >&2
+    rm -f "$RAW_VMLINUZ" "$EXTRACT_ERR"
+    exit 1
+  fi
+  rm -f "$EXTRACT_ERR"
+  rm -f "$RAW_VMLINUZ"
+else
+  mv "$RAW_VMLINUZ" "$OUT_FILE"
+fi
 
 echo "[kernel] Kernel extracted to: $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
 echo ""

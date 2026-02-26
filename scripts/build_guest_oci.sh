@@ -43,7 +43,14 @@ for arch in "${ARCHS[@]}"; do
 
     case "$arch" in
         x86_64)  cp target/vmlinuz-amd64  "${arch_dir}/vmlinuz" ;;
-        aarch64) cp target/vmlinuz-arm64   "${arch_dir}/vmlinuz" ;;
+        aarch64)
+            # macOS download_kernel.sh produces vmlinux (uncompressed) for VZ
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                cp target/vmlinux-arm64 "${arch_dir}/vmlinuz"
+            else
+                cp target/vmlinuz-arm64 "${arch_dir}/vmlinuz"
+            fi
+            ;;
     esac
 
     echo "=== ${arch}: vmlinuz + rootfs.cpio.gz ready ==="

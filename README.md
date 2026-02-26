@@ -310,7 +310,7 @@ codesign --force --sign - --entitlements voidbox.entitlements target/debug/examp
 
 # Run (Ollama must be listening on 0.0.0.0:11434)
 OLLAMA_MODEL=qwen3-coder \
-VOID_BOX_KERNEL=target/vmlinuz-arm64 \
+VOID_BOX_KERNEL=target/vmlinux-arm64 \
 VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 target/debug/examples/ollama_local
 ```
@@ -414,7 +414,7 @@ VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
 
 # macOS (Virtualization.framework) — requires initramfs already built (see "macOS mode" above)
-VOID_BOX_KERNEL=target/vmlinuz-arm64 \
+VOID_BOX_KERNEL=target/vmlinux-arm64 \
 VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
 ```
