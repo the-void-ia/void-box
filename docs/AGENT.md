@@ -14,9 +14,23 @@ This document is the operational reference for running VoidBox with OCI images a
 
 ### OCI root switch sequence (`setup_oci_rootfs`)
 
-1. Host builds an ext4 disk image from the extracted OCI rootfs (`build_oci_rootfs_disk` in `src/runtime.rs`).
+**Linux/KVM (virtio-blk):**
+
+1. Host builds a cached ext4 disk image from the extracted OCI rootfs
+   (`build_oci_rootfs_disk` in `src/runtime.rs`, `#[cfg(target_os = "linux")]`).
 2. Disk is attached as a **read-only virtio-blk** device (`/dev/vda`).
-3. Guest-agent mounts `/dev/vda` as ext4 with `MS_RDONLY` at `/mnt/oci-lower` (overlay lowerdir).
+3. Guest-agent mounts `/dev/vda` as ext4 with `MS_RDONLY` at `/mnt/oci-lower`.
+
+**macOS/VZ (virtiofs):**
+
+1. Host shares the extracted OCI rootfs directory into the guest via virtiofs
+   (`read_only: true`), resolved in `apply_oci_rootfs` (`src/runtime.rs`).
+2. Guest-agent finds the rootfs at `/mnt/oci-rootfs` (already mounted by
+   `mount_shared_dirs`).
+3. The virtiofs mount is used directly as the overlay lowerdir.
+
+**Common (both platforms):**
+
 4. A tmpfs is mounted for overlay `upper` + `work` directories.
 5. Overlayfs is mounted at `/mnt/newroot` (lower=OCI rootfs RO, upper=tmpfs RW).
 6. Essential mounts (`/proc`, `/sys`, `/dev`) are move-mounted into the new root.
@@ -31,24 +45,27 @@ Status is tracked via `OCI_SETUP_STATUS` (`AtomicU8`), with distinct codes for
 each failure point (e.g. `OCI_FAIL_BLOCK_MOUNT`, `OCI_FAIL_OVERLAY_MOUNT`,
 `OCI_FAIL_PIVOT_ROOT_*`).
 
-### Block device read-only strategy (defense-in-depth)
+### Read-only strategy (defense-in-depth)
 
-Three layers enforce read-only access to the OCI rootfs disk:
+| Layer | Mechanism | Platform | File |
+|-------|-----------|----------|------|
+| Host file | `File::open()` (read-only) | Linux | `src/devices/virtio_blk.rs` |
+| Virtio feature | `VIRTIO_BLK_F_RO` (bit 5); writes rejected with `VIRTIO_BLK_S_UNSUPP` | Linux | `src/devices/virtio_blk.rs` |
+| Virtiofs mount | `VZVirtioFileSystemDeviceConfiguration` with `read_only: true` | macOS | `src/backend/vz/backend.rs` |
+| Guest mount | `mount(..., MS_RDONLY)` | Both | `guest-agent/src/main.rs` |
 
-| Layer | Mechanism | File |
-|-------|-----------|------|
-| Host file | `File::open()` (read-only) | `src/devices/virtio_blk.rs` |
-| Virtio feature | `VIRTIO_BLK_F_RO` (bit 5) advertised; write requests rejected with `VIRTIO_BLK_S_UNSUPP` | `src/devices/virtio_blk.rs` |
-| Guest mount | `mount("/dev/vda", ..., MS_RDONLY)` | `guest-agent/src/main.rs` (`mount_oci_block_lowerdir`) |
-
-The overlayfs upper layer (tmpfs) absorbs all writes, so the guest has a writable
-root without modifying the cached disk image.
+On Linux the three-layer block-device strategy applies. On macOS the virtiofs
+share is host-enforced RO and the guest adds `MS_RDONLY`. Both platforms use the
+overlayfs upper layer (tmpfs) to absorb writes, so the guest has a writable root
+without modifying the base rootfs.
 
 ### Key source files
 
 - `guest-agent/src/main.rs` — `setup_oci_rootfs` (~line 754), `mount_oci_block_lowerdir` (~line 1133)
 - `src/devices/virtio_blk.rs` — RO feature flag (line 21), write rejection (line 394)
-- `src/runtime.rs` — `build_oci_rootfs_disk` (~line 815, host-side ext4 image creation)
+- `src/runtime.rs` — `build_oci_rootfs_disk` (~line 815, host-side ext4 image creation),
+  `resolve_oci_rootfs_plan` (~line 776), `apply_oci_rootfs` (~line 745)
+- `src/backend/vz/backend.rs` — VZ virtiofs mount setup
 
 ## Test matrix (CI parity)
 

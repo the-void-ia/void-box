@@ -1,9 +1,11 @@
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use kvm_ioctls::{Cap, Kvm};
 
+#[allow(dead_code)]
 pub fn require_kernel_artifacts(kernel: &Path, initramfs: Option<&Path>) -> Result<(), String> {
     if !kernel.exists() {
         return Err(format!("kernel path does not exist: {}", kernel.display()));
@@ -45,6 +47,7 @@ pub fn require_kvm_usable() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn require_kvm_usable() -> Result<(), String> {
     Ok(())
 }
@@ -60,6 +63,7 @@ pub fn require_vsock_usable() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn require_vsock_usable() -> Result<(), String> {
     Ok(())
 }
