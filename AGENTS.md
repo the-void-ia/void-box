@@ -1,8 +1,11 @@
-# AGENT Operations Guide
+# AGENTS.md — VoidBox
 
-This document is the operational reference for running VoidBox with OCI images and validating conformance.
+VoidBox is a lightweight micro-VM runtime for sandboxed execution. It boots a
+guest agent from initramfs, optionally performs an OCI root switch, and exposes
+a host↔guest API over vsock. This file covers architecture, testing, validation,
+and debugging guidance for agents working on the project.
 
-## Runtime model
+## Architecture overview
 
 - Host runtime launches a VM backend (`KvmBackend` on Linux, `VzBackend` on macOS).
 - Guest boots `guest-agent` from initramfs.
@@ -102,7 +105,7 @@ each tag at the specified guest path with the declared mode.
   `resolve_oci_rootfs_plan` (~line 776), `apply_oci_rootfs` (~line 745)
 - `src/backend/vz/backend.rs` — VZ virtiofs mount setup
 
-## Test matrix (CI parity)
+## Testing
 
 Static quality:
 
@@ -138,7 +141,7 @@ cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 ```
 
-## Validation Run Contract
+## Validation contract
 
 Use this contract when shipping VM/OCI/OpenClaw changes. Commands are ordered and
 all required gates are explicit.
@@ -231,7 +234,7 @@ Do not use `/tmp/void-box-test-rootfs.cpio.gz` for OpenClaw gateway validation.
 - VM suites must either pass or skip with explicit environment reason.
 - OpenClaw validation must use production initramfs and reach startup/interaction.
 
-## Run Examples (Safe Snippets)
+## Run examples
 
 Use placeholders for secrets (`...`) and keep real tokens out of docs/commits.
 
@@ -296,7 +299,7 @@ Do **not** use `target/void-box-rootfs.cpio.gz` for these deterministic e2e suit
 That production image is for real Claude/OpenClaw runtime paths.
 These suites are Linux/KVM only.
 
-## Known issues / debugging
+## Known issues
 
 ### EPERM during OCI layer unpack
 
@@ -308,7 +311,7 @@ bypass the EPERM handling and surface as an `OciError::Io`. When debugging OCI
 unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 `entry.unpack()` calls that don't go through the EPERM catch-and-skip pattern.
 
-## OCI-focused conformance expectations
+## Conformance expectations
 
 - `conformance`: command execution, lifecycle, streaming, filesystem primitives.
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.

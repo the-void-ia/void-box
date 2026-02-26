@@ -119,8 +119,8 @@ If an ignored VM suite reports `Kvm(Error(13))` (or `Permission denied`) it usua
 For runtime setup examples and platform-specific details, see:
 - `README.md` (KVM zero-setup, macOS/VZ, OCI examples)
 - `docs/architecture.md` (backend, OCI, and security model)
-- `docs/AGENT.md` (operations checklist, conformance suites, and guest image script differences)
-- `docs/AGENT.md#validation-run-contract` (required command order and pass/skip exit gates)
+- `AGENTS.md` (operations checklist, conformance suites, and guest image script differences)
+- `AGENTS.md#validation-contract` (required command order and pass/skip exit gates)
 
 ### Code Quality
 

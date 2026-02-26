@@ -44,7 +44,7 @@ pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
 
     // OCI rootfs: VZ uses virtiofs (not virtio-blk) for OCI rootfs delivery.
     // The host shares the extracted rootfs directory read-only; the guest
-    // overlays it with a tmpfs upper layer. See docs/AGENT.md for details.
+    // overlays it with a tmpfs upper layer. See AGENTS.md for details.
 
     // Mount config: tell the guest-agent which virtiofs tags to mount and where.
     // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
