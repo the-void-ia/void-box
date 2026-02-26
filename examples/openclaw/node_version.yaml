@@ -1,0 +1,23 @@
+api_version: v1
+kind: workflow
+name: node-version
+
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  vcpus: 1
+  network: false
+  image: "node:22"
+
+workflow:
+  steps:
+    - name: node_version
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            node --version
+
+  output_step: node_version

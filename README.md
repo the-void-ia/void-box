@@ -427,6 +427,10 @@ More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
 | `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
 | `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs (on macOS, codesign required; gzip kernel is auto-decompressed for VZ) |
 
+OpenClaw examples and runbook:
+
+- [`examples/openclaw/README.md`](examples/openclaw/README.md)
+
 ---
 
 ## Roadmap

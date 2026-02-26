@@ -58,7 +58,10 @@ fn trigger_oci_rootfs_setup_async() {
             kmsg("OCI setup: async rootfs setup thread started");
             setup_oci_rootfs();
             if let Ok(status) = OCI_SETUP_STATUS.lock() {
-                kmsg(&format!("OCI setup: async rootfs setup thread finished status={}", *status));
+                kmsg(&format!(
+                    "OCI setup: async rootfs setup thread finished status={}",
+                    *status
+                ));
             }
         });
     });

@@ -32,6 +32,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "common/vm_preflight.rs"]
+mod vm_preflight;
+
 use void_box::agent_box::VoidBox;
 use void_box::backend::MountConfig;
 use void_box::sandbox::Sandbox;
@@ -451,10 +454,14 @@ fn build_sandbox_with_oci_mount(
     oci_dir: &std::path::Path,
     _read_only: bool,
 ) -> Option<Arc<Sandbox>> {
-    // Linux: require /dev/kvm
     #[cfg(target_os = "linux")]
-    if !std::path::Path::new("/dev/kvm").exists() {
-        eprintln!("skipping VM OCI test: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping VM OCI test: {e}");
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping VM OCI test: {e}");
         return None;
     }
 
@@ -469,11 +476,8 @@ fn build_sandbox_with_oci_mount(
         }
     };
 
-    if !kernel.exists() {
-        eprintln!(
-            "skipping VM OCI test: kernel path does not exist: {}",
-            kernel.display()
-        );
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping VM OCI test: {e}");
         return None;
     }
 
@@ -723,8 +727,13 @@ fn example_spec_oci_skills() {
 #[ignore = "requires VM backend + kernel/initramfs + network (pulls alpine:3.20)"]
 async fn vm_oci_alpine_os_release() {
     #[cfg(target_os = "linux")]
-    if !std::path::Path::new("/dev/kvm").exists() {
-        eprintln!("skipping: /dev/kvm not available");
+    if let Err(e) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: {e}");
         return;
     }
 
@@ -736,8 +745,8 @@ async fn vm_oci_alpine_os_release() {
         }
     };
 
-    if !kernel.exists() {
-        eprintln!("skipping: kernel not found: {}", kernel.display());
+    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
+        eprintln!("skipping: {e}");
         return;
     }
 

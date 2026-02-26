@@ -174,7 +174,10 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
 
     // We need to handle whiteouts ourselves, so iterate entries manually.
     let entries = archive.entries().map_err(|e| {
-        OciError::Layer(format!("failed to enumerate tar entries for {}: {}", layer.digest, e))
+        OciError::Layer(format!(
+            "failed to enumerate tar entries for {}: {}",
+            layer.digest, e
+        ))
     })?;
     for entry_result in entries {
         let mut entry = entry_result
@@ -517,7 +520,9 @@ fn decompressor<'a>(media_type: &str, data: &'a [u8]) -> Result<Box<dyn Read + '
 fn clear_directory(dir: &Path) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) =>
+        {
             warn!(path = %dir.display(), "read_dir skipped due to permission denied");
             return Ok(());
         }
@@ -526,7 +531,10 @@ fn clear_directory(dir: &Path) -> Result<()> {
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1) =>
+            {
                 warn!(path = %dir.display(), "directory entry skipped due to permission denied");
                 continue;
             }
@@ -541,7 +549,9 @@ fn clear_directory(dir: &Path) -> Result<()> {
 fn remove_path(path: &Path) -> Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) =>
+        {
             warn!(path = %path.display(), "symlink_metadata skipped due to permission denied");
             return Ok(());
         }
@@ -556,14 +566,12 @@ fn remove_path(path: &Path) -> Result<()> {
             }
             return Err(e.into());
         }
-    } else {
-        if let Err(e) = fs::remove_file(path) {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!(path = %path.display(), "remove_file skipped due to permission denied");
-                return Ok(());
-            }
-            return Err(e.into());
+    } else if let Err(e) = fs::remove_file(path) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            warn!(path = %path.display(), "remove_file skipped due to permission denied");
+            return Ok(());
         }
+        return Err(e.into());
     }
     Ok(())
 }

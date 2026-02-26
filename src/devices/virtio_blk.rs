@@ -369,7 +369,10 @@ impl VirtioBlkDevice {
                     let mut buf = vec![0u8; d.len as usize];
                     let mut n = 0usize;
                     while n < buf.len() {
-                        match self.disk.read_at(&mut buf[n..], file_off.saturating_add(n as u64)) {
+                        match self
+                            .disk
+                            .read_at(&mut buf[n..], file_off.saturating_add(n as u64))
+                        {
                             Ok(0) => break, // EOF: keep remaining bytes zero-filled
                             Ok(read_now) => n += read_now,
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

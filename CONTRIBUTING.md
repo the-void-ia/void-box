@@ -69,6 +69,10 @@ Use these scripts based on purpose:
 - `build_test_image.sh`: test/E2E image with deterministic `claudio`.
 - `build_claude_rootfs.sh`: includes native `claude-code`, CA certs, and sandbox user.
 
+OpenClaw note:
+- `examples/openclaw/openclaw_telegram.yaml` should run with `build_claude_rootfs.sh` output (`target/void-box-rootfs.cpio.gz`).
+- Using the test initramfs for OpenClaw can lead to boot/handshake failures in VM workflows.
+
 ### Guest image script differences
 
 | Script | Primary use | Includes Claude runtime | Kernel module policy |
@@ -97,16 +101,26 @@ export VOID_BOX_KERNEL=/path/to/vmlinuz
 export VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz
 cargo test --workspace --all-targets -- --include-ignored
 
-# Targeted VM suites
+# Targeted VM suites (generic guest image)
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
+
+# Claudio-based deterministic E2E suites (requires test initramfs)
+./scripts/build_test_image.sh
+export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 ```
 
+Note: `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`).
+
+If an ignored VM suite reports `Kvm(Error(13))` (or `Permission denied`) it usually means KVM ioctls are blocked in the current execution context; run the same command in a host shell/session with usable `/dev/kvm` and `/dev/vhost-vsock`.
+
 For runtime setup examples and platform-specific details, see:
 - `README.md` (KVM zero-setup, macOS/VZ, OCI examples)
 - `docs/architecture.md` (backend, OCI, and security model)
+- `docs/AGENT.md` (operations checklist, conformance suites, and guest image script differences)
+- `docs/AGENT.md#validation-run-contract` (required command order and pass/skip exit gates)
 
 ### Code Quality
 

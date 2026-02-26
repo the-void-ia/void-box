@@ -115,6 +115,19 @@ then `proposer` applies the fixes and opens a GitHub PR.
 cargo run --bin voidbox -- run --file examples/code_review/code_review_agent.yaml
 ```
 
+## openclaw
+
+OpenClaw workflow specs and runtime notes live in:
+
+- `examples/openclaw/README.md`
+
+Quick commands:
+
+```bash
+cargo run --bin voidbox -- run --file examples/openclaw/node_version.yaml
+cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram.yaml
+```
+
 ## specs/
 
 Reference spec files for the `voidbox run --file` CLI:
