@@ -158,6 +158,19 @@ export ANTHROPIC_API_KEY=...
 cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram.yaml
 ```
 
+Or validate the Ollama-backed gateway workflow:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+export OLLAMA_BASE_URL=http://10.0.2.2:11434
+export OLLAMA_API_KEY=ollama-local
+export OLLAMA_MODEL=qwen2.5-coder:7b
+ollama serve
+ollama pull qwen2.5-coder:7b
+cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_ollama.yaml
+```
+
 Do not use `/tmp/void-box-test-rootfs.cpio.gz` for OpenClaw gateway validation.
 
 ### Exit gates
@@ -194,6 +207,22 @@ export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 export ANTHROPIC_API_KEY=...
 cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram.yaml
+```
+
+OpenClaw Telegram gateway with host Ollama (production path):
+
+```bash
+TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
+export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+export OLLAMA_BASE_URL=http://10.0.2.2:11434
+export OLLAMA_API_KEY=ollama-local
+export OLLAMA_MODEL=qwen2.5-coder:7b
+ollama serve
+ollama pull qwen2.5-coder:7b
+cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_ollama.yaml
 ```
 
 Do **not** use `/tmp/void-box-test-rootfs.cpio.gz` for OpenClaw gateway runs.

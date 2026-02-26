@@ -126,6 +126,7 @@ Quick commands:
 ```bash
 cargo run --bin voidbox -- run --file examples/openclaw/node_version.yaml
 cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram.yaml
+cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_ollama.yaml
 ```
 
 ## specs/

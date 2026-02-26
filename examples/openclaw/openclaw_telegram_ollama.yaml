@@ -1,0 +1,106 @@
+api_version: v1
+kind: workflow
+name: openclaw-telegram-ollama
+
+sandbox:
+  mode: auto
+  memory_mb: 3072
+  vcpus: 2
+  network: true
+  image: "alpine/openclaw"
+  env:
+    TELEGRAM_BOT_TOKEN: ""
+    TELEGRAM_CHAT_ID: ""
+    OLLAMA_BASE_URL: "http://10.0.2.2:11434"
+    OLLAMA_API_KEY: "ollama-local"
+    OLLAMA_MODEL: "qwen2.5-coder:7b"
+
+workflow:
+  steps:
+    - name: verify
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            command -v node
+            command -v curl
+            test -f /app/openclaw.mjs
+            node /app/openclaw.mjs --version
+
+    - name: preflight
+      depends_on: [verify]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            test -n "${TELEGRAM_BOT_TOKEN}"
+            test -n "${OLLAMA_BASE_URL}"
+            test -n "${OLLAMA_MODEL}"
+
+            TAGS_URL="${OLLAMA_BASE_URL%/}/api/tags"
+            curl -fsS "${TAGS_URL}" > /tmp/ollama_tags.json
+            grep -F '"models"' /tmp/ollama_tags.json
+            if ! grep -F '"'"${OLLAMA_MODEL}"'"' /tmp/ollama_tags.json >/dev/null; then
+              echo "required model not found in Ollama tags: ${OLLAMA_MODEL}" >&2
+              echo "Pull on host: ollama pull ${OLLAMA_MODEL}" >&2
+              exit 1
+            fi
+
+    - name: configure
+      depends_on: [preflight]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            mkdir -p "${HOME}/.openclaw"
+            if [ ! -f "${HOME}/.openclaw/openclaw.json" ]; then
+              printf '%s\n' '{}' > "${HOME}/.openclaw/openclaw.json"
+            fi
+
+            node /app/openclaw.mjs config set --json gateway.mode '"local"'
+            node /app/openclaw.mjs config set --json channels.telegram.enabled 'true'
+            node /app/openclaw.mjs config set channels.telegram.botToken "${TELEGRAM_BOT_TOKEN}"
+            node /app/openclaw.mjs config set --json channels.telegram.allowFrom '["*"]'
+            node /app/openclaw.mjs config set channels.telegram.dmPolicy "open"
+
+            OLLAMA_PROVIDER_JSON="{\"baseUrl\":\"${OLLAMA_BASE_URL}\",\"apiKey\":\"${OLLAMA_API_KEY}\",\"api\":\"ollama\",\"models\":[{\"id\":\"${OLLAMA_MODEL}\",\"name\":\"Ollama ${OLLAMA_MODEL}\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":8192,\"maxTokens\":4096}]}"
+            node /app/openclaw.mjs config set --json models.providers.ollama "${OLLAMA_PROVIDER_JSON}"
+            node /app/openclaw.mjs config set agents.defaults.model.primary "ollama/${OLLAMA_MODEL}"
+
+            node /app/openclaw.mjs doctor
+
+    - name: smoke_message
+      depends_on: [configure]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            if [ -n "$TELEGRAM_CHAT_ID" ]; then
+              curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"OpenClaw Ollama gateway started ($(date -Iseconds))\"}"
+            fi
+
+    - name: gateway
+      depends_on: [smoke_message]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            exec node /app/openclaw.mjs gateway run --verbose
+
+  output_step: gateway
