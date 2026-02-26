@@ -23,7 +23,12 @@ pub fn unpack_layers(layers: &[LayerInfo], dest: &Path) -> Result<PathBuf> {
             media_type = %layer.media_type,
             "unpacking layer",
         );
-        unpack_single_layer(layer, dest)?;
+        unpack_single_layer(layer, dest).map_err(|e| {
+            OciError::Layer(format!(
+                "layer {} ({}) unpack failed: {}",
+                i, layer.digest, e
+            ))
+        })?;
     }
 
     Ok(dest.to_path_buf())
@@ -58,6 +63,7 @@ pub fn extract_guest_files(layers: &[LayerInfo], dest: &Path) -> Result<GuestFil
         let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed)?;
         let mut archive = Archive::new(reader);
         archive.set_preserve_permissions(false);
+        archive.set_unpack_xattrs(false);
 
         for entry_result in archive.entries()? {
             let mut entry = entry_result?;
@@ -148,11 +154,11 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
     let compressed = fs::read(&layer.local_path)?;
     let reader: Box<dyn Read> = decompressor(&layer.media_type, &compressed)?;
     let mut archive = Archive::new(reader);
-    // Do not preserve permissions bits that could block later access.
+    // Do not preserve permissions bits/xattrs that can cause host-side unpack failures.
     archive.set_preserve_permissions(false);
+    archive.set_unpack_xattrs(false);
 
-    // Hard links whose target hasn't been extracted yet — retry after the
-    // main pass.
+    // Hard links whose target hasn't been extracted yet — retry after the main pass.
     let mut deferred_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     // We need to handle whiteouts ourselves, so iterate entries manually.
@@ -172,8 +178,7 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
             }
         };
 
-        // --- Opaque whiteout: delete everything in the parent directory that
-        //     was placed by *earlier* layers. ---
+        // Opaque whiteout: delete everything in the parent directory from earlier layers.
         if file_name == ".wh..wh..opq" {
             let parent = dest.join(rel_path.parent().unwrap_or_else(|| Path::new("")));
             if parent.exists() {
@@ -182,7 +187,7 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
             continue;
         }
 
-        // --- Regular whiteout: delete the named entry. ---
+        // Regular whiteout: delete the named entry.
         if let Some(hidden) = file_name.strip_prefix(".wh.") {
             let target = dest
                 .join(rel_path.parent().unwrap_or_else(|| Path::new("")))
@@ -198,7 +203,7 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
             continue;
         }
 
-        // --- Hard links: the target may not be extracted yet. ---
+        // Hard links: the target may not be extracted yet.
         if entry.header().entry_type() == tar::EntryType::Link {
             if let Ok(Some(link_name)) = entry.header().link_name() {
                 let link_target = dest.join(link_name);
@@ -207,19 +212,39 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
                     if let Some(parent) = link_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    // Remove stale entry if present.
                     let _ = fs::remove_file(&link_path);
-                    fs::hard_link(&link_target, &link_path)?;
+                    create_hardlink_or_copy(&link_target, &link_path)?;
                 } else {
                     deferred_hardlinks.push((link_path, link_target));
                 }
-                continue;
             }
+            continue;
         }
 
-        // --- Normal file / directory / symlink ---
+        // Device nodes/FIFO entries often require mknod privileges.
+        let entry_type = entry.header().entry_type();
+        if entry_type == tar::EntryType::Block
+            || entry_type == tar::EntryType::Char
+            || entry_type == tar::EntryType::Fifo
+        {
+            debug!(
+                path = %rel_path.display(),
+                ?entry_type,
+                "skipping special filesystem node during OCI unpack",
+            );
+            continue;
+        }
+
+        // Normal file / directory / symlink.
         let target = dest.join(&rel_path);
-        entry.unpack(&target)?;
+        entry.unpack(&target).map_err(|e| {
+            OciError::Layer(format!(
+                "unpack failed for {} ({:?}): {}",
+                rel_path.display(),
+                entry_type,
+                e
+            ))
+        })?;
     }
 
     // Retry deferred hard links now that all regular entries are on disk.
@@ -229,7 +254,7 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
             let _ = fs::remove_file(link_path);
-            fs::hard_link(link_target, link_path)?;
+            create_hardlink_or_copy(link_target, link_path)?;
             debug!(
                 link = %link_path.display(),
                 target = %link_target.display(),
@@ -245,6 +270,29 @@ fn unpack_single_layer(layer: &LayerInfo, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn create_hardlink_or_copy(target: &Path, link_path: &Path) -> Result<()> {
+    match fs::hard_link(target, link_path) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::Unsupported =>
+        {
+            if target.is_file() {
+                fs::copy(target, link_path)?;
+                debug!(
+                    link = %link_path.display(),
+                    target = %target.display(),
+                    "hard link denied; copied file instead",
+                );
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------

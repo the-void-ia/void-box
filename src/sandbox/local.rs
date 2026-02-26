@@ -68,6 +68,8 @@ impl LocalSandbox {
             shared_dir: self.config.shared_dir.clone(),
             mounts: self.config.mounts.clone(),
             oci_rootfs: self.config.oci_rootfs.clone(),
+            oci_rootfs_dev: self.config.oci_rootfs_dev.clone(),
+            oci_rootfs_disk: self.config.oci_rootfs_disk.clone(),
             env: self.config.env.clone(),
             security: BackendSecurityConfig {
                 session_secret,

@@ -71,6 +71,8 @@ fn backend_config() -> Option<BackendConfig> {
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,
+        oci_rootfs_dev: None,
+        oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
             session_secret: secret,

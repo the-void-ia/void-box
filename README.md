@@ -166,7 +166,8 @@ voidbox run --file hackernews_agent.yaml
 │  │ VMM (KVM / Virtualization.framework)            │  │
 │  │  vsock ←→ guest-agent (PID 1)                   │  │
 │  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
-│  │  9p/virtiofs ←→ OCI rootfs + skill mounts       │  │
+│  │  Linux/KVM: virtio-blk ←→ OCI base rootfs       │  │
+│  │  9p/virtiofs ←→ skills + host mounts            │  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                       │
 │  Seccomp-BPF │ OTLP export                            │
@@ -345,10 +346,10 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 VoidBox supports OCI container images in three ways:
 
 1. **`sandbox.guest_image`** — Pre-built kernel + initramfs distributed as an OCI image. Auto-pulled from GHCR on first run (no local build needed). See [KVM mode (zero-setup)](#kvm-mode-zero-setup).
-2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image.
+2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image. On Linux/KVM, VoidBox builds a cached ext4 disk artifact from the extracted OCI rootfs and attaches it as `virtio-blk` (`/dev/vda` in guest). On macOS/VZ, the OCI rootfs remains directory-mounted via virtiofs.
 3. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
 
-Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry, cached locally at `~/.voidbox/oci/`, and mounted into the guest VM via virtiofs (macOS) or 9p (Linux).
+Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry and cached locally at `~/.voidbox/oci/`. OCI base rootfs transport is platform-specific (`virtio-blk` on Linux/KVM, virtiofs directory mount on macOS/VZ), while OCI skills and host mounts use `9p/virtiofs` shares.
 
 ### Example: OCI skills
 
@@ -428,4 +429,3 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 ## License
 
 Apache-2.0 · [The Void Platform](LICENSE)
-

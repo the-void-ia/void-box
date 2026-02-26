@@ -14,8 +14,10 @@
 //!   getattr, readdir, lcreate, mkdir, clunk
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
@@ -60,16 +62,22 @@ const T_LOPEN: u8 = 12;
 const R_LOPEN: u8 = 13;
 const T_LCREATE: u8 = 14;
 const R_LCREATE: u8 = 15;
+const T_STATFS: u8 = 8;
+const R_STATFS: u8 = 9;
 const T_READ: u8 = 116;
 const R_READ: u8 = 117;
 const T_WRITE: u8 = 118;
 const R_WRITE: u8 = 119;
 const T_CLUNK: u8 = 120;
 const R_CLUNK: u8 = 121;
+const T_READLINK: u8 = 22;
+const R_READLINK: u8 = 23;
 const T_GETATTR: u8 = 24;
 const R_GETATTR: u8 = 25;
 const T_READDIR: u8 = 40;
 const R_READDIR: u8 = 41;
+const T_XATTRWALK: u8 = 30;
+const R_XATTRWALK: u8 = 31;
 const T_MKDIR: u8 = 72;
 const R_MKDIR: u8 = 73;
 const R_ERROR: u8 = 7;
@@ -130,6 +138,23 @@ pub struct Virtio9pDevice {
 }
 
 impl Virtio9pDevice {
+    fn normalize_under_root(root: &PathBuf, path: &std::path::Path) -> Option<PathBuf> {
+        let mut out = root.clone();
+        for comp in path.components() {
+            match comp {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if out == *root {
+                        return None;
+                    }
+                    out.pop();
+                }
+                std::path::Component::Normal(p) => out.push(p),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
     /// Create a new virtio-9P device sharing `root_dir` with the given mount tag.
     ///
     /// The mount tag is what the guest uses in the mount command:
@@ -505,10 +530,13 @@ impl Virtio9pDevice {
             T_WALK => self.handle_walk(tag, payload),
             T_LOPEN => self.handle_lopen(tag, payload),
             T_LCREATE => self.handle_lcreate(tag, payload),
+            T_STATFS => self.handle_statfs(tag, payload),
             T_READ => self.handle_read(tag, payload),
             T_WRITE => self.handle_write(tag, payload),
             T_CLUNK => self.handle_clunk(tag, payload),
+            T_READLINK => self.handle_readlink(tag, payload),
             T_GETATTR => self.handle_getattr(tag, payload),
+            T_XATTRWALK => self.handle_xattrwalk(tag, payload),
             T_READDIR => self.handle_readdir(tag, payload),
             T_MKDIR => self.handle_mkdir(tag, payload),
             _ => {
@@ -539,7 +567,13 @@ impl Virtio9pDevice {
     /// Build a QID from file metadata.
     /// QID: type(1) + version(4) + path(8) = 13 bytes
     fn build_qid(metadata: &fs::Metadata) -> [u8; QID_SIZE] {
-        let qtype: u8 = if metadata.is_dir() { 0x80 } else { 0x00 };
+        let qtype: u8 = if metadata.is_dir() {
+            0x80
+        } else if metadata.file_type().is_symlink() {
+            0x02
+        } else {
+            0x00
+        };
         // Use mtime as version (truncated to u32)
         let version = metadata.mtime() as u32;
         // Use inode number as path identifier
@@ -656,7 +690,12 @@ impl Virtio9pDevice {
         let mut current = base_path;
         let mut qids = Vec::new();
         let mut off = 10;
+        let root_path = match self.root_dir.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return Self::build_error(tag, libc::EIO as u32),
+        };
 
+        let mut walked_names: Vec<String> = Vec::new();
         for _ in 0..nwname {
             if off + 2 > payload.len() {
                 return Self::build_error(tag, libc::EINVAL as u32);
@@ -671,41 +710,78 @@ impl Virtio9pDevice {
                 Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
             };
             off += name_len;
+            walked_names.push(name.to_string());
 
-            // Resolve the next component
-            let next = current.join(name);
-            let canon = match next.canonicalize() {
-                Ok(c) => c,
-                Err(e) => {
-                    // Return partial walk if we resolved at least one component
-                    if !qids.is_empty() {
-                        break;
-                    }
-                    return Self::build_error(tag, io_error_to_errno(&e));
+            // Resolve each component under rootfs semantics, including symlinks.
+            let next = if name == "." {
+                current.clone()
+            } else if name == ".." {
+                if current == root_path {
+                    root_path.clone()
+                } else {
+                    current
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| root_path.clone())
                 }
+            } else {
+                current.join(name)
             };
 
-            // Security: ensure we stay within root
-            let root_canon = match self.root_dir.canonicalize() {
-                Ok(r) => r,
-                Err(_) => return Self::build_error(tag, libc::EIO as u32),
-            };
-            if !canon.starts_with(&root_canon) {
+            if !next.starts_with(&root_path) {
                 return Self::build_error(tag, libc::EACCES as u32);
             }
 
-            let metadata = match fs::metadata(&canon) {
+            let mut resolved = next.clone();
+            let mut metadata = match fs::symlink_metadata(&resolved) {
                 Ok(m) => m,
                 Err(e) => {
                     if !qids.is_empty() {
                         break;
                     }
+                    trace!(
+                        "virtio-9p: Twalk missing component '{}' under {:?}: {}",
+                        name,
+                        current,
+                        e
+                    );
                     return Self::build_error(tag, io_error_to_errno(&e));
                 }
             };
 
+            // Follow symlinks with container-root semantics:
+            // absolute targets stay within root_path.
+            for _ in 0..8 {
+                if !metadata.file_type().is_symlink() {
+                    break;
+                }
+                let target = match fs::read_link(&resolved) {
+                    Ok(t) => t,
+                    Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
+                };
+                let candidate = if target.is_absolute() {
+                    root_path.join(target.strip_prefix("/").unwrap_or(target.as_path()))
+                } else {
+                    resolved
+                        .parent()
+                        .map(|p| p.join(&target))
+                        .unwrap_or_else(|| root_path.join(&target))
+                };
+                resolved = match Self::normalize_under_root(&root_path, &candidate) {
+                    Some(p) => p,
+                    None => return Self::build_error(tag, libc::EACCES as u32),
+                };
+                if !resolved.starts_with(&root_path) {
+                    return Self::build_error(tag, libc::EACCES as u32);
+                }
+                metadata = match fs::symlink_metadata(&resolved) {
+                    Ok(m) => m,
+                    Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
+                };
+            }
+
             qids.push(Self::build_qid(&metadata));
-            current = canon;
+            current = resolved;
         }
 
         // Install newfid pointing at the walked-to path
@@ -725,10 +801,10 @@ impl Virtio9pDevice {
         }
 
         trace!(
-            "virtio-9p: Twalk fid={} newfid={} nwname={} walked={}",
+            "virtio-9p: Twalk fid={} newfid={} names={:?} walked={}",
             fid,
             newfid,
-            nwname,
+            walked_names,
             qids.len()
         );
         Self::build_message(R_WALK, tag, &resp)
@@ -897,6 +973,51 @@ impl Virtio9pDevice {
         Self::build_message(R_LCREATE, tag, &resp)
     }
 
+    /// Handle Tstatfs: return filesystem statistics for a fid path
+    fn handle_statfs(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        // Tstatfs: fid(4)
+        if payload.len() < 4 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let state = match self.fids.get(&fid) {
+            Some(s) => s,
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        let cpath = match CString::new(state.path.as_os_str().as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
+        };
+
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut st as *mut libc::statvfs) };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO) as u32;
+            return Self::build_error(tag, errno);
+        }
+
+        // Rstatfs: type(4) + bsize(4) + blocks(8) + bfree(8) + bavail(8) +
+        //          files(8) + ffree(8) + fsid(8) + namelen(4)
+        let mut resp = Vec::with_capacity(60);
+        let fs_type: u32 = 0;
+        resp.extend_from_slice(&fs_type.to_le_bytes());
+        resp.extend_from_slice(&(st.f_bsize as u32).to_le_bytes());
+        resp.extend_from_slice(&(st.f_blocks as u64).to_le_bytes());
+        resp.extend_from_slice(&(st.f_bfree as u64).to_le_bytes());
+        resp.extend_from_slice(&(st.f_bavail as u64).to_le_bytes());
+        resp.extend_from_slice(&(st.f_files as u64).to_le_bytes());
+        resp.extend_from_slice(&(st.f_ffree as u64).to_le_bytes());
+        resp.extend_from_slice(&0u64.to_le_bytes()); // fsid not provided by statvfs
+        resp.extend_from_slice(&(st.f_namemax as u32).to_le_bytes());
+
+        trace!("virtio-9p: Tstatfs fid={}", fid);
+        Self::build_message(R_STATFS, tag, &resp)
+    }
+
     /// Handle Tread: read data from an open fid
     fn handle_read(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
         // Tread: fid(4) + offset(8) + count(4)
@@ -1006,6 +1127,35 @@ impl Virtio9pDevice {
         Self::build_message(R_CLUNK, tag, &[])
     }
 
+    /// Handle Treadlink: read symlink target
+    fn handle_readlink(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        if payload.len() < 4 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let state = match self.fids.get(&fid) {
+            Some(s) => s,
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        let target = match fs::read_link(&state.path) {
+            Ok(t) => t,
+            Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
+        };
+
+        let target_bytes = target.as_os_str().as_bytes();
+        if target_bytes.len() > u16::MAX as usize {
+            return Self::build_error(tag, libc::ENAMETOOLONG as u32);
+        }
+
+        // Rreadlink payload is a 9P string.
+        let mut resp = Vec::with_capacity(2 + target_bytes.len());
+        resp.extend_from_slice(&(target_bytes.len() as u16).to_le_bytes());
+        resp.extend_from_slice(target_bytes);
+        Self::build_message(R_READLINK, tag, &resp)
+    }
+
     /// Handle Tgetattr: get file attributes
     fn handle_getattr(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
         // Tgetattr: fid(4) + request_mask(8)
@@ -1067,6 +1217,40 @@ impl Virtio9pDevice {
 
         trace!("virtio-9p: Tgetattr fid={}", fid);
         Self::build_message(R_GETATTR, tag, &resp)
+    }
+
+    /// Handle Txattrwalk: report xattr size for a file.
+    ///
+    /// For OCI rootfs execution we only need "no xattr" semantics; returning
+    /// size=0 keeps Linux client lookups moving instead of failing on EOPNOTSUPP.
+    fn handle_xattrwalk(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        // Txattrwalk: fid(4) + newfid(4) + name(2+n)
+        if payload.len() < 10 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let newfid = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+        let name_len = u16::from_le_bytes(payload[8..10].try_into().unwrap()) as usize;
+        if payload.len() < 10 + name_len {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let base = match self.fids.get(&fid) {
+            Some(s) => s.path.clone(),
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        self.fids.insert(
+            newfid,
+            FidState {
+                path: base,
+                open_file: None,
+            },
+        );
+
+        // Rxattrwalk: size(8). Report no xattr data.
+        Self::build_message(R_XATTRWALK, tag, &0u64.to_le_bytes())
     }
 
     /// Handle Treaddir: read directory entries

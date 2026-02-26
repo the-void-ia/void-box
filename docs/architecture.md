@@ -46,8 +46,8 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │     │
 │  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │     │
 │  │  └────────┘ └────────┘ └───────┬─────┘ └───────┬──────┘ │     │
-│  │  9p/virtiofs: OCI rootfs +     │               │        │     │
-│  │    skill mounts                │               │        │     │
+│  │  Linux/KVM: virtio-blk (OCI rootfs)            │        │     │
+│  │  9p/virtiofs: skills + host mounts             │        │     │
 │  │  Seccomp-BPF on VMM thread    │               │        │     │
 │  └────────────────────────────────┼───────────────┼────────┘     │
 │                                   │               │              │
@@ -299,7 +299,16 @@ Cache layout: `~/.voidbox/oci/guest/<sha256>/vmlinuz` + `rootfs.cpio.gz` + `<sha
 
 ### Base image (`sandbox.image`)
 
-Full container image (e.g. `python:3.12-slim`) used as the guest root filesystem. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the extracted OCI image layers. Mounted read-only via 9p (Linux) or virtiofs (macOS) at `/mnt/oci-rootfs`.
+Full container image (e.g. `python:3.12-slim`) used as the guest root filesystem.
+
+- Linux/KVM: host builds a cached ext4 disk artifact from the extracted OCI rootfs and attaches it as `virtio-blk` (guest sees `/dev/vda`).
+- macOS/VZ: rootfs remains directory-mounted (virtiofs path).
+- Guest-agent switches root with overlayfs + `pivot_root` (or secure switch-root fallback when kernel returns `EINVAL` for initramfs root).
+
+Security properties are preserved across both paths:
+- OCI root switch is driven only by kernel cmdline flags set by the trusted host.
+- command allowlist + authenticated vsock control channel still gate execution.
+- writable layer is tmpfs-backed; base OCI lowerdir remains read-only.
 
 Cache layout: `~/.voidbox/oci/rootfs/<sha256>/` (full layer extraction with whiteout handling).
 

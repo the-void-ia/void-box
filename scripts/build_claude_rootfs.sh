@@ -146,6 +146,21 @@ if [[ "$IS_CROSS_BUILD" == "false" ]]; then
   fi
 fi
 
+# Auto-detect kernel module version when not explicitly set.
+# The GHCR kernel is pinned in download_kernel.sh; if we're building on a host
+# with a different kernel (e.g. 6.17.7), copying host modules into the initramfs
+# causes version mismatches → 9p modules fail to load → no OCI rootfs.
+# Parse the pinned version so modules always match the VM kernel.
+if [[ -z "${VOID_BOX_KMOD_VERSION:-}" ]]; then
+  # Extract pinned KERNEL_VER and KERNEL_UPLOAD from download_kernel.sh
+  _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
+  _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+  _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+  export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
+  export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
+  echo "[claude-rootfs] Auto-detected kernel module version: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
+fi
+
 # Pass the claude binary to the base script via CLAUDE_CODE_BIN.
 # The base script handles copying it to /usr/local/bin/claude-code and
 # running ldd to install shared libraries into the initramfs.

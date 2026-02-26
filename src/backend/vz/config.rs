@@ -87,6 +87,8 @@ mod tests {
             shared_dir: None,
             mounts: vec![],
             oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
             env: vec![],
             security: BackendSecurityConfig {
                 session_secret: [0xAB; 32],

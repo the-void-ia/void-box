@@ -65,6 +65,10 @@ pub struct BackendConfig {
     pub mounts: Vec<MountConfig>,
     /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
     pub oci_rootfs: Option<String>,
+    /// OCI rootfs block device in guest (e.g. /dev/vda).
+    pub oci_rootfs_dev: Option<String>,
+    /// Host path to OCI rootfs disk image to attach via virtio-blk (KVM).
+    pub oci_rootfs_disk: Option<PathBuf>,
     /// Environment variables to inject into guest commands.
     pub env: Vec<(String, String)>,
     /// Security configuration.

@@ -86,6 +86,8 @@ impl VmmBackend for KvmBackend {
         // Apply mounts
         vm_config.mounts = config.mounts.clone();
         vm_config.oci_rootfs = config.oci_rootfs.clone();
+        vm_config.oci_rootfs_dev = config.oci_rootfs_dev.clone();
+        vm_config.oci_rootfs_disk = config.oci_rootfs_disk.clone();
 
         // Apply security config
         vm_config.security = SecurityConfig {

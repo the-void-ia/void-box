@@ -1,0 +1,76 @@
+api_version: v1
+kind: workflow
+name: openclaw-telegram
+
+sandbox:
+  mode: auto
+  memory_mb: 3072
+  vcpus: 2
+  network: true
+  image: "alpine/openclaw"
+  env:
+    TELEGRAM_BOT_TOKEN: ""
+    ANTHROPIC_API_KEY: ""
+    TELEGRAM_CHAT_ID: ""
+
+workflow:
+  steps:
+    - name: verify
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            command -v node
+            test -f /app/openclaw.mjs
+            node /app/openclaw.mjs --version
+
+    - name: configure
+      depends_on: [verify]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            mkdir -p "${HOME}/.openclaw"
+            if [ ! -f "${HOME}/.openclaw/openclaw.json" ]; then
+              printf '%s\n' '{}' > "${HOME}/.openclaw/openclaw.json"
+            fi
+            node /app/openclaw.mjs config set --json gateway.mode '"local"'
+            node /app/openclaw.mjs config set --json channels.telegram.enabled 'true'
+            node /app/openclaw.mjs config set channels.telegram.botToken "${TELEGRAM_BOT_TOKEN}"
+            node /app/openclaw.mjs config set --json channels.telegram.allowFrom '["*"]'
+            node /app/openclaw.mjs config set channels.telegram.dmPolicy "open"
+            node /app/openclaw.mjs doctor || true
+
+    - name: smoke_message
+      depends_on: [configure]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            if [ -n "$TELEGRAM_CHAT_ID" ]; then
+              curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"OpenClaw prebuilt gateway started ($(date -Iseconds))\"}"
+            fi
+
+    - name: gateway
+      depends_on: [smoke_message]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            exec node /app/openclaw.mjs gateway run --allow-unconfigured --verbose
+
+  output_step: gateway

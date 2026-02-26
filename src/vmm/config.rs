@@ -72,6 +72,10 @@ pub struct VoidBoxConfig {
     pub mounts: Vec<crate::backend::MountConfig>,
     /// Guest path where an OCI rootfs is mounted (triggers pivot_root in guest-agent).
     pub oci_rootfs: Option<String>,
+    /// OCI rootfs block device in guest (e.g. /dev/vda).
+    pub oci_rootfs_dev: Option<String>,
+    /// Host path to OCI rootfs disk image attached via virtio-blk.
+    pub oci_rootfs_disk: Option<PathBuf>,
     /// Enable vsock for host-guest communication
     pub enable_vsock: bool,
     /// Vsock context ID (auto-generated if not specified)
@@ -95,6 +99,8 @@ impl Default for VoidBoxConfig {
             shared_dir: None,
             mounts: Vec::new(),
             oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
             enable_vsock: true,
             cid: None,
             extra_cmdline: Vec::new(),
@@ -206,6 +212,9 @@ impl VoidBoxConfig {
         if !self.mounts.is_empty() {
             cmdline.push("virtio_mmio.device=512@0xd1000000:12".to_string());
         }
+        if self.oci_rootfs_disk.is_some() {
+            cmdline.push("virtio_mmio.device=512@0xd1800000:13".to_string());
+        }
 
         // Add root device if rootfs is specified
         if self.rootfs.is_some() {
@@ -245,6 +254,9 @@ impl VoidBoxConfig {
         // OCI rootfs: tell the guest-agent to pivot_root to the mounted rootfs.
         if let Some(ref oci_path) = self.oci_rootfs {
             cmdline.push(format!("voidbox.oci_rootfs={}", oci_path));
+        }
+        if let Some(ref dev) = self.oci_rootfs_dev {
+            cmdline.push(format!("voidbox.oci_rootfs_dev={}", dev));
         }
 
         // Add extra arguments

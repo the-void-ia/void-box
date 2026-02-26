@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use crate::agent_box::VoidBox;
 use crate::backend::MountConfig;
@@ -22,6 +24,14 @@ use crate::{Error, Result};
 
 /// Well-known guest path for OCI rootfs mounts.
 const OCI_ROOTFS_GUEST_PATH: &str = "/mnt/oci-rootfs";
+const OCI_ROOTFS_BLOCK_DEV: &str = "/dev/vda";
+
+#[derive(Debug, Clone)]
+struct OciRootfsPlan {
+    host_rootfs: PathBuf,
+    host_disk: Option<PathBuf>,
+    guest_dev: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunReport {
@@ -59,9 +69,10 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
     let guest = resolve_guest_image(spec).await;
 
     // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
-        Some(resolve_oci_base_image(image).await?)
+        let host_rootfs = resolve_oci_base_image(image).await?;
+        Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
     } else {
         None
     };
@@ -71,8 +82,8 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
     builder = apply_box_llm(builder, spec.llm.as_ref());
 
     // Wire OCI rootfs mount if resolved.
-    if let Some(ref rootfs_dir) = oci_rootfs_host {
-        builder = apply_oci_rootfs(builder, rootfs_dir);
+    if let Some(ref plan) = oci_rootfs_plan {
+        builder = apply_oci_rootfs(builder, plan);
     }
 
     for s in &agent.skills {
@@ -122,9 +133,10 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     let guest = resolve_guest_image(spec).await;
 
     // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
-        Some(resolve_oci_base_image(image).await?)
+        let host_rootfs = resolve_oci_base_image(image).await?;
+        Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
     } else {
         None
     };
@@ -153,7 +165,7 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
             spec,
             b,
             &output_registry,
-            oci_rootfs_host.as_deref(),
+            oci_rootfs_plan.as_ref(),
             guest.as_ref(),
         )?;
         boxes_by_name.insert(b.name.clone(), ab);
@@ -242,9 +254,10 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     let guest = resolve_guest_image(spec).await;
 
     // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_host = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
-        Some(resolve_oci_base_image(image).await?)
+        let host_rootfs = resolve_oci_base_image(image).await?;
+        Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
     } else {
         None
     };
@@ -289,7 +302,7 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 
     let workflow = builder.build();
 
-    let sandbox = build_shared_sandbox(spec, oci_rootfs_host.as_deref(), guest.as_ref())?;
+    let sandbox = build_shared_sandbox(spec, oci_rootfs_plan.as_ref(), guest.as_ref())?;
 
     let observed = workflow
         .observe(crate::observe::ObserveConfig::from_env())
@@ -327,7 +340,7 @@ fn build_pipeline_box_with_io(
     spec: &RunSpec,
     b: &PipelineBoxSpec,
     output_registry: &OutputRegistry,
-    oci_rootfs_host: Option<&Path>,
+    oci_rootfs_plan: Option<&OciRootfsPlan>,
     guest: Option<&GuestFiles>,
 ) -> Result<VoidBox> {
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
@@ -389,8 +402,8 @@ fn build_pipeline_box_with_io(
     }
 
     // Wire OCI rootfs mount if resolved.
-    if let Some(rootfs_dir) = oci_rootfs_host {
-        builder = apply_oci_rootfs(builder, rootfs_dir);
+    if let Some(plan) = oci_rootfs_plan {
+        builder = apply_oci_rootfs(builder, plan);
     }
 
     builder.build()
@@ -398,7 +411,7 @@ fn build_pipeline_box_with_io(
 
 fn build_shared_sandbox(
     spec: &RunSpec,
-    oci_rootfs_host: Option<&Path>,
+    oci_rootfs_plan: Option<&OciRootfsPlan>,
     guest: Option<&GuestFiles>,
 ) -> Result<std::sync::Arc<Sandbox>> {
     let mode = spec.sandbox.mode.to_ascii_lowercase();
@@ -419,7 +432,7 @@ fn build_shared_sandbox(
     }
 
     for (k, v) in &spec.sandbox.env {
-        builder = builder.env(k, v);
+        builder = builder.env(k, resolve_env_value(k, v));
     }
 
     for m in &spec.sandbox.mounts {
@@ -427,14 +440,8 @@ fn build_shared_sandbox(
     }
 
     // OCI rootfs mount + pivot_root flag
-    if let Some(rootfs_dir) = oci_rootfs_host {
-        builder = builder
-            .mount(MountConfig {
-                host_path: rootfs_dir.to_string_lossy().into_owned(),
-                guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
-                read_only: true,
-            })
-            .oci_rootfs(OCI_ROOTFS_GUEST_PATH);
+    if let Some(plan) = oci_rootfs_plan {
+        builder = apply_oci_rootfs_sandbox(builder, plan);
     }
 
     if mode == "local" && guest.is_none() {
@@ -548,8 +555,7 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
 /// Pull + extract guest files from an OCI image reference.
 async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
     eprintln!("[void-box] Resolving guest image: {}", image_ref);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+    let cache_dir = oci_cache_dir();
     let client = voidbox_oci::OciClient::new(cache_dir);
     let guest = client.resolve_guest_files(image_ref).await.map_err(|e| {
         Error::Config(format!(
@@ -721,8 +727,7 @@ fn mount_spec_to_config(spec: &MountSpec) -> MountConfig {
 /// Uses `~/.voidbox/oci/` as the content-addressed cache directory.
 /// Returns the path to the extracted rootfs on the host.
 async fn resolve_oci_base_image(image_ref: &str) -> Result<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+    let cache_dir = oci_cache_dir();
     let client = voidbox_oci::OciClient::new(cache_dir);
     client.resolve_rootfs(image_ref).await.map_err(|e| {
         Error::Config(format!(
@@ -735,14 +740,151 @@ async fn resolve_oci_base_image(image_ref: &str) -> Result<PathBuf> {
 /// Wire an OCI base image into a VoidBox builder: add a read-only mount at
 /// `/mnt/oci-rootfs` and set the `oci_rootfs` flag so the guest-agent does
 /// `pivot_root` after boot.
-fn apply_oci_rootfs(builder: VoidBox, rootfs_host_path: &Path) -> VoidBox {
-    builder
-        .mount(MountConfig {
-            host_path: rootfs_host_path.to_string_lossy().into_owned(),
-            guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
-            read_only: true,
+fn apply_oci_rootfs(builder: VoidBox, plan: &OciRootfsPlan) -> VoidBox {
+    if let (Some(dev), Some(disk)) = (&plan.guest_dev, &plan.host_disk) {
+        builder.oci_rootfs_dev(dev).oci_rootfs_disk(disk)
+    } else {
+        builder
+            .mount(MountConfig {
+                host_path: plan.host_rootfs.to_string_lossy().into_owned(),
+                guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
+                read_only: true,
+            })
+            .oci_rootfs(OCI_ROOTFS_GUEST_PATH)
+    }
+}
+
+fn apply_oci_rootfs_sandbox(
+    builder: crate::sandbox::SandboxBuilder,
+    plan: &OciRootfsPlan,
+) -> crate::sandbox::SandboxBuilder {
+    if let (Some(dev), Some(disk)) = (&plan.guest_dev, &plan.host_disk) {
+        builder.oci_rootfs_dev(dev).oci_rootfs_disk(disk)
+    } else {
+        builder
+            .mount(MountConfig {
+                host_path: plan.host_rootfs.to_string_lossy().into_owned(),
+                guest_path: OCI_ROOTFS_GUEST_PATH.to_string(),
+                read_only: true,
+            })
+            .oci_rootfs(OCI_ROOTFS_GUEST_PATH)
+    }
+}
+
+async fn resolve_oci_rootfs_plan(image_ref: &str, host_rootfs: PathBuf) -> Result<OciRootfsPlan> {
+    #[cfg(target_os = "linux")]
+    {
+        let host_disk = build_oci_rootfs_disk(image_ref, &host_rootfs).await?;
+        Ok(OciRootfsPlan {
+            host_rootfs,
+            host_disk: Some(host_disk),
+            guest_dev: Some(OCI_ROOTFS_BLOCK_DEV.to_string()),
         })
-        .oci_rootfs(OCI_ROOTFS_GUEST_PATH)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(OciRootfsPlan {
+            host_rootfs,
+            host_disk: None,
+            guest_dev: None,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn build_oci_rootfs_disk(image_ref: &str, rootfs_dir: &Path) -> Result<PathBuf> {
+    let disks_dir = oci_cache_dir().join("disks");
+    std::fs::create_dir_all(&disks_dir).map_err(|e| {
+        Error::Config(format!(
+            "failed to create OCI disk cache dir {}: {}",
+            disks_dir.display(),
+            e
+        ))
+    })?;
+
+    let cache_key =
+        stable_cache_key(&(image_ref, rootfs_dir.to_string_lossy().as_ref(), "ext4-v1"));
+    let disk_path = disks_dir.join(format!("{cache_key}.img"));
+    if disk_path.exists() {
+        return Ok(disk_path);
+    }
+
+    let tmp_disk = disks_dir.join(format!("{cache_key}.tmp"));
+    let _ = std::fs::remove_file(&tmp_disk);
+
+    let content_size = directory_size_bytes(rootfs_dir).unwrap_or(512 * 1024 * 1024);
+    let disk_size = ((content_size as f64) * 1.35) as u64 + 512 * 1024 * 1024;
+    let disk_size = disk_size.max(2 * 1024 * 1024 * 1024);
+
+    let truncate_status = Command::new("truncate")
+        .arg("-s")
+        .arg(disk_size.to_string())
+        .arg(&tmp_disk)
+        .status()
+        .map_err(|e| Error::Config(format!("failed to run truncate: {}", e)))?;
+    if !truncate_status.success() {
+        return Err(Error::Config(
+            "truncate failed while creating OCI disk".into(),
+        ));
+    }
+
+    let mkfs_status = Command::new("mkfs.ext4")
+        .arg("-q")
+        .arg("-F")
+        .arg("-d")
+        .arg(rootfs_dir)
+        .arg(&tmp_disk)
+        .status()
+        .map_err(|e| Error::Config(format!("failed to run mkfs.ext4: {}", e)))?;
+    if !mkfs_status.success() {
+        return Err(Error::Config(
+            "mkfs.ext4 failed while building OCI rootfs disk".into(),
+        ));
+    }
+
+    std::fs::rename(&tmp_disk, &disk_path).map_err(|e| {
+        Error::Config(format!(
+            "failed to finalize OCI disk {}: {}",
+            disk_path.display(),
+            e
+        ))
+    })?;
+    Ok(disk_path)
+}
+
+#[cfg(target_os = "linux")]
+fn directory_size_bytes(path: &Path) -> std::io::Result<u64> {
+    fn walk(path: &Path, total: &mut u64) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                walk(&entry.path(), total)?;
+            } else if meta.is_file() {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(())
+    }
+
+    let mut total = 0u64;
+    walk(path, &mut total)?;
+    Ok(total)
+}
+
+fn stable_cache_key<T: Hash>(value: &T) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn oci_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("VOIDBOX_CACHE_DIR") {
+        return PathBuf::from(dir).join("oci");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".voidbox/oci")
 }
 
 fn parse_skill(raw: &str) -> Result<Skill> {

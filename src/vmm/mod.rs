@@ -22,6 +22,7 @@ use tracing::{debug, error, info};
 
 use crate::devices::serial::SerialDevice;
 use crate::devices::virtio_9p::Virtio9pDevice;
+use crate::devices::virtio_blk::VirtioBlkDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
 use crate::devices::virtio_vsock::VsockDevice;
 use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
@@ -215,10 +216,24 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             None
         };
 
+        let virtio_blk = if let Some(ref disk_path) = config.oci_rootfs_disk {
+            let mut dev = VirtioBlkDevice::new(disk_path)?;
+            dev.set_mmio_base(0xd180_0000);
+            info!(
+                "virtio-blk MMIO at {:#x}, disk={}",
+                dev.mmio_base(),
+                disk_path.display()
+            );
+            Some(Arc::new(Mutex::new(dev)))
+        } else {
+            None
+        };
+
         let mmio_devices = MmioDevices {
             virtio_net,
             virtio_vsock: virtio_vsock_mmio,
             virtio_9p,
+            virtio_blk,
         };
 
         // Create vCPUs (with MMIO dispatch to virtio-net and virtio-vsock)
@@ -235,6 +250,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                     virtio_net: mmio_devices.virtio_net.clone(),
                     virtio_vsock: mmio_devices.virtio_vsock.clone(),
                     virtio_9p: mmio_devices.virtio_9p.clone(),
+                    virtio_blk: mmio_devices.virtio_blk.clone(),
                 },
             )?;
             vcpu_handles.push(handle);
@@ -951,7 +967,6 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
     let vm_fd = vm.vm_fd().as_raw_fd();
     let guest_memory = vm.guest_memory();
-
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(5));
 
@@ -964,6 +979,8 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             guard.has_pending_interrupt()
         };
 
+        // Always pulse IRQ10 while pending; this prevents RX stalls if
+        // an earlier edge was missed by the guest.
         if has_interrupt {
             let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
             unsafe {
