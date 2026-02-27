@@ -98,6 +98,20 @@ impl Scheduler {
         // Get execution plan (with parallel groups)
         let plan = ExecutionPlan::from_workflow(workflow)?;
 
+        let workflow_name = &workflow.name;
+        let total_steps = plan.steps.len();
+        let mut step_counter = 0usize;
+
+        self.observer.logger().info(
+            &format!(
+                "[workflow:{}] executing {} steps in {} groups",
+                workflow_name,
+                total_steps,
+                plan.parallel_groups.len()
+            ),
+            &[],
+        );
+
         // Track step outputs — shared across parallel tasks via RwLock
         let step_outputs: Arc<tokio::sync::RwLock<HashMap<String, StepOutput>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -114,6 +128,16 @@ impl Scheduler {
                 let mut step_span = self
                     .observer
                     .start_step_span(step_name, Some(&workflow_ctx));
+
+                step_counter += 1;
+                let step_start = Instant::now();
+                self.observer.logger().info(
+                    &format!(
+                        "[workflow:{}] step {}/{}: \"{}\" running...",
+                        workflow_name, step_counter, total_steps, step_name
+                    ),
+                    &[("step", step_name.as_str())],
+                );
 
                 let outputs_snapshot = step_outputs.read().await.clone();
                 let mut ctx_builder = StepContextBuilder::new(step_name, sandbox.clone())
@@ -137,6 +161,7 @@ impl Scheduler {
 
                 match result {
                     Ok(output) => {
+                        let elapsed = step_start.elapsed();
                         let step_output = StepOutput::new(output.clone(), Vec::new(), 0);
                         step_span.record_stdout(output.len());
                         step_outputs
@@ -144,8 +169,23 @@ impl Scheduler {
                             .await
                             .insert(step_name.clone(), step_output);
                         step_span.set_ok();
+                        self.observer.logger().info(
+                            &format!(
+                                "[workflow:{}] step {}/{}: \"{}\" ok ({:.1}s)",
+                                workflow_name,
+                                step_counter,
+                                total_steps,
+                                step_name,
+                                elapsed.as_secs_f64()
+                            ),
+                            &[
+                                ("step", step_name.as_str()),
+                                ("duration_ms", &elapsed.as_millis().to_string()),
+                            ],
+                        );
                     }
                     Err(e) => {
+                        let elapsed = step_start.elapsed();
                         let error_msg = e.to_string();
                         let step_output =
                             StepOutput::new(Vec::new(), error_msg.as_bytes().to_vec(), 1);
@@ -155,15 +195,37 @@ impl Scheduler {
                             .await
                             .insert(step_name.clone(), step_output);
                         step_span.set_error(&error_msg);
-                        self.observer
-                            .logger()
-                            .error(&format!("Step {} failed: {}", step_name, error_msg), &[]);
+                        self.observer.logger().error(
+                            &format!(
+                                "[workflow:{}] step {}/{}: \"{}\" FAILED ({:.1}s): {}",
+                                workflow_name,
+                                step_counter,
+                                total_steps,
+                                step_name,
+                                elapsed.as_secs_f64(),
+                                &error_msg[..error_msg.len().min(200)]
+                            ),
+                            &[("step", step_name.as_str())],
+                        );
                     }
                 }
             } else {
                 // Multiple steps — run in parallel with JoinSet
                 let mut join_set = tokio::task::JoinSet::new();
                 let outputs_snapshot = step_outputs.read().await.clone();
+
+                let group_step_names: Vec<_> = group.iter().map(|s| format!("\"{}\"", s)).collect();
+                self.observer.logger().info(
+                    &format!(
+                        "[workflow:{}] steps {}-{}/{}: [{}] running in parallel...",
+                        workflow_name,
+                        step_counter + 1,
+                        step_counter + group.len(),
+                        total_steps,
+                        group_step_names.join(", ")
+                    ),
+                    &[],
+                );
 
                 for step_name in group {
                     let step = workflow.steps.get(step_name).ok_or_else(|| {
@@ -179,9 +241,11 @@ impl Scheduler {
                     let outputs_snap = outputs_snapshot.clone();
                     let observer = self.observer.clone();
                     let wf_ctx = workflow_ctx.clone();
+                    let wf_name = workflow_name.clone();
 
                     join_set.spawn(async move {
                         let mut step_span = observer.start_step_span(&name, Some(&wf_ctx));
+                        let step_start = Instant::now();
 
                         let mut ctx_builder = StepContextBuilder::new(&name, sb)
                             .with_outputs(outputs_snap.clone())
@@ -227,15 +291,31 @@ impl Scheduler {
                             Ok(output) => {
                                 step_span.record_stdout(output.len());
                                 step_span.set_ok();
+                                observer.logger().info(
+                                    &format!(
+                                        "[workflow:{}] step \"{}\" ok ({:.1}s)",
+                                        wf_name,
+                                        name,
+                                        step_start.elapsed().as_secs_f64()
+                                    ),
+                                    &[("step", name.as_str())],
+                                );
                                 StepOutput::new(output, Vec::new(), 0)
                             }
                             Err(e) => {
                                 let error_msg = e.to_string();
                                 step_span.record_stderr(error_msg.len());
                                 step_span.set_error(&error_msg);
-                                observer
-                                    .logger()
-                                    .error(&format!("Step {} failed: {}", name, error_msg), &[]);
+                                observer.logger().error(
+                                    &format!(
+                                        "[workflow:{}] step \"{}\" FAILED ({:.1}s): {}",
+                                        wf_name,
+                                        name,
+                                        step_start.elapsed().as_secs_f64(),
+                                        &error_msg[..error_msg.len().min(200)]
+                                    ),
+                                    &[("step", name.as_str())],
+                                );
                                 StepOutput::new(Vec::new(), error_msg.as_bytes().to_vec(), 1)
                             }
                         };
@@ -250,11 +330,37 @@ impl Scheduler {
                         result.map_err(|e| Error::Guest(format!("Join error: {}", e)))?;
                     step_outputs.write().await.insert(name, output);
                 }
+
+                step_counter += group.len();
             }
         }
 
-        // Get final output
+        // Workflow completion summary
         let outputs = step_outputs.read().await;
+        let total_elapsed = start_time.elapsed();
+        let failed_count = outputs.iter().filter(|(_, o)| o.exit_code != 0).count();
+        if failed_count == 0 {
+            self.observer.logger().info(
+                &format!(
+                    "[workflow:{}] completed ({:.1}s)",
+                    workflow_name,
+                    total_elapsed.as_secs_f64()
+                ),
+                &[],
+            );
+        } else {
+            self.observer.logger().warn(
+                &format!(
+                    "[workflow:{}] completed with {} failure(s) ({:.1}s)",
+                    workflow_name,
+                    failed_count,
+                    total_elapsed.as_secs_f64()
+                ),
+                &[],
+            );
+        }
+
+        // Get final output
         let (output, exit_code) = if let Some(output_step) = &workflow.output_step {
             if let Some(step_output) = outputs.get(output_step) {
                 (step_output.stdout.clone(), step_output.exit_code)

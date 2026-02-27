@@ -97,6 +97,63 @@ holds the list of mount configs for the VM.
 **Guest-agent:** Parses `voidbox.mount*` params from `/proc/cmdline` and mounts
 each tag at the specified guest path with the declared mode.
 
+### Structured logging & observability
+
+VoidBox has a structured logging abstraction that bridges application-level log
+calls to the `tracing` ecosystem. All workflow progress messages should go
+through this pipeline rather than raw `eprintln!` or bare `tracing::info!`.
+
+**Pipeline:**
+
+```
+observer.logger().info(msg, attrs)
+  → StructuredLogger::log()
+    → tracing::info!()  (when output_to_tracing is true, which is the default)
+      → tracing_subscriber (EnvFilter) → stderr
+```
+
+**How to use it:** In workflow/scheduler code, obtain the logger from the
+`Observer` and call `.info()`, `.warn()`, `.error()`, etc. with structured
+key-value attributes:
+
+```rust
+self.observer.logger().info(
+    &format!("[workflow:{}] step {}/{}: \"{}\" running...", name, i, total, step),
+    &[("step", step_name)],
+);
+```
+
+Do not use `eprintln!` for progress messages — it bypasses the structured
+pipeline and won't carry trace context or attributes.
+
+**Log levels:** `LogConfig::default()` sets the minimum level to `INFO`.
+
+| Level | Use for |
+|-------|---------|
+| `.info()` | User-visible progress (step start/finish, workflow lifecycle) |
+| `.debug()` | Internal detail (durations, stdout/stderr capture) |
+| `.warn()` | Partial failures, degraded conditions |
+| `.error()` | Step/workflow failures |
+
+**CLI subscriber:** `src/bin/voidbox.rs` initializes `tracing_subscriber` with
+`EnvFilter` defaulting to `"info"`. Override at runtime with:
+
+```bash
+RUST_LOG=debug cargo run --bin voidbox -- run --file spec.yaml
+```
+
+**Convention:** Workflow progress messages use the `[workflow:<name>]` prefix
+pattern, e.g. `[workflow:my-flow] step 1/3: "build" running...`.
+
+**Key files:**
+
+| File | Role |
+|------|------|
+| `src/observe/logs.rs` | `StructuredLogger`, `LogConfig`, `LogEntry`, `LogLevel` |
+| `src/observe/mod.rs` | `Observer` (owns logger), `SpanGuard` (RAII span + logging) |
+| `src/workflow/scheduler.rs` | Step progress logging via `observer.logger()` |
+| `src/bin/voidbox.rs` | CLI `tracing_subscriber` + `EnvFilter` setup |
+
 ### Key source files
 
 - `guest-agent/src/main.rs` — `setup_oci_rootfs` (~line 754), `mount_oci_block_lowerdir` (~line 1133)
