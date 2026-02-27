@@ -279,7 +279,7 @@ impl Observer {
         } else {
             self.tracer.start_span(&format!("step:{}", name))
         };
-        self.logger.debug(&format!("Starting step: {}", name), &[]);
+        self.logger.info(&format!("Starting step: {}", name), &[]);
         SpanGuard {
             span,
             tracer: self.tracer.clone(),

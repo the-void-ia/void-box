@@ -304,6 +304,12 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 
     let workflow = builder.build();
 
+    tracing::info!(
+        "[workflow:{}] starting ({} steps)",
+        spec.name,
+        w.steps.len()
+    );
+
     let sandbox = build_shared_sandbox(spec, oci_rootfs_plan.as_ref(), guest.as_ref())?;
 
     let observed = workflow
