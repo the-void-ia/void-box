@@ -532,6 +532,8 @@ fn load_kernel_modules() {
         ("failover.ko", String::new(), false),
         ("net_failover.ko", String::new(), false),
         ("virtio_net.ko", String::new(), false),
+        // virtiofs module (for macOS/VZ host directory sharing — OCI rootfs)
+        ("virtiofs.ko", String::new(), false),
         // 9p filesystem modules (for host directory sharing — optional, missing on macOS)
         ("9pnet.ko", String::new(), false),
         ("netfs.ko", String::new(), false),
@@ -811,6 +813,11 @@ fn setup_oci_rootfs() {
     };
     kmsg(&format!("Setting up OCI rootfs from {}", lowerdir));
 
+    // Preserve DNS config before pivot_root (network setup wrote resolv.conf;
+    // on VZ/DHCP it's 8.8.8.8, on KVM/SLIRP it's 10.0.2.3).
+    let resolv_contents = std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_else(|_| "nameserver 10.0.2.3\n".to_string());
+
     let newroot = "/mnt/newroot";
     // Overlay requires upperdir and workdir to be on the same filesystem.
     // Use one tmpfs parent and create both subdirs inside it.
@@ -1050,9 +1057,9 @@ fn setup_oci_rootfs() {
     let _ = std::fs::create_dir_all("/home/sandbox");
     let _ = std::fs::create_dir_all("/etc/voidbox");
 
-    // Preserve DNS inside the new root. Network setup happened before root switch.
+    // Preserve DNS inside the new root (saved before pivot_root).
     // Force a regular resolv.conf (not a dangling symlink from base image layers).
-    ensure_resolv_conf("nameserver 10.0.2.3\n");
+    ensure_resolv_conf(&resolv_contents);
 
     // Chown workspace and home to sandbox user (uid 1000)
     unsafe {

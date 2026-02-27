@@ -71,7 +71,7 @@ workflow:
             node /app/openclaw.mjs config set --json channels.telegram.allowFrom '["*"]'
             node /app/openclaw.mjs config set channels.telegram.dmPolicy "open"
 
-            OLLAMA_PROVIDER_JSON="{\"baseUrl\":\"${OLLAMA_BASE_URL}\",\"apiKey\":\"${OLLAMA_API_KEY}\",\"api\":\"ollama\",\"models\":[{\"id\":\"${OLLAMA_MODEL}\",\"name\":\"Ollama ${OLLAMA_MODEL}\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":16384,\"maxTokens\":4096}]}"
+            OLLAMA_PROVIDER_JSON="{\"baseUrl\":\"${OLLAMA_BASE_URL}\",\"apiKey\":\"${OLLAMA_API_KEY}\",\"api\":\"ollama\",\"models\":[{\"id\":\"${OLLAMA_MODEL}\",\"name\":\"Ollama ${OLLAMA_MODEL}\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":32768,\"maxTokens\":4096}]}"
             node /app/openclaw.mjs config set --json models.providers.ollama "${OLLAMA_PROVIDER_JSON}"
             node /app/openclaw.mjs config set agents.defaults.model.primary "ollama/${OLLAMA_MODEL}"
 
