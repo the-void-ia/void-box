@@ -72,6 +72,8 @@ pub struct StepContext {
     env: HashMap<String, String>,
     /// Working directory
     working_dir: Option<String>,
+    /// Timeout in seconds for sandbox exec calls
+    timeout_secs: Option<u64>,
 }
 
 impl StepContext {
@@ -88,6 +90,7 @@ impl StepContext {
             input: None,
             env: HashMap::new(),
             working_dir: None,
+            timeout_secs: None,
         }
     }
 
@@ -126,7 +129,10 @@ impl StepContext {
 
     /// Execute a command in the sandbox
     pub async fn exec(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
-        let output = self.sandbox.exec(program, args).await?;
+        let output = self
+            .sandbox
+            .exec_with_options(program, args, &[], self.timeout_secs)
+            .await?;
         if output.success() {
             Ok(output.stdout)
         } else {
@@ -145,7 +151,10 @@ impl StepContext {
         args: &[&str],
         stdin: &[u8],
     ) -> Result<Vec<u8>> {
-        let output = self.sandbox.exec_with_stdin(program, args, stdin).await?;
+        let output = self
+            .sandbox
+            .exec_with_options(program, args, stdin, self.timeout_secs)
+            .await?;
         if output.success() {
             Ok(output.stdout)
         } else {
@@ -192,6 +201,7 @@ pub struct StepContextBuilder {
     input: Option<Vec<u8>>,
     env: HashMap<String, String>,
     working_dir: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 impl StepContextBuilder {
@@ -204,6 +214,7 @@ impl StepContextBuilder {
             input: None,
             env: HashMap::new(),
             working_dir: None,
+            timeout_secs: None,
         }
     }
 
@@ -237,6 +248,12 @@ impl StepContextBuilder {
         self
     }
 
+    /// Set timeout in seconds for sandbox exec calls
+    pub fn with_timeout(mut self, timeout_secs: Option<u64>) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
     /// Build the context
     pub fn build(self) -> StepContext {
         StepContext {
@@ -246,6 +263,7 @@ impl StepContextBuilder {
             input: self.input,
             env: self.env,
             working_dir: self.working_dir,
+            timeout_secs: self.timeout_secs,
         }
     }
 }

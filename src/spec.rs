@@ -223,12 +223,22 @@ pub struct WorkflowSpec {
     pub output_step: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StepMode {
+    Service,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStepSpec {
     pub name: String,
     pub run: WorkflowRunSpec,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub mode: Option<StepMode>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,8 +341,102 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
             if workflow.steps.is_empty() {
                 return Err(Error::Config("workflow.steps cannot be empty".into()));
             }
+            for step in &workflow.steps {
+                if step.mode == Some(StepMode::Service) && step.timeout_secs.is_some() {
+                    return Err(Error::Config(format!(
+                        "step '{}': mode: service and timeout_secs are mutually exclusive",
+                        step.name
+                    )));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_step_mode_service_parses() {
+        let yaml = r#"
+api_version: v1
+kind: workflow
+name: test
+workflow:
+  steps:
+    - name: svc
+      mode: service
+      run:
+        program: sleep
+        args: ["infinity"]
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let step = &spec.workflow.unwrap().steps[0];
+        assert_eq!(step.mode, Some(StepMode::Service));
+        assert!(step.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn workflow_step_timeout_secs_parses() {
+        let yaml = r#"
+api_version: v1
+kind: workflow
+name: test
+workflow:
+  steps:
+    - name: build
+      timeout_secs: 300
+      run:
+        program: make
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let step = &spec.workflow.unwrap().steps[0];
+        assert!(step.mode.is_none());
+        assert_eq!(step.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn workflow_step_mode_service_and_timeout_rejects() {
+        let yaml = r#"
+api_version: v1
+kind: workflow
+name: test
+workflow:
+  steps:
+    - name: bad
+      mode: service
+      timeout_secs: 300
+      run:
+        program: sleep
+        args: ["infinity"]
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn workflow_step_no_mode_no_timeout_parses() {
+        let yaml = r#"
+api_version: v1
+kind: workflow
+name: test
+workflow:
+  steps:
+    - name: plain
+      run:
+        program: echo
+        args: ["hello"]
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let step = &spec.workflow.unwrap().steps[0];
+        assert!(step.mode.is_none());
+        assert!(step.timeout_secs.is_none());
+    }
 }

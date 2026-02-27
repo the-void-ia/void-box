@@ -63,6 +63,7 @@ workflow:
 
     - name: gateway
       depends_on: [smoke_message]
+      mode: service
       run:
         program: sh
         args:

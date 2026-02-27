@@ -117,7 +117,8 @@ impl Scheduler {
 
                 let outputs_snapshot = step_outputs.read().await.clone();
                 let mut ctx_builder = StepContextBuilder::new(step_name, sandbox.clone())
-                    .with_outputs(outputs_snapshot.clone());
+                    .with_outputs(outputs_snapshot.clone())
+                    .with_timeout(step.timeout_secs);
 
                 if let Some(input) =
                     resolve_pipe_input(step_name, &workflow.compositions, &outputs_snapshot)
@@ -172,6 +173,7 @@ impl Scheduler {
                     let name = step_name.clone();
                     let func = step.func.clone();
                     let retry = step.retry.clone();
+                    let step_timeout = step.timeout_secs;
                     let sb = sandbox.clone();
                     let compositions = workflow.compositions.clone();
                     let outputs_snap = outputs_snapshot.clone();
@@ -181,8 +183,9 @@ impl Scheduler {
                     join_set.spawn(async move {
                         let mut step_span = observer.start_step_span(&name, Some(&wf_ctx));
 
-                        let mut ctx_builder =
-                            StepContextBuilder::new(&name, sb).with_outputs(outputs_snap.clone());
+                        let mut ctx_builder = StepContextBuilder::new(&name, sb)
+                            .with_outputs(outputs_snap.clone())
+                            .with_timeout(step_timeout);
 
                         if let Some(input) = resolve_pipe_input(&name, &compositions, &outputs_snap)
                         {

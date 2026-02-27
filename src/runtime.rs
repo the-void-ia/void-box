@@ -13,7 +13,7 @@ use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::spec::{
     load_spec, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec, PipelineStageSpec, RunKind,
-    RunSpec, SkillEntry,
+    RunSpec, SkillEntry, StepMode,
 };
 
 /// Tracks host directories created for pipeline stage outputs.
@@ -295,6 +295,16 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     for step in &w.steps {
         for dep in &step.depends_on {
             builder = builder.pipe(dep, &step.name);
+        }
+    }
+
+    for step in &w.steps {
+        let effective_timeout = match step.mode {
+            Some(StepMode::Service) => Some(0u64),
+            None => step.timeout_secs,
+        };
+        if let Some(t) = effective_timeout {
+            builder = builder.timeout(&step.name, t);
         }
     }
 

@@ -118,6 +118,29 @@ impl LocalSandbox {
         backend.exec(program, args, stdin, &env, None, None).await
     }
 
+    /// Execute a command with stdin input and an explicit timeout.
+    pub async fn exec_with_options(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecOutput> {
+        if self.config.kernel.is_none() {
+            return self.simulate_exec(program, args, stdin);
+        }
+
+        self.ensure_started().await?;
+
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+
+        let env: Vec<(String, String)> = self.config.env.clone();
+        backend
+            .exec(program, args, stdin, &env, None, timeout_secs)
+            .await
+    }
+
     /// Simulate command execution (for testing without a real VM)
     fn simulate_exec(&self, program: &str, args: &[&str], stdin: &[u8]) -> Result<ExecOutput> {
         match program {
