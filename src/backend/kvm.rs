@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::backend::control_channel::{ControlChannel, GuestStream};
 use crate::backend::{BackendConfig, VmmBackend};
@@ -113,7 +113,7 @@ impl VmmBackend for KvmBackend {
         self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
         self.vm = Some(vm);
 
-        info!("KvmBackend started with CID {}", self.cid);
+        debug!("KvmBackend started with CID {}", self.cid);
         Ok(())
     }
 

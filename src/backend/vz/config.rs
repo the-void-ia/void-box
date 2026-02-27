@@ -14,7 +14,7 @@ use crate::backend::BackendConfig;
 pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
     let mut parts = vec![
         "console=hvc0".to_string(),
-        "loglevel=4".to_string(),
+        "loglevel=0".to_string(),
         "reboot=k".to_string(),
         "panic=1".to_string(),
         // No pci=off — VZ needs PCI for virtio

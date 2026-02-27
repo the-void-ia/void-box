@@ -56,7 +56,7 @@ impl VsockDevice {
             )));
         }
 
-        info!(
+        debug!(
             "Creating vsock device with CID {} (host connects to guest via AF_VSOCK)",
             cid
         );
@@ -110,7 +110,7 @@ impl VsockDevice {
             .write_all(&msg_bytes)
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        info!("vsock: sent ExecRequest, waiting for ExecResponse");
+        debug!("vsock: sent ExecRequest, waiting for ExecResponse");
         // Read messages in a loop, discarding streaming ExecOutputChunk
         // messages until we get the final ExecResponse. The guest-agent
         // always streams stdout/stderr chunks during execution.
@@ -123,7 +123,7 @@ impl VsockDevice {
                 }
                 MessageType::ExecResponse => {
                     let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    info!(
+                    debug!(
                         "vsock: ExecResponse received exit_code={}",
                         response.exit_code
                     );
@@ -178,7 +178,7 @@ impl VsockDevice {
             .write_all(&msg_bytes)
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        info!("vsock: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
+        debug!("vsock: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
 
         // Read messages in a loop until we get the final ExecResponse
         loop {
@@ -191,7 +191,7 @@ impl VsockDevice {
                 }
                 MessageType::ExecResponse => {
                     let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    info!(
+                    debug!(
                         "vsock: ExecResponse received (streaming) exit_code={}",
                         response.exit_code
                     );

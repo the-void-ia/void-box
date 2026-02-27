@@ -8,7 +8,7 @@ use linux_loader::bootparam::boot_params;
 use linux_loader::loader::bzimage::BzImage;
 use linux_loader::loader::elf::Elf as ElfLoader;
 use linux_loader::loader::KernelLoader;
-use tracing::{debug, info};
+use tracing::debug;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryMmap};
 
 use crate::vmm::kvm::{layout, Vm};
@@ -39,7 +39,7 @@ pub fn load_kernel(
 
     // Detect kernel format and load it
     let (kernel_load_addr, kernel_entry) = load_kernel_image(guest_memory, &mut kernel_file)?;
-    info!(
+    debug!(
         "Loaded kernel at {:#x}, entry point {:#x}",
         kernel_load_addr, kernel_entry
     );
@@ -225,7 +225,7 @@ fn load_initramfs(
 
     // Verify first bytes were written correctly
     let verify = read_from_guest(guest_memory, initramfs_addr, 16)?;
-    info!(
+    debug!(
         "Loaded initramfs at {:#x}, size {} bytes, first bytes: {:02x?}",
         initramfs_addr.raw_value(),
         initramfs_size,
