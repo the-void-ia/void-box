@@ -3,7 +3,6 @@
 //! Provides a simple serial console using vm-superio's Serial device.
 //! The serial port handles I/O at ports 0x3f8-0x3ff (COM1).
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -92,12 +91,8 @@ impl SerialDevice {
                     // Transmit Holding Register - output character
                     trace!("Serial TX: {:02x} '{}'", value, value as char);
 
-                    // Try to send to output channel
+                    // Send to output channel
                     let _ = inner.output_tx.try_send(value);
-
-                    // Also print to stdout for debugging
-                    let _ = std::io::stdout().write_all(&[value]);
-                    let _ = std::io::stdout().flush();
                 }
             }
             1 => {

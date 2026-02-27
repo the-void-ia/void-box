@@ -11,7 +11,7 @@ pub use crate::backend::{ResourceLimits, DEFAULT_COMMAND_ALLOWLIST};
 ///
 /// All security features are mandatory by default. No opt-out toggles
 /// unless there's a concrete development need.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecurityConfig {
     /// 32-byte session secret for vsock authentication.
     /// Auto-generated via `getrandom` in `Default`.
@@ -28,6 +28,26 @@ pub struct SecurityConfig {
     pub max_concurrent_connections: usize,
     /// Whether to install seccomp-bpf filter on the VMM process.
     pub seccomp: bool,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurityConfig")
+            .field("session_secret", &"[REDACTED]")
+            .field("command_allowlist", &self.command_allowlist)
+            .field("resource_limits", &self.resource_limits)
+            .field("network_deny_list", &self.network_deny_list)
+            .field(
+                "max_connections_per_second",
+                &self.max_connections_per_second,
+            )
+            .field(
+                "max_concurrent_connections",
+                &self.max_concurrent_connections,
+            )
+            .field("seccomp", &self.seccomp)
+            .finish()
+    }
 }
 
 impl Default for SecurityConfig {
@@ -185,8 +205,7 @@ impl VoidBoxConfig {
     pub fn kernel_cmdline(&self) -> String {
         let mut cmdline = vec![
             "console=ttyS0".to_string(),
-            "loglevel=4".to_string(), // Suppress INFO messages (keeps warnings/errors)
-            "earlyprintk=serial,ttyS0,115200".to_string(),
+            "loglevel=0".to_string(), // Suppress kernel console messages
             "reboot=k".to_string(),
             "panic=1".to_string(),
             "pci=off".to_string(),

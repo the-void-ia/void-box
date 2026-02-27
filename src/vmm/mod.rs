@@ -109,7 +109,7 @@ enum VmCommand {
 impl MicroVm {
     /// Create and start a new micro-VM with the given configuration
     pub async fn new(config: VoidBoxConfig) -> Result<Self> {
-        info!("Creating new MicroVm with config: {:?}", config);
+        debug!("Full MicroVm config: {:?}", config);
 
         // Validate configuration
         config.validate()?;
@@ -157,7 +157,7 @@ impl MicroVm {
             match VirtioVsockMmio::new_with_require_vhost(cid, true) {
                 Ok(mut dev) => {
                     dev.set_mmio_base(0xd080_0000);
-                    info!("virtio-vsock MMIO at {:#x}, CID {}", dev.mmio_base(), cid);
+                    debug!("virtio-vsock MMIO at {:#x}, CID {}", dev.mmio_base(), cid);
                     Some(Arc::new(Mutex::new(dev)))
                 }
                 Err(e) => {
@@ -182,7 +182,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             )?));
             let mut net_device = VirtioNetDevice::new(slirp)?;
             net_device.set_mmio_base(0xd000_0000);
-            info!(
+            debug!(
                 "virtio-net enabled at MMIO {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 net_device.mmio_base(),
                 net_device.mac()[0],
@@ -206,7 +206,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             let mut dev =
                 Virtio9pDevice::new(&first_mount.host_path, "mount0", first_mount.read_only);
             dev.set_mmio_base(0xd100_0000);
-            info!(
+            debug!(
                 "virtio-9p MMIO at {:#x}, tag='mount0', root={}",
                 dev.mmio_base(),
                 first_mount.host_path,
@@ -219,7 +219,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         let virtio_blk = if let Some(ref disk_path) = config.oci_rootfs_disk {
             let mut dev = VirtioBlkDevice::new(disk_path)?;
             dev.set_mmio_base(0xd180_0000);
-            info!(
+            debug!(
                 "virtio-blk MMIO at {:#x}, disk={}",
                 dev.mmio_base(),
                 disk_path.display()
@@ -405,7 +405,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         }
         debug!("Set PR_SET_NO_NEW_PRIVS");
 
-        info!(
+        debug!(
             "MicroVm started with CID {}, network={}",
             cid, config.network
         );
@@ -850,7 +850,7 @@ fn install_seccomp_filter() -> Result<()> {
     seccompiler::apply_filter(&bpf_prog)
         .map_err(|e| Error::Config(format!("Failed to apply seccomp filter: {:?}", e)))?;
 
-    info!(
+    debug!(
         "Seccomp-BPF filter installed ({} syscalls allowed)",
         allowed_syscalls.len()
     );

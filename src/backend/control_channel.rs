@@ -84,7 +84,7 @@ impl ControlChannel {
             .write_all(&message.serialize())
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        info!("control_channel: sent ExecRequest, waiting for ExecResponse");
+        debug!("control_channel: sent ExecRequest, waiting for ExecResponse");
 
         loop {
             let msg = Message::read_from_sync(&mut *stream)?;
@@ -92,7 +92,7 @@ impl ControlChannel {
                 MessageType::ExecOutputChunk => continue,
                 MessageType::ExecResponse => {
                     let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    info!(
+                    debug!(
                         "control_channel: ExecResponse received exit_code={}",
                         response.exit_code
                     );
@@ -135,7 +135,7 @@ impl ControlChannel {
             .write_all(&message.serialize())
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        info!("control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
+        debug!("control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
 
         loop {
             let msg = Message::read_from_sync(&mut *stream)?;
@@ -147,7 +147,7 @@ impl ControlChannel {
                 }
                 MessageType::ExecResponse => {
                     let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    info!(
+                    debug!(
                         "control_channel: ExecResponse received (streaming) exit_code={}",
                         response.exit_code
                     );
@@ -186,7 +186,7 @@ impl ControlChannel {
             .write_all(&message.serialize())
             .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
 
-        info!("control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
+        debug!("control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
 
         tokio::task::spawn_blocking(move || loop {
             let msg = Message::read_from_sync(&mut *stream)?;
@@ -198,7 +198,7 @@ impl ControlChannel {
                 }
                 MessageType::ExecResponse => {
                     let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    info!(
+                    debug!(
                         "control_channel: ExecResponse received (streaming) exit_code={}",
                         response.exit_code
                     );

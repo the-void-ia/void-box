@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -58,6 +58,9 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .ok_or("run requires --file <path>")?;
     let input = arg_value(args, "--input");
+
+    let spec = load_spec(&file)?;
+    print_startup_banner(&spec.sandbox);
 
     let report = run_file(&file, input).await?;
     println!("name: {}", report.name);
@@ -414,6 +417,34 @@ NOTES:
   - TUI logo file: set VOIDBOX_LOGO_ASCII_PATH or pass --logo-ascii <path>.
   - LLM override envs for `run`: VOIDBOX_LLM_PROVIDER, VOIDBOX_LLM_MODEL, VOIDBOX_LLM_BASE_URL, VOIDBOX_LLM_API_KEY_ENV."#
     );
+}
+
+fn print_startup_banner(sandbox: &void_box::spec::SandboxSpec) {
+    let banner = concat!(
+        " ██╗   ██╗ ██████╗ ██╗██████╗        ██████╗  ██████╗ ██╗  ██╗\n",
+        " ██║   ██║██╔═══██╗██║██╔══██╗       ██╔══██╗██╔═══██╗╚██╗██╔╝\n",
+        " ██║   ██║██║   ██║██║██║  ██║       ██████╔╝██║   ██║ ╚███╔╝\n",
+        " ╚██╗ ██╔╝██║   ██║██║██║  ██║█████╗ ██╔══██╗██║   ██║ ██╔██╗\n",
+        "  ╚████╔╝ ╚██████╔╝██║██████╔╝╚════╝ ██████╔╝╚██████╔╝██╔╝ ██╗\n",
+        "   ╚═══╝   ╚═════╝ ╚═╝╚═════╝        ╚═════╝  ╚═════╝ ╚═╝  ╚═╝",
+    );
+    let version = env!("CARGO_PKG_VERSION");
+    let net = if sandbox.network { "on" } else { "off" };
+    let mut summary = format!(
+        "  {}MB RAM · {} vCPUs · network={}",
+        sandbox.memory_mb, sandbox.vcpus, net
+    );
+    if sandbox.image.is_some() {
+        summary.push_str(" · oci=yes");
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "\x1b[38;5;153m{}  v{}\n\n{}\x1b[0m\n",
+            banner, version, summary
+        );
+    } else {
+        eprintln!("{}  v{}\n\n{}\n", banner, version, summary);
+    }
 }
 
 fn print_logo_header(args: &[String]) {
