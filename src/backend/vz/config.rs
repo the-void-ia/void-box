@@ -38,7 +38,9 @@ pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
     parts.push(format!("voidbox.clock={}", epoch_secs));
 
     // Disable IPv6 if networking is enabled (our guest stack is IPv4 only)
+    // voidbox.network=1: guest-agent uses this to run setup_network() (VZ has no virtio_mmio in cmdline)
     if config.network {
+        parts.push("voidbox.network=1".to_string());
         parts.push("ipv6.disable=1".to_string());
     }
 

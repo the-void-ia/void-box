@@ -631,9 +631,15 @@ fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverri
 /// Resolve an env-var value: if the spec value is empty (`""`), read the
 /// actual value from the host process environment. This lets YAML authors
 /// write `GITHUB_TOKEN: ""` to mean "inject from host".
+///
+/// For `OLLAMA_BASE_URL`, host env overrides the spec so macOS users can set
+/// `OLLAMA_BASE_URL=http://192.168.64.1:11434` (VZ NAT) instead of the default
+/// `10.0.2.2` (Linux SLIRP).
 fn resolve_env_value(key: &str, spec_value: &str) -> String {
     if spec_value.is_empty() {
         std::env::var(key).unwrap_or_default()
+    } else if key == "OLLAMA_BASE_URL" {
+        std::env::var(key).unwrap_or_else(|_| spec_value.to_string())
     } else {
         spec_value.to_string()
     }

@@ -5,6 +5,17 @@ guest agent from initramfs, optionally performs an OCI root switch, and exposes
 a host↔guest API over vsock. This file covers architecture, testing, validation,
 and debugging guidance for agents working on the project.
 
+## Platform parity
+
+**Contributions must work on both Linux (KVM) and macOS (VZ).** Validate on both
+where applicable. Key platform differences:
+
+| Concern | Linux (KVM) | macOS (VZ) |
+|---------|-------------|------------|
+| Kernel | `vmlinuz` (compressed OK) | `vmlinux` (uncompressed); `download_kernel.sh` uses `extract-vmlinux` |
+| Network detection | `virtio_mmio.device=512@0xd0000000:10` in cmdline | `voidbox.network=1` in cmdline (VZ uses PCI) |
+| Kernel modules | Host or pinned; `build_test_image.sh` | `guest_macos.sh`; `VOID_BOX_KMOD_VERSION` must match `download_kernel.sh` |
+
 ## Architecture overview
 
 - Host runtime launches a VM backend (`KvmBackend` on Linux, `VzBackend` on macOS).
@@ -210,9 +221,10 @@ all required gates are explicit.
   export TMPDIR=$PWD/target/tmp
   mkdir -p "$TMPDIR"
   ```
-- Set kernel once:
+- Set kernel once (Linux: host kernel; macOS: `scripts/download_kernel.sh` then `VOID_BOX_KERNEL=target/vmlinux-arm64`):
   ```bash
-  export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
+  export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)   # Linux
+  export VOID_BOX_KERNEL=target/vmlinux-arm64        # macOS
   ```
 - VM suites require usable KVM/vsock (not only device presence).
 
@@ -244,6 +256,8 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 macOS (VZ):
 
 ```bash
+scripts/download_kernel.sh
+export VOID_BOX_KERNEL=target/vmlinux-arm64
 export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1

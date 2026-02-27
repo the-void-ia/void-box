@@ -71,7 +71,7 @@ jobs:
       - name: Download arm64 Linux kernel
         run: |
           scripts/download_kernel.sh
-          cp target/vmlinuz-arm64 /tmp/void-box-kernel
+          cp target/vmlinux-arm64 /tmp/void-box-kernel
 
       # ---- Run conformance tests ----
       - name: Run conformance E2E tests
