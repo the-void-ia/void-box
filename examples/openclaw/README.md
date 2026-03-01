@@ -1,5 +1,7 @@
 # OpenClaw Examples
 
+![OpenClaw demo](../../assets/openclaw-demo.gif)
+
 This folder contains the OpenClaw-focused workflow specs.
 
 ## Files
