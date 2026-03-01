@@ -162,6 +162,49 @@ impl Sandbox {
         }
     }
 
+    /// Execute a command with streaming output.
+    ///
+    /// Returns a channel of `ExecOutputChunk` and a oneshot for the final
+    /// `ExecResponse`. For Mock sandboxes, falls back to non-streaming exec
+    /// and wraps the result in channels.
+    pub async fn exec_streaming(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout_secs: Option<u64>,
+    ) -> Result<(
+        tokio::sync::mpsc::Receiver<crate::guest::protocol::ExecOutputChunk>,
+        tokio::sync::oneshot::Receiver<Result<crate::guest::protocol::ExecResponse>>,
+    )> {
+        match &self.inner {
+            SandboxInner::Local(local) => local.exec_streaming(program, args, timeout_secs).await,
+            SandboxInner::Mock(mock) => {
+                use crate::guest::protocol::{ExecOutputChunk, ExecResponse};
+
+                let output = mock.exec_with_stdin(program, args, &[]).await?;
+                let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(1);
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+                if !output.stdout.is_empty() {
+                    let _ = chunk_tx
+                        .send(ExecOutputChunk {
+                            stream: "stdout".to_string(),
+                            data: output.stdout.clone(),
+                            seq: 0,
+                        })
+                        .await;
+                }
+                let _ = resp_tx.send(Ok(ExecResponse::success(
+                    output.stdout,
+                    output.stderr,
+                    output.exit_code,
+                    0,
+                )));
+                Ok((chunk_rx, resp_rx))
+            }
+        }
+    }
+
     /// Check if a file exists in the sandbox
     pub async fn file_exists(&self, path: &str) -> Result<bool> {
         let output = self.exec("test", &["-e", path]).await?;

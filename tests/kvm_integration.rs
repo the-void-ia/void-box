@@ -341,7 +341,10 @@ async fn kvm_claude_workflow_plan_apply() {
     }
 
     assert!(
-        observed.result.output_str().contains("Mock applied")
+        observed
+            .result
+            .output_str()
+            .contains("Mock execution complete")
             || observed.result.output_str().contains("applied"),
         "apply step output: {}",
         observed.result.output_str()

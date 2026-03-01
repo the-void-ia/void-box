@@ -59,8 +59,11 @@ const OCI_FAIL_PIVOT_ROOT_EBUSY: u8 = 21;
 const OCI_FAIL_PIVOT_ROOT_EPERM: u8 = 22;
 const OCI_FAIL_PIVOT_ROOT_ENOENT: u8 = 23;
 const OCI_FAIL_PIVOT_ROOT: u8 = 24;
+const OCI_FAIL_MOUNT_SHARED: u8 = 25;
 
 static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
+/// Stores the last OCI setup error detail (e.g., mount failure reasons).
+static OCI_SETUP_ERROR_DETAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn oci_status_str(code: u8) -> &'static str {
     match code {
@@ -83,6 +86,7 @@ fn oci_status_str(code: u8) -> &'static str {
         OCI_FAIL_PIVOT_ROOT_EPERM => "pivot-root-eperm",
         OCI_FAIL_PIVOT_ROOT_ENOENT => "pivot-root-enoent",
         OCI_FAIL_PIVOT_ROOT => "pivot-root-failed",
+        OCI_FAIL_MOUNT_SHARED => "mount-shared-failed",
         _ => "unknown",
     }
 }
@@ -133,10 +137,15 @@ fn wait_for_oci_setup_ready(timeout: std::time::Duration) -> Result<(), String> 
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             _ => {
+                let detail = OCI_SETUP_ERROR_DETAIL
+                    .get()
+                    .map(|s| format!(" [{}]", s))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "OCI rootfs setup failed (status={})",
-                    oci_status_str(code)
-                ))
+                    "OCI rootfs setup failed (status={}){}",
+                    oci_status_str(code),
+                    detail
+                ));
             }
         }
     }
@@ -283,6 +292,8 @@ fn main() {
 
     // Mount shared directories (virtiofs or 9p) specified via kernel cmdline.
     // Must happen after module loading (9p needs 9pnet_virtio.ko).
+    // In OCI rootfs mode, this is skipped — mounts are deferred to
+    // setup_oci_rootfs() which mounts directly inside the overlay newroot.
     mount_shared_dirs();
 
     // Set up networking after modules are loaded (virtio_net.ko creates eth0).
@@ -534,9 +545,10 @@ fn load_kernel_modules() {
         ("virtio_net.ko", String::new(), false),
         // virtiofs module (for macOS/VZ host directory sharing — OCI rootfs)
         ("virtiofs.ko", String::new(), false),
-        // 9p filesystem modules (for host directory sharing — optional, missing on macOS)
-        ("9pnet.ko", String::new(), false),
+        // 9p filesystem modules (for host directory sharing — optional, missing on macOS).
+        // Load order matters: netfs → 9pnet → 9p → 9pnet_virtio (dependency chain).
         ("netfs.ko", String::new(), false),
+        ("9pnet.ko", String::new(), false),
         ("9p.ko", String::new(), false),
         ("9pnet_virtio.ko", String::new(), false),
         // overlayfs module (required for OCI rootfs writable overlay + pivot_root)
@@ -627,18 +639,395 @@ fn load_module_file(path: &str, params: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Mount shared directories specified via kernel cmdline parameters.
+#[derive(Debug, PartialEq)]
+enum ProbeResult {
+    Ok,
+    WriteFailed,
+    PrivilegeDropFailed,
+    ForkFailed,
+    WaitFailed,
+}
+
+/// Fork a child that drops to uid 1000 and probes create+rename+delete writability.
+fn write_probe_as_sandbox(guest_path: &str) -> ProbeResult {
+    // Collision-safe name: pid + monotonic nanos
+    let nanos = {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    };
+    let probe_name = format!(".voidbox_probe_{}_{}", std::process::id(), nanos);
+    let probe_dir = format!("{}/{}", guest_path, probe_name);
+    let probe_renamed = format!("{}/{}_ok", guest_path, probe_name);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return ProbeResult::ForkFailed;
+    }
+
+    if pid == 0 {
+        // Child: drop privileges to sandbox user
+        unsafe {
+            // Clear supplementary groups
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                libc::_exit(2);
+            }
+            if libc::setgid(1000) != 0 {
+                libc::_exit(2);
+            }
+            if libc::setuid(1000) != 0 {
+                libc::_exit(2);
+            }
+        }
+
+        let result = (|| -> Result<(), std::io::Error> {
+            std::fs::create_dir(&probe_dir)?;
+            std::fs::rename(&probe_dir, &probe_renamed)?;
+            std::fs::remove_dir(&probe_renamed)?;
+            std::result::Result::Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            let _ = std::fs::remove_dir_all(&probe_renamed);
+        }
+
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) };
+    }
+
+    // Parent: wait for child (loop on EINTR)
+    let mut status: libc::c_int = 0;
+    loop {
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return ProbeResult::WaitFailed;
+        }
+    }
+
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        ProbeResult::Ok
+    } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 2 {
+        ProbeResult::PrivilegeDropFailed
+    } else {
+        ProbeResult::WriteFailed
+    }
+}
+
+fn log_probe_result(guest_path: &str, result: &ProbeResult) {
+    match result {
+        ProbeResult::Ok => kmsg(&format!(
+            "Write probe passed for {} (uid=1000 can create+rename+delete)",
+            guest_path
+        )),
+        ProbeResult::PrivilegeDropFailed => kmsg(&format!(
+            "WARNING: write probe could not drop to uid=1000 for {}",
+            guest_path
+        )),
+        ProbeResult::WriteFailed => kmsg(&format!(
+            "WARNING: write probe FAILED for {} — uid=1000 cannot write",
+            guest_path
+        )),
+        ProbeResult::ForkFailed => kmsg(&format!(
+            "WARNING: fork failed for write probe on {}",
+            guest_path
+        )),
+        ProbeResult::WaitFailed => kmsg(&format!(
+            "WARNING: waitpid failed for write probe on {}",
+            guest_path
+        )),
+    }
+}
+
+/// After mounting an rw shared directory, ensure uid 1000 can write to it.
 ///
-/// The host encodes mount config as `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>`.
-/// On macOS/VZ the filesystem type is `virtiofs`; on Linux/KVM it's `9p`.
-/// We try virtiofs first and fall back to 9p.
-fn mount_shared_dirs() {
-    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
-        Ok(c) => c,
-        Err(_) => return,
+/// Tries chown first, then runs a write probe as uid 1000. If the probe fails
+/// and this is a declared rw mount, falls back to chmod 0777 and re-probes.
+/// Check whether `path` is a mount point by comparing its device ID to its parent's.
+fn is_mount_point(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("/"));
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+    meta.dev() != parent_meta.dev()
+}
+
+fn ensure_mount_writable(guest_path: &str, is_rw_mount: bool) {
+    let c_path = match std::ffi::CString::new(guest_path) {
+        std::result::Result::Ok(p) => p,
+        Err(e) => {
+            kmsg(&format!(
+                "WARNING: invalid mount path '{}': {}",
+                guest_path, e
+            ));
+            return;
+        }
     };
 
-    let mut mounts: Vec<(String, String, bool)> = Vec::new(); // (tag, guest_path, read_only)
+    // Step 1: Try chown to sandbox user
+    let chown_ok = unsafe { libc::chown(c_path.as_ptr(), 1000, 1000) } == 0;
+    if chown_ok {
+        kmsg(&format!("chown {} to 1000:1000 succeeded", guest_path));
+    } else {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!(
+            "chown {} to 1000:1000 failed ({})",
+            guest_path, err
+        ));
+    }
+
+    // Step 2: Write probe as uid 1000
+    let result = write_probe_as_sandbox(guest_path);
+    log_probe_result(guest_path, &result);
+
+    if result == ProbeResult::Ok {
+        return;
+    }
+
+    // Only apply chmod fallback for actual write failures.
+    // Infra failures (fork/wait/privdrop) should not mutate permissions.
+    if result != ProbeResult::WriteFailed {
+        kmsg(&format!(
+            "WARNING: skipping chmod fallback for {} (probe error was {:?})",
+            guest_path, result
+        ));
+        return;
+    }
+
+    // Step 3: Fallback chmod 0777 — only for declared rw mounts from cmdline.
+    if !is_rw_mount {
+        kmsg(&format!(
+            "WARNING: {} is not a declared rw mount, skipping chmod fallback",
+            guest_path
+        ));
+        return;
+    }
+    let chmod_ok = unsafe { libc::chmod(c_path.as_ptr(), 0o777) } == 0;
+    if chmod_ok {
+        kmsg(&format!(
+            "Applied chmod 0777 fallback on {} (declared rw mount)",
+            guest_path
+        ));
+    } else {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!(
+            "WARNING: chmod 0777 {} failed: {} — mount may not be writable",
+            guest_path, err
+        ));
+        return;
+    }
+
+    // Step 4: Re-probe after chmod
+    let result = write_probe_as_sandbox(guest_path);
+    log_probe_result(guest_path, &result);
+}
+
+/// Dump diagnostic info when a post-pivot mount is missing.
+/// Logs /proc/filesystems, /proc/mounts, and virtio sysfs state.
+fn dump_mount_diagnostics(tag: &str, guest_path: &str) {
+    kmsg(&format!(
+        "=== mount diagnostics for tag='{}' path='{}' ===",
+        tag, guest_path
+    ));
+
+    // Check supported filesystem types
+    if let Ok(fs_types) = std::fs::read_to_string("/proc/filesystems") {
+        let relevant: Vec<&str> = fs_types
+            .lines()
+            .filter(|l| l.contains("9p") || l.contains("virtiofs"))
+            .collect();
+        if relevant.is_empty() {
+            kmsg("  /proc/filesystems: NO 9p or virtiofs support");
+        } else {
+            for line in &relevant {
+                kmsg(&format!("  /proc/filesystems: {}", line.trim()));
+            }
+        }
+    } else {
+        kmsg("  /proc/filesystems: unreadable");
+    }
+
+    // Show current mounts (look for 9p/virtiofs/overlay)
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let relevant: Vec<&str> = mounts
+            .lines()
+            .filter(|l| {
+                l.contains("9p")
+                    || l.contains("virtiofs")
+                    || l.contains(tag)
+                    || l.contains(guest_path)
+            })
+            .collect();
+        if relevant.is_empty() {
+            kmsg("  /proc/mounts: no 9p/virtiofs/tag matches");
+        } else {
+            for line in &relevant {
+                kmsg(&format!("  /proc/mounts: {}", line));
+            }
+        }
+    } else {
+        kmsg("  /proc/mounts: unreadable");
+    }
+
+    // Check virtio devices in sysfs
+    let sysfs_path = "/sys/bus/virtio/devices";
+    match std::fs::read_dir(sysfs_path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let dev = entry.path();
+                let dev_name = dev
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                // Read device type
+                let id_path = dev.join("device");
+                let dev_type = std::fs::read_to_string(&id_path)
+                    .unwrap_or_else(|_| "?".into())
+                    .trim()
+                    .to_string();
+                // For 9p devices (type 9), try to read the mount_tag
+                let tag_info = if dev_type.trim_start_matches("0x") == "9"
+                    || dev_type == "9"
+                    || dev_type == "0x0009"
+                {
+                    std::fs::read_to_string(dev.join("mount_tag"))
+                        .unwrap_or_else(|_| "?".into())
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                kmsg(&format!(
+                    "  sysfs: {} type={} {}",
+                    dev_name,
+                    dev_type,
+                    if tag_info.is_empty() {
+                        String::new()
+                    } else {
+                        format!("mount_tag={}", tag_info)
+                    }
+                ));
+            }
+        }
+        Err(e) => kmsg(&format!("  sysfs: {} unreadable: {}", sysfs_path, e)),
+    }
+
+    // Check if target path exists and its metadata
+    match std::fs::metadata(guest_path) {
+        Ok(meta) => {
+            kmsg(&format!(
+                "  target: {} exists, dev={}, ino={}",
+                guest_path,
+                meta.dev(),
+                meta.ino()
+            ));
+        }
+        Err(e) => kmsg(&format!("  target: {} — {}", guest_path, e)),
+    }
+    kmsg("=== end mount diagnostics ===");
+}
+
+/// Attempt to mount a shared directory via virtiofs or 9p.
+/// Returns Ok(()) on success, Err(diagnostic string) on failure.
+fn try_mount_9p_virtiofs(tag: &str, guest_path: &str, read_only: bool) -> Result<(), String> {
+    let tag_cstr = std::ffi::CString::new(tag).unwrap();
+    let path_cstr = std::ffi::CString::new(guest_path).unwrap();
+    let virtiofs_type = std::ffi::CString::new("virtiofs").unwrap();
+    let p9_type = std::ffi::CString::new("9p").unwrap();
+    let ro_flag: libc::c_ulong = if read_only {
+        libc::MS_RDONLY as libc::c_ulong
+    } else {
+        0
+    };
+
+    let mut errors = Vec::new();
+
+    // Try virtiofs first (macOS/VZ)
+    let ret = unsafe {
+        libc::mount(
+            tag_cstr.as_ptr(),
+            path_cstr.as_ptr(),
+            virtiofs_type.as_ptr(),
+            ro_flag,
+            std::ptr::null(),
+        )
+    };
+    if ret == 0 {
+        kmsg(&format!("Mounted virtiofs '{}' at {}", tag, guest_path));
+        return Ok(());
+    }
+    let virtiofs_err = std::io::Error::last_os_error();
+    errors.push(format!("virtiofs: {}", virtiofs_err));
+
+    // Try 9p with trans=virtio (Linux/KVM).
+    // RW mounts need access control that allows uid 1000; kernels vary in
+    // which access= modes are accepted, so try a compatibility chain.
+    let p9_candidates: Vec<String> = if read_only {
+        vec!["trans=virtio,version=9p2000.L,ro".to_string()]
+    } else {
+        vec![
+            "trans=virtio,version=9p2000.L,access=any".to_string(),
+            "trans=virtio,version=9p2000.L,access=1000".to_string(),
+            "trans=virtio,version=9p2000.L".to_string(),
+        ]
+    };
+
+    for opts in &p9_candidates {
+        let p9_opts = std::ffi::CString::new(opts.as_str()).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                tag_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                p9_type.as_ptr(),
+                ro_flag,
+                p9_opts.as_ptr() as *const libc::c_void,
+            )
+        };
+        if ret == 0 {
+            let mode = if read_only { "ro" } else { "rw" };
+            kmsg(&format!(
+                "Mounted 9p '{}' at {} ({}) with opts '{}'",
+                tag, guest_path, mode, opts
+            ));
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        errors.push(format!("9p({}): {}", opts, err));
+        kmsg(&format!(
+            "9p mount attempt failed for '{}' at {} with opts '{}': {}",
+            tag, guest_path, opts, err
+        ));
+    }
+
+    Err(errors.join("; "))
+}
+
+/// Parse shared mount entries from `/proc/cmdline`.
+fn parse_shared_mount_entries() -> Vec<(String, String, bool)> {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_shared_mount_entries_from(&cmdline)
+}
+
+/// Parse shared mount entries from a given kernel cmdline string.
+///
+/// Each `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>` parameter produces a
+/// `(tag, guest_path, read_only)` tuple. When the mode suffix is omitted the
+/// mount defaults to read-only.
+fn parse_shared_mount_entries_from(cmdline: &str) -> Vec<(String, String, bool)> {
+    let mut mounts: Vec<(String, String, bool)> = Vec::new();
 
     for param in cmdline.split_whitespace() {
         // Match voidbox.mount0=mount0:/workspace/output:rw
@@ -657,6 +1046,28 @@ fn mount_shared_dirs() {
         }
     }
 
+    mounts
+}
+
+/// Mount shared directories specified via kernel cmdline parameters.
+///
+/// The host encodes mount config as `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>`.
+/// On macOS/VZ the filesystem type is `virtiofs`; on Linux/KVM it's `9p`.
+/// We try virtiofs first and fall back to 9p.
+///
+/// When OCI rootfs is configured, shared mounts are deferred to
+/// `setup_oci_rootfs()` which mounts them directly inside the overlay
+/// newroot before pivot_root.  Mounting here AND in setup_oci_rootfs
+/// would cause a double-mount on the same virtio device, which hangs
+/// on some kernels.
+fn mount_shared_dirs() {
+    if oci_rootfs_requested() {
+        kmsg("Skipping early shared mounts — OCI rootfs mode will mount inside overlay");
+        return;
+    }
+
+    let mounts = parse_shared_mount_entries();
+
     if mounts.is_empty() {
         return;
     }
@@ -668,7 +1079,6 @@ fn mount_shared_dirs() {
     ));
 
     for (tag, guest_path, read_only) in &mounts {
-        // Create the mount point
         if let Err(e) = std::fs::create_dir_all(guest_path) {
             kmsg(&format!(
                 "WARNING: failed to create mount point {}: {}",
@@ -677,66 +1087,14 @@ fn mount_shared_dirs() {
             continue;
         }
 
-        let mode = if *read_only { "ro" } else { "rw" };
-
-        // Try virtiofs first (macOS/VZ), then 9p (Linux/KVM)
-        let tag_cstr = std::ffi::CString::new(tag.as_str()).unwrap();
-        let path_cstr = std::ffi::CString::new(guest_path.as_str()).unwrap();
-        let virtiofs_type = std::ffi::CString::new("virtiofs").unwrap();
-        let p9_type = std::ffi::CString::new("9p").unwrap();
-
-        let ro_flag: libc::c_ulong = if *read_only {
-            libc::MS_RDONLY as libc::c_ulong
+        if try_mount_9p_virtiofs(tag, guest_path, *read_only).is_ok() {
+            if !*read_only {
+                ensure_mount_writable(guest_path, true);
+            }
         } else {
-            0
-        };
-
-        // Try virtiofs
-        let ret = unsafe {
-            libc::mount(
-                tag_cstr.as_ptr(),
-                path_cstr.as_ptr(),
-                virtiofs_type.as_ptr(),
-                ro_flag,
-                std::ptr::null(),
-            )
-        };
-
-        if ret == 0 {
             kmsg(&format!(
-                "Mounted virtiofs '{}' at {} ({})",
-                tag, guest_path, mode
-            ));
-            continue;
-        }
-
-        // Try 9p with trans=virtio
-        let p9_opts = std::ffi::CString::new(format!(
-            "trans=virtio,version=9p2000.L{}",
-            if *read_only { ",ro" } else { "" }
-        ))
-        .unwrap();
-
-        let ret = unsafe {
-            libc::mount(
-                tag_cstr.as_ptr(),
-                path_cstr.as_ptr(),
-                p9_type.as_ptr(),
-                ro_flag,
-                p9_opts.as_ptr() as *const libc::c_void,
-            )
-        };
-
-        if ret == 0 {
-            kmsg(&format!(
-                "Mounted 9p '{}' at {} ({})",
-                tag, guest_path, mode
-            ));
-        } else {
-            let err = std::io::Error::last_os_error();
-            kmsg(&format!(
-                "WARNING: failed to mount '{}' at {}: {} (tried virtiofs and 9p)",
-                tag, guest_path, err
+                "WARNING: failed to mount '{}' at {} (tried virtiofs + 9p candidates)",
+                tag, guest_path
             ));
         }
     }
@@ -943,6 +1301,49 @@ fn setup_oci_rootfs() {
         }
     }
 
+    // Mount shared (9p/virtiofs) dirs directly into the overlay newroot.
+    //
+    // mount_shared_dirs() skips early mounts when OCI rootfs is configured,
+    // so this is the FIRST (and only) mount of each tag.  Mounting directly
+    // at the destination avoids MS_MOVE (fails on overlay targets) and
+    // double-mount (hangs on some kernels when the virtio device is claimed
+    // twice).  After pivot_root the mount survives because it's a submount
+    // of the overlay.
+    //
+    // Parse from the local `cmdline` variable because /proc has already
+    // been MS_MOVEd above.
+    let shared_mounts = parse_shared_mount_entries_from(&cmdline);
+    kmsg(&format!(
+        "Mounting {} shared dir(s) into newroot",
+        shared_mounts.len()
+    ));
+    for (tag, guest_path, read_only) in &shared_mounts {
+        let dst_path = format!("{}{}", newroot, guest_path);
+        if let Err(e) = std::fs::create_dir_all(&dst_path) {
+            kmsg(&format!(
+                "WARNING: failed to create shared mount target {}: {}",
+                dst_path, e
+            ));
+            continue;
+        }
+
+        match try_mount_9p_virtiofs(tag, &dst_path, *read_only) {
+            Ok(()) => {
+                kmsg(&format!(
+                    "Mounted shared dir '{}' at {} (inside newroot)",
+                    tag, dst_path
+                ));
+            }
+            Err(ref e) => {
+                kmsg(&format!(
+                    "WARNING: failed to mount '{}' at {}: {} — \
+                     post-pivot verification will catch this",
+                    tag, dst_path, e
+                ));
+            }
+        }
+    }
+
     // Switch to overlay root via pivot_root.
     // pivot_root requires mount propagation to be private.
     unsafe {
@@ -1067,6 +1468,46 @@ fn setup_oci_rootfs() {
         libc::chown(workspace.as_ptr(), 1000, 1000);
         let home = std::ffi::CString::new("/home/sandbox").unwrap();
         libc::chown(home.as_ptr(), 1000, 1000);
+    }
+
+    // Verify RW shared mounts are real mount points (not just overlay dirs).
+    // If a mount was lost during MS_MOVE / pivot_root, attempt a fresh
+    // 9p/virtiofs mount directly on the post-pivot overlay filesystem.
+    kmsg("Post-pivot: verifying shared mounts...");
+    for (tag, guest_path, read_only) in &shared_mounts {
+        if *read_only {
+            continue;
+        }
+        if !is_mount_point(guest_path) {
+            // Mount wasn't carried through pivot_root — try mounting fresh.
+            kmsg(&format!(
+                "Shared mount '{}' at {} is NOT a mount point after pivot_root, \
+                 attempting fresh 9p/virtiofs mount...",
+                tag, guest_path
+            ));
+
+            dump_mount_diagnostics(tag, guest_path);
+            let _ = std::fs::create_dir_all(guest_path);
+            let mount_result = try_mount_9p_virtiofs(tag, guest_path, *read_only);
+            if mount_result.is_err() || !is_mount_point(guest_path) {
+                let mount_err = mount_result.err().unwrap_or_default();
+                let msg = format!(
+                    "FATAL: rw mount '{}' at {} failed — {}. \
+                     Aborting to prevent silent data loss.",
+                    tag, guest_path, mount_err
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(mount_err);
+                OCI_SETUP_STATUS.store(OCI_FAIL_MOUNT_SHARED, Ordering::Release);
+                return;
+            }
+        }
+        kmsg(&format!(
+            "Verified shared mount '{}' at {} is a real mount point",
+            tag, guest_path
+        ));
+        ensure_mount_writable(guest_path, true);
     }
 
     kmsg("OCI rootfs pivot_root complete — running on overlay filesystem");
@@ -2513,5 +2954,124 @@ mod tests {
     #[test]
     fn test_page_size_bytes_positive() {
         assert!(page_size_bytes() > 0);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = {
+            let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+        };
+        std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos))
+    }
+
+    #[test]
+    fn test_write_probe_passes_on_writable_dir() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: requires root");
+            return;
+        }
+        let dir = unique_temp_dir("voidbox_test_probe_writable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chown(c_path.as_ptr(), 1000, 1000);
+        }
+        let result = write_probe_as_sandbox(dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, ProbeResult::Ok);
+    }
+
+    #[test]
+    fn test_write_probe_fails_on_readonly_dir() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: requires root");
+            return;
+        }
+        let dir = unique_temp_dir("voidbox_test_probe_readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chmod(c_path.as_ptr(), 0o555);
+        }
+        let result = write_probe_as_sandbox(dir.to_str().unwrap());
+        unsafe {
+            libc::chmod(c_path.as_ptr(), 0o755);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, ProbeResult::WriteFailed);
+    }
+
+    #[test]
+    fn test_probe_result_variants() {
+        assert_ne!(ProbeResult::Ok, ProbeResult::WriteFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::PrivilegeDropFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::ForkFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::WaitFailed);
+        assert_ne!(ProbeResult::WriteFailed, ProbeResult::PrivilegeDropFailed);
+    }
+
+    #[test]
+    fn test_is_mount_point_detects_proc() {
+        // /proc is almost always a mount point on Linux
+        assert!(is_mount_point("/proc"));
+    }
+
+    #[test]
+    fn test_is_mount_point_regular_dir_is_not() {
+        let dir = unique_temp_dir("voidbox_test_mount_point");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_mount_point(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_multiple() {
+        let cmdline = "console=ttyS0 voidbox.mount0=mount0:/workspace/output:rw voidbox.mount1=mount1:/data:ro quiet";
+        let mounts = parse_shared_mount_entries_from(cmdline);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(
+            mounts[0],
+            ("mount0".into(), "/workspace/output".into(), false)
+        );
+        assert_eq!(mounts[1], ("mount1".into(), "/data".into(), true));
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_empty() {
+        let mounts = parse_shared_mount_entries_from("");
+        assert!(mounts.is_empty());
+
+        let mounts = parse_shared_mount_entries_from("console=ttyS0 quiet");
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_default_readonly() {
+        // When no mode suffix is given, mount should default to read-only.
+        let cmdline = "voidbox.mount0=tag0:/mnt/share";
+        let mounts = parse_shared_mount_entries_from(cmdline);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0], ("tag0".into(), "/mnt/share".into(), true));
+    }
+
+    #[test]
+    fn test_try_mount_9p_virtiofs_returns_err_without_device() {
+        // Outside a VM, there's no virtio device — both virtiofs and 9p should
+        // fail gracefully and return Err (not panic or hang).
+        let dir = unique_temp_dir("voidbox_test_9p_mount");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = try_mount_9p_virtiofs("mount0", dir.to_str().unwrap(), false);
+        assert!(result.is_err(), "mount should fail outside a VM");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dump_mount_diagnostics_does_not_panic() {
+        // Verify the diagnostic dump runs without panicking.
+        // On a dev machine it will log "unreadable" for most sysfs paths.
+        dump_mount_diagnostics("mount0", "/nonexistent/path");
     }
 }

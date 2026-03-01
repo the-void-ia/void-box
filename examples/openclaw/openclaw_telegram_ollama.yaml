@@ -8,6 +8,17 @@ sandbox:
   vcpus: 2
   network: true
   image: "alpine/openclaw"
+  # Shared host directory mounted read-write inside the guest VM via virtio-9p.
+  # The host path (.openclaw-data) is relative to cwd and created automatically.
+  # Writes from inside the guest (config, chat history, logs) land directly on
+  # the host filesystem, so data persists across VM restarts.
+  # On Linux/KVM this uses virtio-9p; on macOS/VZ it uses virtiofs.
+  # The guest-agent parses the mount from the kernel cmdline
+  # (voidbox.mount0=mount0:/home/openclaw:rw) and mounts it at boot.
+  mounts:
+    - host: ".openclaw-data"
+      guest: "/home/openclaw"
+      mode: "rw"
   env:
     TELEGRAM_BOT_TOKEN: ""
     TELEGRAM_CHAT_ID: ""
@@ -58,7 +69,7 @@ workflow:
           - -lc
           - |
             set -eux
-            export OPENCLAW_HOME="/tmp/.openclaw"
+            export OPENCLAW_HOME="/home/openclaw"
             export HOME="${OPENCLAW_HOME}"
             mkdir -p "${HOME}/.openclaw"
             if [ ! -f "${HOME}/.openclaw/openclaw.json" ]; then
@@ -100,7 +111,7 @@ workflow:
           - -lc
           - |
             set -eux
-            export OPENCLAW_HOME="/tmp/.openclaw"
+            export OPENCLAW_HOME="/home/openclaw"
             export HOME="${OPENCLAW_HOME}"
             exec node /app/openclaw.mjs gateway run --verbose
 

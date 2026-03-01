@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use super::composition::resolve_pipe_input;
 use super::context::{StepContext, StepContextBuilder, StepOutput};
-use super::definition::Workflow;
+use super::definition::{Step, Workflow};
 use super::WorkflowResult;
 use crate::observe::Observer;
 use crate::sandbox::Sandbox;
@@ -65,6 +65,36 @@ impl ExecutionPlan {
             parallel_groups: levels,
         })
     }
+}
+
+/// Check whether all dependencies of a step succeeded (exit_code == 0).
+/// Returns the name of the first failed dependency, if any.
+fn first_failed_dependency(step: &Step, outputs: &HashMap<String, StepOutput>) -> Option<String> {
+    for dep in &step.depends_on {
+        match outputs.get(dep) {
+            Some(o) if o.exit_code != 0 => return Some(dep.clone()),
+            None => return Some(dep.clone()), // missing = not run = treat as failed
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Like [`first_failed_dependency`] but takes a plain slice of dependency names
+/// instead of a `Step` reference, so it can be used inside spawned tasks where
+/// `Step` (which is not `Send`) is unavailable.
+fn first_failed_dependency_static(
+    depends_on: &[String],
+    outputs: &HashMap<String, StepOutput>,
+) -> Option<String> {
+    for dep in depends_on {
+        match outputs.get(dep) {
+            Some(o) if o.exit_code != 0 => return Some(dep.clone()),
+            None => return Some(dep.clone()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Scheduler for executing workflows
@@ -139,7 +169,26 @@ impl Scheduler {
                     &[("step", step_name.as_str())],
                 );
 
+                // Check dependency health — skip if any dependency failed
                 let outputs_snapshot = step_outputs.read().await.clone();
+                if let Some(failed_dep) = first_failed_dependency(step, &outputs_snapshot) {
+                    let skip_msg = format!("dependency \"{}\" failed", failed_dep);
+                    let step_output = StepOutput::new(Vec::new(), skip_msg.as_bytes().to_vec(), 1);
+                    step_outputs
+                        .write()
+                        .await
+                        .insert(step_name.clone(), step_output);
+                    step_span.set_error(&skip_msg);
+                    self.observer.logger().info(
+                        &format!(
+                            "[workflow:{}] step {}/{}: \"{}\" SKIPPED ({})",
+                            workflow_name, step_counter, total_steps, step_name, skip_msg
+                        ),
+                        &[("step", step_name.as_str())],
+                    );
+                    continue;
+                }
+
                 let mut ctx_builder = StepContextBuilder::new(step_name, sandbox.clone())
                     .with_outputs(outputs_snapshot.clone())
                     .with_timeout(step.timeout_secs);
@@ -236,6 +285,7 @@ impl Scheduler {
                     let func = step.func.clone();
                     let retry = step.retry.clone();
                     let step_timeout = step.timeout_secs;
+                    let depends_on_list = step.depends_on.clone();
                     let sb = sandbox.clone();
                     let compositions = workflow.compositions.clone();
                     let outputs_snap = outputs_snapshot.clone();
@@ -245,6 +295,26 @@ impl Scheduler {
 
                     join_set.spawn(async move {
                         let mut step_span = observer.start_step_span(&name, Some(&wf_ctx));
+
+                        // Check dependency health
+                        if let Some(failed_dep) =
+                            first_failed_dependency_static(&depends_on_list, &outputs_snap)
+                        {
+                            let skip_msg = format!("dependency \"{}\" failed", failed_dep);
+                            step_span.set_error(&skip_msg);
+                            observer.logger().info(
+                                &format!(
+                                    "[workflow:{}] step \"{}\" SKIPPED ({})",
+                                    wf_name, name, skip_msg
+                                ),
+                                &[("step", name.as_str())],
+                            );
+                            return (
+                                name,
+                                StepOutput::new(Vec::new(), skip_msg.as_bytes().to_vec(), 1),
+                            );
+                        }
+
                         let step_start = Instant::now();
 
                         let mut ctx_builder = StepContextBuilder::new(&name, sb)
@@ -524,5 +594,46 @@ mod tests {
         let plan = ExecutionPlan::from_workflow(&workflow).unwrap();
         assert_eq!(plan.parallel_groups.len(), 1);
         assert_eq!(plan.parallel_groups[0].len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_skips_on_failed_dependency() {
+        // a (fails) -> b -> c
+        // b and c should be skipped because a fails
+        let workflow = Workflow::define("test")
+            .step("a", |_ctx| async {
+                Err(crate::Error::Guest("step a failed".into()))
+            })
+            .step_depends("b", &["a"], |_ctx| async { Ok(b"b-output".to_vec()) })
+            .step_depends("c", &["b"], |_ctx| async { Ok(b"c-output".to_vec()) })
+            .build();
+
+        let observer = crate::observe::Observer::test();
+        let sandbox = crate::sandbox::Sandbox::mock().build().unwrap();
+        let scheduler = Scheduler::new(observer);
+
+        let result = scheduler.execute(&workflow, sandbox).await.unwrap();
+
+        // All three steps should have exit_code != 0
+        let a_out = result.step_outputs.get("a").expect("a should have output");
+        assert_ne!(a_out.exit_code, 0, "step a should have failed");
+
+        let b_out = result.step_outputs.get("b").expect("b should have output");
+        assert_ne!(b_out.exit_code, 0, "step b should be skipped");
+        let b_stderr = String::from_utf8_lossy(&b_out.stderr);
+        assert!(
+            b_stderr.contains("dependency \"a\" failed"),
+            "b stderr should mention failed dep a, got: {}",
+            b_stderr
+        );
+
+        let c_out = result.step_outputs.get("c").expect("c should have output");
+        assert_ne!(c_out.exit_code, 0, "step c should be skipped");
+        let c_stderr = String::from_utf8_lossy(&c_out.stderr);
+        assert!(
+            c_stderr.contains("dependency \"b\" failed"),
+            "c stderr should mention failed dep b, got: {}",
+            c_stderr
+        );
     }
 }

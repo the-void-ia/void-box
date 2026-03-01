@@ -287,7 +287,7 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
                     return ctx.exec_with_stdin(&program, &args_ref, prev).await;
                 }
 
-                ctx.exec(&program, &args_ref).await
+                ctx.exec_streaming(&program, &args_ref).await
             }
         });
     }
@@ -739,8 +739,29 @@ fn parse_skill_entry(entry: &SkillEntry) -> Result<Skill> {
 
 /// Convert a YAML `MountSpec` into a backend `MountConfig`.
 fn mount_spec_to_config(spec: &MountSpec) -> MountConfig {
+    let host = std::path::Path::new(&spec.host);
+    let abs_host = if host.is_absolute() {
+        host.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .expect("cannot determine cwd")
+            .join(host)
+    };
+
+    // For rw mounts, ensure the host directory exists so the 9p
+    // device can serve it. Read-only mounts must already exist.
+    if spec.mode == "rw" {
+        if let Err(e) = std::fs::create_dir_all(&abs_host) {
+            tracing::warn!(
+                "failed to create mount host directory {}: {}",
+                abs_host.display(),
+                e
+            );
+        }
+    }
+
     MountConfig {
-        host_path: spec.host.clone(),
+        host_path: abs_host.to_string_lossy().into_owned(),
         guest_path: spec.guest.clone(),
         read_only: spec.mode != "rw",
     }

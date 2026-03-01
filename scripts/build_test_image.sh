@@ -75,15 +75,30 @@ echo "[test-image] Installing claudio as /usr/local/bin/claude-code..."
 cp "$CLAUDIO_BIN" "$OUT_DIR/usr/local/bin/claude-code"
 chmod +x "$OUT_DIR/usr/local/bin/claude-code"
 
-# ---- Optional: BusyBox for /bin/sh ----
+# ---- BusyBox for /bin/sh ----
+# Auto-detect a static busybox if BUSYBOX is not explicitly set.
+if [[ -z "${BUSYBOX:-}" ]]; then
+    for candidate in /usr/bin/busybox /bin/busybox /sbin/busybox; do
+        if [[ -x "$candidate" ]] && file "$candidate" | grep -q "statically linked"; then
+            BUSYBOX="$candidate"
+            break
+        fi
+    done
+fi
+
 if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
     echo "[test-image] Installing BusyBox at /bin/sh..."
     cp "$BUSYBOX" "$OUT_DIR/bin/busybox"
     chmod +x "$OUT_DIR/bin/busybox"
     ln -sf busybox "$OUT_DIR/bin/sh"
-    for cmd in echo cat env tr test ls mkdir rm cp mv pwd id hostname; do
+    for cmd in echo cat env tr test ls mkdir rm cp mv pwd id hostname \
+               dd stat chmod wc touch head tail grep sed awk sort uniq \
+               uname date df du find xargs; do
         ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
+else
+    echo "[test-image] WARNING: No static busybox found — /bin/sh will not be available"
+    echo "[test-image]   Set BUSYBOX=/path/to/busybox-static to include it"
 fi
 
 # ---- Kernel modules (Linux only) ----
@@ -139,6 +154,11 @@ if [[ "$HOST_OS" == "Linux" ]]; then
         failover \
         net_failover \
         virtio_net \
+        netfs \
+        9pnet \
+        9p \
+        9pnet_virtio \
+        overlay \
         ; do
         copy_module "$mod_name"
     done

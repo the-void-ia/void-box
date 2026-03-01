@@ -11,14 +11,14 @@
 //! - Host directory sharing into the guest
 //! - Read-only or read-write access
 //! - 9P2000.L protocol subset: version, attach, walk, lopen, read, write,
-//!   getattr, readdir, lcreate, mkdir, clunk
+//!   getattr, setattr, readdir, lcreate, mkdir, renameat, unlinkat, fsync, clunk
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use tracing::{debug, trace, warn};
@@ -83,8 +83,16 @@ const T_READDIR: u8 = 40;
 const R_READDIR: u8 = 41;
 const T_XATTRWALK: u8 = 30;
 const R_XATTRWALK: u8 = 31;
+const T_SETATTR: u8 = 26;
+const R_SETATTR: u8 = 27;
+const T_FSYNC: u8 = 50;
+const R_FSYNC: u8 = 51;
 const T_MKDIR: u8 = 72;
 const R_MKDIR: u8 = 73;
+const T_RENAMEAT: u8 = 74;
+const R_RENAMEAT: u8 = 75;
+const T_UNLINKAT: u8 = 76;
+const R_UNLINKAT: u8 = 77;
 const R_ERROR: u8 = 7;
 
 /// QID size in bytes: type(1) + version(4) + path(8) = 13
@@ -321,14 +329,23 @@ impl Virtio9pDevice {
             mmio::QUEUE_READY => {
                 self.queue.ready = value != 0;
                 if self.queue.ready {
-                    debug!("virtio-9p: queue {} ready", self.queue_sel);
+                    trace!("virtio-9p: queue {} ready", self.queue_sel);
                 }
             }
             mmio::QUEUE_NOTIFY => {
+                trace!(
+                    "virtio-9p: QUEUE_NOTIFY (avail_idx={}, queue_ready={})",
+                    self.avail_idx,
+                    self.queue.ready
+                );
                 if let Some(mem) = guest_mem {
                     if let Err(e) = self.process_queue(mem) {
                         warn!("virtio-9p: queue processing error: {}", e);
                     }
+                    trace!(
+                        "virtio-9p: QUEUE_NOTIFY done (avail_idx={})",
+                        self.avail_idx
+                    );
                 } else {
                     trace!("virtio-9p: queue notify without guest memory");
                 }
@@ -337,6 +354,11 @@ impl Virtio9pDevice {
                 self.interrupt_status &= !value;
             }
             mmio::STATUS => {
+                trace!(
+                    "virtio-9p: STATUS write {:#x} (was {:#x})",
+                    value,
+                    self.status
+                );
                 self.status = value;
                 if value == 0 {
                     self.reset();
@@ -379,7 +401,7 @@ impl Virtio9pDevice {
     // -- Device reset --------------------------------------------------------
 
     fn reset(&mut self) {
-        debug!("virtio-9p: device reset");
+        trace!("virtio-9p: device reset");
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
@@ -540,10 +562,14 @@ impl Virtio9pDevice {
             T_WRITE => self.handle_write(tag, payload),
             T_CLUNK => self.handle_clunk(tag, payload),
             T_READLINK => self.handle_readlink(tag, payload),
+            T_SETATTR => self.handle_setattr(tag, payload),
             T_GETATTR => self.handle_getattr(tag, payload),
             T_XATTRWALK => self.handle_xattrwalk(tag, payload),
             T_READDIR => self.handle_readdir(tag, payload),
+            T_FSYNC => self.handle_fsync(tag, payload),
             T_MKDIR => self.handle_mkdir(tag, payload),
+            T_RENAMEAT => self.handle_renameat(tag, payload),
+            T_UNLINKAT => self.handle_unlinkat(tag, payload),
             _ => {
                 warn!("virtio-9p: unsupported message type {}", msg_type);
                 Self::build_error(tag, libc::EOPNOTSUPP as u32)
@@ -1418,6 +1444,333 @@ impl Virtio9pDevice {
         debug!("virtio-9p: Tmkdir dfid={} name={}", dfid, name);
         Self::build_message(R_MKDIR, tag, &qid)
     }
+
+    /// Handle Tsetattr: set file attributes (mode, size, timestamps)
+    fn handle_setattr(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        if self.read_only {
+            return Self::build_error(tag, libc::EROFS as u32);
+        }
+
+        // Tsetattr: fid(4) + valid(4) + mode(4) + uid(4) + gid(4) + size(8)
+        //         + atime_sec(8) + atime_nsec(8) + mtime_sec(8) + mtime_nsec(8)
+        //         = 60 bytes
+        if payload.len() < 60 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let valid = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+
+        const ATTR_MODE: u32 = 0x001;
+        const ATTR_UID: u32 = 0x002;
+        const ATTR_GID: u32 = 0x004;
+        const ATTR_SIZE: u32 = 0x008;
+        const ATTR_ATIME: u32 = 0x010;
+        const ATTR_ATIME_SET: u32 = 0x020;
+        const ATTR_MTIME: u32 = 0x040;
+        const ATTR_MTIME_SET: u32 = 0x080;
+
+        let known_bits = ATTR_MODE
+            | ATTR_UID
+            | ATTR_GID
+            | ATTR_SIZE
+            | ATTR_ATIME
+            | ATTR_ATIME_SET
+            | ATTR_MTIME
+            | ATTR_MTIME_SET;
+        if (valid & !known_bits) != 0 {
+            return Self::build_error(tag, libc::EOPNOTSUPP as u32);
+        }
+
+        let state = match self.fids.get_mut(&fid) {
+            Some(s) => s,
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+        let path = state.path.clone();
+
+        // ATTR_SIZE: truncate
+        if (valid & ATTR_SIZE) != 0 {
+            let size = u64::from_le_bytes(payload[20..28].try_into().unwrap());
+            // Use the open file handle if available, otherwise open temporarily
+            if let Some(ref f) = state.open_file {
+                if let Err(e) = f.set_len(size) {
+                    return Self::build_error(tag, io_error_to_errno(&e));
+                }
+            } else {
+                match fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(f) => {
+                        if let Err(e) = f.set_len(size) {
+                            return Self::build_error(tag, io_error_to_errno(&e));
+                        }
+                    }
+                    Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
+                }
+            }
+        }
+
+        // ATTR_MODE: chmod
+        if (valid & ATTR_MODE) != 0 {
+            let mode = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let perms = std::fs::Permissions::from_mode(mode);
+            if let Err(e) = fs::set_permissions(&path, perms) {
+                return Self::build_error(tag, io_error_to_errno(&e));
+            }
+        }
+
+        // ATTR_ATIME / ATTR_MTIME: set timestamps via utimensat
+        if (valid & (ATTR_ATIME | ATTR_ATIME_SET | ATTR_MTIME | ATTR_MTIME_SET)) != 0 {
+            let atime = if (valid & ATTR_ATIME_SET) != 0 {
+                let sec = u64::from_le_bytes(payload[28..36].try_into().unwrap()) as i64;
+                let nsec = u64::from_le_bytes(payload[36..44].try_into().unwrap()) as i64;
+                libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec,
+                }
+            } else if (valid & ATTR_ATIME) != 0 {
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                }
+            } else {
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                }
+            };
+
+            let mtime = if (valid & ATTR_MTIME_SET) != 0 {
+                let sec = u64::from_le_bytes(payload[44..52].try_into().unwrap()) as i64;
+                let nsec = u64::from_le_bytes(payload[52..60].try_into().unwrap()) as i64;
+                libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec,
+                }
+            } else if (valid & ATTR_MTIME) != 0 {
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                }
+            } else {
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                }
+            };
+
+            let times = [atime, mtime];
+            let cpath = match CString::new(path.as_os_str().as_bytes()) {
+                Ok(p) => p,
+                Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
+            };
+            let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO) as u32;
+                return Self::build_error(tag, errno);
+            }
+        }
+
+        // ATTR_UID / ATTR_GID: silently accept (host owns files)
+
+        trace!("virtio-9p: Tsetattr fid={} valid={:#x}", fid, valid);
+        Self::build_message(R_SETATTR, tag, &[])
+    }
+
+    /// Handle Trenameat: atomically rename a file or directory
+    fn handle_renameat(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        if self.read_only {
+            return Self::build_error(tag, libc::EROFS as u32);
+        }
+
+        // Trenameat: olddirfid(4) + oldname(2+n) + newdirfid(4) + newname(2+n)
+        if payload.len() < 12 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let olddirfid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let oldname_len = u16::from_le_bytes(payload[4..6].try_into().unwrap()) as usize;
+        if payload.len() < 6 + oldname_len + 6 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+        let oldname = match std::str::from_utf8(&payload[6..6 + oldname_len]) {
+            Ok(s) => s,
+            Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
+        };
+
+        let off = 6 + oldname_len;
+        let newdirfid = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        let newname_len =
+            u16::from_le_bytes(payload[off + 4..off + 6].try_into().unwrap()) as usize;
+        if payload.len() < off + 6 + newname_len {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+        let newname = match std::str::from_utf8(&payload[off + 6..off + 6 + newname_len]) {
+            Ok(s) => s,
+            Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
+        };
+
+        let olddir = match self.fids.get(&olddirfid) {
+            Some(s) => s.path.clone(),
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+        let newdir = match self.fids.get(&newdirfid) {
+            Some(s) => s.path.clone(),
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        let root = match self.root_dir.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return Self::build_error(tag, libc::EIO as u32),
+        };
+
+        let old_rel = match olddir.strip_prefix(&root) {
+            Ok(r) => r.join(oldname),
+            Err(_) => return Self::build_error(tag, libc::EACCES as u32),
+        };
+        let src = match Self::normalize_under_root(&root, &old_rel) {
+            Some(p) => p,
+            None => return Self::build_error(tag, libc::EACCES as u32),
+        };
+        let new_rel = match newdir.strip_prefix(&root) {
+            Ok(r) => r.join(newname),
+            Err(_) => return Self::build_error(tag, libc::EACCES as u32),
+        };
+        let dst = match Self::normalize_under_root(&root, &new_rel) {
+            Some(p) => p,
+            None => return Self::build_error(tag, libc::EACCES as u32),
+        };
+
+        if let Err(e) = fs::rename(&src, &dst) {
+            return Self::build_error(tag, io_error_to_errno(&e));
+        }
+
+        // Update all fids whose path starts with src
+        let src_with_sep = {
+            let mut s = src.as_os_str().to_os_string();
+            s.push(std::ffi::OsStr::new(std::path::MAIN_SEPARATOR_STR));
+            PathBuf::from(s)
+        };
+        for state in self.fids.values_mut() {
+            if state.path == src {
+                state.path = dst.clone();
+            } else if state.path.starts_with(&src_with_sep) {
+                if let Ok(suffix) = state.path.strip_prefix(&src) {
+                    state.path = dst.join(suffix);
+                }
+            }
+        }
+
+        debug!("virtio-9p: Trenameat {:?} -> {:?}", src, dst);
+        Self::build_message(R_RENAMEAT, tag, &[])
+    }
+
+    /// Handle Tunlinkat: delete a file or directory
+    fn handle_unlinkat(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        if self.read_only {
+            return Self::build_error(tag, libc::EROFS as u32);
+        }
+
+        // Tunlinkat: dirfid(4) + name(2+n) + flags(4)
+        if payload.len() < 10 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let dirfid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let name_len = u16::from_le_bytes(payload[4..6].try_into().unwrap()) as usize;
+        if payload.len() < 6 + name_len + 4 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+        let name = match std::str::from_utf8(&payload[6..6 + name_len]) {
+            Ok(s) => s,
+            Err(_) => return Self::build_error(tag, libc::EINVAL as u32),
+        };
+        let flags = u32::from_le_bytes(payload[6 + name_len..6 + name_len + 4].try_into().unwrap());
+
+        let dir_path = match self.fids.get(&dirfid) {
+            Some(s) => s.path.clone(),
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        let root = match self.root_dir.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return Self::build_error(tag, libc::EIO as u32),
+        };
+
+        let rel = match dir_path.strip_prefix(&root) {
+            Ok(r) => r.join(name),
+            Err(_) => return Self::build_error(tag, libc::EACCES as u32),
+        };
+        let target = match Self::normalize_under_root(&root, &rel) {
+            Some(p) => p,
+            None => return Self::build_error(tag, libc::EACCES as u32),
+        };
+
+        const AT_REMOVEDIR: u32 = 0x200;
+        if (flags & AT_REMOVEDIR) != 0 {
+            if let Err(e) = fs::remove_dir(&target) {
+                return Self::build_error(tag, io_error_to_errno(&e));
+            }
+        } else if let Err(e) = fs::remove_file(&target) {
+            return Self::build_error(tag, io_error_to_errno(&e));
+        }
+
+        // Invalidate fids pointing to the deleted target or descendants
+        let target_with_sep = {
+            let mut s = target.as_os_str().to_os_string();
+            s.push(std::ffi::OsStr::new(std::path::MAIN_SEPARATOR_STR));
+            PathBuf::from(s)
+        };
+        let to_remove: Vec<u32> = self
+            .fids
+            .iter()
+            .filter(|(_, state)| state.path == target || state.path.starts_with(&target_with_sep))
+            .map(|(&fid, _)| fid)
+            .collect();
+        for fid in to_remove {
+            self.fids.remove(&fid);
+        }
+
+        debug!("virtio-9p: Tunlinkat {:?} flags={:#x}", target, flags);
+        Self::build_message(R_UNLINKAT, tag, &[])
+    }
+
+    /// Handle Tfsync: flush file data to disk
+    fn handle_fsync(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+        // Tfsync: fid(4) + datasync(4)
+        if payload.len() < 8 {
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        let fid_val = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        let datasync = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+
+        let state = match self.fids.get_mut(&fid_val) {
+            Some(s) => s,
+            None => return Self::build_error(tag, libc::EBADF as u32),
+        };
+
+        let result = if let Some(ref f) = state.open_file {
+            if datasync != 0 {
+                f.sync_data()
+            } else {
+                f.sync_all()
+            }
+        } else {
+            // Fallback: open the path read-only and sync
+            match fs::File::open(&state.path) {
+                Ok(f) => f.sync_all(),
+                Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
+            }
+        };
+
+        if let Err(e) = result {
+            return Self::build_error(tag, io_error_to_errno(&e));
+        }
+
+        trace!("virtio-9p: Tfsync fid={} datasync={}", fid_val, datasync);
+        Self::build_message(R_FSYNC, tag, &[])
+    }
 }
 
 /// Map a `std::io::Error` to a Linux errno value for the 9P Rerror response.
@@ -1742,5 +2095,537 @@ mod tests {
 
         let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
         assert_eq!(io_error_to_errno(&e), libc::ENOENT as u32);
+    }
+
+    // -- Helper to build a 9P request from type + tag + payload ---------------
+
+    fn build_request(msg_type: u8, tag: u16, payload: &[u8]) -> Vec<u8> {
+        let size = (4 + 1 + 2 + payload.len()) as u32;
+        let mut req = Vec::with_capacity(size as usize);
+        req.extend_from_slice(&size.to_le_bytes());
+        req.push(msg_type);
+        req.extend_from_slice(&tag.to_le_bytes());
+        req.extend_from_slice(payload);
+        req
+    }
+
+    /// Create an rw device rooted at a tempdir and return (device, tempdir_path).
+    fn make_rw_device() -> (Virtio9pDevice, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Virtio9pDevice::new(tmp.path(), "test", false);
+        (dev, tmp)
+    }
+
+    /// Create a file inside the device root via lcreate+write pattern.
+    /// Returns the fid used.
+    fn create_file_with_content(
+        dev: &mut Virtio9pDevice,
+        dir_fid: u32,
+        file_fid: u32,
+        name: &str,
+        content: &[u8],
+    ) {
+        // Walk to get a new fid for creation (clone dir fid)
+        dev.fids.insert(
+            file_fid,
+            FidState {
+                path: dev.fids.get(&dir_fid).unwrap().path.join(name),
+                open_file: None,
+            },
+        );
+
+        // Actually create and write the file on disk
+        let path = dev.fids.get(&file_fid).unwrap().path.clone();
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(content).unwrap();
+        // Keep file handle open in the fid
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        dev.fids.get_mut(&file_fid).unwrap().open_file = Some(f);
+    }
+
+    // -- Renameat tests -------------------------------------------------------
+
+    #[test]
+    fn test_renameat_file() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Set up root fid
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+
+        // Create a file
+        create_file_with_content(&mut dev, 0, 1, "old.txt", b"hello rename");
+
+        // Build Trenameat: olddirfid=0, oldname="old.txt", newdirfid=0, newname="new.txt"
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // olddirfid
+        let oldname = b"old.txt";
+        payload.extend_from_slice(&(oldname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(oldname);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // newdirfid
+        let newname = b"new.txt";
+        payload.extend_from_slice(&(newname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(newname);
+
+        let req = build_request(T_RENAMEAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_RENAMEAT);
+
+        // Old path is gone, new path exists
+        assert!(!root.join("old.txt").exists());
+        assert!(root.join("new.txt").exists());
+        assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"hello rename");
+
+        // Fid should be updated
+        assert_eq!(dev.fids.get(&1).unwrap().path, root.join("new.txt"));
+    }
+
+    #[test]
+    fn test_renameat_overwrite() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+
+        create_file_with_content(&mut dev, 0, 1, "src.txt", b"new content");
+        create_file_with_content(&mut dev, 0, 2, "dst.txt", b"old content");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let oldname = b"src.txt";
+        payload.extend_from_slice(&(oldname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(oldname);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let newname = b"dst.txt";
+        payload.extend_from_slice(&(newname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(newname);
+
+        let req = build_request(T_RENAMEAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_RENAMEAT);
+
+        assert!(!root.join("src.txt").exists());
+        assert_eq!(fs::read(root.join("dst.txt")).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn test_renameat_directory() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Create subdir with a file
+        fs::create_dir(root.join("olddir")).unwrap();
+        fs::write(root.join("olddir").join("child.txt"), b"data").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+        // Fid for the directory
+        dev.fids.insert(
+            1,
+            FidState {
+                path: root.join("olddir"),
+                open_file: None,
+            },
+        );
+        // Fid for the child file
+        dev.fids.insert(
+            2,
+            FidState {
+                path: root.join("olddir").join("child.txt"),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let oldname = b"olddir";
+        payload.extend_from_slice(&(oldname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(oldname);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let newname = b"newdir";
+        payload.extend_from_slice(&(newname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(newname);
+
+        let req = build_request(T_RENAMEAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_RENAMEAT);
+
+        assert!(!root.join("olddir").exists());
+        assert!(root.join("newdir").join("child.txt").exists());
+
+        // Fids should be rewritten
+        assert_eq!(dev.fids.get(&1).unwrap().path, root.join("newdir"));
+        assert_eq!(
+            dev.fids.get(&2).unwrap().path,
+            root.join("newdir").join("child.txt")
+        );
+    }
+
+    #[test]
+    fn test_renameat_cross_dir() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::create_dir(root.join("dir_a")).unwrap();
+        fs::create_dir(root.join("dir_b")).unwrap();
+        fs::write(root.join("dir_a").join("file.txt"), b"cross").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.join("dir_a"),
+                open_file: None,
+            },
+        );
+        dev.fids.insert(
+            1,
+            FidState {
+                path: root.join("dir_b"),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // olddirfid
+        let oldname = b"file.txt";
+        payload.extend_from_slice(&(oldname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(oldname);
+        payload.extend_from_slice(&1u32.to_le_bytes()); // newdirfid
+        let newname = b"file.txt";
+        payload.extend_from_slice(&(newname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(newname);
+
+        let req = build_request(T_RENAMEAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_RENAMEAT);
+
+        assert!(!root.join("dir_a").join("file.txt").exists());
+        assert_eq!(
+            fs::read(root.join("dir_b").join("file.txt")).unwrap(),
+            b"cross"
+        );
+    }
+
+    #[test]
+    fn test_renameat_read_only_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut dev = Virtio9pDevice::new(tmp.path(), "test", true);
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root,
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let oldname = b"a";
+        payload.extend_from_slice(&(oldname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(oldname);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let newname = b"b";
+        payload.extend_from_slice(&(newname.len() as u16).to_le_bytes());
+        payload.extend_from_slice(newname);
+
+        let req = build_request(T_RENAMEAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_ERROR);
+        let ecode = u32::from_le_bytes(resp[7..11].try_into().unwrap());
+        assert_eq!(ecode, libc::EROFS as u32);
+    }
+
+    // -- Unlinkat tests -------------------------------------------------------
+
+    #[test]
+    fn test_unlinkat_file() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::write(root.join("doomed.txt"), b"bye").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+        dev.fids.insert(
+            1,
+            FidState {
+                path: root.join("doomed.txt"),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // dirfid
+        let name = b"doomed.txt";
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        let req = build_request(T_UNLINKAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_UNLINKAT);
+
+        assert!(!root.join("doomed.txt").exists());
+        // Fid 1 should be invalidated
+        assert!(!dev.fids.contains_key(&1));
+    }
+
+    #[test]
+    fn test_unlinkat_dir() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::create_dir(root.join("emptydir")).unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let name = b"emptydir";
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&0x200u32.to_le_bytes()); // AT_REMOVEDIR
+
+        let req = build_request(T_UNLINKAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_UNLINKAT);
+
+        assert!(!root.join("emptydir").exists());
+    }
+
+    #[test]
+    fn test_unlinkat_symlink() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Create target file and symlink
+        fs::write(root.join("target.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let name = b"link.txt";
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // no AT_REMOVEDIR
+
+        let req = build_request(T_UNLINKAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_UNLINKAT);
+
+        // Symlink gone, target untouched
+        assert!(!root.join("link.txt").exists());
+        assert!(root.join("target.txt").exists());
+    }
+
+    #[test]
+    fn test_unlinkat_read_only_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut dev = Virtio9pDevice::new(tmp.path(), "test", true);
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root,
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let name = b"file";
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let req = build_request(T_UNLINKAT, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_ERROR);
+        let ecode = u32::from_le_bytes(resp[7..11].try_into().unwrap());
+        assert_eq!(ecode, libc::EROFS as u32);
+    }
+
+    // -- Setattr tests --------------------------------------------------------
+
+    #[test]
+    fn test_setattr_truncate() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::write(root.join("big.txt"), b"hello world 1234567890").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.join("big.txt"),
+                open_file: None,
+            },
+        );
+
+        // Tsetattr: fid(4) + valid(4) + mode(4) + uid(4) + gid(4) + size(8)
+        //         + atime_sec(8) + atime_nsec(8) + mtime_sec(8) + mtime_nsec(8)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // fid
+        payload.extend_from_slice(&0x008u32.to_le_bytes()); // valid = ATTR_SIZE
+        payload.extend_from_slice(&0u32.to_le_bytes()); // mode (unused)
+        payload.extend_from_slice(&0u32.to_le_bytes()); // uid (unused)
+        payload.extend_from_slice(&0u32.to_le_bytes()); // gid (unused)
+        payload.extend_from_slice(&5u64.to_le_bytes()); // size = 5
+        payload.extend_from_slice(&0u64.to_le_bytes()); // atime_sec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // atime_nsec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // mtime_sec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // mtime_nsec
+
+        let req = build_request(T_SETATTR, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_SETATTR);
+
+        let content = fs::read(root.join("big.txt")).unwrap();
+        assert_eq!(content.len(), 5);
+        assert_eq!(&content, b"hello");
+    }
+
+    #[test]
+    fn test_setattr_mode() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        fs::write(root.join("modme.txt"), b"x").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path: root.join("modme.txt"),
+                open_file: None,
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // fid
+        payload.extend_from_slice(&0x001u32.to_le_bytes()); // valid = ATTR_MODE
+        payload.extend_from_slice(&0o755u32.to_le_bytes()); // mode
+        payload.extend_from_slice(&0u32.to_le_bytes()); // uid
+        payload.extend_from_slice(&0u32.to_le_bytes()); // gid
+        payload.extend_from_slice(&0u64.to_le_bytes()); // size
+        payload.extend_from_slice(&0u64.to_le_bytes()); // atime_sec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // atime_nsec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // mtime_sec
+        payload.extend_from_slice(&0u64.to_le_bytes()); // mtime_nsec
+
+        let req = build_request(T_SETATTR, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_SETATTR);
+
+        let meta = fs::metadata(root.join("modme.txt")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+    }
+
+    // -- Fsync tests ----------------------------------------------------------
+
+    #[test]
+    fn test_fsync() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Create a file with an open handle
+        let path = root.join("syncme.txt");
+        {
+            let mut f = fs::File::create(&path).unwrap();
+            f.write_all(b"sync data").unwrap();
+        }
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path,
+                open_file: Some(f),
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // fid
+        payload.extend_from_slice(&0u32.to_le_bytes()); // datasync=0 -> sync_all
+
+        let req = build_request(T_FSYNC, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_FSYNC);
+    }
+
+    #[test]
+    fn test_fsync_unopened_fid() {
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let path = root.join("nohandle.txt");
+        fs::write(&path, b"data").unwrap();
+
+        dev.fids.insert(
+            0,
+            FidState {
+                path,
+                open_file: None, // no open file handle
+            },
+        );
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // fid
+        payload.extend_from_slice(&1u32.to_le_bytes()); // datasync=1
+
+        let req = build_request(T_FSYNC, 1, &payload);
+        let resp = dev.handle_9p_request(&req);
+        assert_eq!(resp[4], R_FSYNC);
     }
 }
