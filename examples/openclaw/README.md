@@ -6,6 +6,7 @@ This folder contains the OpenClaw-focused workflow specs.
 
 - `openclaw_telegram.yaml`: Runs OpenClaw as a Telegram gateway using `sandbox.image: alpine/openclaw`.
 - `openclaw_telegram_ollama.yaml`: Runs OpenClaw as a Telegram gateway using host Ollama (`OLLAMA_BASE_URL`) as model backend.
+- `openclaw_telegram_lmstudio.yaml`: Runs OpenClaw as a Telegram gateway using host LM Studio (`LM_STUDIO_BASE_URL`) as model backend via OpenAI-compatible API.
 - `node_version.yaml`: Minimal OCI rootfs sanity check using `sandbox.image: node:22` and `node --version`.
 
 ## Prerequisites
@@ -63,6 +64,29 @@ ollama serve
 ollama pull qwen2.5-coder:7b
 ```
 
+Telegram gateway (LM Studio backend) env vars:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+export LM_STUDIO_BASE_URL=http://10.0.2.2:1234   # Linux (KVM/SLIRP); use http://192.168.64.1:1234 on macOS (VZ)
+export LM_STUDIO_API_KEY=lm-studio
+export LM_STUDIO_MODEL=qwen2.5-coder-7b-instruct  # exact model ID as shown in LM Studio
+```
+
+Host prerequisites for LM Studio workflow:
+
+- Open LM Studio, load a model, and start the local server on port 1234.
+- LM Studio must listen on all interfaces (not just loopback):
+  **Settings → Local Server → Listen on all network interfaces → ON**
+
+Verify before running:
+
+```bash
+ss -tlnp | grep 1234   # must show *:1234 or 0.0.0.0:1234, NOT 127.0.0.1:1234
+curl -sS http://127.0.0.1:1234/v1/models | head
+```
+
 Notes:
 
 - You must start the bot in Telegram (`/start`) before expecting replies.
@@ -89,9 +113,16 @@ Telegram gateway (Ollama backend):
 cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_ollama.yaml
 ```
 
+Telegram gateway (LM Studio backend):
+
+```bash
+cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_lmstudio.yaml
+```
+
 Expected startup signal in Telegram:
 - `OpenClaw prebuilt gateway started (...)`
 - `OpenClaw Ollama gateway started (...)`
+- `OpenClaw LM Studio gateway started (...)`
 - Then OpenClaw runtime/status messages from the bot.
 
 ## Long-running gateway operation
@@ -126,6 +157,22 @@ nohup env \
 echo $! > target/tmp/openclaw_telegram_ollama.pid
 ```
 
+Run detached for the LM Studio-backed gateway:
+
+```bash
+nohup env \
+  VOID_BOX_KERNEL="$VOID_BOX_KERNEL" \
+  VOID_BOX_INITRAMFS="$VOID_BOX_INITRAMFS" \
+  TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+  TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
+  LM_STUDIO_BASE_URL="$LM_STUDIO_BASE_URL" \
+  LM_STUDIO_API_KEY="$LM_STUDIO_API_KEY" \
+  LM_STUDIO_MODEL="$LM_STUDIO_MODEL" \
+  cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram_lmstudio.yaml \
+  > target/tmp/openclaw_telegram_lmstudio.log 2>&1 &
+echo $! > target/tmp/openclaw_telegram_lmstudio.pid
+```
+
 Monitor:
 
 ```bash
@@ -142,6 +189,14 @@ ps -fp "$(cat target/tmp/openclaw_telegram_ollama.pid)"
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | head -c 400
 ```
 
+Monitor LM Studio-backed gateway:
+
+```bash
+tail -f target/tmp/openclaw_telegram_lmstudio.log
+ps -fp "$(cat target/tmp/openclaw_telegram_lmstudio.pid)"
+curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | head -c 400
+```
+
 Stop:
 
 ```bash
@@ -152,6 +207,12 @@ Stop Ollama-backed gateway:
 
 ```bash
 kill "$(cat target/tmp/openclaw_telegram_ollama.pid)"
+```
+
+Stop LM Studio-backed gateway:
+
+```bash
+kill "$(cat target/tmp/openclaw_telegram_lmstudio.pid)"
 ```
 
 ## Troubleshooting
@@ -168,4 +229,10 @@ kill "$(cat target/tmp/openclaw_telegram_ollama.pid)"
     `curl -sS http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"qwen2.5-coder:7b","prompt":"say hi","stream":false}' | head`
   - Use `OLLAMA_BASE_URL=http://10.0.2.2:11434` on Linux; `http://192.168.64.1:11434` on macOS (not `127.0.0.1`)
   - If still unstable, lower model/context or switch to a smaller model.
+- Telegram shows `fetch failed` on LM Studio flow:
+  - Verify LM Studio local server is running and a model is loaded.
+  - On host, verify the API is live: `curl -sS http://127.0.0.1:1234/v1/models | head`
+  - LM Studio must listen on all interfaces: **Settings → Local Server → Listen on all network interfaces → ON**
+  - Use `LM_STUDIO_BASE_URL=http://10.0.2.2:1234` on Linux; `http://192.168.64.1:1234` on macOS (not `127.0.0.1`)
+  - Confirm `LM_STUDIO_MODEL` exactly matches the model ID returned by `/v1/models` (e.g. `qwen2.5-coder-7b-instruct`).
 - Network-bound behavior may fail in restricted environments (for example CI sandboxes).

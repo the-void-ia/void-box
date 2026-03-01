@@ -1,0 +1,106 @@
+api_version: v1
+kind: workflow
+name: openclaw-telegram-lmstudio
+
+sandbox:
+  mode: auto
+  memory_mb: 3072
+  vcpus: 2
+  network: true
+  image: "alpine/openclaw"
+  env:
+    TELEGRAM_BOT_TOKEN: ""
+    TELEGRAM_CHAT_ID: ""
+    LM_STUDIO_BASE_URL: "http://10.0.2.2:1234"
+    LM_STUDIO_API_KEY: "lm-studio"
+    LM_STUDIO_MODEL: ""
+
+workflow:
+  steps:
+    - name: verify
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            command -v node
+            command -v curl
+            test -f /app/openclaw.mjs
+            node /app/openclaw.mjs --version
+
+    - name: preflight
+      depends_on: [verify]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            test -n "${TELEGRAM_BOT_TOKEN}"
+            test -n "${LM_STUDIO_BASE_URL}"
+            test -n "${LM_STUDIO_MODEL}"
+
+            MODELS_URL="${LM_STUDIO_BASE_URL%/}/v1/models"
+            curl -fsS "${MODELS_URL}" > /tmp/lmstudio_models.json
+            if ! grep -F '"'"${LM_STUDIO_MODEL}"'"' /tmp/lmstudio_models.json >/dev/null; then
+              echo "required model not found in LM Studio models: ${LM_STUDIO_MODEL}" >&2
+              echo "Load it in LM Studio and ensure the server is running." >&2
+              exit 1
+            fi
+
+    - name: configure
+      depends_on: [preflight]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            mkdir -p "${HOME}/.openclaw"
+            if [ ! -f "${HOME}/.openclaw/openclaw.json" ]; then
+              printf '%s\n' '{}' > "${HOME}/.openclaw/openclaw.json"
+            fi
+
+            node /app/openclaw.mjs config set --json gateway.mode '"local"'
+            node /app/openclaw.mjs config set --json channels.telegram.enabled 'true'
+            node /app/openclaw.mjs config set channels.telegram.botToken "${TELEGRAM_BOT_TOKEN}"
+            node /app/openclaw.mjs config set --json channels.telegram.allowFrom '["*"]'
+            node /app/openclaw.mjs config set channels.telegram.dmPolicy "open"
+
+            LMSTUDIO_PROVIDER_JSON="{\"baseUrl\":\"${LM_STUDIO_BASE_URL}/v1\",\"apiKey\":\"${LM_STUDIO_API_KEY}\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"${LM_STUDIO_MODEL}\",\"name\":\"LM Studio ${LM_STUDIO_MODEL}\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":32768,\"maxTokens\":4096}]}"
+            node /app/openclaw.mjs config set --json models.providers.lmstudio "${LMSTUDIO_PROVIDER_JSON}"
+            node /app/openclaw.mjs config set agents.defaults.model.primary "lmstudio/${LM_STUDIO_MODEL}"
+
+            node /app/openclaw.mjs doctor
+
+    - name: smoke_message
+      depends_on: [configure]
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            if [ -n "$TELEGRAM_CHAT_ID" ]; then
+              curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"OpenClaw LM Studio gateway started ($(date -Iseconds))\"}"
+            fi
+
+    - name: gateway
+      depends_on: [smoke_message]
+      mode: service
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            set -eux
+            export OPENCLAW_HOME="/tmp/.openclaw"
+            export HOME="${OPENCLAW_HOME}"
+            exec node /app/openclaw.mjs gateway run --verbose
+
+  output_step: gateway
