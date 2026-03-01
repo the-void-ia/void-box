@@ -1,23 +1,23 @@
-#![cfg(target_os = "linux")]
-//! End-to-End 9p/mount integration tests
+//! End-to-End mount integration tests
 //!
-//! These tests boot a real KVM micro-VM and exercise the virtio-9p shared
-//! directory feature (host ↔ guest file sharing). Each test creates a
-//! temporary host directory, configures a 9p mount, boots the VM, and runs
-//! commands inside the guest to validate the mount behavior.
+//! These tests boot a real VM and exercise host↔guest directory sharing via
+//! virtio-9p (Linux/KVM) or virtiofs (macOS/VZ). Each test creates a temporary
+//! host directory, configures a mount, boots the VM, and runs commands inside
+//! the guest to validate the mount behavior.
 //!
 //! ## Prerequisites
 //!
-//! 1. Build the test initramfs (includes 9p kernel modules):
+//! 1. Build the test initramfs:
 //!    ```bash
-//!    scripts/build_test_image.sh
+//!    scripts/build_test_image.sh          # Linux
+//!    scripts/download_kernel.sh           # macOS
 //!    ```
 //!
 //! 2. Run with:
 //!    ```bash
 //!    VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 //!    VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-//!    cargo test --test e2e_mount_9p -- --ignored --test-threads=1
+//!    cargo test --test e2e_mount -- --ignored --test-threads=1
 //!    ```
 //!
 //! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
@@ -27,102 +27,133 @@ use std::path::{Path, PathBuf};
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::backend::MountConfig;
-use void_box::vmm::config::VoidBoxConfig;
-use void_box::vmm::MicroVm;
-use void_box::Error;
+use void_box::backend::{BackendConfig, BackendSecurityConfig, MountConfig, VmmBackend};
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
+/// Returns `true` when the platform's VM backend is available.
+fn backend_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true // Virtualization.framework is always available on macOS 13+
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
-/// Build a VoidBoxConfig with a 9p mount. Returns `None` (skips) if KVM or
-/// artifacts are unavailable.
-fn build_vm_with_mount(
+/// Build a `BackendConfig` with a mount. Returns `None` (skips) if the backend
+/// or kernel artifacts are unavailable.
+fn build_config_with_mount(
     host_dir: &Path,
     guest_path: &str,
     read_only: bool,
-) -> Option<VoidBoxConfig> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
+) -> Option<BackendConfig> {
+    if !backend_available() {
+        eprintln!("skipping: VM backend not available on this platform");
         return None;
     }
 
-    let (kernel, initramfs) = match kvm_artifacts_from_env() {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS \
-                 (use scripts/build_test_image.sh)"
-            );
-            return None;
-        }
-    };
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
+    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
+    let kernel = PathBuf::from(kernel);
+    if kernel.as_os_str().is_empty() {
+        eprintln!("skipping: set VOID_BOX_KERNEL");
         return None;
     }
 
-    let mut cfg = VoidBoxConfig::new()
-        .memory_mb(256)
-        .vcpus(1)
-        .kernel(&kernel)
-        .enable_vsock(true);
-
-    if let Some(ref p) = initramfs {
-        cfg = cfg.initramfs(p);
+    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
+    let initramfs = PathBuf::from(initramfs);
+    if initramfs.as_os_str().is_empty() {
+        eprintln!("skipping: set VOID_BOX_INITRAMFS");
+        return None;
     }
 
-    cfg.mounts.push(MountConfig {
-        host_path: host_dir.to_string_lossy().into_owned(),
-        guest_path: guest_path.to_string(),
-        read_only,
-    });
+    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
+        eprintln!("skipping: kernel/initramfs not found or unreadable");
+        return None;
+    }
 
-    Some(cfg)
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).ok()?;
+
+    Some(BackendConfig {
+        memory_mb: 256,
+        vcpus: 1,
+        kernel,
+        initramfs: Some(initramfs),
+        rootfs: None,
+        network: true,
+        enable_vsock: true,
+        shared_dir: None,
+        mounts: vec![MountConfig {
+            host_path: host_dir.to_string_lossy().into_owned(),
+            guest_path: guest_path.to_string(),
+            read_only,
+        }],
+        oci_rootfs: None,
+        oci_rootfs_dev: None,
+        oci_rootfs_disk: None,
+        env: vec![],
+        security: BackendSecurityConfig {
+            session_secret: secret,
+            command_allowlist: vec![
+                "sh".into(),
+                "cat".into(),
+                "echo".into(),
+                "mkdir".into(),
+                "rm".into(),
+                "mv".into(),
+                "chmod".into(),
+                "stat".into(),
+                "dd".into(),
+                "ls".into(),
+                "wc".into(),
+                "test".into(),
+                "grep".into(),
+            ],
+            network_deny_list: vec!["169.254.0.0/16".into()],
+            max_connections_per_second: 50,
+            max_concurrent_connections: 64,
+            seccomp: true,
+        },
+    })
 }
 
-/// Boot a MicroVm from config. Returns `None` on soft failures (environment issues).
-async fn boot_vm(cfg: VoidBoxConfig) -> Option<MicroVm> {
-    cfg.validate()
-        .expect("invalid VoidBoxConfig for mount test");
-    match MicroVm::new(cfg).await {
-        Ok(vm) => Some(vm),
+/// Create and start a VM backend with a mount. Returns `None` on soft failures.
+async fn create_started_backend_with_mount(
+    host_dir: &Path,
+    guest_path: &str,
+    read_only: bool,
+) -> Option<Box<dyn VmmBackend>> {
+    let config = build_config_with_mount(host_dir, guest_path, read_only)?;
+    let mut backend = void_box::backend::create_backend();
+    match backend.start(config).await {
+        Ok(()) => Some(backend),
         Err(e) => {
-            eprintln!("skipping: failed to create MicroVm: {e}");
+            eprintln!("skipping: backend start failed: {e}");
             None
         }
     }
 }
 
 /// Execute a shell command inside the guest, returning the ExecOutput.
-/// Soft-skips on VmNotRunning / Guest errors (environment flakiness).
-async fn guest_sh(vm: &mut MicroVm, script: &str) -> Option<void_box::ExecOutput> {
-    match vm.exec("sh", &["-c", script]).await {
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
+    match backend
+        .exec("sh", &["-c", script], &[], &[], None, Some(30))
+        .await
+    {
         Ok(out) => Some(out),
-        Err(Error::VmNotRunning) => {
-            let serial = vm.read_serial_output();
-            let console = String::from_utf8_lossy(&serial);
-            eprintln!("VM not running, console:\n{console}");
+        Err(e) => {
+            eprintln!("guest exec error: {e}");
             None
         }
-        Err(Error::Guest(msg)) => {
-            eprintln!("guest communication error: {msg}");
-            None
-        }
-        Err(e) => panic!("exec failed: {e}"),
     }
 }
 
@@ -131,18 +162,17 @@ async fn guest_sh(vm: &mut MicroVm, script: &str) -> Option<void_box::ExecOutput
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_write_read() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "echo 'hello 9p' > /mnt/shared/test.txt && cat /mnt/shared/test.txt",
     )
     .await;
@@ -164,17 +194,16 @@ async fn mount_rw_write_read() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_host_visible() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
-    let out = guest_sh(&mut vm, "echo 'from guest' > /mnt/shared/host_check.txt").await;
+    let out = guest_sh(&*backend, "echo 'from guest' > /mnt/shared/host_check.txt").await;
     let Some(out) = out else { return };
     assert!(out.success(), "write failed: {}", out.stderr_str());
 
@@ -191,18 +220,17 @@ async fn mount_rw_host_visible() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_mkdir_nested() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "mkdir -p /mnt/shared/a/b/c/d && echo ok > /mnt/shared/a/b/c/d/deep.txt && cat /mnt/shared/a/b/c/d/deep.txt",
     )
     .await;
@@ -221,18 +249,17 @@ async fn mount_rw_mkdir_nested() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_rename_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "echo data > /mnt/shared/old.txt && mv /mnt/shared/old.txt /mnt/shared/new.txt && \
          test ! -e /mnt/shared/old.txt && cat /mnt/shared/new.txt",
     )
@@ -252,18 +279,17 @@ async fn mount_rw_rename_file() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_delete_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "echo gone > /mnt/shared/remove_me.txt && rm /mnt/shared/remove_me.txt && \
          test ! -e /mnt/shared/remove_me.txt && echo deleted",
     )
@@ -282,18 +308,17 @@ async fn mount_rw_delete_file() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_chmod() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "echo x > /mnt/shared/script.sh && chmod 755 /mnt/shared/script.sh && \
          stat -c '%a' /mnt/shared/script.sh",
     )
@@ -310,19 +335,18 @@ async fn mount_rw_chmod() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_large_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     // Write ~1MB of data (1024 lines × 1024 chars each)
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "dd if=/dev/zero bs=1024 count=1024 2>/dev/null > /mnt/shared/large.bin && \
          stat -c '%s' /mnt/shared/large.bin",
     )
@@ -350,18 +374,17 @@ async fn mount_rw_large_file() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_ro_cannot_write() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", true) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "echo nope > /mnt/shared/should_fail.txt 2>&1; echo $?",
     )
     .await;
@@ -387,19 +410,18 @@ async fn mount_ro_cannot_write() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_ro_can_read() {
     let host_dir = tempfile::tempdir().unwrap();
     std::fs::write(host_dir.path().join("readme.txt"), "hello from host\n").unwrap();
 
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", true) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
+    else {
         return;
     };
 
-    let out = guest_sh(&mut vm, "cat /mnt/shared/readme.txt").await;
+    let out = guest_sh(&*backend, "cat /mnt/shared/readme.txt").await;
     let Some(out) = out else { return };
     assert!(out.success(), "read failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "hello from host");
@@ -412,7 +434,7 @@ async fn mount_ro_can_read() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_host_preexisting() {
     let host_dir = tempfile::tempdir().unwrap();
     std::fs::write(host_dir.path().join("a.txt"), "aaa\n").unwrap();
@@ -420,15 +442,14 @@ async fn mount_host_preexisting() {
     std::fs::create_dir(host_dir.path().join("subdir")).unwrap();
     std::fs::write(host_dir.path().join("subdir/c.txt"), "ccc\n").unwrap();
 
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "cat /mnt/shared/a.txt /mnt/shared/b.txt /mnt/shared/subdir/c.txt",
     )
     .await;
@@ -452,19 +473,18 @@ async fn mount_host_preexisting() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + test initramfs with 9p modules"]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_empty_dir() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(cfg) = build_vm_with_mount(host_dir.path(), "/mnt/shared", false) else {
-        return;
-    };
-    let Some(mut vm) = boot_vm(cfg).await else {
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
         return;
     };
 
     // Verify empty, then write
     let out = guest_sh(
-        &mut vm,
+        &*backend,
         "ls /mnt/shared/ | wc -l && echo 'first file' > /mnt/shared/new.txt && cat /mnt/shared/new.txt",
     )
     .await;

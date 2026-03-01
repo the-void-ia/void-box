@@ -207,7 +207,7 @@ scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-cargo test --test e2e_mount_9p -- --ignored --test-threads=1
+cargo test --test e2e_mount -- --ignored --test-threads=1
 ```
 
 ### Test initramfs and BusyBox
@@ -224,7 +224,7 @@ BUSYBOX=/path/to/busybox-static scripts/build_test_image.sh
 BusyBox provides `/bin/sh` and common utilities (`echo`, `cat`, `mkdir`, `rm`,
 `mv`, `chmod`, `stat`, `dd`, `ls`, `wc`, `test`, `grep`, `sed`, `find`, etc.)
 inside the guest. **Without BusyBox**, any test that runs `sh -c "..."` will
-fail with `No such file or directory`. The `e2e_mount_9p` tests require BusyBox
+fail with `No such file or directory`. The `e2e_mount` tests require BusyBox
 because they use shell commands to exercise the mounted filesystem.
 
 ### 9p kernel module loading order
@@ -285,7 +285,7 @@ scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-cargo test --test e2e_mount_9p -- --ignored --test-threads=1
+cargo test --test e2e_mount -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -296,6 +296,7 @@ export VOID_BOX_KERNEL=target/vmlinux-arm64
 export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
+cargo test --test e2e_mount -- --ignored --test-threads=1
 ```
 
 `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`)
@@ -391,7 +392,7 @@ That test image is only for deterministic `claudio` suites.
 
 For the full catalog, see `examples/README.md` and `examples/openclaw/README.md`.
 
-Linux-only deterministic e2e suites (test image with `claudio` + BusyBox):
+Deterministic e2e suites (test image with `claudio` + BusyBox):
 
 ```bash
 scripts/build_test_image.sh
@@ -399,12 +400,13 @@ export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-cargo test --test e2e_mount_9p -- --ignored --test-threads=1
+cargo test --test e2e_mount -- --ignored --test-threads=1
 ```
 
 Do **not** use `target/void-box-rootfs.cpio.gz` for these deterministic e2e suites.
 That production image is for real Claude/OpenClaw runtime paths.
-These suites are Linux/KVM only.
+`e2e_telemetry` and `e2e_skill_pipeline` are Linux/KVM only.
+`e2e_mount` runs on both Linux (KVM, virtio-9p) and macOS (VZ, virtiofs).
 
 ## Known issues
 
@@ -424,8 +426,9 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.
 - `e2e_telemetry`: telemetry flow from guest to host pipeline.
 - `e2e_skill_pipeline`: multi-stage skill execution in VM mode.
-- `e2e_mount_9p`: virtio-9p host↔guest directory sharing (RW/RO, write, read,
-  mkdir, rename, delete, chmod, large files, pre-existing content, empty dirs).
+- `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs
+  (macOS) — RW/RO, write, read, mkdir, rename, delete, chmod, large files,
+  pre-existing content, empty dirs.
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 
