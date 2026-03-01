@@ -166,6 +166,46 @@ impl StepContext {
         }
     }
 
+    /// Execute a command with streaming output.
+    ///
+    /// Like [`exec()`](Self::exec), but streams stdout/stderr chunks to the
+    /// terminal in real-time, prefixed with `[step-name]`. Returns the final
+    /// stdout on success.
+    pub async fn exec_streaming(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
+        let (mut chunk_rx, resp_rx) = self
+            .sandbox
+            .exec_streaming(program, args, self.timeout_secs)
+            .await?;
+
+        let mut line_buf = String::new();
+        while let Some(chunk) = chunk_rx.recv().await {
+            let text = String::from_utf8_lossy(&chunk.data);
+            line_buf.push_str(&text);
+            while let Some(newline_pos) = line_buf.find('\n') {
+                let line = &line_buf[..newline_pos];
+                tracing::info!("[{}] {}", self.step_name, line);
+                line_buf = line_buf[newline_pos + 1..].to_string();
+            }
+        }
+        if !line_buf.is_empty() {
+            tracing::info!("[{}] {}", self.step_name, line_buf);
+        }
+
+        let response = resp_rx
+            .await
+            .map_err(|_| Error::Guest("Streaming response channel closed".into()))??;
+
+        if response.exit_code == 0 {
+            Ok(response.stdout)
+        } else {
+            Err(Error::Guest(format!(
+                "Command failed with exit code {}: {}",
+                response.exit_code,
+                String::from_utf8_lossy(&response.stderr)
+            )))
+        }
+    }
+
     /// Execute a command piping input from previous step
     pub async fn exec_piped(&self, program: &str, args: &[&str]) -> Result<Vec<u8>> {
         let stdin = self.input.as_deref().unwrap_or(&[]);

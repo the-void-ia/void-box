@@ -207,7 +207,41 @@ scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+cargo test --test e2e_mount_9p -- --ignored --test-threads=1
 ```
+
+### Test initramfs and BusyBox
+
+`scripts/build_test_image.sh` builds a minimal initramfs with `guest-agent`
+(as `/init`) and `claudio` (as `/usr/local/bin/claude-code`). The script
+**auto-detects** a statically linked BusyBox on the host and includes it if
+found. If BusyBox is not auto-detected, set the `BUSYBOX` env var explicitly:
+
+```bash
+BUSYBOX=/path/to/busybox-static scripts/build_test_image.sh
+```
+
+BusyBox provides `/bin/sh` and common utilities (`echo`, `cat`, `mkdir`, `rm`,
+`mv`, `chmod`, `stat`, `dd`, `ls`, `wc`, `test`, `grep`, `sed`, `find`, etc.)
+inside the guest. **Without BusyBox**, any test that runs `sh -c "..."` will
+fail with `No such file or directory`. The `e2e_mount_9p` tests require BusyBox
+because they use shell commands to exercise the mounted filesystem.
+
+### 9p kernel module loading order
+
+The guest-agent loads kernel modules at boot time from `/lib/modules/` inside
+the initramfs. For 9p shared mounts, the dependency chain must be loaded in
+order:
+
+```
+netfs.ko → 9pnet.ko → 9p.ko → 9pnet_virtio.ko
+```
+
+This order is enforced in `guest-agent/src/main.rs` (`load_kernel_modules()`
+~line 540). The corresponding modules must also be included in the initramfs
+by `scripts/build_test_image.sh`. The `overlay.ko` module is also included
+for OCI rootfs overlay support. If any module in the chain is missing from
+the initramfs, 9p mounts will hang or fail silently.
 
 ## Validation contract
 
@@ -246,11 +280,12 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
 
-# Linux-only deterministic e2e suites (claudio)
+# Linux-only deterministic e2e suites (claudio + busybox)
 scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+cargo test --test e2e_mount_9p -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -356,7 +391,7 @@ That test image is only for deterministic `claudio` suites.
 
 For the full catalog, see `examples/README.md` and `examples/openclaw/README.md`.
 
-Linux-only deterministic e2e suites (test image with `claudio`):
+Linux-only deterministic e2e suites (test image with `claudio` + BusyBox):
 
 ```bash
 scripts/build_test_image.sh
@@ -364,6 +399,7 @@ export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+cargo test --test e2e_mount_9p -- --ignored --test-threads=1
 ```
 
 Do **not** use `target/void-box-rootfs.cpio.gz` for these deterministic e2e suites.
@@ -388,6 +424,8 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.
 - `e2e_telemetry`: telemetry flow from guest to host pipeline.
 - `e2e_skill_pipeline`: multi-stage skill execution in VM mode.
+- `e2e_mount_9p`: virtio-9p host↔guest directory sharing (RW/RO, write, read,
+  mkdir, rename, delete, chmod, large files, pre-existing content, empty dirs).
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 

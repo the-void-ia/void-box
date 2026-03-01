@@ -118,6 +118,10 @@ name = "e2e_telemetry"
 path = "tests/e2e/telemetry.rs"
 
 [[test]]
+name = "e2e_mount_9p"
+path = "tests/e2e/mount_9p.rs"
+
+[[test]]
 name = "conformance"
 path = "tests/conformance.rs"
 

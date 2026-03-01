@@ -99,3 +99,6 @@ jobs:
 
           # Run E2E tests (--ignored to include KVM tests, sequential to avoid resource contention)
           cargo test --test e2e_telemetry -- --ignored --test-threads=1
+
+          # Run 9p/mount integration tests
+          cargo test --test e2e_mount_9p -- --ignored --test-threads=1
