@@ -38,6 +38,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Security (cross-platform)
 getrandom = "0.3"
 
+# IDs and time formatting
+uuid = { version = "1", features = ["v7"] }
+humantime = "2"
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"
@@ -120,6 +124,10 @@ path = "tests/e2e/telemetry.rs"
 [[test]]
 name = "e2e_mount"
 path = "tests/e2e/mount.rs"
+
+[[test]]
+name = "orchestration_contract"
+path = "tests/orchestration_contract.rs"
 
 [[test]]
 name = "conformance"

@@ -62,7 +62,7 @@ async fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let spec = load_spec(&file)?;
     print_startup_banner(&spec.sandbox);
 
-    let report = run_file(&file, input).await?;
+    let report = run_file(&file, input, None).await?;
     println!("name: {}", report.name);
     println!("kind: {}", report.kind);
     println!("success: {}", report.success);

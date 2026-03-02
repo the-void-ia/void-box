@@ -10,13 +10,26 @@ use serde_json::Value;
 
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    Pending,
+    Starting,
     Running,
-    Completed,
+    #[serde(alias = "completed")]
+    Succeeded,
     Failed,
     Cancelled,
+}
+
+impl RunStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.is_terminal()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +59,15 @@ pub struct RunEvent {
     pub seq: Option<u64>,
     #[serde(default)]
     pub payload: Option<Value>,
+    // --- v2 orchestration fields ---
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub attempt_id: Option<u64>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub event_type_v2: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +78,54 @@ pub struct RunState {
     pub report: Option<crate::runtime::RunReport>,
     pub error: Option<String>,
     pub events: Vec<RunEvent>,
+    // --- v2 orchestration fields ---
+    #[serde(default = "default_attempt_id")]
+    pub attempt_id: u64,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub active_stage_count: u32,
+    #[serde(default)]
+    pub active_microvm_count: u32,
+    #[serde(default)]
+    pub policy: Option<RunPolicy>,
+    #[serde(default)]
+    pub terminal_event_id: Option<String>,
+}
+
+fn default_attempt_id() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunPolicy {
+    #[serde(default = "default_max_parallel_microvms")]
+    pub max_parallel_microvms_per_run: u32,
+    #[serde(default = "default_max_stage_retries")]
+    pub max_stage_retries: u32,
+    #[serde(default = "default_stage_timeout_secs")]
+    pub stage_timeout_secs: u64,
+    #[serde(default = "default_cancel_grace_period_secs")]
+    pub cancel_grace_period_secs: u64,
+}
+
+fn default_max_parallel_microvms() -> u32 {
+    4
+}
+fn default_max_stage_retries() -> u32 {
+    3
+}
+fn default_stage_timeout_secs() -> u64 {
+    3600
+}
+fn default_cancel_grace_period_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +379,52 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// RFC 3339 timestamp for the current time.
+pub fn now_rfc3339() -> String {
+    humantime::format_rfc3339(SystemTime::now()).to_string()
+}
+
+/// Generate a UUID v7 event ID (time-ordered).
+pub fn generate_event_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Map legacy dotted event types to PascalCase v2 names.
+pub fn legacy_to_v2_event_type(legacy: &str) -> String {
+    match legacy {
+        "run.started" => "RunStarted".to_string(),
+        "run.finished" => "RunCompleted".to_string(),
+        "run.failed" => "RunFailed".to_string(),
+        "run.cancelled" => "RunCancelled".to_string(),
+        "run.spec.loaded" => "SpecLoaded".to_string(),
+        "env.provisioned" => "EnvironmentProvisioned".to_string(),
+        "box.started" => "BoxStarted".to_string(),
+        "skill.mounted" => "SkillMounted".to_string(),
+        "workflow.planned" => "WorkflowPlanned".to_string(),
+        "log.chunk" => "LogChunk".to_string(),
+        "log.closed" => "LogClosed".to_string(),
+        "spec.parse_failed" => "SpecParseFailed".to_string(),
+        other => {
+            // Best-effort PascalCase: "foo.bar_baz" → "FooBarBaz"
+            other
+                .split(['.', '_'])
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let mut chars = s.chars();
+                    match chars.next() {
+                        Some(c) => {
+                            let mut out = c.to_uppercase().to_string();
+                            out.extend(chars);
+                            out
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 #[allow(dead_code)]

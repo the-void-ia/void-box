@@ -1,9 +1,87 @@
 //! Error types for void-box
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Result type alias using void-box Error
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Spec-compliant API error codes for the void-control orchestration contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiErrorCode {
+    InvalidSpec,
+    InvalidPolicy,
+    NotFound,
+    AlreadyTerminal,
+    ResourceLimitExceeded,
+    InternalError,
+}
+
+/// Structured API error response: `{"code":"NOT_FOUND","message":"...","retryable":false}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: ApiErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ApiError {
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::NotFound,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn invalid_spec(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::InvalidSpec,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn invalid_policy(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::InvalidPolicy,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn already_terminal(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::AlreadyTerminal,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn resource_limit_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::ResourceLimitExceeded,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::InternalError,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"code":"INTERNAL_ERROR","message":"serialization failed","retryable":true}"#
+                .to_string()
+        })
+    }
+}
 
 /// Errors that can occur in void-box operations
 #[derive(Error, Debug)]

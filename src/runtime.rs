@@ -47,17 +47,25 @@ pub struct RunReport {
     pub output_tokens: u64,
 }
 
-pub async fn run_file(path: &Path, input: Option<String>) -> Result<RunReport> {
+pub async fn run_file(
+    path: &Path,
+    input: Option<String>,
+    policy: Option<crate::persistence::RunPolicy>,
+) -> Result<RunReport> {
     let mut spec = load_spec(path)?;
     apply_llm_overrides_from_env(&mut spec);
-    run_spec(&spec, input).await
+    run_spec(&spec, input, policy).await
 }
 
-pub async fn run_spec(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
+pub async fn run_spec(
+    spec: &RunSpec,
+    input: Option<String>,
+    policy: Option<crate::persistence::RunPolicy>,
+) -> Result<RunReport> {
     match spec.kind {
         RunKind::Agent => run_agent(spec, input).await,
-        RunKind::Pipeline => run_pipeline(spec, input).await,
-        RunKind::Workflow => run_workflow(spec, input).await,
+        RunKind::Pipeline => run_pipeline(spec, input, policy).await,
+        RunKind::Workflow => run_workflow(spec, input, policy).await,
     }
 }
 
@@ -125,7 +133,11 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
     })
 }
 
-async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
+async fn run_pipeline(
+    spec: &RunSpec,
+    input: Option<String>,
+    _policy: Option<crate::persistence::RunPolicy>,
+) -> Result<RunReport> {
     let pipeline = spec
         .pipeline
         .as_ref()
@@ -246,7 +258,11 @@ async fn run_pipeline(spec: &RunSpec, input: Option<String>) -> Result<RunReport
     })
 }
 
-async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
+async fn run_workflow(
+    spec: &RunSpec,
+    input: Option<String>,
+    policy: Option<crate::persistence::RunPolicy>,
+) -> Result<RunReport> {
     let w = spec
         .workflow
         .as_ref()
@@ -300,8 +316,10 @@ async fn run_workflow(spec: &RunSpec, input: Option<String>) -> Result<RunReport
 
     for step in &w.steps {
         let effective_timeout = match step.mode {
-            Some(StepMode::Service) => Some(0u64),
-            None => step.timeout_secs,
+            Some(StepMode::Service) => Some(0u64), // explicit infinite — don't override
+            None => step
+                .timeout_secs
+                .or_else(|| policy.as_ref().map(|p| p.stage_timeout_secs)),
         };
         if let Some(t) = effective_timeout {
             builder = builder.timeout(&step.name, t);
