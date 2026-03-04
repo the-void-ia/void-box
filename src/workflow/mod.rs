@@ -41,12 +41,15 @@ pub mod scheduler;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 pub use composition::{CompositionOp, Pipeline};
 pub use context::{StepContext, StepOutput};
 pub use definition::{Step, StepFn, Workflow, WorkflowBuilder};
 pub use scheduler::{ExecutionPlan, Scheduler};
 
 use crate::observe::{ObserveConfig, ObservedResult, Observer};
+use crate::persistence::RunEvent;
 use crate::sandbox::Sandbox;
 use crate::Result;
 
@@ -84,6 +87,7 @@ impl WorkflowResult {
 pub struct ObservableWorkflow {
     workflow: Workflow,
     observer: Observer,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 }
 
 impl ObservableWorkflow {
@@ -92,12 +96,13 @@ impl ObservableWorkflow {
         Self {
             workflow,
             observer: Observer::new(config),
+            stage_tx: None,
         }
     }
 
     /// Run the workflow in a sandbox
     pub async fn run_in(self, sandbox: Arc<Sandbox>) -> Result<ObservedResult<WorkflowResult>> {
-        let scheduler = Scheduler::new(self.observer.clone());
+        let scheduler = Scheduler::new(self.observer.clone(), self.stage_tx);
         let result = scheduler.execute(&self.workflow, sandbox).await?;
 
         Ok(ObservedResult::new(result, &self.observer))
@@ -113,11 +118,30 @@ impl ObservableWorkflow {
 pub trait WorkflowExt {
     /// Attach observability to this workflow
     fn observe(self, config: ObserveConfig) -> ObservableWorkflow;
+
+    /// Attach observability with a stage event sender
+    fn observe_with_stage_tx(
+        self,
+        config: ObserveConfig,
+        stage_tx: Option<UnboundedSender<RunEvent>>,
+    ) -> ObservableWorkflow;
 }
 
 impl WorkflowExt for Workflow {
     fn observe(self, config: ObserveConfig) -> ObservableWorkflow {
         ObservableWorkflow::new(self, config)
+    }
+
+    fn observe_with_stage_tx(
+        self,
+        config: ObserveConfig,
+        stage_tx: Option<UnboundedSender<RunEvent>>,
+    ) -> ObservableWorkflow {
+        ObservableWorkflow {
+            workflow: self,
+            observer: Observer::new(config),
+            stage_tx,
+        }
     }
 }
 

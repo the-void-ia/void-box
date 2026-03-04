@@ -22,6 +22,7 @@
 //! ```
 
 pub mod claude;
+pub mod host_metrics;
 pub mod logs;
 pub mod metrics;
 pub mod otlp;

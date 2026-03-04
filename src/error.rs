@@ -15,6 +15,7 @@ pub enum ApiErrorCode {
     NotFound,
     AlreadyTerminal,
     ResourceLimitExceeded,
+    InvalidParams,
     InternalError,
 }
 
@@ -54,6 +55,14 @@ impl ApiError {
     pub fn already_terminal(message: impl Into<String>) -> Self {
         Self {
             code: ApiErrorCode::AlreadyTerminal,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::InvalidParams,
             message: message.into(),
             retryable: false,
         }
@@ -167,4 +176,26 @@ pub enum Error {
     /// Protocol wire-format errors
     #[error("Protocol error: {0}")]
     Protocol(#[from] void_box_protocol::ProtocolError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalid_params_serialization() {
+        let err = ApiError::invalid_params("from_seq must be numeric");
+        let json = err.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["code"], "INVALID_PARAMS");
+        assert_eq!(parsed["message"], "from_seq must be numeric");
+        assert_eq!(parsed["retryable"], false);
+    }
+
+    #[test]
+    fn test_invalid_params_not_retryable() {
+        let err = ApiError::invalid_params("bad param");
+        assert!(!err.retryable);
+        assert_eq!(err.code, ApiErrorCode::InvalidParams);
+    }
 }

@@ -33,11 +33,14 @@
 
 use std::time::Instant;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::agent_box::VoidBox;
 use crate::guest::protocol::ExecOutputChunk;
 use crate::observe::claude::{create_otel_spans, ClaudeExecResult};
 use crate::observe::tracer::SpanStatus;
 use crate::observe::{ObserveConfig, ObservedResult, Observer};
+use crate::persistence::RunEvent;
 
 /// Result of running a full pipeline.
 #[derive(Debug)]
@@ -154,7 +157,7 @@ impl Pipeline {
     /// array for the next stage.
     pub async fn run(self) -> crate::Result<PipelineResult> {
         let mut hook = NoopOutputHook;
-        run_pipeline_core(self.name, self.stages, &mut hook, None).await
+        run_pipeline_core(self.name, self.stages, &mut hook, None, None).await
     }
 
     /// Execute the pipeline with a streaming callback for output chunks.
@@ -169,7 +172,7 @@ impl Pipeline {
         F: FnMut(&str, &ExecOutputChunk) + Send,
     {
         let mut hook = StreamingOutputHook(on_output);
-        run_pipeline_core(self.name, self.stages, &mut hook, None).await
+        run_pipeline_core(self.name, self.stages, &mut hook, None, None).await
     }
 
     /// Number of stages in the pipeline.
@@ -180,6 +183,19 @@ impl Pipeline {
     /// Check if pipeline is empty.
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// Execute the pipeline with a stage event sender for telemetry.
+    ///
+    /// Stage lifecycle events (`StageStarted`, `StageSucceeded`, `StageFailed`,
+    /// `StageSkipped`) are emitted through the provided channel. `StageQueued`
+    /// events should be emitted by the caller before calling this method.
+    pub async fn run_with_stage_tx(
+        self,
+        stage_tx: Option<UnboundedSender<RunEvent>>,
+    ) -> crate::Result<PipelineResult> {
+        let mut hook = NoopOutputHook;
+        run_pipeline_core(self.name, self.stages, &mut hook, None, stage_tx).await
     }
 
     /// Attach observability to this pipeline.
@@ -251,6 +267,7 @@ async fn run_pipeline_core(
     pipeline_stages: Vec<PipelineStage>,
     output_hook: &mut dyn OutputHook,
     observer: Option<&Observer>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 ) -> crate::Result<PipelineResult> {
     let total_stages = pipeline_stages.len();
     let tracer = observer.map(|o| o.tracer().clone());
@@ -273,6 +290,7 @@ async fn run_pipeline_core(
     let mut had_pipeline_error = false;
 
     for (i, stage) in pipeline_stages.into_iter().enumerate() {
+        let group_id = format!("g{}", i);
         match stage {
             PipelineStage::Single(agent_box) => {
                 let box_name = agent_box.name.clone();
@@ -282,6 +300,16 @@ async fn run_pipeline_core(
                     total_stages,
                     box_name
                 );
+
+                // Emit StageStarted
+                if let Some(ref tx) = stage_tx {
+                    let _ = tx.send(crate::persistence::stage_event_started(
+                        &box_name,
+                        Some(&box_name),
+                        &group_id,
+                        1,
+                    ));
+                }
 
                 let stage_start = Instant::now();
                 let stage_result = agent_box.run(carry_data.as_deref()).await?;
@@ -300,10 +328,38 @@ async fn run_pipeline_core(
                 log_stage_complete(i, total_stages, &box_name, &stage_result);
 
                 if stage_result.claude_result.is_error {
+                    // Emit StageFailed
+                    if let Some(ref tx) = stage_tx {
+                        let _ = tx.send(crate::persistence::stage_event_failed(
+                            &box_name,
+                            Some(&box_name),
+                            &group_id,
+                            elapsed.as_millis() as u64,
+                            1,
+                            stage_result
+                                .claude_result
+                                .error
+                                .as_deref()
+                                .unwrap_or("stage error"),
+                            1,
+                        ));
+                    }
                     log_stage_error(&box_name, &stage_result.claude_result);
                     had_pipeline_error = true;
                     stages.push(stage_result);
                     break;
+                }
+
+                // Emit StageSucceeded
+                if let Some(ref tx) = stage_tx {
+                    let _ = tx.send(crate::persistence::stage_event_succeeded(
+                        &box_name,
+                        Some(&box_name),
+                        &group_id,
+                        elapsed.as_millis() as u64,
+                        0,
+                        1,
+                    ));
                 }
 
                 stages.push(stage_result);
@@ -335,7 +391,66 @@ async fn run_pipeline_core(
                 let mut join_set = tokio::task::JoinSet::new();
                 for agent_box in boxes {
                     let input = carry_data.clone();
-                    join_set.spawn(async move { agent_box.run(input.as_deref()).await });
+                    let stx = stage_tx.clone();
+                    let gid = group_id.clone();
+                    let bname = agent_box.name.clone();
+                    join_set.spawn(async move {
+                        // Emit StageStarted
+                        if let Some(ref tx) = stx {
+                            let _ = tx.send(crate::persistence::stage_event_started(
+                                &bname,
+                                Some(&bname),
+                                &gid,
+                                1,
+                            ));
+                        }
+                        let start = Instant::now();
+                        let result = agent_box.run(input.as_deref()).await;
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                        // Emit StageSucceeded or StageFailed
+                        match &result {
+                            Ok(sr) if sr.claude_result.is_error => {
+                                if let Some(ref tx) = stx {
+                                    let _ = tx.send(crate::persistence::stage_event_failed(
+                                        &bname,
+                                        Some(&bname),
+                                        &gid,
+                                        elapsed_ms,
+                                        1,
+                                        sr.claude_result.error.as_deref().unwrap_or("stage error"),
+                                        1,
+                                    ));
+                                }
+                            }
+                            Ok(_) => {
+                                if let Some(ref tx) = stx {
+                                    let _ = tx.send(crate::persistence::stage_event_succeeded(
+                                        &bname,
+                                        Some(&bname),
+                                        &gid,
+                                        elapsed_ms,
+                                        0,
+                                        1,
+                                    ));
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(ref tx) = stx {
+                                    let _ = tx.send(crate::persistence::stage_event_failed(
+                                        &bname,
+                                        Some(&bname),
+                                        &gid,
+                                        elapsed_ms,
+                                        -1,
+                                        "execution error",
+                                        1,
+                                    ));
+                                }
+                            }
+                        }
+                        result
+                    });
                 }
 
                 let mut parallel_results: Vec<StageResult> = Vec::new();
@@ -503,6 +618,7 @@ impl ObservablePipeline {
             self.pipeline.stages,
             &mut hook,
             Some(&observer),
+            None,
         )
         .await?;
 
@@ -525,6 +641,7 @@ impl ObservablePipeline {
             self.pipeline.stages,
             &mut hook,
             Some(&observer),
+            None,
         )
         .await?;
 

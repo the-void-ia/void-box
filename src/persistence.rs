@@ -59,6 +59,11 @@ pub struct RunEvent {
     pub seq: Option<u64>,
     #[serde(default)]
     pub payload: Option<Value>,
+    // --- stage-scoping fields ---
+    #[serde(default)]
+    pub stage_name: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
     // --- v2 orchestration fields ---
     #[serde(default)]
     pub event_id: Option<String>,
@@ -406,6 +411,11 @@ pub fn legacy_to_v2_event_type(legacy: &str) -> String {
         "log.chunk" => "LogChunk".to_string(),
         "log.closed" => "LogClosed".to_string(),
         "spec.parse_failed" => "SpecParseFailed".to_string(),
+        "stage.queued" => "StageQueued".to_string(),
+        "stage.started" => "StageStarted".to_string(),
+        "stage.completed" => "StageSucceeded".to_string(),
+        "stage.failed" => "StageFailed".to_string(),
+        "stage.skipped" => "StageSkipped".to_string(),
         other => {
             // Best-effort PascalCase: "foo.bar_baz" → "FooBarBaz"
             other
@@ -427,5 +437,262 @@ pub fn legacy_to_v2_event_type(legacy: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage event builders
+// ---------------------------------------------------------------------------
+
+/// Build a `StageQueued` event. `seq` and `attempt_id` are left unset — the
+/// collector task in `daemon.rs` assigns them when the event is pushed into
+/// `RunState`.
+pub fn stage_event_queued(
+    stage_name: &str,
+    box_name: Option<&str>,
+    group_id: &str,
+    depends_on: &[String],
+) -> RunEvent {
+    RunEvent {
+        ts_ms: now_ms(),
+        level: "info".to_string(),
+        event_type: "stage.queued".to_string(),
+        message: format!("stage '{}' queued", stage_name),
+        run_id: None,
+        box_name: box_name.map(ToString::to_string),
+        skill_id: None,
+        skill_type: None,
+        environment_id: None,
+        mode: None,
+        stream: None,
+        seq: None,
+        payload: Some(serde_json::json!({ "depends_on": depends_on })),
+        stage_name: Some(stage_name.to_string()),
+        group_id: Some(group_id.to_string()),
+        event_id: Some(generate_event_id()),
+        attempt_id: None,
+        timestamp: Some(now_rfc3339()),
+        event_type_v2: Some(legacy_to_v2_event_type("stage.queued")),
+    }
+}
+
+pub fn stage_event_started(
+    stage_name: &str,
+    box_name: Option<&str>,
+    group_id: &str,
+    stage_attempt: u32,
+) -> RunEvent {
+    RunEvent {
+        ts_ms: now_ms(),
+        level: "info".to_string(),
+        event_type: "stage.started".to_string(),
+        message: format!("stage '{}' started (attempt {})", stage_name, stage_attempt),
+        run_id: None,
+        box_name: box_name.map(ToString::to_string),
+        skill_id: None,
+        skill_type: None,
+        environment_id: None,
+        mode: None,
+        stream: None,
+        seq: None,
+        payload: Some(serde_json::json!({ "stage_attempt": stage_attempt })),
+        stage_name: Some(stage_name.to_string()),
+        group_id: Some(group_id.to_string()),
+        event_id: Some(generate_event_id()),
+        attempt_id: None,
+        timestamp: Some(now_rfc3339()),
+        event_type_v2: Some(legacy_to_v2_event_type("stage.started")),
+    }
+}
+
+pub fn stage_event_succeeded(
+    stage_name: &str,
+    box_name: Option<&str>,
+    group_id: &str,
+    duration_ms: u64,
+    exit_code: i32,
+    stage_attempt: u32,
+) -> RunEvent {
+    RunEvent {
+        ts_ms: now_ms(),
+        level: "info".to_string(),
+        event_type: "stage.completed".to_string(),
+        message: format!("stage '{}' succeeded in {}ms", stage_name, duration_ms),
+        run_id: None,
+        box_name: box_name.map(ToString::to_string),
+        skill_id: None,
+        skill_type: None,
+        environment_id: None,
+        mode: None,
+        stream: None,
+        seq: None,
+        payload: Some(serde_json::json!({
+            "duration_ms": duration_ms,
+            "exit_code": exit_code,
+            "stage_attempt": stage_attempt,
+        })),
+        stage_name: Some(stage_name.to_string()),
+        group_id: Some(group_id.to_string()),
+        event_id: Some(generate_event_id()),
+        attempt_id: None,
+        timestamp: Some(now_rfc3339()),
+        event_type_v2: Some(legacy_to_v2_event_type("stage.completed")),
+    }
+}
+
+pub fn stage_event_failed(
+    stage_name: &str,
+    box_name: Option<&str>,
+    group_id: &str,
+    duration_ms: u64,
+    exit_code: i32,
+    error: &str,
+    stage_attempt: u32,
+) -> RunEvent {
+    RunEvent {
+        ts_ms: now_ms(),
+        level: "error".to_string(),
+        event_type: "stage.failed".to_string(),
+        message: format!("stage '{}' failed: {}", stage_name, error),
+        run_id: None,
+        box_name: box_name.map(ToString::to_string),
+        skill_id: None,
+        skill_type: None,
+        environment_id: None,
+        mode: None,
+        stream: None,
+        seq: None,
+        payload: Some(serde_json::json!({
+            "duration_ms": duration_ms,
+            "exit_code": exit_code,
+            "error": error,
+            "stage_attempt": stage_attempt,
+        })),
+        stage_name: Some(stage_name.to_string()),
+        group_id: Some(group_id.to_string()),
+        event_id: Some(generate_event_id()),
+        attempt_id: None,
+        timestamp: Some(now_rfc3339()),
+        event_type_v2: Some(legacy_to_v2_event_type("stage.failed")),
+    }
+}
+
+pub fn stage_event_skipped(
+    stage_name: &str,
+    box_name: Option<&str>,
+    group_id: &str,
+    reason: &str,
+    stage_attempt: u32,
+) -> RunEvent {
+    RunEvent {
+        ts_ms: now_ms(),
+        level: "warn".to_string(),
+        event_type: "stage.skipped".to_string(),
+        message: format!("stage '{}' skipped: {}", stage_name, reason),
+        run_id: None,
+        box_name: box_name.map(ToString::to_string),
+        skill_id: None,
+        skill_type: None,
+        environment_id: None,
+        mode: None,
+        stream: None,
+        seq: None,
+        payload: Some(serde_json::json!({
+            "reason": reason,
+            "stage_attempt": stage_attempt,
+        })),
+        stage_name: Some(stage_name.to_string()),
+        group_id: Some(group_id.to_string()),
+        event_id: Some(generate_event_id()),
+        attempt_id: None,
+        timestamp: Some(now_rfc3339()),
+        event_type_v2: Some(legacy_to_v2_event_type("stage.skipped")),
+    }
+}
+
 #[allow(dead_code)]
 fn _ensure_ascii_path(_p: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stage_event_queued_fields() {
+        let ev = stage_event_queued("build", Some("build-box"), "g1", &["fetch".to_string()]);
+        assert_eq!(ev.event_type, "stage.queued");
+        assert_eq!(ev.event_type_v2.as_deref(), Some("StageQueued"));
+        assert_eq!(ev.stage_name.as_deref(), Some("build"));
+        assert_eq!(ev.box_name.as_deref(), Some("build-box"));
+        assert_eq!(ev.group_id.as_deref(), Some("g1"));
+        assert!(ev.payload.is_some());
+        let deps = ev.payload.unwrap();
+        assert_eq!(deps["depends_on"][0].as_str(), Some("fetch"));
+    }
+
+    #[test]
+    fn test_stage_event_started_fields() {
+        let ev = stage_event_started("build", Some("build-box"), "g1", 2);
+        assert_eq!(ev.event_type, "stage.started");
+        assert_eq!(ev.event_type_v2.as_deref(), Some("StageStarted"));
+        assert_eq!(ev.stage_name.as_deref(), Some("build"));
+        let payload = ev.payload.unwrap();
+        assert_eq!(payload["stage_attempt"], 2);
+    }
+
+    #[test]
+    fn test_stage_event_succeeded_fields() {
+        let ev = stage_event_succeeded("build", Some("build-box"), "g1", 4500, 0, 1);
+        assert_eq!(ev.event_type, "stage.completed");
+        assert_eq!(ev.event_type_v2.as_deref(), Some("StageSucceeded"));
+        let payload = ev.payload.unwrap();
+        assert_eq!(payload["duration_ms"], 4500);
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["stage_attempt"], 1);
+    }
+
+    #[test]
+    fn test_stage_event_failed_fields() {
+        let ev = stage_event_failed(
+            "build",
+            None,
+            "g0",
+            1200,
+            1,
+            "command exited with code 1",
+            1,
+        );
+        assert_eq!(ev.event_type, "stage.failed");
+        assert_eq!(ev.event_type_v2.as_deref(), Some("StageFailed"));
+        assert!(ev.box_name.is_none());
+        let payload = ev.payload.unwrap();
+        assert_eq!(payload["duration_ms"], 1200);
+        assert_eq!(payload["exit_code"], 1);
+        assert_eq!(payload["error"], "command exited with code 1");
+    }
+
+    #[test]
+    fn test_stage_event_skipped_fields() {
+        let ev = stage_event_skipped("deploy", None, "g2", "dependency \"build\" failed", 1);
+        assert_eq!(ev.event_type, "stage.skipped");
+        assert_eq!(ev.event_type_v2.as_deref(), Some("StageSkipped"));
+        let payload = ev.payload.unwrap();
+        assert_eq!(payload["reason"], "dependency \"build\" failed");
+    }
+
+    #[test]
+    fn test_legacy_to_v2_stage_mappings() {
+        assert_eq!(legacy_to_v2_event_type("stage.queued"), "StageQueued");
+        assert_eq!(legacy_to_v2_event_type("stage.started"), "StageStarted");
+        assert_eq!(legacy_to_v2_event_type("stage.completed"), "StageSucceeded");
+        assert_eq!(legacy_to_v2_event_type("stage.failed"), "StageFailed");
+        assert_eq!(legacy_to_v2_event_type("stage.skipped"), "StageSkipped");
+    }
+
+    #[test]
+    fn test_run_status_terminal() {
+        assert!(RunStatus::Succeeded.is_terminal());
+        assert!(RunStatus::Failed.is_terminal());
+        assert!(RunStatus::Cancelled.is_terminal());
+        assert!(!RunStatus::Pending.is_terminal());
+        assert!(!RunStatus::Starting.is_terminal());
+        assert!(!RunStatus::Running.is_terminal());
+    }
+}

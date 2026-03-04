@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use super::composition::resolve_pipe_input;
 use super::context::{StepContext, StepContextBuilder, StepOutput};
 use super::definition::{Step, Workflow};
 use super::WorkflowResult;
 use crate::observe::Observer;
+use crate::persistence::RunEvent;
 use crate::sandbox::Sandbox;
 use crate::{Error, Result};
 
@@ -100,12 +103,20 @@ fn first_failed_dependency_static(
 /// Scheduler for executing workflows
 pub struct Scheduler {
     observer: Observer,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 }
 
 impl Scheduler {
     /// Create a new scheduler
-    pub fn new(observer: Observer) -> Self {
-        Self { observer }
+    pub fn new(observer: Observer, stage_tx: Option<UnboundedSender<RunEvent>>) -> Self {
+        Self { observer, stage_tx }
+    }
+
+    /// Helper to emit a stage event via the channel (fire-and-forget).
+    fn emit(&self, event: RunEvent) {
+        if let Some(ref tx) = self.stage_tx {
+            let _ = tx.send(event);
+        }
     }
 
     /// Execute a workflow in a sandbox.
@@ -127,6 +138,15 @@ impl Scheduler {
 
         // Get execution plan (with parallel groups)
         let plan = ExecutionPlan::from_workflow(workflow)?;
+
+        // Build step -> group_id mapping from plan
+        let mut step_group_id: HashMap<String, String> = HashMap::new();
+        for (level, group) in plan.parallel_groups.iter().enumerate() {
+            let gid = format!("g{}", level);
+            for name in group {
+                step_group_id.insert(name.clone(), gid.clone());
+            }
+        }
 
         let workflow_name = &workflow.name;
         let total_steps = plan.steps.len();
@@ -155,6 +175,11 @@ impl Scheduler {
                     Error::Config(format!("Step '{}' not found in workflow", step_name))
                 })?;
 
+                let gid = step_group_id
+                    .get(step_name)
+                    .cloned()
+                    .unwrap_or_else(|| "g0".to_string());
+
                 let mut step_span = self
                     .observer
                     .start_step_span(step_name, Some(&workflow_ctx));
@@ -179,6 +204,10 @@ impl Scheduler {
                         .await
                         .insert(step_name.clone(), step_output);
                     step_span.set_error(&skip_msg);
+                    // Emit StageSkipped
+                    self.emit(crate::persistence::stage_event_skipped(
+                        step_name, None, &gid, &skip_msg, 1,
+                    ));
                     self.observer.logger().info(
                         &format!(
                             "[workflow:{}] step {}/{}: \"{}\" SKIPPED ({})",
@@ -188,6 +217,11 @@ impl Scheduler {
                     );
                     continue;
                 }
+
+                // Emit StageStarted
+                self.emit(crate::persistence::stage_event_started(
+                    step_name, None, &gid, 1,
+                ));
 
                 let mut ctx_builder = StepContextBuilder::new(step_name, sandbox.clone())
                     .with_outputs(outputs_snapshot.clone())
@@ -218,6 +252,15 @@ impl Scheduler {
                             .await
                             .insert(step_name.clone(), step_output);
                         step_span.set_ok();
+                        // Emit StageSucceeded
+                        self.emit(crate::persistence::stage_event_succeeded(
+                            step_name,
+                            None,
+                            &gid,
+                            elapsed.as_millis() as u64,
+                            0,
+                            1,
+                        ));
                         self.observer.logger().info(
                             &format!(
                                 "[workflow:{}] step {}/{}: \"{}\" ok ({:.1}s)",
@@ -244,6 +287,16 @@ impl Scheduler {
                             .await
                             .insert(step_name.clone(), step_output);
                         step_span.set_error(&error_msg);
+                        // Emit StageFailed
+                        self.emit(crate::persistence::stage_event_failed(
+                            step_name,
+                            None,
+                            &gid,
+                            elapsed.as_millis() as u64,
+                            1,
+                            &error_msg,
+                            1,
+                        ));
                         self.observer.logger().error(
                             &format!(
                                 "[workflow:{}] step {}/{}: \"{}\" FAILED ({:.1}s): {}",
@@ -282,6 +335,10 @@ impl Scheduler {
                     })?;
 
                     let name = step_name.clone();
+                    let gid = step_group_id
+                        .get(step_name)
+                        .cloned()
+                        .unwrap_or_else(|| "g0".to_string());
                     let func = step.func.clone();
                     let retry = step.retry.clone();
                     let step_timeout = step.timeout_secs;
@@ -290,6 +347,7 @@ impl Scheduler {
                     let compositions = workflow.compositions.clone();
                     let outputs_snap = outputs_snapshot.clone();
                     let observer = self.observer.clone();
+                    let stx = self.stage_tx.clone();
                     let wf_ctx = workflow_ctx.clone();
                     let wf_name = workflow_name.clone();
 
@@ -302,6 +360,12 @@ impl Scheduler {
                         {
                             let skip_msg = format!("dependency \"{}\" failed", failed_dep);
                             step_span.set_error(&skip_msg);
+                            // Emit StageSkipped
+                            if let Some(ref tx) = stx {
+                                let _ = tx.send(crate::persistence::stage_event_skipped(
+                                    &name, None, &gid, &skip_msg, 1,
+                                ));
+                            }
                             observer.logger().info(
                                 &format!(
                                     "[workflow:{}] step \"{}\" SKIPPED ({})",
@@ -313,6 +377,13 @@ impl Scheduler {
                                 name,
                                 StepOutput::new(Vec::new(), skip_msg.as_bytes().to_vec(), 1),
                             );
+                        }
+
+                        // Emit StageStarted
+                        if let Some(ref tx) = stx {
+                            let _ = tx.send(crate::persistence::stage_event_started(
+                                &name, None, &gid, 1,
+                            ));
                         }
 
                         let step_start = Instant::now();
@@ -359,29 +430,54 @@ impl Scheduler {
 
                         let step_output = match result {
                             Ok(output) => {
+                                let elapsed = step_start.elapsed();
                                 step_span.record_stdout(output.len());
                                 step_span.set_ok();
+                                // Emit StageSucceeded
+                                if let Some(ref tx) = stx {
+                                    let _ = tx.send(crate::persistence::stage_event_succeeded(
+                                        &name,
+                                        None,
+                                        &gid,
+                                        elapsed.as_millis() as u64,
+                                        0,
+                                        1,
+                                    ));
+                                }
                                 observer.logger().info(
                                     &format!(
                                         "[workflow:{}] step \"{}\" ok ({:.1}s)",
                                         wf_name,
                                         name,
-                                        step_start.elapsed().as_secs_f64()
+                                        elapsed.as_secs_f64()
                                     ),
                                     &[("step", name.as_str())],
                                 );
                                 StepOutput::new(output, Vec::new(), 0)
                             }
                             Err(e) => {
+                                let elapsed = step_start.elapsed();
                                 let error_msg = e.to_string();
                                 step_span.record_stderr(error_msg.len());
                                 step_span.set_error(&error_msg);
+                                // Emit StageFailed
+                                if let Some(ref tx) = stx {
+                                    let _ = tx.send(crate::persistence::stage_event_failed(
+                                        &name,
+                                        None,
+                                        &gid,
+                                        elapsed.as_millis() as u64,
+                                        1,
+                                        &error_msg,
+                                        1,
+                                    ));
+                                }
                                 observer.logger().error(
                                     &format!(
                                         "[workflow:{}] step \"{}\" FAILED ({:.1}s): {}",
                                         wf_name,
                                         name,
-                                        step_start.elapsed().as_secs_f64(),
+                                        elapsed.as_secs_f64(),
                                         &error_msg[..error_msg.len().min(200)]
                                     ),
                                     &[("step", name.as_str())],
@@ -610,7 +706,7 @@ mod tests {
 
         let observer = crate::observe::Observer::test();
         let sandbox = crate::sandbox::Sandbox::mock().build().unwrap();
-        let scheduler = Scheduler::new(observer);
+        let scheduler = Scheduler::new(observer, None);
 
         let result = scheduler.execute(&workflow, sandbox).await.unwrap();
 

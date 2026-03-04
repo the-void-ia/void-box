@@ -100,6 +100,8 @@ pub struct ObserveSpec {
     pub otlp_endpoint: Option<String>,
     #[serde(default)]
     pub service_name: Option<String>,
+    #[serde(default)]
+    pub telemetry_buffer_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

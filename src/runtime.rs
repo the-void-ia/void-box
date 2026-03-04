@@ -5,9 +5,12 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::agent_box::VoidBox;
 use crate::backend::MountConfig;
 use crate::llm::LlmProvider;
+use crate::persistence::RunEvent;
 use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
@@ -51,29 +54,58 @@ pub async fn run_file(
     path: &Path,
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 ) -> Result<RunReport> {
     let mut spec = load_spec(path)?;
     apply_llm_overrides_from_env(&mut spec);
-    run_spec(&spec, input, policy).await
+    run_spec(&spec, input, policy, stage_tx).await
 }
 
 pub async fn run_spec(
     spec: &RunSpec,
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 ) -> Result<RunReport> {
     match spec.kind {
-        RunKind::Agent => run_agent(spec, input).await,
-        RunKind::Pipeline => run_pipeline(spec, input, policy).await,
-        RunKind::Workflow => run_workflow(spec, input, policy).await,
+        RunKind::Agent => run_agent(spec, input, stage_tx).await,
+        RunKind::Pipeline => run_pipeline(spec, input, policy, stage_tx).await,
+        RunKind::Workflow => run_workflow(spec, input, policy, stage_tx).await,
     }
 }
 
-async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
+/// Helper to send a stage event through the channel (fire-and-forget).
+fn emit_stage_event(tx: &Option<UnboundedSender<RunEvent>>, event: RunEvent) {
+    if let Some(ref tx) = tx {
+        let _ = tx.send(event);
+    }
+}
+
+async fn run_agent(
+    spec: &RunSpec,
+    input: Option<String>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
+) -> Result<RunReport> {
     let agent = spec
         .agent
         .as_ref()
         .ok_or_else(|| Error::Config("missing agent section".into()))?;
+
+    let stage_name = &spec.name;
+    let group_id = "g0";
+    let box_name = Some(spec.name.as_str());
+
+    // Emit StageQueued + StageStarted
+    emit_stage_event(
+        &stage_tx,
+        crate::persistence::stage_event_queued(stage_name, box_name, group_id, &[]),
+    );
+    emit_stage_event(
+        &stage_tx,
+        crate::persistence::stage_event_started(stage_name, box_name, group_id, 1),
+    );
+
+    let stage_start = std::time::Instant::now();
 
     // Resolve guest image (kernel + initramfs) via the 5-step chain.
     let guest = resolve_guest_image(spec).await;
@@ -121,6 +153,38 @@ async fn run_agent(spec: &RunSpec, input: Option<String>) -> Result<RunReport> {
         String::new()
     };
 
+    let duration_ms = stage_start.elapsed().as_millis() as u64;
+    if stage.claude_result.is_error {
+        emit_stage_event(
+            &stage_tx,
+            crate::persistence::stage_event_failed(
+                stage_name,
+                box_name,
+                group_id,
+                duration_ms,
+                1,
+                stage
+                    .claude_result
+                    .error
+                    .as_deref()
+                    .unwrap_or("agent execution failed"),
+                1,
+            ),
+        );
+    } else {
+        emit_stage_event(
+            &stage_tx,
+            crate::persistence::stage_event_succeeded(
+                stage_name,
+                box_name,
+                group_id,
+                duration_ms,
+                0,
+                1,
+            ),
+        );
+    }
+
     Ok(RunReport {
         name: spec.name.clone(),
         kind: "agent".to_string(),
@@ -137,6 +201,7 @@ async fn run_pipeline(
     spec: &RunSpec,
     input: Option<String>,
     _policy: Option<crate::persistence::RunPolicy>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 ) -> Result<RunReport> {
     let pipeline = spec
         .pipeline
@@ -210,6 +275,42 @@ async fn run_pipeline(
         .remove(&first_name)
         .ok_or_else(|| Error::Config(format!("unknown box '{}'", first_name)))?;
 
+    // Emit StageQueued for all pipeline stages
+    {
+        let mut prev_names: Vec<String> = Vec::new();
+        for (i, stage_spec) in stage_plan.iter().enumerate() {
+            let gid = format!("g{}", i);
+            match stage_spec {
+                PipelineStageSpec::Box { name } => {
+                    emit_stage_event(
+                        &stage_tx,
+                        crate::persistence::stage_event_queued(
+                            name,
+                            Some(name.as_str()),
+                            &gid,
+                            &prev_names,
+                        ),
+                    );
+                    prev_names = vec![name.clone()];
+                }
+                PipelineStageSpec::FanOut { boxes } => {
+                    for bname in boxes {
+                        emit_stage_event(
+                            &stage_tx,
+                            crate::persistence::stage_event_queued(
+                                bname,
+                                Some(bname.as_str()),
+                                &gid,
+                                &prev_names,
+                            ),
+                        );
+                    }
+                    prev_names = boxes.clone();
+                }
+            }
+        }
+    }
+
     let mut p = Pipeline::named(&spec.name, first);
     for stage in stage_plan.into_iter().skip(1) {
         match stage {
@@ -235,9 +336,9 @@ async fn run_pipeline(
     let result = if let Some(i) = input {
         // lightweight input injection: prefix into first box prompt
         let _ = i;
-        p.run().await?
+        p.run_with_stage_tx(stage_tx).await?
     } else {
-        p.run().await?
+        p.run_with_stage_tx(stage_tx).await?
     };
 
     let output = result.output.clone();
@@ -262,6 +363,7 @@ async fn run_workflow(
     spec: &RunSpec,
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
+    stage_tx: Option<UnboundedSender<RunEvent>>,
 ) -> Result<RunReport> {
     let w = spec
         .workflow
@@ -340,8 +442,33 @@ async fn run_workflow(
 
     let sandbox = build_shared_sandbox(spec, oci_rootfs_plan.as_ref(), guest.as_ref())?;
 
+    // Emit StageQueued for all workflow steps using the execution plan
+    if stage_tx.is_some() {
+        if let Ok(plan) = crate::workflow::scheduler::ExecutionPlan::from_workflow(&workflow) {
+            for (level, group) in plan.parallel_groups.iter().enumerate() {
+                let gid = format!("g{}", level);
+                for step_name in group {
+                    let depends_on: Vec<String> = workflow
+                        .steps
+                        .get(step_name)
+                        .map(|s| s.depends_on.clone())
+                        .unwrap_or_default();
+                    emit_stage_event(
+                        &stage_tx,
+                        crate::persistence::stage_event_queued(
+                            step_name,
+                            None, // workflow steps don't have box_name
+                            &gid,
+                            &depends_on,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     let observed = workflow
-        .observe(crate::observe::ObserveConfig::from_env())
+        .observe_with_stage_tx(crate::observe::ObserveConfig::from_env(), stage_tx)
         .run_in(sandbox)
         .await?;
 

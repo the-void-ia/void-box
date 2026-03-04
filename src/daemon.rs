@@ -21,6 +21,14 @@ use crate::spec::{RunKind, RunSpec};
 struct AppState {
     runs: Arc<Mutex<HashMap<String, RunState>>>,
     provider: Arc<dyn PersistenceProvider>,
+    telemetry_buffers: Arc<
+        Mutex<
+            HashMap<
+                String,
+                std::sync::Arc<std::sync::Mutex<crate::observe::telemetry::TelemetryRingBuffer>>,
+            >,
+        >,
+    >,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +86,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         runs: Arc::new(Mutex::new(initial_runs)),
         provider,
+        telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let listener = TcpListener::bind(addr).await?;
@@ -163,6 +172,16 @@ async fn route_request(
         ("GET", "/v1/runs") => list_runs(query, state).await,
         _ => {
             if let Some(id) = path.strip_prefix("/v1/runs/") {
+                if let Some(id) = id.strip_suffix("/stages") {
+                    if method == "GET" {
+                        return get_stages(id, state).await;
+                    }
+                }
+                if let Some(id) = id.strip_suffix("/telemetry") {
+                    if method == "GET" {
+                        return get_telemetry(id, query, state).await;
+                    }
+                }
                 if let Some(id) = id.strip_suffix("/events") {
                     return get_events(id, query, state).await;
                 }
@@ -323,12 +342,107 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         );
     }
 
+    // Create telemetry ring buffer for this run
+    let buffer_size = std::env::var("VOIDBOX_TELEMETRY_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000usize);
+    let ring_buffer = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::observe::telemetry::TelemetryRingBuffer::new(buffer_size),
+    ));
+    {
+        let mut bufs = state.telemetry_buffers.lock().await;
+        bufs.insert(run_id.clone(), ring_buffer.clone());
+    }
+
+    // Spawn host metrics collection task (1s interval)
+    let host_state = state.clone();
+    let host_run_id = run_id.clone();
+    let host_rb = ring_buffer.clone();
+    tokio::spawn(async move {
+        let collector = crate::observe::host_metrics::HostMetricsCollector::new();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            // Check if run is terminal
+            let is_terminal = {
+                let runs = host_state.runs.lock().await;
+                runs.get(&host_run_id)
+                    .map(|r| r.status.is_terminal())
+                    .unwrap_or(true)
+            };
+            if is_terminal {
+                break;
+            }
+
+            // Determine current stage name from latest StageStarted event
+            let current_stage = {
+                let runs = host_state.runs.lock().await;
+                runs.get(&host_run_id)
+                    .and_then(|r| {
+                        r.events
+                            .iter()
+                            .rev()
+                            .find(|e| e.event_type == "stage.started")
+                            .and_then(|e| e.stage_name.clone())
+                    })
+                    .unwrap_or_default()
+            };
+
+            let snap = collector.collect();
+            if let Ok(mut buf) = host_rb.lock() {
+                buf.push(crate::observe::telemetry::TelemetrySample {
+                    seq: 0, // assigned by push()
+                    timestamp_ms: now_ms(),
+                    timestamp: Some(now_rfc3339()),
+                    stage_name: current_stage,
+                    guest: None,
+                    host: Some(crate::observe::telemetry::HostMetricsSample {
+                        rss_bytes: snap.rss_bytes,
+                        cpu_percent: snap.cpu_percent,
+                        io_read_bytes: snap.io_read_bytes,
+                        io_write_bytes: snap.io_write_bytes,
+                    }),
+                });
+            }
+        }
+    });
+
     let state_bg = state.clone();
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
     tokio::spawn(async move {
+        // Stage event channel: execution code sends RunEvents through this sender,
+        // and the collector task pushes them into RunState.
+        let (stage_tx, mut stage_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::persistence::RunEvent>();
+
+        // Collector task: drains events from the channel into RunState.
+        let collector_state = state_bg.clone();
+        let collector_run_id = run_id_bg.clone();
+        let collector_handle = tokio::spawn(async move {
+            while let Some(mut ev) = stage_rx.recv().await {
+                let mut runs = collector_state.runs.lock().await;
+                if let Some(r) = runs.get_mut(&collector_run_id) {
+                    // Terminal guard: skip if run already terminal
+                    if r.status.is_terminal() {
+                        continue;
+                    }
+                    ev.seq = Some(r.events.len() as u64);
+                    ev.attempt_id = Some(r.attempt_id);
+                    ev.run_id = Some(collector_run_id.clone());
+                    r.events.push(ev);
+                    r.updated_at = Some(now_rfc3339());
+                    let _ = collector_state.provider.save_run(r);
+                }
+            }
+        });
+
         let path = PathBuf::from(&req.file);
-        let result = run_file(&path, req.input, policy_bg).await;
+        let result = run_file(&path, req.input, policy_bg, Some(stage_tx)).await;
+
+        // Wait for collector to drain remaining events
+        let _ = collector_handle.await;
 
         let mut runs = state_bg.runs.lock().await;
         if let Some(r) = runs.get_mut(&run_id_bg) {
@@ -371,8 +485,14 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     if !report.output.is_empty() {
                         for (i, line) in report.output.lines().enumerate() {
                             let seq = r.events.len() as u64;
-                            let mut chunk =
-                                event_log_chunk(&run_id_bg, i as u64, "stdout", line.to_string());
+                            let mut chunk = event_log_chunk(
+                                &run_id_bg,
+                                i as u64,
+                                "stdout",
+                                line.to_string(),
+                                None,
+                                None,
+                            );
                             chunk.seq = Some(seq);
                             chunk.attempt_id = Some(attempt);
                             r.events.push(chunk);
@@ -519,8 +639,88 @@ async fn cancel_run(id: &str, body: &str, state: AppState) -> (String, String) {
         r.status = RunStatus::Cancelled;
         let cancel_msg = reason.as_deref().unwrap_or("run marked cancelled");
         r.terminal_reason = Some(cancel_msg.to_string());
-        let seq = r.events.len() as u64;
         let attempt = r.attempt_id;
+
+        // Emit stage cancellation events: scan existing events to determine
+        // the current state of each stage, then emit StageSkipped for queued
+        // stages and StageFailed for running stages.
+        {
+            // Track stage states: stage_name -> (state, group_id, box_name, started_ts_ms, stage_attempt)
+            let mut stage_states: HashMap<String, (&str, String, Option<String>, u64, u32)> =
+                HashMap::new();
+            for ev in &r.events {
+                if let Some(ref sn) = ev.stage_name {
+                    let gid = ev.group_id.clone().unwrap_or_default();
+                    let bn = ev.box_name.clone();
+                    let sa = ev
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("stage_attempt"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u32;
+                    match ev.event_type.as_str() {
+                        "stage.queued" => {
+                            stage_states.insert(sn.clone(), ("queued", gid, bn, ev.ts_ms, sa));
+                        }
+                        "stage.started" => {
+                            stage_states.insert(sn.clone(), ("started", gid, bn, ev.ts_ms, sa));
+                        }
+                        "stage.completed" | "stage.failed" | "stage.skipped" => {
+                            stage_states.insert(sn.clone(), ("terminal", gid, bn, ev.ts_ms, sa));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Collect cancellation events, sorted by group_id
+            let mut cancel_events: Vec<(String, RunEvent)> = Vec::new();
+            let now = now_ms();
+            for (sn, (state, gid, bn, started_ts, sa)) in &stage_states {
+                match *state {
+                    "queued" => {
+                        cancel_events.push((
+                            gid.clone(),
+                            crate::persistence::stage_event_skipped(
+                                sn,
+                                bn.as_deref(),
+                                gid,
+                                "run cancelled",
+                                *sa,
+                            ),
+                        ));
+                    }
+                    "started" => {
+                        let duration_ms = now.saturating_sub(*started_ts);
+                        cancel_events.push((
+                            gid.clone(),
+                            crate::persistence::stage_event_failed(
+                                sn,
+                                bn.as_deref(),
+                                gid,
+                                duration_ms,
+                                -1,
+                                "run cancelled",
+                                *sa,
+                            ),
+                        ));
+                    }
+                    _ => {} // terminal stages are immutable
+                }
+            }
+
+            // Sort by group_id (lowest first)
+            cancel_events.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (_, mut ev) in cancel_events {
+                ev.seq = Some(r.events.len() as u64);
+                ev.attempt_id = Some(attempt);
+                ev.run_id = Some(id.to_string());
+                r.events.push(ev);
+            }
+        }
+
+        let seq = r.events.len() as u64;
         let cancel_event = event_with_seq(
             id,
             "warn",
@@ -613,6 +813,237 @@ async fn get_session_messages(session_id: &str, state: AppState) -> (String, Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage view endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct StageView {
+    stage_name: String,
+    box_name: Option<String>,
+    group_id: String,
+    depends_on: Vec<String>,
+    status: String,
+    stage_attempt: u32,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    duration_ms: Option<u64>,
+    exit_code: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct StagesResponse {
+    run_id: String,
+    attempt_id: u64,
+    updated_at: Option<String>,
+    stages: Vec<StageView>,
+}
+
+async fn get_stages(id: &str, state: AppState) -> (String, String) {
+    let runs = state.runs.lock().await;
+    let Some(r) = runs.get(id) else {
+        return (
+            "404 Not Found".to_string(),
+            ApiError::not_found(format!("run '{id}' not found")).to_json(),
+        );
+    };
+
+    // Reconstruct stage graph from stage events
+    let mut stages: HashMap<String, StageView> = HashMap::new();
+    // Maintain insertion order by tracking order
+    let mut order: Vec<String> = Vec::new();
+
+    for ev in &r.events {
+        let Some(ref sn) = ev.stage_name else {
+            continue;
+        };
+        let gid = ev.group_id.clone().unwrap_or_default();
+        let sa = ev
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("stage_attempt"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+
+        match ev.event_type.as_str() {
+            "stage.queued" => {
+                let depends_on = ev
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("depends_on"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !stages.contains_key(sn) {
+                    order.push(sn.clone());
+                }
+                stages.insert(
+                    sn.clone(),
+                    StageView {
+                        stage_name: sn.clone(),
+                        box_name: ev.box_name.clone(),
+                        group_id: gid,
+                        depends_on,
+                        status: "queued".to_string(),
+                        stage_attempt: sa,
+                        started_at: None,
+                        completed_at: None,
+                        duration_ms: None,
+                        exit_code: None,
+                    },
+                );
+            }
+            "stage.started" => {
+                if let Some(sv) = stages.get_mut(sn) {
+                    sv.status = "running".to_string();
+                    sv.started_at = ev.timestamp.clone();
+                    sv.stage_attempt = sa;
+                }
+            }
+            "stage.completed" => {
+                if let Some(sv) = stages.get_mut(sn) {
+                    sv.status = "succeeded".to_string();
+                    sv.completed_at = ev.timestamp.clone();
+                    sv.stage_attempt = sa;
+                    sv.exit_code = ev
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("exit_code"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32);
+                    sv.duration_ms = ev
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("duration_ms"))
+                        .and_then(|v| v.as_u64());
+                }
+            }
+            "stage.failed" => {
+                if let Some(sv) = stages.get_mut(sn) {
+                    sv.status = "failed".to_string();
+                    sv.completed_at = ev.timestamp.clone();
+                    sv.stage_attempt = sa;
+                    sv.exit_code = ev
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("exit_code"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32);
+                    sv.duration_ms = ev
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("duration_ms"))
+                        .and_then(|v| v.as_u64());
+                }
+            }
+            "stage.skipped" => {
+                if let Some(sv) = stages.get_mut(sn) {
+                    sv.status = "skipped".to_string();
+                    sv.completed_at = ev.timestamp.clone();
+                    sv.stage_attempt = sa;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let stages_vec: Vec<StageView> = order
+        .into_iter()
+        .filter_map(|name| stages.remove(&name))
+        .collect();
+
+    let resp = StagesResponse {
+        run_id: id.to_string(),
+        attempt_id: r.attempt_id,
+        updated_at: r.updated_at.clone(),
+        stages: stages_vec,
+    };
+
+    (
+        "200 OK".to_string(),
+        serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct TelemetryResponse {
+    run_id: String,
+    attempt_id: u64,
+    next_seq: u64,
+    samples: Vec<crate::observe::telemetry::TelemetrySample>,
+}
+
+async fn get_telemetry(id: &str, query: Option<&str>, state: AppState) -> (String, String) {
+    // Parse from_seq — must be numeric if present
+    let from_seq = match parse_query_param(query, "from_seq") {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return (
+                    "400 Bad Request".to_string(),
+                    ApiError::invalid_params(format!(
+                        "from_seq must be a non-negative integer, got '{}'",
+                        v
+                    ))
+                    .to_json(),
+                )
+            }
+        },
+        None => 0,
+    };
+
+    let stage_name_filter = parse_query_param(query, "stage_name");
+
+    // Check run exists
+    let (attempt_id,) = {
+        let runs = state.runs.lock().await;
+        match runs.get(id) {
+            Some(r) => (r.attempt_id,),
+            None => {
+                return (
+                    "404 Not Found".to_string(),
+                    ApiError::not_found(format!("run '{id}' not found")).to_json(),
+                )
+            }
+        }
+    };
+
+    // Query ring buffer
+    let (samples, next_seq) = {
+        let bufs = state.telemetry_buffers.lock().await;
+        if let Some(rb) = bufs.get(id) {
+            if let Ok(buf) = rb.lock() {
+                buf.query(from_seq, stage_name_filter.as_deref())
+            } else {
+                (Vec::new(), from_seq)
+            }
+        } else {
+            (Vec::new(), from_seq)
+        }
+    };
+
+    let resp = TelemetryResponse {
+        run_id: id.to_string(),
+        attempt_id,
+        next_seq,
+        samples,
+    };
+
+    (
+        "200 OK".to_string(),
+        serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+    )
+}
+
 #[deprecated(note = "use ApiError constructors instead")]
 #[allow(dead_code)]
 fn json_error(message: String) -> String {
@@ -634,6 +1065,8 @@ fn event(run_id: &str, level: &str, event_type: &str, message: String) -> RunEve
         stream: None,
         seq: None,
         payload: None,
+        stage_name: None,
+        group_id: None,
         event_id: Some(generate_event_id()),
         attempt_id: Some(1),
         timestamp: Some(now_rfc3339()),
@@ -695,11 +1128,20 @@ fn event_skill(
     e
 }
 
-fn event_log_chunk(run_id: &str, seq: u64, stream: &str, data: String) -> RunEvent {
+fn event_log_chunk(
+    run_id: &str,
+    seq: u64,
+    stream: &str,
+    data: String,
+    stage_name: Option<&str>,
+    group_id: Option<&str>,
+) -> RunEvent {
     let mut e = event(run_id, "info", "log.chunk", "stream chunk".to_string());
     e.stream = Some(stream.to_string());
     e.seq = Some(seq);
     e.payload = Some(json!({ "data": data }));
+    e.stage_name = stage_name.map(ToString::to_string);
+    e.group_id = group_id.map(ToString::to_string);
     e
 }
 
