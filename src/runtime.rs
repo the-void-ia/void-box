@@ -662,15 +662,16 @@ struct GuestFiles {
     initramfs: Option<PathBuf>,
 }
 
-/// Resolve guest image files following the 5-step resolution chain:
+/// Resolve guest image files following the 6-step resolution chain:
 ///
 /// 1. `spec.sandbox.kernel` / `spec.sandbox.initramfs` (explicit paths)
 /// 2. `$VOID_BOX_KERNEL` / `$VOID_BOX_INITRAMFS` env vars
-/// 3. `spec.sandbox.guest_image` OCI ref (explicit)
-/// 4. Default: `ghcr.io/the-void-ia/voidbox-guest:v{CARGO_PKG_VERSION}`
-/// 5. `None` → mock fallback when `mode: auto`
+/// 3. Well-known installed paths (`/usr/lib/voidbox/`, Homebrew prefix, etc.)
+/// 4. `spec.sandbox.guest_image` OCI ref (explicit)
+/// 5. Default: `ghcr.io/the-void-ia/voidbox-guest:v{CARGO_PKG_VERSION}`
+/// 6. `None` → mock fallback when `mode: auto`
 async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
-    // Steps 1-2: local kernel/initramfs paths (sync).
+    // Steps 1-2: local kernel/initramfs paths (spec + env vars).
     if let Some(kernel) = resolve_kernel_local(spec) {
         return Some(GuestFiles {
             kernel,
@@ -678,7 +679,20 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
         });
     }
 
-    // Step 3: explicit guest_image in spec.
+    // Step 3: well-known installed paths (package manager installs).
+    if let Some(installed) = crate::artifacts::resolve_installed_artifacts() {
+        eprintln!(
+            "[void-box] Using installed artifacts: kernel={}, initramfs={}",
+            installed.kernel.display(),
+            installed.initramfs.display()
+        );
+        return Some(GuestFiles {
+            kernel: installed.kernel,
+            initramfs: Some(installed.initramfs),
+        });
+    }
+
+    // Step 4: explicit guest_image in spec.
     // An empty string means "disable auto-pull".
     if let Some(ref guest_image) = spec.sandbox.guest_image {
         if guest_image.is_empty() {

@@ -1,0 +1,46 @@
+# nfpm configuration for void-box Linux packages (.deb + .rpm)
+# https://nfpm.goreleaser.com/configuration/
+#
+# Build packages:
+#   VERSION=0.1.1 ARCH=x86_64 nfpm package --packager deb --target dist/
+#   VERSION=0.1.1 ARCH=x86_64 nfpm package --packager rpm --target dist/
+#
+# Environment variables:
+#   VERSION  — package version (e.g. 0.1.1), required
+#   ARCH     — target architecture (x86_64 or aarch64), required
+
+name: voidbox
+arch: "${ARCH}"
+version: "v${VERSION}"
+maintainer: "Diego Parra <diegolparra@gmail.com>"
+description: "Composable workflow sandbox with KVM micro-VMs and native observability"
+homepage: "https://github.com/the-void-ia/void-box"
+license: "Apache-2.0"
+vendor: "the-void-ia"
+section: "devel"
+
+contents:
+  - src: dist/voidbox
+    dst: /usr/bin/voidbox
+    file_info:
+      mode: 0755
+
+  - src: dist/vmlinuz
+    dst: /usr/lib/voidbox/vmlinuz
+    file_info:
+      mode: 0644
+
+  - src: dist/initramfs.cpio.gz
+    dst: /usr/lib/voidbox/initramfs.cpio.gz
+    file_info:
+      mode: 0644
+
+overrides:
+  deb:
+    depends:
+      - qemu-system-x86 | qemu-system-arm
+    recommends:
+      - busybox-static
+  rpm:
+    depends:
+      - qemu-kvm

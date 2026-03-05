@@ -8,13 +8,17 @@ on:
 permissions:
   contents: write
 
+env:
+  CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION || '2.1.53' }}
+
 jobs:
-  build-artifacts:
-    name: Build Release Artifacts
+  # ── Linux builds (x86_64 + aarch64) ──────────────────────────────────────
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [x86_64]  # Add aarch64 when cross-compilation is set up
+        arch: [x86_64, aarch64]
 
     steps:
       - uses: actions/checkout@v4
@@ -27,21 +31,125 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools cpio gzip xz-utils
+          sudo apt-get install -y musl-tools cpio gzip xz-utils zstd
 
-      - name: Build artifacts
+      - name: Install aarch64 cross-compiler
+        if: matrix.arch == 'aarch64'
         run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo ln -s /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
+
+      - name: Download static busybox
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_amd64.deb"
+              ;;
+            aarch64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb"
+              ;;
+          esac
+          curl -fsSL "$DEB_URL" -o /tmp/busybox-static.deb
+          cd /tmp && ar x busybox-static.deb && tar xf data.tar* ./usr/bin/busybox
+          chmod +x /tmp/usr/bin/busybox
+
+      - name: Build all artifacts
+        run: |
+          export BUSYBOX=/tmp/usr/bin/busybox
+          export CLAUDE_CODE_VERSION="${{ env.CLAUDE_CODE_VERSION }}"
+          export VOID_BOX_KMOD_VERSION=6.8.0-51
+          export VOID_BOX_KMOD_UPLOAD=52
           ./scripts/build_release_artifacts.sh ${{ github.ref_name }} ${{ matrix.arch }}
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin nfpm
+
+      - name: Build .deb package
+        run: |
+          VERSION="${{ github.ref_name }}" ARCH="${{ matrix.arch }}" \
+            nfpm package --packager deb --target target/release-artifacts/${{ github.ref_name }}/
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+
+      - name: Build .rpm package
+        run: |
+          VERSION="${{ github.ref_name }}" ARCH="${{ matrix.arch }}" \
+            nfpm package --packager rpm --target target/release-artifacts/${{ github.ref_name }}/
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+
+      - name: Verify .deb package
+        if: matrix.arch == 'x86_64'
+        run: |
+          DEB_FILE=$(ls target/release-artifacts/${{ github.ref_name }}/voidbox_*.deb)
+          sudo dpkg -i "$DEB_FILE"
+          voidbox version
+          test -f /usr/lib/voidbox/vmlinuz
+          test -f /usr/lib/voidbox/initramfs.cpio.gz
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: void-box-${{ github.ref_name }}-${{ matrix.arch }}
+          name: release-linux-${{ matrix.arch }}
           path: target/release-artifacts/${{ github.ref_name }}/*
 
+  # ── macOS build (Apple Silicon) ──────────────────────────────────────────
+  build-macos:
+    name: Build macOS (aarch64)
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build voidbox host binary
+        run: |
+          cargo build --release --bin voidbox
+
+      - name: Build guest artifacts
+        run: |
+          export CLAUDE_CODE_VERSION="${{ env.CLAUDE_CODE_VERSION }}"
+          export VOID_BOX_KMOD_VERSION=6.8.0-51
+          export VOID_BOX_KMOD_UPLOAD=52
+          ARCH=aarch64 scripts/build_claude_rootfs.sh
+
+      - name: Download kernel
+        run: |
+          ARCH=aarch64 scripts/download_kernel.sh
+
+      - name: Stage and create tarball
+        run: |
+          VERSION="${{ github.ref_name }}"
+          mkdir -p dist
+          cp target/release/voidbox dist/voidbox
+          cp /tmp/rootfs.cpio.gz dist/initramfs.cpio.gz
+          # macOS uses vmlinux (uncompressed) for Virtualization.framework
+          cp target/vmlinux-arm64 dist/vmlinux
+
+          mkdir -p target/release-artifacts/$VERSION
+          tar -czf "target/release-artifacts/$VERSION/voidbox-${VERSION}-darwin-aarch64.tar.gz" \
+            -C dist voidbox vmlinux initramfs.cpio.gz
+
+          cd "target/release-artifacts/$VERSION"
+          shasum -a 256 "voidbox-${VERSION}-darwin-aarch64.tar.gz" \
+            > "checksums-${VERSION}-darwin-aarch64.txt"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin-aarch64
+          path: target/release-artifacts/${{ github.ref_name }}/*
+
+  # ── Create GitHub Release ────────────────────────────────────────────────
   create-release:
     name: Create GitHub Release
-    needs: build-artifacts
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
 
     steps:
@@ -51,32 +159,112 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lhR release-artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: release-artifacts/**/*
+          files: release-artifacts/*
           body: |
             ## void-box ${{ github.ref_name }}
 
-            Pre-built artifacts for easy setup:
+            ### Install
 
-            **Download:**
-            - Initramfs: `void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz`
-            - Guest agent: `guest-agent-x86_64`
-            - Checksums: `checksums-${{ github.ref_name }}-x86_64.txt`
-
-            **Quick start:**
+            **Linux (deb):**
             ```bash
-            # Download artifacts
-            wget https://github.com/the-void-ia/void-box/releases/download/${{ github.ref_name }}/void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz
-
-            # Use with void-box
-            VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-            VOID_BOX_INITRAMFS=void-box-initramfs-${{ github.ref_name }}-x86_64.cpio.gz \
-            cargo run --example claude_workflow
+            curl -fsSLO https://github.com/the-void-ia/void-box/releases/download/${{ github.ref_name }}/voidbox_${{ github.ref_name }}_amd64.deb
+            sudo dpkg -i voidbox_${{ github.ref_name }}_amd64.deb
             ```
+
+            **Linux (rpm):**
+            ```bash
+            sudo rpm -i https://github.com/the-void-ia/void-box/releases/download/${{ github.ref_name }}/voidbox-${{ github.ref_name }}.x86_64.rpm
+            ```
+
+            **macOS (Homebrew):**
+            ```bash
+            brew tap the-void-ia/tap
+            brew install voidbox
+            ```
+
+            **Shell installer (Linux & macOS):**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/the-void-ia/void-box/main/scripts/install.sh | sh
+            ```
+
+            **Manual download:**
+            - Linux x86_64: `voidbox-${{ github.ref_name }}-linux-x86_64.tar.gz`
+            - Linux aarch64: `voidbox-${{ github.ref_name }}-linux-aarch64.tar.gz`
+            - macOS aarch64: `voidbox-${{ github.ref_name }}-darwin-aarch64.tar.gz`
+
+            All packages bundle the `voidbox` binary, kernel, and initramfs — no env vars needed.
 
             See [Getting Started](https://github.com/the-void-ia/void-box#getting-started) for details.
           draft: false
           prerelease: false
+
+  # ── Update Homebrew tap ──────────────────────────────────────────────────
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Compute sha256 of darwin tarball
+        id: sha
+        run: |
+          TARBALL_URL="https://github.com/the-void-ia/void-box/releases/download/${{ github.ref_name }}/voidbox-${{ github.ref_name }}-darwin-aarch64.tar.gz"
+          curl -fsSL "$TARBALL_URL" -o /tmp/darwin-tarball.tar.gz
+          SHA256=$(sha256sum /tmp/darwin-tarball.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Darwin tarball SHA256: $SHA256"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: the-void-ia/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_BARE="${VERSION#v}"
+          SHA256="${{ steps.sha.outputs.sha256 }}"
+
+          cat > homebrew-tap/Formula/voidbox.rb << RUBY
+          class Voidbox < Formula
+            desc "Composable workflow sandbox with micro-VMs and native observability"
+            homepage "https://github.com/the-void-ia/void-box"
+            url "https://github.com/the-void-ia/void-box/releases/download/${VERSION}/voidbox-${VERSION}-darwin-aarch64.tar.gz"
+            sha256 "${SHA256}"
+            license "Apache-2.0"
+            version "${VERSION_BARE}"
+
+            depends_on :macos
+
+            def install
+              bin.install "voidbox"
+              (lib/"voidbox").install "vmlinux"
+              (lib/"voidbox").install "initramfs.cpio.gz"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/voidbox version")
+              assert_predicate lib/"voidbox/vmlinux", :exist?
+              assert_predicate lib/"voidbox/initramfs.cpio.gz", :exist?
+            end
+          end
+          RUBY
+
+      - name: Push formula update
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/voidbox.rb
+          git commit -m "voidbox ${{ github.ref_name }}"
+          git push

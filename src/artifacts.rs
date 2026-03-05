@@ -53,6 +53,52 @@ pub fn download_prebuilt_artifacts(
     })
 }
 
+/// Try to resolve artifacts from well-known installation paths.
+///
+/// Checks platform-specific directories where package managers install artifacts:
+/// - Linux: `/usr/lib/voidbox/` (vmlinuz + initramfs.cpio.gz)
+/// - macOS: `/opt/homebrew/lib/voidbox/` and `/usr/local/lib/voidbox/` (vmlinux + initramfs.cpio.gz)
+///
+/// macOS uses `vmlinux` (uncompressed) because Apple's Virtualization.framework requires it.
+pub fn resolve_installed_artifacts() -> Option<ArtifactPaths> {
+    let candidates = installed_artifact_dirs();
+    for dir in &candidates {
+        let kernel = dir.join(installed_kernel_name());
+        let initramfs = dir.join("initramfs.cpio.gz");
+        if kernel.exists() && initramfs.exists() {
+            return Some(ArtifactPaths { kernel, initramfs });
+        }
+    }
+    None
+}
+
+/// Return well-known directories where packaged artifacts may be installed.
+fn installed_artifact_dirs() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            PathBuf::from("/opt/homebrew/lib/voidbox"),
+            PathBuf::from("/usr/local/lib/voidbox"),
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![PathBuf::from("/usr/lib/voidbox")]
+    }
+}
+
+/// Return the expected kernel filename for the current platform.
+fn installed_kernel_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "vmlinux"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "vmlinuz"
+    }
+}
+
 /// Try to detect artifacts from environment variables
 ///
 /// Checks VOID_BOX_KERNEL and VOID_BOX_INITRAMFS environment variables.
@@ -147,6 +193,28 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn test_installed_artifact_dirs_not_empty() {
+        let dirs = super::installed_artifact_dirs();
+        assert!(!dirs.is_empty());
+    }
+
+    #[test]
+    fn test_installed_kernel_name() {
+        let name = super::installed_kernel_name();
+        #[cfg(target_os = "macos")]
+        assert_eq!(name, "vmlinux");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(name, "vmlinuz");
+    }
+
+    #[test]
+    fn test_resolve_installed_artifacts_returns_none_when_missing() {
+        // Unless someone actually has /usr/lib/voidbox/ populated, this should be None
+        // We can't guarantee the path doesn't exist, so just verify it doesn't panic
+        let _result = super::resolve_installed_artifacts();
     }
 
     #[test]
