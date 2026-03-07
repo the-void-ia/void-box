@@ -921,7 +921,7 @@ fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
     builder.llm(provider)
 }
 
-fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
+pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
     let provider = std::env::var("VOIDBOX_LLM_PROVIDER").ok();
     let model = std::env::var("VOIDBOX_LLM_MODEL").ok();
     let base_url = std::env::var("VOIDBOX_LLM_BASE_URL").ok();

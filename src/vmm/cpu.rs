@@ -134,6 +134,8 @@ pub struct VcpuHandle {
     id: u64,
     /// vCPU state captured when the thread exits (for snapshotting).
     exit_state: Arc<Mutex<Option<VcpuState>>>,
+    /// Native pthread ID for signaling the vCPU thread out of KVM_RUN.
+    pthread_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VcpuHandle {
@@ -150,6 +152,23 @@ impl VcpuHandle {
             .join()
             .map_err(|_| Error::Vcpu(format!("vCPU {} thread panicked", self.id)))?;
         Ok(self.exit_state.lock().unwrap().take())
+    }
+
+    /// Get a clone of the exit_state Arc for reading vCPU state during live snapshots.
+    pub fn exit_state(&self) -> Arc<Mutex<Option<VcpuState>>> {
+        self.exit_state.clone()
+    }
+
+    /// Send a signal to the vCPU thread to kick it out of KVM_RUN (causes EINTR).
+    pub fn kick(&self) {
+        let tid = self.pthread_id.load(std::sync::atomic::Ordering::SeqCst);
+        if tid != 0 {
+            // SIGRTMIN+0 is safe — it won't terminate the process because
+            // we register a no-op handler in `install_vcpu_signal_handler`.
+            unsafe {
+                libc::pthread_kill(tid as libc::pthread_t, libc::SIGRTMIN());
+            }
+        }
     }
 }
 
@@ -234,6 +253,21 @@ pub fn create_vcpu_restored(
 
 /// Spawn the vCPU thread with state capture.
 #[allow(clippy::too_many_arguments)]
+/// Install a no-op signal handler for SIGRTMIN so that `pthread_kill(SIGRTMIN)`
+/// interrupts KVM_RUN with EINTR instead of terminating the process.
+///
+/// This is idempotent — safe to call multiple times.
+pub fn install_vcpu_signal_handler() {
+    extern "C" fn noop_handler(_: libc::c_int) {}
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = noop_handler as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGRTMIN(), &sa, std::ptr::null_mut());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_vcpu_thread(
     vm: Arc<Vm>,
     vcpu_fd: VcpuFd,
@@ -246,10 +280,17 @@ fn spawn_vcpu_thread(
 ) -> Result<VcpuHandle> {
     let exit_state: Arc<Mutex<Option<VcpuState>>> = Arc::new(Mutex::new(None));
     let exit_state_clone = exit_state.clone();
+    let pthread_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pthread_id_clone = pthread_id.clone();
 
     let thread = thread::Builder::new()
         .name(format!("vcpu-{}", vcpu_id))
         .spawn(move || {
+            // Store our pthread ID so the host can signal us out of KVM_RUN.
+            pthread_id_clone.store(
+                unsafe { libc::pthread_self() } as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             vcpu_run_loop(
                 vcpu_fd,
                 vcpu_id,
@@ -268,6 +309,7 @@ fn spawn_vcpu_thread(
         thread,
         id: vcpu_id,
         exit_state,
+        pthread_id,
     })
 }
 
@@ -388,6 +430,22 @@ fn vcpu_run_loop(
     let guest_memory = vm.guest_memory();
     let mut p9_irq_notified = false;
     let mut blk_irq_notified = false;
+
+    // Block SIGRTMIN on this thread so it can only be delivered during KVM_RUN
+    // via KVM_SET_SIGNAL_MASK. This eliminates the race between checking the
+    // `running` flag and entering `vcpu_fd.run()`.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGRTMIN());
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+
+        // Tell KVM to unblock SIGRTMIN during KVM_RUN. KVM_SET_SIGNAL_MASK
+        // specifies signals to *block* during KVM_RUN — we pass an empty set
+        // so nothing extra is blocked, allowing the (thread-blocked) SIGRTMIN
+        // to be delivered only inside KVM_RUN.
+        set_kvm_signal_mask(vcpu_fd.as_raw_fd());
+    }
 
     while running.load(Ordering::SeqCst) {
         // Live snapshot gate: if the host requested a snapshot, capture
@@ -637,6 +695,27 @@ fn inject_irq(vm_fd: i32, irq: u32) {
     unsafe {
         libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
     }
+}
+
+/// Set the KVM signal mask on a vCPU fd so that SIGRTMIN is NOT blocked
+/// during KVM_RUN. Combined with blocking SIGRTMIN at the thread level via
+/// `pthread_sigmask`, this ensures SIGRTMIN is only delivered inside KVM_RUN.
+unsafe fn set_kvm_signal_mask(vcpu_fd: i32) {
+    // KVM_SET_SIGNAL_MASK ioctl takes a kvm_signal_mask struct followed by
+    // a sigset. We pass an empty sigset (no signals blocked during KVM_RUN).
+    const KVM_SET_SIGNAL_MASK: libc::c_ulong = 0x4004_AE8B;
+
+    #[repr(C)]
+    struct KvmSignalMask {
+        len: u32,
+        sigset: [u8; 8], // 64-bit sigset — enough for signals 1-64
+    }
+
+    let mask = KvmSignalMask {
+        len: 8,
+        sigset: [0u8; 8], // empty set = block nothing during KVM_RUN
+    };
+    libc::ioctl(vcpu_fd, KVM_SET_SIGNAL_MASK, &mask);
 }
 
 /// Handle I/O port output (guest writing to port)

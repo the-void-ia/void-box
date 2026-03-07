@@ -429,25 +429,9 @@ No env var fallback, no auto-detection.
 
 Snapshot cloning shares identical VM state across restored instances:
 
-- **RNG entropy**: Restored VMs inherit the same `/dev/urandom` pool. Mitigated by: fresh CID and session secret per restore, hardware `RDRAND` re-seeding on `rdtsc`
+- **RNG entropy**: Restored VMs inherit the same `/dev/urandom` pool. Mitigated by: fresh CID per restore, hardware `RDRAND` re-seeding on `rdtsc`
 - **ASLR**: Clones share guest page table layout. Mitigated by: short-lived tasks, no direct network addressability (SLIRP NAT), command allowlist limiting attack surface
-- **Session isolation**: Each restored VM gets a unique session secret injected via kernel cmdline — the snapshot's stored secret is not reused for authentication
-
-### Key source files
-
-| File | Contents |
-|---|---|
-| `src/vmm/snapshot.rs` | Snapshot types, memory dump/restore, diff support, cache management |
-| `src/vmm/mod.rs` | `MicroVm::snapshot()`, `from_snapshot()`, `snapshot_live()` |
-| `src/vmm/cpu.rs` | vCPU state capture/restore, live snapshot gate in run loop |
-| `src/sandbox/mod.rs` | `SandboxBuilder::snapshot()` builder method |
-| `src/agent_box.rs` | `VoidBox::snapshot()`, `warmup()`, warmup execution |
-| `src/spec.rs` | `SandboxSpec.snapshot`, `WarmupSpec`, `BoxSandboxOverride.snapshot` |
-| `src/runtime.rs` | `resolve_snapshot()`, `resolve_box_snapshot()`, warmup wiring |
-| `src/daemon.rs` | `CreateRunRequest.snapshot` API field |
-| `src/backend/control_channel.rs` | `wait_for_snapshot_ready()` |
-| `void-box-protocol/src/lib.rs` | `MessageType::SnapshotReady = 17` |
-| `guest-agent/src/main.rs` | Message type 17 dispatch handler |
+- **Session isolation**: Restored VMs reuse the snapshot's stored session secret for vsock authentication (the secret is baked into the guest's kernel cmdline in snapshot memory). Per-restore secret rotation would require guest-side support
 
 ## Developer Notes
 

@@ -324,6 +324,10 @@ async fn snapshot_live_capture_and_restore() {
     assert_eq!(snap.config.memory_mb, 256);
     assert_eq!(snap.config.vcpus, 1);
     assert_eq!(snap.snapshot_type, snapshot::SnapshotType::PostInit);
+    assert!(
+        !snap.vcpu_states.is_empty(),
+        "snapshot must contain vCPU states"
+    );
 
     let mem_path = VmSnapshot::memory_path(&snapshot_path);
     assert!(mem_path.exists(), "memory dump must exist");

@@ -447,6 +447,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             match crate::spec::load_spec(&path) {
                 Ok(mut spec) => {
                     spec.sandbox.snapshot = req.snapshot;
+                    crate::runtime::apply_llm_overrides_from_env(&mut spec);
                     crate::runtime::run_spec(&spec, req.input, policy_bg, Some(stage_tx)).await
                 }
                 Err(e) => Err(e),

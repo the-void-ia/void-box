@@ -42,6 +42,30 @@ use self::config::VoidBoxConfig;
 use self::cpu::VcpuHandle;
 use self::kvm::Vm;
 
+/// Scope guard that ensures vCPUs resume after a live snapshot, even if
+/// the capture steps fail and return early via `?`.
+struct ResumeGuard {
+    barrier: Arc<Barrier>,
+    requested: Arc<AtomicBool>,
+    defused: bool,
+}
+
+impl ResumeGuard {
+    /// Defuse the guard so it does not trigger on drop (call on success path).
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for ResumeGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            self.requested.store(false, Ordering::SeqCst);
+            self.barrier.wait();
+        }
+    }
+}
+
 /// Main MicroVm instance representing a running micro-VM
 pub struct MicroVm {
     /// The underlying KVM VM
@@ -245,6 +269,10 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             virtio_9p,
             virtio_blk,
         };
+
+        // Install no-op signal handler so pthread_kill(SIGRTMIN) causes EINTR
+        // from KVM_RUN instead of terminating the process.
+        cpu::install_vcpu_signal_handler();
 
         // Create vCPUs (with MMIO dispatch to virtio-net and virtio-vsock)
         let running = Arc::new(AtomicBool::new(true));
@@ -536,6 +564,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         };
 
         // 8. Restore vCPUs from snapshot state
+        cpu::install_vcpu_signal_handler();
         let running = Arc::new(AtomicBool::new(true));
         let snapshot_requested = Arc::new(AtomicBool::new(false));
         let snapshot_barrier = Arc::new(Barrier::new(snap.vcpu_states.len() + 1));
@@ -878,11 +907,27 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
         let snapshot_dir = snapshot_dir.to_path_buf();
         let vcpu_count = self.vcpu_handles.len();
 
+        // Collect exit_state Arcs so we can read vCPU states after the barrier
+        let exit_states: Vec<_> = self.vcpu_handles.iter().map(|h| h.exit_state()).collect();
+
         // Run blocking barrier wait + capture on a blocking thread
         let result = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
             // Wait for all vCPUs to pause
             barrier.wait();
             debug!("All {} vCPUs paused for live snapshot", vcpu_count);
+
+            // Scope guard: ensure vCPUs always resume even if capture fails.
+            // Without this, an early `?` return would leave vCPUs stuck at
+            // their second barrier.wait() forever.
+            let resume_guard = {
+                let barrier = barrier.clone();
+                let requested = requested.clone();
+                ResumeGuard {
+                    barrier,
+                    requested,
+                    defused: false,
+                }
+            };
 
             // 3. Capture VM-level state while vCPUs are paused
             let irqchip = vm.capture_irqchip()?;
@@ -922,20 +967,22 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             let mem_path = snapshot::VmSnapshot::memory_path(&snapshot_dir);
             snapshot::dump_memory(vm.guest_memory(), &mem_path)?;
 
-            // Note: vCPU states are captured by each vCPU thread at the
-            // barrier point and stored in their exit_state slots. For live
-            // snapshots we read them from the VcpuHandle's shared state.
-            // However, since vCPU threads capture state into exit_state only
-            // on exit, we need a separate capture mechanism for live snapshots.
-            // The vCPU run loop captures state into snapshot_vcpu_states when
-            // snapshot_requested is set (see cpu.rs changes).
+            // Collect vCPU states — each vCPU captured its state into
+            // exit_state before hitting the barrier, so they're safe to read.
+            let vcpu_states: Vec<_> = exit_states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| {
+                    state.lock().unwrap().clone().unwrap_or_else(|| {
+                        panic!("vCPU {} state not captured for live snapshot", i)
+                    })
+                })
+                .collect();
 
-            // Build snapshot with empty vcpu_states — they are filled by
-            // the vCPU threads and retrieved after barrier release.
             let snap = snapshot::VmSnapshot {
                 version: snapshot::SNAPSHOT_VERSION,
                 parent_id: None,
-                vcpu_states: Vec::new(), // placeholder
+                vcpu_states,
                 irqchip,
                 pit,
                 vsock_state,
@@ -946,9 +993,9 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             };
             snap.save(&snapshot_dir)?;
 
-            // 4. Resume vCPUs
+            // 4. Resume vCPUs — defuse guard and do it explicitly
+            resume_guard.defuse();
             requested.store(false, Ordering::SeqCst);
-            // Wait on barrier again to synchronize resume
             barrier.wait();
             debug!("vCPUs resumed after live snapshot");
 
@@ -1250,6 +1297,11 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
 
         // Signal vCPUs to stop
         self.running.store(false, Ordering::SeqCst);
+
+        // Kick vCPU threads out of KVM_RUN (HLT blocks indefinitely without this)
+        for handle in &self.vcpu_handles {
+            handle.kick();
+        }
 
         // Wait for vCPU threads to finish
         for handle in self.vcpu_handles.drain(..) {
