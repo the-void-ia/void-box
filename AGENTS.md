@@ -298,6 +298,10 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
 
+# Snapshot integration suites (required for any snapshot/restore/vCPU changes):
+export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
+cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
+
 # Claudio-based deterministic E2E suites:
 scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
@@ -376,9 +380,12 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
 
-# Linux-only deterministic e2e suites (claudio + busybox)
+# Snapshot integration (required for snapshot/restore/vCPU/barrier changes)
 scripts/build_test_image.sh
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
+cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
+
+# Linux-only deterministic e2e suites (claudio + busybox)
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
@@ -520,6 +527,9 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 
 - `conformance`: command execution, lifecycle, streaming, filesystem primitives.
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.
+- `snapshot_integration`: snapshot capture (cold + live), vCPU state persistence,
+  restore pipeline, VM stop after restore. **Must pass** for any changes to
+  snapshot, restore, vCPU, barrier, or `stop()` code paths.
 - `e2e_telemetry`: telemetry flow from guest to host pipeline.
 - `e2e_skill_pipeline`: multi-stage skill execution in VM mode.
 - `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs
