@@ -246,7 +246,7 @@ impl Vm {
     /// Enable dirty page logging on all memory regions.
     ///
     /// After this call, KVM tracks which guest pages are written to.
-    /// Use [`get_dirty_bitmap`] to retrieve the bitmap of modified pages.
+    /// Use `get_dirty_bitmap` to retrieve the bitmap of modified pages.
     pub fn enable_dirty_log(&self) -> Result<()> {
         for (index, region) in self.guest_memory.iter().enumerate() {
             let memory_region = kvm_userspace_memory_region {

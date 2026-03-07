@@ -712,7 +712,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
     /// Create a diff snapshot.
     ///
     /// Like [`snapshot`], but saves only the dirty pages (pages modified since
-    /// [`enable_dirty_tracking`] was called). The resulting snapshot has
+    /// `enable_dirty_tracking` was called). The resulting snapshot has
     /// `snapshot_type = Diff` and stores `parent_id` pointing to the base.
     ///
     /// The diff memory file is much smaller than a full dump when only a

@@ -752,6 +752,7 @@ async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
 /// Returns `Some(path)` only if the spec explicitly declares a snapshot.
 /// No auto-detection, no env var fallback — snapshots are off unless
 /// the user explicitly sets `sandbox.snapshot` in the spec.
+#[cfg(target_os = "linux")]
 fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
     let hash = spec.sandbox.snapshot.as_deref()?;
     if hash.is_empty() {
@@ -777,7 +778,13 @@ fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn resolve_snapshot(_spec: &RunSpec) -> Option<PathBuf> {
+    None
+}
+
 /// Resolve per-box snapshot override, falling back to the top-level spec.
+#[cfg(target_os = "linux")]
 fn resolve_box_snapshot(
     box_override: Option<&BoxSandboxOverride>,
     spec: &RunSpec,
@@ -801,6 +808,14 @@ fn resolve_box_snapshot(
     }
     // Fall back to top-level spec
     resolve_snapshot(spec)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_box_snapshot(
+    _box_override: Option<&BoxSandboxOverride>,
+    _spec: &RunSpec,
+) -> Option<PathBuf> {
+    None
 }
 
 fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {
