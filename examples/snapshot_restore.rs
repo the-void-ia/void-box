@@ -49,12 +49,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(256);
 
+    let enable_network = std::env::var("VOID_BOX_NETWORK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let snap_config = SnapshotConfig {
         memory_mb,
         vcpus: 1,
         cid: 0, // overwritten by snapshot_internal()
         vsock_mmio_base: 0xd080_0000,
-        network: false,
+        network: enable_network,
     };
 
     // ═══════════════════════════════════════════════════════════════
@@ -67,7 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vcpus(1)
         .kernel(&kernel)
         .enable_vsock(true)
-        .vsock_backend(VsockBackendType::Userspace);
+        .vsock_backend(VsockBackendType::Userspace)
+        .network(enable_network);
     if let Some(ref p) = initramfs {
         cfg = cfg.initramfs(p);
     }

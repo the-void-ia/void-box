@@ -108,6 +108,36 @@ fn snap_config_vcpus(vcpus: usize) -> SnapshotConfig {
     }
 }
 
+/// Build a `VoidBoxConfig` with networking enabled.
+fn build_config_net(
+    kernel: &std::path::Path,
+    initramfs: Option<&std::path::Path>,
+) -> VoidBoxConfig {
+    let mut cfg = VoidBoxConfig::new()
+        .memory_mb(256)
+        .vcpus(1)
+        .kernel(kernel)
+        .enable_vsock(true)
+        .vsock_backend(VsockBackendType::Userspace)
+        .network(true);
+    if let Some(p) = initramfs {
+        cfg = cfg.initramfs(p);
+    }
+    cfg.validate().expect("invalid VoidBoxConfig");
+    cfg
+}
+
+/// Build a `SnapshotConfig` with networking enabled.
+fn snap_config_net() -> SnapshotConfig {
+    SnapshotConfig {
+        memory_mb: 256,
+        vcpus: 1,
+        cid: 0,
+        vsock_mmio_base: 0xd080_0000,
+        network: true,
+    }
+}
+
 /// Try exec on a restored VM. Returns success/failure without panicking,
 /// since CID mismatch is a known limitation.
 async fn try_restored_exec(vm: &MicroVm) -> bool {
@@ -629,6 +659,174 @@ async fn snapshot_multi_vcpu() {
     eprintln!("  Restore:     {:>10.1?}", restore_time);
     eprintln!("  Speedup:     {:>10.1}x", speedup);
     eprintln!("========================================");
+
+    restored_vm.stop().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test: Virtio-net snapshot → restore (networking survives snapshot)
+// ---------------------------------------------------------------------------
+
+/// Cold-boot a VM with networking, take a snapshot, restore, and verify that
+/// the restored VM can open new TCP connections via the fresh SLIRP stack.
+///
+/// TCP connections don't survive snapshot/restore (SLIRP state is not
+/// serialized), but the virtio-net device state is restored so the guest
+/// driver can immediately establish new connections.
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_net_restore() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config_net(&kernel, initramfs.as_deref());
+
+    // --- Cold boot with networking ---
+    eprintln!("[net_restore] Booting VM with networking...");
+    let cold_start = Instant::now();
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+    let cold_boot_time = cold_start.elapsed();
+
+    // Health check
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  cold boot exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+    assert_eq!(output.stdout_str().trim(), "ready");
+    eprintln!("[net_restore] Cold boot OK ({:.1?})", cold_boot_time);
+
+    // Verify networking works before snapshot
+    let net_check = match vm.exec("ip", &["link", "show", "eth0"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  net check failed: {e}");
+            return;
+        }
+    };
+    eprintln!(
+        "[net_restore] Pre-snapshot eth0: exit={}, stdout='{}'",
+        net_check.exit_code,
+        net_check.stdout_str().trim()
+    );
+    assert!(net_check.success(), "eth0 must exist before snapshot");
+
+    // --- Snapshot ---
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+
+    eprintln!("[net_restore] Taking snapshot...");
+    let snap_start = Instant::now();
+    let snapshot_path = match vm
+        .snapshot(snap_dir.path(), config_hash, snap_config_net())
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            return;
+        }
+    };
+    let snap_time = snap_start.elapsed();
+    eprintln!("[net_restore] Snapshot captured in {:.1?}", snap_time);
+
+    // Validate snapshot has net_state
+    let snap = VmSnapshot::load(&snapshot_path).expect("load snapshot");
+    assert!(
+        snap.config.network,
+        "snapshot config must have network=true"
+    );
+    assert!(snap.net_state.is_some(), "snapshot must contain net_state");
+    let net_state = snap.net_state.as_ref().unwrap();
+    assert_eq!(
+        net_state.queues.len(),
+        2,
+        "net_state must have rx + tx queues"
+    );
+    assert_eq!(
+        net_state.mac,
+        [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+        "MAC must match GUEST_MAC"
+    );
+    eprintln!(
+        "[net_restore] Snapshot net_state: status={:#x}, features={:#x}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        net_state.status, net_state.driver_features,
+        net_state.mac[0], net_state.mac[1], net_state.mac[2],
+        net_state.mac[3], net_state.mac[4], net_state.mac[5],
+    );
+
+    // --- Restore ---
+    eprintln!("[net_restore] Restoring from snapshot...");
+    let restore_start = Instant::now();
+    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  restore failed: {e}");
+            return;
+        }
+    };
+    let restore_time = restore_start.elapsed();
+    eprintln!(
+        "[net_restore] Restored VM CID={} (restore took {:.1?})",
+        restored_vm.cid(),
+        restore_time
+    );
+
+    // Verify exec works
+    let exec_ok = try_restored_exec(&restored_vm).await;
+    assert!(exec_ok, "restored VM exec must succeed");
+
+    // Verify eth0 is still visible in the restored VM
+    let net_check_restored = match tokio::time::timeout(
+        Duration::from_secs(30),
+        restored_vm.exec("ip", &["link", "show", "eth0"]),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let serial = restored_vm.read_serial_output();
+            if !serial.is_empty() {
+                eprintln!(
+                    "[net_restore] Serial output:\n{}",
+                    String::from_utf8_lossy(&serial)
+                );
+            }
+            panic!("post-restore net check failed: {e}");
+        }
+        Err(_) => {
+            panic!("post-restore net check timed out");
+        }
+    };
+    eprintln!(
+        "[net_restore] Post-restore eth0: exit={}, stdout='{}'",
+        net_check_restored.exit_code,
+        net_check_restored.stdout_str().trim()
+    );
+    assert!(
+        net_check_restored.success(),
+        "eth0 must exist after restore"
+    );
+
+    // --- Summary ---
+    let speedup = cold_boot_time.as_secs_f64() / restore_time.as_secs_f64().max(1e-9);
+    eprintln!();
+    eprintln!("=== Net Snapshot/Restore ===");
+    eprintln!("  Cold boot:   {:>10.1?}", cold_boot_time);
+    eprintln!("  Snapshot:    {:>10.1?}", snap_time);
+    eprintln!("  Restore:     {:>10.1?}", restore_time);
+    eprintln!("  Speedup:     {:>10.1}x", speedup);
+    eprintln!("============================");
 
     restored_vm.stop().await.ok();
 }

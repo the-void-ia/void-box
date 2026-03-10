@@ -108,6 +108,21 @@ pub struct QueueSnapshotState {
     pub last_used_idx: Option<u16>,
 }
 
+/// Serializable virtio-net MMIO device state (excludes SLIRP — TCP connections don't survive).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetSnapshotState {
+    pub device_features: u64,
+    pub driver_features: u64,
+    pub features_sel: u32,
+    pub queue_sel: u32,
+    pub status: u32,
+    pub interrupt_status: u32,
+    pub config_generation: u32,
+    pub mac: [u8; 6],
+    /// rx(0), tx(1) queue state.
+    pub queues: Vec<QueueSnapshotState>,
+}
+
 /// Serializable virtio-vsock MMIO device state (excludes FDs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VsockSnapshotState {
@@ -150,6 +165,9 @@ pub struct VmSnapshot {
     /// forever waiting for time sync.
     #[serde(default)]
     pub clock: Vec<u8>,
+    /// Virtio-net device state (None if networking was disabled).
+    #[serde(default)]
+    pub net_state: Option<NetSnapshotState>,
 }
 
 impl VmSnapshot {
@@ -900,6 +918,7 @@ mod tests {
             snapshot_type: SnapshotType::Base,
             session_secret: vec![0xAA; 32],
             clock: vec![],
+            net_state: None,
         };
         let bytes = bincode::serialize(&snap).unwrap();
         let restored: VmSnapshot = bincode::deserialize(&bytes).unwrap();

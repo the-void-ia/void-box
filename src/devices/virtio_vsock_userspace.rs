@@ -396,8 +396,8 @@ impl VirtioVsockUserspace {
         state: &VsockSnapshotState,
         cid: u32,
         guest_memory: &GuestMemoryMmap,
+        socket_path: PathBuf,
     ) -> Result<Self> {
-        let socket_path = PathBuf::from(format!("/tmp/void-box-vsock-{}.sock", cid));
         let mut dev = Self::with_socket_path(cid, socket_path)?;
 
         // Restore MMIO register state

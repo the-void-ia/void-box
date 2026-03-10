@@ -688,6 +688,88 @@ impl VirtioNetDevice {
         self.interrupt_status |= 1;
     }
 
+    /// Capture device state for snapshot.
+    pub fn snapshot_state(&self) -> crate::vmm::snapshot::NetSnapshotState {
+        use crate::vmm::snapshot::{NetSnapshotState, QueueSnapshotState};
+
+        let queues = [&self.rx_queue, &self.tx_queue]
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let (last_avail_idx, last_used_idx) = if i == 0 {
+                    (Some(self.rx_avail_idx), Some(self.rx_used_idx))
+                } else {
+                    (Some(self.tx_avail_idx), Some(self.tx_used_idx))
+                };
+                QueueSnapshotState {
+                    num_max: q.num_max,
+                    num: q.num,
+                    ready: q.ready,
+                    desc_addr: q.desc_addr,
+                    driver_addr: q.driver_addr,
+                    device_addr: q.device_addr,
+                    last_avail_idx,
+                    last_used_idx,
+                }
+            })
+            .collect();
+
+        NetSnapshotState {
+            device_features: self.device_features,
+            driver_features: self.driver_features,
+            features_sel: self.features_sel,
+            queue_sel: self.queue_sel,
+            status: self.status,
+            interrupt_status: self.interrupt_status,
+            config_generation: self.config_generation,
+            mac: self.mac,
+            queues,
+        }
+    }
+
+    /// Restore device state from a snapshot onto a freshly created device.
+    pub fn restore_state(&mut self, state: &crate::vmm::snapshot::NetSnapshotState) {
+        self.device_features = state.device_features;
+        self.driver_features = state.driver_features;
+        self.features_sel = state.features_sel;
+        self.queue_sel = state.queue_sel;
+        self.status = state.status;
+        self.interrupt_status = state.interrupt_status;
+        self.config_generation = state.config_generation;
+        self.mac = state.mac;
+
+        if let Some(q) = state.queues.first() {
+            self.rx_queue = QueueState {
+                num_max: q.num_max,
+                num: q.num,
+                ready: q.ready,
+                desc_addr: q.desc_addr,
+                driver_addr: q.driver_addr,
+                device_addr: q.device_addr,
+            };
+            self.rx_avail_idx = q.last_avail_idx.unwrap_or(0);
+            self.rx_used_idx = q.last_used_idx.unwrap_or(0);
+        }
+        if let Some(q) = state.queues.get(1) {
+            self.tx_queue = QueueState {
+                num_max: q.num_max,
+                num: q.num,
+                ready: q.ready,
+                desc_addr: q.desc_addr,
+                driver_addr: q.driver_addr,
+                device_addr: q.device_addr,
+            };
+            self.tx_avail_idx = q.last_avail_idx.unwrap_or(0);
+            self.tx_used_idx = q.last_used_idx.unwrap_or(0);
+        }
+
+        debug!(
+            "Restored virtio-net state: status={:#x}, features={:#x}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.status, self.driver_features,
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5],
+        );
+    }
+
     /// Check if there are pending interrupts
     pub fn has_pending_interrupt(&self) -> bool {
         self.interrupt_status != 0

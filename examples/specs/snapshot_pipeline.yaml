@@ -1,15 +1,15 @@
 # Snapshot Pipeline Example
 #
-# A two-stage pipeline where one or both boxes restore from snapshots
-# instead of cold-booting. Each box can override the snapshot setting
-# independently via `sandbox.snapshot`.
+# Works in two modes:
+#   1. With snapshot (fast restore) — set `sandbox.snapshot` to a hash or path
+#   2. Without snapshot (cold boot) — just omit the snapshot line
 #
 # The snapshot path can be:
 #   - A hash prefix (e.g. "60e3c527") → ~/.void-box/snapshots/<prefix>/
 #   - A literal directory path containing state.bin + memory.mem
 #   - Omitted → normal cold boot
 #
-# To create snapshots, use:
+# To create snapshots (optional, for faster restores):
 #   cargo run --example snapshot_restore
 #
 # Run:
@@ -23,13 +23,9 @@ name: snapshot-pipeline
 sandbox:
   mode: auto
   memory_mb: 2048
-  vcpus: 1
-  network: false
-  # Top-level snapshot: all boxes restore from this snapshot by default.
-  # Per-box overrides below take priority.
-  # NOTE: snapshot restore does not yet include networking, so LLM-backed
-  # pipelines that call external APIs (Claude, Ollama via network) cannot
-  # use snapshots until virtio-net restore is implemented.
+  vcpus: 4
+  network: true
+  # Uncomment to restore from a snapshot instead of cold-booting:
   # snapshot: "4add3d695dbd609b"
 
 llm:

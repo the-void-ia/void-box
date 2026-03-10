@@ -14,7 +14,7 @@ pub mod memory;
 pub mod snapshot;
 
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -79,6 +79,8 @@ pub struct MicroVm {
     /// Active span context for trace propagation into the guest.
     /// When set, `exec_with_env` will inject a `TRACEPARENT` env var.
     active_span_context: Option<crate::observe::tracer::SpanContext>,
+    /// Socket path for the userspace vsock backend (unique per restore instance).
+    vsock_socket_path: Option<PathBuf>,
 }
 
 /// Commands that can be sent to the VM event loop
@@ -467,6 +469,7 @@ impl MicroVm {
             net_poll_handle,
             telemetry: None,
             active_span_context: None,
+            vsock_socket_path: None,
         })
     }
 
@@ -544,7 +547,15 @@ impl MicroVm {
             .as_slice()
             .try_into()
             .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
-        let socket_path = std::path::PathBuf::from(format!("/tmp/void-box-vsock-{}.sock", cid));
+        // Generate a unique runtime ID so multiple restores from the same
+        // snapshot don't collide on the socket path.
+        let mut id_bytes = [0u8; 4];
+        getrandom::fill(&mut id_bytes).expect("getrandom");
+        let runtime_id = u32::from_le_bytes(id_bytes);
+        let socket_path = PathBuf::from(format!(
+            "/tmp/void-box-vsock-{}-{:08x}.sock",
+            cid, runtime_id
+        ));
         let vsock = Arc::new(VsockDevice::restored_with_unix_socket(
             cid,
             session_secret,
@@ -553,7 +564,12 @@ impl MicroVm {
 
         // 7. Restore virtio-vsock MMIO device (always use userspace backend for restore)
         let virtio_vsock_mmio: Option<Arc<Mutex<dyn VsockMmioDevice>>> = {
-            let mut dev = VirtioVsockUserspace::restore(&snap.vsock_state, cid, vm.guest_memory())?;
+            let mut dev = VirtioVsockUserspace::restore(
+                &snap.vsock_state,
+                cid,
+                vm.guest_memory(),
+                socket_path.clone(),
+            )?;
             dev.set_mmio_base(snap.config.vsock_mmio_base);
             // NOTE: Do NOT inject_transport_reset here. The event queue
             // event and the first RX OP_REQUEST may be processed in the same
@@ -568,8 +584,26 @@ impl MicroVm {
             Some(Arc::new(Mutex::new(dev)))
         };
 
+        // 7b. Restore virtio-net if snapshot had networking enabled
+        let virtio_net: Option<Arc<Mutex<VirtioNetDevice>>> = if snap.config.network {
+            if let Some(ref net_state) = snap.net_state {
+                let slirp = Arc::new(Mutex::new(SlirpStack::new()?));
+                let mut net_dev = VirtioNetDevice::new(slirp)?;
+                net_dev.restore_state(net_state);
+                net_dev.set_mmio_base(0xd000_0000);
+                debug!("Restored virtio-net MMIO at {:#x}", net_dev.mmio_base());
+                Some(Arc::new(Mutex::new(net_dev)))
+            } else {
+                // config.network was true but no net_state saved (old snapshot)
+                debug!("Snapshot has network=true but no net_state; skipping net restore");
+                None
+            }
+        } else {
+            None
+        };
+
         let mmio_devices = cpu::MmioDevices {
-            virtio_net: None, // TODO: restore networking in future phases
+            virtio_net: virtio_net.clone(),
             virtio_vsock: virtio_vsock_mmio,
             virtio_9p: None,
             virtio_blk: None,
@@ -618,6 +652,23 @@ impl MicroVm {
             } else {
                 None
             }
+        } else {
+            None
+        };
+
+        // 10. Spawn net-poll thread for SLIRP RX relay (if networking restored)
+        let net_poll_handle = if let Some(ref net_dev) = virtio_net {
+            let net_dev_clone = net_dev.clone();
+            let vm_clone2 = vm.clone();
+            let running_net = running.clone();
+            let handle = std::thread::Builder::new()
+                .name("net-poll".into())
+                .spawn(move || {
+                    net_poll_thread(net_dev_clone, vm_clone2, running_net);
+                })
+                .expect("Failed to spawn net-poll thread");
+            debug!("Spawned net-poll thread for SLIRP RX relay (restore)");
+            Some(handle)
         } else {
             None
         };
@@ -706,13 +757,14 @@ impl MicroVm {
             cid,
             vsock: Some(vsock),
             virtio_vsock_mmio: mmio_devices.virtio_vsock,
-            virtio_net: None,
+            virtio_net,
             command_tx,
             event_loop_handle: Some(event_loop_handle),
             vsock_irq_handle,
-            net_poll_handle: None,
+            net_poll_handle,
             telemetry: None,
             active_span_context: None,
+            vsock_socket_path: Some(socket_path),
         })
     }
 
@@ -847,6 +899,12 @@ impl MicroVm {
             }
         };
 
+        // 5b. Capture virtio-net device state
+        let net_state = self
+            .virtio_net
+            .as_ref()
+            .map(|dev| dev.lock().unwrap().snapshot_state());
+
         // 6. Get session secret from vsock device
         let session_secret = self
             .vsock
@@ -887,6 +945,7 @@ impl MicroVm {
             },
             session_secret,
             clock,
+            net_state,
         };
         snap.save(snapshot_dir)?;
 
@@ -1158,6 +1217,11 @@ impl MicroVm {
     /// Get the vsock CID for this VM
     pub fn cid(&self) -> u32 {
         self.cid
+    }
+
+    /// Get the vsock Unix socket path (set on restored VMs).
+    pub fn vsock_socket_path(&self) -> Option<&Path> {
+        self.vsock_socket_path.as_deref()
     }
 
     /// Check if the VM is currently running
