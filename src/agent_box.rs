@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use crate::llm::LlmProvider;
 use crate::observe::claude::ClaudeExecOpts;
+use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
@@ -514,13 +515,29 @@ impl VoidBox {
     ///
     /// If `input` is provided, it's written to `/workspace/input.json` before
     /// the agent runs, and the prompt is augmented to reference it.
-    pub async fn run(self, input: Option<&[u8]>) -> Result<StageResult> {
+    pub async fn run(
+        self,
+        input: Option<&[u8]>,
+        telemetry_buffer: Option<TelemetryBuffer>,
+    ) -> Result<StageResult> {
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             crate::Error::Config("VoidBox not built — call .build() first".into())
         })?;
 
         // Provision security configuration (resource limits, command allowlist)
         self.provision_security(sandbox).await?;
+
+        // Start guest telemetry (best-effort, don't fail the run)
+        let tag = &self.name;
+        match sandbox.start_telemetry(telemetry_buffer).await {
+            Ok(agg) => {
+                agg.set_current_stage(&self.name);
+                eprintln!("[vm:{}] Guest telemetry started", tag);
+            }
+            Err(e) => {
+                eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
+            }
+        }
 
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
@@ -695,7 +712,7 @@ mod tests {
             .unwrap();
 
         // Mock sandbox will return default claude-code response
-        let result = ab.run(None).await.unwrap();
+        let result = ab.run(None, None).await.unwrap();
         assert_eq!(result.box_name, "test_box");
     }
 }

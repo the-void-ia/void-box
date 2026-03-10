@@ -3,10 +3,15 @@
 //! Uses the platform-appropriate VM backend (KVM on Linux, VZ on macOS)
 //! via the `VmmBackend` trait.
 
+use std::sync::Arc;
+
 use tokio::sync::Mutex;
 
 use super::SandboxConfig;
 use crate::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
+use crate::guest::protocol::TelemetrySubscribeRequest;
+use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
+use crate::observe::{ObserveConfig, Observer};
 use crate::{Error, ExecOutput, Result};
 
 /// Local sandbox backed by a real VM.
@@ -382,6 +387,25 @@ impl LocalSandbox {
         backend
             .exec_streaming("claude-code", args, &env, None, timeout_secs)
             .await
+    }
+
+    /// Start guest telemetry collection.
+    ///
+    /// Subscribes to CPU/memory/IO metrics from the guest-agent at 1s intervals.
+    /// Returns the `TelemetryAggregator` that accumulates the samples.
+    pub async fn start_telemetry(
+        &self,
+        ring_buffer: Option<TelemetryBuffer>,
+    ) -> Result<Arc<TelemetryAggregator>> {
+        self.ensure_started().await?;
+        let mut backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_mut().ok_or(Error::VmNotRunning)?;
+        let observer = Observer::new(ObserveConfig::default());
+        let opts = TelemetrySubscribeRequest {
+            interval_ms: 1000,
+            include_kernel_threads: false,
+        };
+        backend.start_telemetry(observer, opts, ring_buffer).await
     }
 
     /// Stop the sandbox

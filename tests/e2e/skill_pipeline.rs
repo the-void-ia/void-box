@@ -116,7 +116,7 @@ async fn test_agent_box_with_local_skill() {
         None => return,
     };
 
-    let result = match ab.run(None).await {
+    let result = match ab.run(None, None).await {
         Ok(r) => r,
         Err(void_box::Error::Guest(msg))
             if msg.contains("control_channel: deadline reached (connect or handshake)") =>
@@ -174,7 +174,7 @@ async fn test_agent_box_with_multiple_skills() {
         None => return,
     };
 
-    let result = match ab.run(None).await {
+    let result = match ab.run(None, None).await {
         Ok(r) => r,
         Err(void_box::Error::Guest(msg))
             if msg.contains("control_channel: deadline reached (connect or handshake)") =>
@@ -229,7 +229,7 @@ async fn test_agent_box_with_mcp_skill() {
         None => return,
     };
 
-    let result = match ab.run(None).await {
+    let result = match ab.run(None, None).await {
         Ok(r) => r,
         Err(void_box::Error::Guest(msg))
             if msg.contains("control_channel: deadline reached (connect or handshake)") =>
@@ -290,7 +290,7 @@ async fn test_agent_box_mixed_skills() {
         None => return,
     };
 
-    let result = match ab.run(None).await {
+    let result = match ab.run(None, None).await {
         Ok(r) => r,
         Err(void_box::Error::Guest(msg))
             if msg.contains("control_channel: deadline reached (connect or handshake)") =>
@@ -412,7 +412,7 @@ async fn test_agent_box_with_input_data_kvm() {
     };
 
     let input = br#"{"symbols": ["AAPL", "NVDA"], "period": "30d"}"#;
-    let result = match ab.run(Some(input)).await {
+    let result = match ab.run(Some(input), None).await {
         Ok(r) => r,
         Err(void_box::Error::Guest(msg))
             if msg.contains("control_channel: deadline reached (connect or handshake)") =>

@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent_box::VoidBox;
 use crate::backend::MountConfig;
 use crate::llm::LlmProvider;
+use crate::observe::telemetry::TelemetryBuffer;
 use crate::persistence::RunEvent;
 use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
@@ -55,10 +56,11 @@ pub async fn run_file(
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    telemetry_buffer: Option<TelemetryBuffer>,
 ) -> Result<RunReport> {
     let mut spec = load_spec(path)?;
     apply_llm_overrides_from_env(&mut spec);
-    run_spec(&spec, input, policy, stage_tx).await
+    run_spec(&spec, input, policy, stage_tx, telemetry_buffer).await
 }
 
 pub async fn run_spec(
@@ -66,10 +68,11 @@ pub async fn run_spec(
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    telemetry_buffer: Option<TelemetryBuffer>,
 ) -> Result<RunReport> {
     match spec.kind {
-        RunKind::Agent => run_agent(spec, input, stage_tx).await,
-        RunKind::Pipeline => run_pipeline(spec, input, policy, stage_tx).await,
+        RunKind::Agent => run_agent(spec, input, stage_tx, telemetry_buffer).await,
+        RunKind::Pipeline => run_pipeline(spec, input, policy, stage_tx, telemetry_buffer).await,
         RunKind::Workflow => run_workflow(spec, input, policy, stage_tx).await,
     }
 }
@@ -85,6 +88,7 @@ async fn run_agent(
     spec: &RunSpec,
     input: Option<String>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    telemetry_buffer: Option<TelemetryBuffer>,
 ) -> Result<RunReport> {
     let agent = spec
         .agent
@@ -141,7 +145,9 @@ async fn run_agent(
     }
 
     let ab = builder.build()?;
-    let stage = ab.run(input.as_deref().map(str::as_bytes)).await?;
+    let stage = ab
+        .run(input.as_deref().map(str::as_bytes), telemetry_buffer)
+        .await?;
 
     // Prefer the JSONL result_text, but fall back to file_output when
     // claude-code is killed before emitting the result event.
@@ -202,6 +208,7 @@ async fn run_pipeline(
     input: Option<String>,
     _policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    telemetry_buffer: Option<TelemetryBuffer>,
 ) -> Result<RunReport> {
     let pipeline = spec
         .pipeline
@@ -336,9 +343,9 @@ async fn run_pipeline(
     let result = if let Some(i) = input {
         // lightweight input injection: prefix into first box prompt
         let _ = i;
-        p.run_with_stage_tx(stage_tx).await?
+        p.run_with_stage_tx(stage_tx, telemetry_buffer).await?
     } else {
-        p.run_with_stage_tx(stage_tx).await?
+        p.run_with_stage_tx(stage_tx, telemetry_buffer).await?
     };
 
     let output = result.output.clone();

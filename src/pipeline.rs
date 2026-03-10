@@ -38,6 +38,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent_box::VoidBox;
 use crate::guest::protocol::ExecOutputChunk;
 use crate::observe::claude::{create_otel_spans, ClaudeExecResult};
+use crate::observe::telemetry::TelemetryBuffer;
 use crate::observe::tracer::SpanStatus;
 use crate::observe::{ObserveConfig, ObservedResult, Observer};
 use crate::persistence::RunEvent;
@@ -157,7 +158,7 @@ impl Pipeline {
     /// array for the next stage.
     pub async fn run(self) -> crate::Result<PipelineResult> {
         let mut hook = NoopOutputHook;
-        run_pipeline_core(self.name, self.stages, &mut hook, None, None).await
+        run_pipeline_core(self.name, self.stages, &mut hook, None, None, None).await
     }
 
     /// Execute the pipeline with a streaming callback for output chunks.
@@ -172,7 +173,7 @@ impl Pipeline {
         F: FnMut(&str, &ExecOutputChunk) + Send,
     {
         let mut hook = StreamingOutputHook(on_output);
-        run_pipeline_core(self.name, self.stages, &mut hook, None, None).await
+        run_pipeline_core(self.name, self.stages, &mut hook, None, None, None).await
     }
 
     /// Number of stages in the pipeline.
@@ -193,9 +194,18 @@ impl Pipeline {
     pub async fn run_with_stage_tx(
         self,
         stage_tx: Option<UnboundedSender<RunEvent>>,
+        telemetry_buffer: Option<TelemetryBuffer>,
     ) -> crate::Result<PipelineResult> {
         let mut hook = NoopOutputHook;
-        run_pipeline_core(self.name, self.stages, &mut hook, None, stage_tx).await
+        run_pipeline_core(
+            self.name,
+            self.stages,
+            &mut hook,
+            None,
+            stage_tx,
+            telemetry_buffer,
+        )
+        .await
     }
 
     /// Attach observability to this pipeline.
@@ -268,6 +278,7 @@ async fn run_pipeline_core(
     output_hook: &mut dyn OutputHook,
     observer: Option<&Observer>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    telemetry_buffer: Option<TelemetryBuffer>,
 ) -> crate::Result<PipelineResult> {
     let total_stages = pipeline_stages.len();
     let tracer = observer.map(|o| o.tracer().clone());
@@ -312,7 +323,9 @@ async fn run_pipeline_core(
                 }
 
                 let stage_start = Instant::now();
-                let stage_result = agent_box.run(carry_data.as_deref()).await?;
+                let stage_result = agent_box
+                    .run(carry_data.as_deref(), telemetry_buffer.clone())
+                    .await?;
                 let elapsed = stage_start.elapsed();
 
                 output_hook.on_stage_result(&box_name, &stage_result);
@@ -394,6 +407,7 @@ async fn run_pipeline_core(
                     let stx = stage_tx.clone();
                     let gid = group_id.clone();
                     let bname = agent_box.name.clone();
+                    let tb = telemetry_buffer.clone();
                     join_set.spawn(async move {
                         // Emit StageStarted
                         if let Some(ref tx) = stx {
@@ -405,7 +419,7 @@ async fn run_pipeline_core(
                             ));
                         }
                         let start = Instant::now();
-                        let result = agent_box.run(input.as_deref()).await;
+                        let result = agent_box.run(input.as_deref(), tb).await;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
 
                         // Emit StageSucceeded or StageFailed
@@ -619,6 +633,7 @@ impl ObservablePipeline {
             &mut hook,
             Some(&observer),
             None,
+            None,
         )
         .await?;
 
@@ -641,6 +656,7 @@ impl ObservablePipeline {
             self.pipeline.stages,
             &mut hook,
             Some(&observer),
+            None,
             None,
         )
         .await?;

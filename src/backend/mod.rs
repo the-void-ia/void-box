@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::guest::protocol::{ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest};
-use crate::observe::telemetry::TelemetryAggregator;
+use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
 use crate::ExecOutput;
@@ -142,6 +142,7 @@ pub trait VmmBackend: Send + Sync {
         &mut self,
         observer: Observer,
         opts: TelemetrySubscribeRequest,
+        ring_buffer: Option<TelemetryBuffer>,
     ) -> Result<Arc<TelemetryAggregator>>;
 
     /// Set the active span context for TRACEPARENT propagation.

@@ -12,6 +12,11 @@ use serde::Serialize;
 use super::Observer;
 use crate::guest::protocol::{SystemMetrics, TelemetryBatch};
 
+/// Shared telemetry ring buffer handle, threaded from the daemon down to the
+/// `TelemetryAggregator` so guest samples appear alongside host samples in the
+/// HTTP telemetry endpoint.
+pub type TelemetryBuffer = Arc<Mutex<TelemetryRingBuffer>>;
+
 // ---------------------------------------------------------------------------
 // Telemetry ring buffer types
 // ---------------------------------------------------------------------------
@@ -80,6 +85,7 @@ impl TelemetryRingBuffer {
     }
 
     /// Query samples with `seq > from_seq`, optionally filtered by stage_name.
+    ///
     /// Returns `(matching_samples, next_seq)`.
     pub fn query(
         &self,
@@ -454,6 +460,118 @@ mod tests {
         let (samples, next) = rb.query(0, None);
         assert!(samples.is_empty());
         assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn test_aggregator_ingest_pushes_to_ring_buffer() {
+        let observer = Observer::test();
+        let rb = Arc::new(Mutex::new(TelemetryRingBuffer::new(10)));
+        let aggregator = TelemetryAggregator::with_ring_buffer(observer, 42, rb.clone());
+
+        aggregator.set_current_stage("build");
+
+        let batch = TelemetryBatch {
+            seq: 1,
+            timestamp_ms: 1700000000000,
+            system: Some(SystemMetrics {
+                cpu_percent: 75.0,
+                memory_used_bytes: 256 * 1024 * 1024,
+                memory_total_bytes: 512 * 1024 * 1024,
+                net_rx_bytes: 100,
+                net_tx_bytes: 200,
+                procs_running: 2,
+                open_fds: 32,
+            }),
+            processes: vec![],
+            trace_context: None,
+        };
+        aggregator.ingest(&batch);
+
+        let buf = rb.lock().unwrap();
+        let (samples, _) = buf.query(0, None);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].stage_name, "build");
+
+        let guest = samples[0].guest.as_ref().unwrap();
+        assert!((guest.cpu_percent - 75.0).abs() < f64::EPSILON);
+        assert_eq!(guest.memory_used_bytes, 256 * 1024 * 1024);
+        assert_eq!(guest.net_rx_bytes, 100);
+        assert_eq!(guest.procs_running, 2);
+    }
+
+    #[test]
+    fn test_aggregator_stage_name_updates() {
+        let observer = Observer::test();
+        let rb = Arc::new(Mutex::new(TelemetryRingBuffer::new(10)));
+        let aggregator = TelemetryAggregator::with_ring_buffer(observer, 1, rb.clone());
+
+        let batch = TelemetryBatch {
+            seq: 0,
+            timestamp_ms: 1000,
+            system: None,
+            processes: vec![],
+            trace_context: None,
+        };
+
+        aggregator.set_current_stage("stage_a");
+        aggregator.ingest(&batch);
+
+        aggregator.set_current_stage("stage_b");
+        aggregator.ingest(&batch);
+
+        let buf = rb.lock().unwrap();
+        let (samples, _) = buf.query(0, None);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].stage_name, "stage_a");
+        assert_eq!(samples[1].stage_name, "stage_b");
+    }
+
+    #[test]
+    fn test_guest_metrics_sample_from_system_metrics() {
+        let sys = SystemMetrics {
+            cpu_percent: 42.5,
+            memory_used_bytes: 1024,
+            memory_total_bytes: 4096,
+            net_rx_bytes: 500,
+            net_tx_bytes: 600,
+            procs_running: 7,
+            open_fds: 128,
+        };
+
+        let sample = GuestMetricsSample::from_system_metrics(&sys);
+        assert!((sample.cpu_percent - 42.5).abs() < f64::EPSILON);
+        assert_eq!(sample.memory_used_bytes, 1024);
+        assert_eq!(sample.memory_total_bytes, 4096);
+        assert_eq!(sample.net_rx_bytes, 500);
+        assert_eq!(sample.net_tx_bytes, 600);
+        assert_eq!(sample.procs_running, 7);
+        assert_eq!(sample.open_fds, 128);
+    }
+
+    #[test]
+    fn test_aggregator_no_ring_buffer_does_not_panic() {
+        let observer = Observer::test();
+        let aggregator = TelemetryAggregator::new(observer, 10);
+
+        let batch = TelemetryBatch {
+            seq: 1,
+            timestamp_ms: 5000,
+            system: Some(SystemMetrics {
+                cpu_percent: 10.0,
+                memory_used_bytes: 100,
+                memory_total_bytes: 200,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
+                procs_running: 1,
+                open_fds: 5,
+            }),
+            processes: vec![],
+            trace_context: None,
+        };
+
+        // Should not panic — samples go to observer only, no ring buffer
+        aggregator.ingest(&batch);
+        assert!(aggregator.latest_batch().is_some());
     }
 
     #[test]
