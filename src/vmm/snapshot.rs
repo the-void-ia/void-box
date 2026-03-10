@@ -40,8 +40,6 @@ pub enum SnapshotType {
     Base,
     /// Differential snapshot on top of a base.
     Diff,
-    /// Post-init snapshot after warm-up commands.
-    PostInit,
 }
 
 /// Hardware configuration captured at snapshot time.
@@ -67,6 +65,12 @@ pub struct VcpuState {
     pub xsave: Vec<u8>,
     /// MSR (index, value) pairs.
     pub msrs: Vec<(u32, u64)>,
+    /// `kvm_vcpu_events` as raw bytes (interrupt/exception delivery state).
+    #[serde(default)]
+    pub vcpu_events: Vec<u8>,
+    /// `kvm_xcrs` as raw bytes (XCR0 — controls which XSAVE features are active).
+    #[serde(default)]
+    pub xcrs: Vec<u8>,
 }
 
 /// IRQ chip state (PIC master + PIC slave + IOAPIC) as raw bytes.
@@ -89,6 +93,14 @@ pub struct QueueSnapshotState {
     pub desc_addr: u64,
     pub driver_addr: u64,
     pub device_addr: u64,
+    /// Userspace backend only: last consumed available-ring index.
+    /// `None` for the vhost kernel backend (kernel tracks this internally).
+    #[serde(default)]
+    pub last_avail_idx: Option<u16>,
+    /// Userspace backend only: last produced used-ring index.
+    /// `None` for the vhost kernel backend.
+    #[serde(default)]
+    pub last_used_idx: Option<u16>,
 }
 
 /// Serializable virtio-vsock MMIO device state (excludes FDs).
@@ -124,7 +136,7 @@ pub struct VmSnapshot {
     pub config: SnapshotConfig,
     /// `sha256(kernel + initramfs + memory_mb + vcpus)`.
     pub config_hash: String,
-    /// Base | Diff | PostInit.
+    /// Base | Diff.
     pub snapshot_type: SnapshotType,
     /// Session secret that the guest-agent expects (from kernel cmdline).
     pub session_secret: Vec<u8>,
@@ -769,11 +781,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_type_serde_roundtrip() {
-        let types = vec![
-            SnapshotType::Base,
-            SnapshotType::Diff,
-            SnapshotType::PostInit,
-        ];
+        let types = vec![SnapshotType::Base, SnapshotType::Diff];
         for t in types {
             let bytes = bincode::serialize(&t).unwrap();
             let restored: SnapshotType = bincode::deserialize(&bytes).unwrap();
@@ -789,6 +797,8 @@ mod tests {
             lapic: vec![9, 10],
             xsave: vec![11, 12, 13],
             msrs: vec![(0x10, 1000), (0xC0000080, 2000)],
+            vcpu_events: vec![],
+            xcrs: vec![],
         };
         let bytes = bincode::serialize(&state).unwrap();
         let restored: VcpuState = bincode::deserialize(&bytes).unwrap();
@@ -839,6 +849,8 @@ mod tests {
                 lapic: vec![0; 8],
                 xsave: vec![0; 64],
                 msrs: vec![(0x10, 100)],
+                vcpu_events: vec![],
+                xcrs: vec![],
             }],
             irqchip: IrqchipState {
                 pic_master: vec![0; 64],
@@ -861,6 +873,8 @@ mod tests {
                     desc_addr: 0x1000,
                     driver_addr: 0x2000,
                     device_addr: 0x3000,
+                    last_avail_idx: None,
+                    last_used_idx: None,
                 }],
             },
             config: SnapshotConfig {

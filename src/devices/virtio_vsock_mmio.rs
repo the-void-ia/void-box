@@ -693,6 +693,8 @@ impl VirtioVsockMmio {
                 desc_addr: q.desc_addr,
                 driver_addr: q.driver_addr,
                 device_addr: q.device_addr,
+                last_avail_idx: None,
+                last_used_idx: None,
             })
             .collect();
 
@@ -795,6 +797,41 @@ impl VirtioVsockMmio {
 
         debug!("Restored virtio-vsock MMIO (CID {})", cid);
         Ok(dev)
+    }
+}
+
+impl crate::devices::vsock_backend::VsockMmioDevice for VirtioVsockMmio {
+    fn mmio_base(&self) -> u64 {
+        self.mmio_base
+    }
+    fn mmio_size(&self) -> u64 {
+        self.mmio_size
+    }
+    fn set_mmio_base(&mut self, base: u64) {
+        self.set_mmio_base(base);
+    }
+    fn handles_mmio(&self, addr: u64) -> bool {
+        self.handles_mmio(addr)
+    }
+    fn mmio_read(&self, offset: u64, data: &mut [u8]) {
+        self.mmio_read(offset, data);
+    }
+    fn mmio_write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        guest_memory: &vm_memory::GuestMemoryMmap,
+    ) -> crate::Result<()> {
+        self.mmio_write(offset, data, guest_memory)
+    }
+    fn call_eventfds(&self) -> &[Option<RawFd>; 3] {
+        self.call_eventfds()
+    }
+    fn set_interrupt_status(&mut self, bits: u32) {
+        self.set_interrupt_status(bits);
+    }
+    fn snapshot_state(&self) -> crate::vmm::snapshot::VsockSnapshotState {
+        self.snapshot_state()
     }
 }
 

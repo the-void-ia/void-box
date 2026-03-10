@@ -144,23 +144,6 @@ pub struct BoxSandboxOverride {
     pub snapshot: Option<String>,
 }
 
-/// Warmup commands to run before agent execution.
-///
-/// When declared alongside a snapshot path, warmup runs after restore
-/// and the result is cached as a PostInit snapshot for subsequent runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WarmupSpec {
-    /// Shell commands to execute sequentially (each via `sh -c`).
-    pub commands: Vec<String>,
-    /// Per-command timeout in seconds (default: 120).
-    #[serde(default = "default_warmup_timeout")]
-    pub timeout_secs: u64,
-}
-
-fn default_warmup_timeout() -> u64 {
-    120
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineBoxSpec {
     pub name: String,
@@ -179,9 +162,6 @@ pub struct PipelineBoxSpec {
     /// Named inputs this stage consumes (host directories mounted ro).
     #[serde(default)]
     pub inputs: Vec<PipelineInputSpec>,
-    /// Warmup commands to run before agent execution (for PostInit snapshots).
-    #[serde(default)]
-    pub warmup: Option<WarmupSpec>,
 }
 
 /// A named output directory that a pipeline stage writes to.

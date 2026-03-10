@@ -1,14 +1,9 @@
 #![cfg(target_os = "linux")]
 //! Snapshot integration tests for void-box.
 //!
-//! Two tests exercising the snapshot / restore pipeline:
-//!
-//! 1. **`snapshot_cold_boot_vs_restore`** — measures cold-boot time, takes a
-//!    snapshot, restores it, and compares cold-boot vs restore latency.
-//!
-//! 2. **`snapshot_live_capture_and_restore`** — measures the live snapshot
-//!    capture time (pausing vCPUs + dumping memory while the VM keeps running)
-//!    and the subsequent restore time.
+//! **`snapshot_cold_boot_vs_restore`** — measures cold-boot time, takes a cold
+//! snapshot (stopping the VM), restores it, and compares cold-boot vs restore
+//! latency.
 //!
 //! Requirements (same as `kvm_integration.rs`):
 //! - `/dev/kvm` present and accessible
@@ -29,7 +24,7 @@ use std::time::{Duration, Instant};
 #[path = "common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::vmm::config::VoidBoxConfig;
+use void_box::vmm::config::{VoidBoxConfig, VsockBackendType};
 use void_box::vmm::snapshot::{self, SnapshotConfig, VmSnapshot};
 use void_box::vmm::MicroVm;
 use void_box::Error;
@@ -77,7 +72,14 @@ fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -
         .memory_mb(256)
         .vcpus(1)
         .kernel(kernel)
-        .enable_vsock(true);
+        .enable_vsock(true)
+        .vsock_backend(VsockBackendType::Userspace)
+        // Force periodic LAPIC timer instead of TSC-deadline mode.
+        // After snapshot restore the kernel's clockevent state is stale and
+        // TSC_DEADLINE=0 means no timer ever fires again.  Periodic mode
+        // survives restore because the LAPIC hardware re-generates ticks from
+        // TMICT/TDCR without needing the kernel to re-arm.
+;
     if let Some(p) = initramfs {
         cfg = cfg.initramfs(p);
     }
@@ -86,50 +88,15 @@ fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -
 }
 
 /// Build a `SnapshotConfig` matching the test VM.
+/// Note: `cid` is set to 0 here — `snapshot_internal()` overwrites it with
+/// the VM's actual CID before saving.
 fn snap_config() -> SnapshotConfig {
     SnapshotConfig {
         memory_mb: 256,
         vcpus: 1,
-        cid: 0,
+        cid: 0, // overwritten by snapshot_internal()
         vsock_mmio_base: 0xd080_0000,
         network: false,
-    }
-}
-
-/// Take a live snapshot while keeping the guest busy so vCPUs exit KVM_RUN.
-///
-/// Returns the snapshot directory path and the time it took.
-async fn take_live_snapshot(
-    vm: &MicroVm,
-    snap_dir: &std::path::Path,
-    config_hash: String,
-    config: SnapshotConfig,
-) -> Option<(PathBuf, Duration)> {
-    let snap_dir_path = snap_dir.to_path_buf();
-    let start = Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
-        // Run a concurrent exec to generate vCPU exits (vsock MMIO traffic)
-        // so vCPUs leave HLT and check the snapshot_requested flag.
-        tokio::select! {
-            snap = vm.snapshot_live(&snap_dir_path, config_hash, config) => snap,
-            _ = vm.exec("sleep", &["30"]) => {
-                Err(void_box::Error::Snapshot("exec completed before snapshot".into()))
-            }
-        }
-    })
-    .await;
-    let duration = start.elapsed();
-
-    match result {
-        Ok(Ok(path)) => Some((path, duration)),
-        Ok(Err(e)) => {
-            eprintln!("  snapshot_live failed: {e}");
-            None
-        }
-        Err(_) => {
-            eprintln!("  snapshot_live timed out (vCPU stuck in KVM_RUN HLT)");
-            None
-        }
     }
 }
 
@@ -165,10 +132,10 @@ async fn try_restored_exec(vm: &MicroVm) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: Cold boot vs snapshot restore
+// Test: Cold boot → cold snapshot → restore
 // ---------------------------------------------------------------------------
 
-/// Cold-boot a VM, take a snapshot, restore from it.
+/// Cold-boot a VM, take a cold snapshot (stops the VM), restore from it.
 ///
 /// Compares cold-boot latency against snapshot-restore latency.
 #[tokio::test]
@@ -211,23 +178,50 @@ async fn snapshot_cold_boot_vs_restore() {
         cold_boot_time
     );
 
-    // --- Snapshot ---
+    // --- Cold snapshot (stops the VM) ---
+    let cold_cid = vm.cid();
+    eprintln!("[cold_boot_vs_restore] Cold boot CID={}", cold_cid);
+
     let snap_dir = tempfile::tempdir().expect("tempdir");
     let config_hash =
         snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
 
-    eprintln!("[cold_boot_vs_restore] Taking snapshot...");
-    let Some((snapshot_path, _snap_time)) =
-        take_live_snapshot(&vm, snap_dir.path(), config_hash, snap_config()).await
-    else {
-        let mut vm = vm;
-        vm.stop().await.ok();
-        return;
+    eprintln!("[cold_boot_vs_restore] Taking cold snapshot...");
+    let snap_start = Instant::now();
+    let snapshot_path = match vm
+        .snapshot(snap_dir.path(), config_hash, snap_config())
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            return;
+        }
     };
+    let snap_time = snap_start.elapsed();
+    eprintln!(
+        "[cold_boot_vs_restore] Snapshot captured in {:.1?}",
+        snap_time
+    );
 
-    // Stop original VM
-    let mut vm = vm;
-    vm.stop().await.ok();
+    // Validate snapshot on disk
+    let snap = VmSnapshot::load(&snapshot_path).expect("load snapshot");
+    eprintln!(
+        "[cold_boot_vs_restore] Snapshot CID={} (cold boot CID={})",
+        snap.config.cid, cold_cid
+    );
+    assert_eq!(snap.version, snapshot::SNAPSHOT_VERSION);
+    assert_eq!(snap.config.memory_mb, 256);
+    assert_eq!(snap.config.vcpus, 1);
+    assert!(snap.config.cid >= 3, "snapshot must preserve real CID");
+    assert!(
+        !snap.vcpu_states.is_empty(),
+        "snapshot must contain vCPU states"
+    );
+    let mem_path = VmSnapshot::memory_path(&snapshot_path);
+    assert!(mem_path.exists(), "memory dump must exist");
+    let mem_size = std::fs::metadata(&mem_path).unwrap().len();
+    assert_eq!(mem_size, 256 * 1024 * 1024, "memory dump must be 256MB");
 
     // --- Restore ---
     eprintln!("[cold_boot_vs_restore] Restoring from snapshot...");
@@ -240,124 +234,49 @@ async fn snapshot_cold_boot_vs_restore() {
         }
     };
     let restore_time = restore_start.elapsed();
+    eprintln!(
+        "[cold_boot_vs_restore] Restored VM CID={} (restore took {:.1?})",
+        restored_vm.cid(),
+        restore_time
+    );
 
-    try_restored_exec(&restored_vm).await;
+    // Verify the Unix socket exists
+    let socket_path = format!("/tmp/void-box-vsock-{}.sock", restored_vm.cid());
+    eprintln!(
+        "[cold_boot_vs_restore] Socket {} exists={}",
+        socket_path,
+        std::path::Path::new(&socket_path).exists()
+    );
+
+    let exec_ok = try_restored_exec(&restored_vm).await;
+
+    // Dump serial output to check for kernel panics
+    let serial = restored_vm.read_serial_output();
+    if !serial.is_empty() {
+        let s = String::from_utf8_lossy(&serial);
+        eprintln!(
+            "[cold_boot_vs_restore] Serial output ({} bytes):\n{}",
+            serial.len(),
+            s
+        );
+    } else {
+        eprintln!("[cold_boot_vs_restore] No serial output from restored VM");
+    }
+
+    assert!(
+        exec_ok,
+        "restored VM exec must succeed (CID preserved across snapshot/restore)"
+    );
 
     // --- Timing ---
     let speedup = cold_boot_time.as_secs_f64() / restore_time.as_secs_f64().max(1e-9);
     eprintln!();
     eprintln!("=== Cold Boot vs Restore ===");
     eprintln!("  Cold boot:   {:>10.1?}", cold_boot_time);
+    eprintln!("  Snapshot:    {:>10.1?}", snap_time);
     eprintln!("  Restore:     {:>10.1?}", restore_time);
     eprintln!("  Speedup:     {:>10.1}x", speedup);
     eprintln!("============================");
-
-    restored_vm.stop().await.ok();
-}
-
-// ---------------------------------------------------------------------------
-// Test 2: Live snapshot capture + restore
-// ---------------------------------------------------------------------------
-
-/// Take a live snapshot from a running VM and restore it.
-///
-/// Measures snapshot capture time (pause vCPUs + dump memory) and restore
-/// time separately.
-#[tokio::test]
-#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
-async fn snapshot_live_capture_and_restore() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
-    let cfg = build_config(&kernel, initramfs.as_deref());
-
-    // Boot VM
-    eprintln!("[live_capture_restore] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
-    };
-
-    // Health check
-    match vm.exec("echo", &["ready"]).await {
-        Ok(out) if out.success() => {}
-        Ok(out) => {
-            eprintln!("  health check failed: exit_code={}", out.exit_code);
-            return;
-        }
-        Err(Error::VmNotRunning) => {
-            eprintln!("  VM not running");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("  guest error: {msg}");
-            return;
-        }
-        Err(e) => panic!("  exec failed: {e}"),
-    };
-    eprintln!("[live_capture_restore] VM ready");
-
-    // --- Live snapshot ---
-    let snap_dir = tempfile::tempdir().expect("tempdir");
-    let config_hash =
-        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
-
-    eprintln!("[live_capture_restore] Taking live snapshot...");
-    let Some((snapshot_path, capture_time)) =
-        take_live_snapshot(&vm, snap_dir.path(), config_hash, snap_config()).await
-    else {
-        let mut vm = vm;
-        vm.stop().await.ok();
-        return;
-    };
-    eprintln!(
-        "[live_capture_restore] Snapshot captured in {:.1?}",
-        capture_time
-    );
-
-    // Validate on disk
-    let snap = VmSnapshot::load(&snapshot_path).expect("load snapshot");
-    assert_eq!(snap.version, snapshot::SNAPSHOT_VERSION);
-    assert_eq!(snap.config.memory_mb, 256);
-    assert_eq!(snap.config.vcpus, 1);
-    assert_eq!(snap.snapshot_type, snapshot::SnapshotType::PostInit);
-    assert!(
-        !snap.vcpu_states.is_empty(),
-        "snapshot must contain vCPU states"
-    );
-
-    let mem_path = VmSnapshot::memory_path(&snapshot_path);
-    assert!(mem_path.exists(), "memory dump must exist");
-    let mem_size = std::fs::metadata(&mem_path).unwrap().len();
-    assert_eq!(mem_size, 256 * 1024 * 1024, "memory dump must be 256MB");
-
-    // Stop original VM
-    let mut vm = vm;
-    vm.stop().await.ok();
-
-    // --- Restore ---
-    eprintln!("[live_capture_restore] Restoring from snapshot...");
-    let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
-    };
-    let restore_time = restore_start.elapsed();
-
-    try_restored_exec(&restored_vm).await;
-
-    // --- Timing ---
-    eprintln!();
-    eprintln!("=== Live Snapshot Capture & Restore ===");
-    eprintln!("  Capture (live):  {:>10.1?}", capture_time);
-    eprintln!("  Restore:         {:>10.1?}", restore_time);
-    eprintln!("=======================================");
 
     restored_vm.stop().await.ok();
 }

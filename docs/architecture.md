@@ -350,47 +350,84 @@ VoidBox supports three types of VM snapshots for sub-second restore. All snapsho
 |---|---|---|---|
 | **Base** | After cold boot, VM stopped | Full memory dump + all KVM state | Golden image for repeated boots |
 | **Diff** | After dirty tracking enabled, VM stopped | Only modified pages since base | Layered caching (base + delta) |
-| **PostInit** | After warmup commands, VM **keeps running** | Full memory + state (live capture) | Pre-warmed environments |
+
+### Performance
+
+Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
+
+| Phase | Time |
+|---|---|
+| Cold boot | 14.6 ms |
+| Snapshot capture | 425.7 ms |
+| Restore | 1.3 ms |
+| **Speedup** | **11.6x** |
 
 ### Storage layout
 
 ```
 ~/.void-box/snapshots/
   └── <hash-prefix>/        # first 16 chars of config hash
-      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
-      ├── memory.mem         # full memory dump (base/postinit)
+      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, vsock, config)
+      ├── memory.mem         # full memory dump (base)
       └── memory.diff        # dirty pages only (diff snapshots)
 ```
 
 ### Restore flow
 
 ```
-1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, PIT, vsock state)
+1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, vsock, config)
 2. Vm::new(memory_mb)              Create KVM VM with matching memory size
 3. restore_memory(mem, path)       COW mmap(MAP_PRIVATE|MAP_FIXED) — lazy page loading
 4. vm.restore_irqchip(state)       Restore PIC master/slave + IOAPIC
-5. vm.restore_pit(state)           Restore PIT timer
-6. VirtioVsockMmio::restore()      Restore vsock device registers
-7. create_vcpu_restored(state)     Set CPUID + restore full register state per vCPU
-8. vCPU threads resume             Guest continues execution from snapshot point
+5. VirtioVsockMmio::restore()      Restore vsock device registers (userspace backend)
+6. create_vcpu_restored(state)     Per-vCPU restore (see register restore order below)
+7. vCPU threads resume             Guest continues execution from snapshot point
 ```
 
 Memory restore uses kernel `MAP_PRIVATE` lazy page loading — pages are demand-faulted from the file, writes create anonymous copies. No userfaultfd required.
 
-### Live snapshot (PostInit)
+#### vCPU register restore order
 
-For PostInit snapshots, the VM stays running:
+The restore sequence in `cpu.rs` is order-sensitive. Getting it wrong causes
+silent guest crashes (kernel panic → reboot via port 0x64).
 
 ```
-1. Host sets snapshot_requested flag
-2. Each vCPU, after its current KVM_RUN exit:
-   a. Captures its own register state
-   b. Waits on barrier (all vCPUs paused)
-3. Host thread waits on barrier (all vCPUs paused)
-4. Host captures: irqchip, PIT, vsock state, full memory dump
-5. Host clears flag, releases barrier
-6. vCPUs resume execution
+1. MSRs              KVM_SET_MSRS
+2. sregs             KVM_SET_SREGS (segment regs, CR0/CR3/CR4)
+3. LAPIC             KVM_SET_LAPIC + periodic timer bootstrap (see below)
+4. vcpu_events       KVM_SET_VCPU_EVENTS (exception/interrupt state)
+5. XCRs (XCR0)       KVM_SET_XCRS — MUST come before xsave
+6. xsave (FPU/SSE)  KVM_SET_XSAVE — depends on XCR0 for feature mask
+7. regs              KVM_SET_REGS (GP registers, RIP, RFLAGS)
 ```
+
+**XCR0 restore is critical.** XCR0 controls which XSAVE features (x87, SSE,
+AVX) are active. Without it, the guest's `XRSTORS` instruction triggers a #GP
+because the default XCR0 only enables x87, but the guest's XSAVE area
+references SSE/AVX features. This manifests as "Bad FPU state detected at
+restore_fpregs_from_fpstate" → kernel panic → reboot loop.
+
+#### LAPIC timer bootstrap
+
+When the guest was idle (NO_HZ) at snapshot time, the LAPIC timer is masked
+with vector=0 (LVTT=0x10000). After restore, no timer interrupt ever fires,
+so the scheduler never runs. The restore code detects this state and
+bootstraps a periodic LAPIC timer (mode=periodic, vector=0xEC, TMICT=0x200000,
+TDCR=divide-by-1) to kick the scheduler back to life.
+
+#### Vsock backend for snapshot
+
+The **userspace** virtio-vsock backend must be used for VMs that will be
+snapshotted. The kernel vhost backend (`/dev/vhost-vsock`) does not expose
+internal vring indices, making queue state capture incomplete. The userspace
+backend tracks `last_avail_idx`/`last_used_idx` directly, ensuring clean
+snapshot/restore of the virtqueue state.
+
+#### CID preservation
+
+The snapshot stores the VM's actual CID (assigned at cold boot). On restore,
+the same CID is reused — the guest kernel caches the CID during virtio-vsock
+probe and silently drops packets with mismatched `dst_cid`.
 
 ### Opt-in plumbing
 
@@ -400,10 +437,8 @@ Every layer has an optional snapshot field that defaults to `None`:
 |---|---|---|---|
 | `SandboxBuilder` | `.snapshot(path)` | `Option<PathBuf>` | `None` |
 | `BoxConfig` | `snapshot` | `Option<PathBuf>` | `None` |
-| `BoxConfig` | `warmup` | `Option<WarmupSpec>` | `None` |
 | `SandboxSpec` (YAML) | `sandbox.snapshot` | `Option<String>` | `None` |
 | `BoxSandboxOverride` | `sandbox.snapshot` | `Option<String>` | `None` |
-| `PipelineBoxSpec` | `warmup` | `Option<WarmupSpec>` | `None` |
 | `CreateRunRequest` (API) | `snapshot` | `Option<String>` | `None` |
 
 Resolution chain: per-box override → top-level spec → `None` (cold boot).

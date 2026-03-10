@@ -473,7 +473,6 @@ fn cmd_snapshot_list() -> Result<(), Box<dyn std::error::Error>> {
         let type_str = match info.snapshot_type {
             snapshot::SnapshotType::Base => "base",
             snapshot::SnapshotType::Diff => "diff",
-            snapshot::SnapshotType::PostInit => "postinit",
         };
         println!(
             "{:<18} {:<8} {:<8} {:<10} {}",

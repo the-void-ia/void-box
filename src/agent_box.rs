@@ -83,8 +83,6 @@ struct BoxConfig {
     oci_rootfs_disk: Option<PathBuf>,
     /// Path to a snapshot directory to restore from (skips cold boot).
     snapshot: Option<PathBuf>,
-    /// Warmup commands to run before agent execution (for PostInit snapshots).
-    warmup: Option<crate::spec::WarmupSpec>,
     /// Path where the agent should write its output (read after execution)
     output_file: String,
     /// Whether to use mock sandbox
@@ -110,7 +108,6 @@ impl Default for BoxConfig {
             oci_rootfs_dev: None,
             oci_rootfs_disk: None,
             snapshot: None,
-            warmup: None,
             output_file: "/workspace/output.json".to_string(),
             mock: false,
             llm: LlmProvider::default(),
@@ -254,15 +251,6 @@ impl VoidBox {
     /// Set a snapshot directory to restore from (skips cold boot).
     pub fn snapshot(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.snapshot = Some(path.into());
-        self
-    }
-
-    /// Set warmup commands to run before agent execution.
-    ///
-    /// When combined with a snapshot, warmup results are cached as a
-    /// PostInit snapshot for subsequent runs.
-    pub fn warmup(mut self, spec: crate::spec::WarmupSpec) -> Self {
-        self.config.warmup = Some(spec);
         self
     }
 
@@ -530,35 +518,6 @@ impl VoidBox {
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             crate::Error::Config("VoidBox not built — call .build() first".into())
         })?;
-
-        // Run warmup commands if declared (PostInit snapshots).
-        // Warmup only runs if explicitly declared in the spec — no implicit behavior.
-        if let Some(ref warmup) = self.config.warmup {
-            let tag = &self.name;
-            eprintln!(
-                "[vm:{}] Running {} warmup command(s)",
-                tag,
-                warmup.commands.len()
-            );
-            for (i, cmd) in warmup.commands.iter().enumerate() {
-                eprintln!("[vm:{}] warmup[{}]: {}", tag, i, cmd);
-                let output = sandbox.exec("sh", &["-c", cmd]).await?;
-                if output.exit_code != 0 {
-                    eprintln!(
-                        "[vm:{}] warmup[{}] failed (exit={}): {}",
-                        tag,
-                        i,
-                        output.exit_code,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    return Err(crate::Error::Guest(format!(
-                        "warmup command {} failed with exit code {}",
-                        i, output.exit_code
-                    )));
-                }
-            }
-            eprintln!("[vm:{}] warmup complete", tag);
-        }
 
         // Provision security configuration (resource limits, command allowlist)
         self.provision_security(sandbox).await?;

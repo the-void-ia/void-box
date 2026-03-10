@@ -7,7 +7,8 @@
 //! only performs the host-side connect using the same CID.
 
 use std::io::{Read, Write};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,8 @@ pub struct VsockDevice {
     /// 32-byte session secret for vsock authentication.
     /// Sent as the Ping payload; guest validates against its cmdline secret.
     session_secret: [u8; 32],
+    /// When set, connect via AF_UNIX instead of AF_VSOCK (userspace backend).
+    unix_socket_path: Option<PathBuf>,
 }
 
 impl VsockDevice {
@@ -65,6 +68,7 @@ impl VsockDevice {
             cid,
             boot_wait_done: AtomicBool::new(false),
             session_secret,
+            unix_socket_path: None,
         })
     }
 
@@ -84,6 +88,57 @@ impl VsockDevice {
             cid,
             boot_wait_done: AtomicBool::new(true), // skip boot wait
             session_secret,
+            unix_socket_path: None,
+        })
+    }
+
+    /// Create a vsock device that connects via AF_UNIX (userspace backend).
+    pub fn with_unix_socket(
+        cid: u32,
+        session_secret: [u8; 32],
+        socket_path: PathBuf,
+    ) -> Result<Self> {
+        if cid < 3 {
+            return Err(Error::Config(format!(
+                "Invalid CID {}: must be >= 3 (0-2 reserved)",
+                cid
+            )));
+        }
+        debug!(
+            "Creating vsock device with CID {} (AF_UNIX: {})",
+            cid,
+            socket_path.display()
+        );
+        Ok(Self {
+            cid,
+            boot_wait_done: AtomicBool::new(false),
+            session_secret,
+            unix_socket_path: Some(socket_path),
+        })
+    }
+
+    /// Create a restored vsock device that connects via AF_UNIX (userspace backend).
+    pub fn restored_with_unix_socket(
+        cid: u32,
+        session_secret: [u8; 32],
+        socket_path: PathBuf,
+    ) -> Result<Self> {
+        if cid < 3 {
+            return Err(Error::Config(format!(
+                "Invalid CID {}: must be >= 3 (0-2 reserved)",
+                cid
+            )));
+        }
+        debug!(
+            "Creating restored vsock device with CID {} (AF_UNIX: {}, boot wait skipped)",
+            cid,
+            socket_path.display()
+        );
+        Ok(Self {
+            cid,
+            boot_wait_done: AtomicBool::new(true),
+            session_secret,
+            unix_socket_path: Some(socket_path),
         })
     }
 
@@ -335,17 +390,11 @@ impl VsockDevice {
             attempt += 1;
 
             let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
-                Ok(stream) => {
-                    debug!(
-                        "vsock[{context}]: attempt {} connect OK (cid={}, port={})",
-                        attempt, self.cid, GUEST_AGENT_PORT
-                    );
-                    stream
-                }
+                Ok(stream) => stream,
                 Err(e) => {
                     debug!(
-                        "vsock[{context}]: attempt {} connect failed: {} (retry in {:?})",
-                        attempt, e, delay
+                        "vsock[{context}]: attempt {} connect failed: {}",
+                        attempt, e
                     );
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, Duration::from_secs(2));
@@ -377,12 +426,11 @@ impl VsockDevice {
             }
             match Message::read_from_sync(&mut s) {
                 Ok(msg) if msg.msg_type == MessageType::Pong => {
-                    debug!("vsock[{context}]: handshake OK");
                     return Ok(s);
                 }
                 Ok(msg) => {
                     debug!(
-                        "vsock[{context}]: attempt {} unexpected handshake message: {:?}",
+                        "vsock[{context}]: attempt {} unexpected msg: {:?}",
                         attempt, msg.msg_type
                     );
                     tokio::time::sleep(delay).await;
@@ -390,7 +438,7 @@ impl VsockDevice {
                 }
                 Err(e) => {
                     debug!(
-                        "vsock[{context}]: attempt {} handshake read failed: {}",
+                        "vsock[{context}]: attempt {} handshake failed: {}",
                         attempt, e
                     );
                     tokio::time::sleep(delay).await;
@@ -463,11 +511,16 @@ impl VsockDevice {
         }
     }
 
-    /// Connect to a port on the guest
+    /// Connect to a port on the guest.
+    ///
+    /// Uses AF_VSOCK by default. When `unix_socket_path` is set (userspace
+    /// backend), connects via AF_UNIX and sends the port as a 4-byte LE header.
     fn connect_to_guest(&self, port: u32) -> Result<VsockStream> {
-        // For userspace vsock, we'd use a Unix socket or similar
-        // For now, use a placeholder that would be replaced with actual vsock
-        VsockStream::connect(self.cid, port)
+        if let Some(ref socket_path) = self.unix_socket_path {
+            VsockStream::connect_unix(socket_path, port)
+        } else {
+            VsockStream::connect(self.cid, port)
+        }
     }
 }
 
@@ -529,6 +582,33 @@ impl VsockStream {
         }
 
         Ok(Self { fd: socket_fd })
+    }
+
+    /// Connect via AF_UNIX to the userspace vsock backend.
+    ///
+    /// Sends the target guest port as a 4-byte LE header after connecting.
+    pub fn connect_unix(socket_path: &std::path::Path, port: u32) -> Result<Self> {
+        use std::os::unix::net::UnixStream;
+
+        let stream = UnixStream::connect(socket_path).map_err(|e| {
+            Error::Guest(format!(
+                "Failed to connect to vsock Unix socket {}: {}",
+                socket_path.display(),
+                e
+            ))
+        })?;
+
+        // Send the port number as a 4-byte LE header
+        let port_bytes = port.to_le_bytes();
+        (&stream).write_all(&port_bytes).map_err(|e| {
+            Error::Guest(format!("Failed to send port to vsock Unix socket: {}", e))
+        })?;
+
+        let fd = stream.as_raw_fd();
+        // Prevent the UnixStream from closing the fd — we own it now
+        std::mem::forget(stream);
+
+        Ok(Self { fd })
     }
 
     /// Set read timeout (e.g. for handshake). Pass `None` for blocking.

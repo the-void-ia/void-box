@@ -468,7 +468,6 @@ VoidBox supports sub-second VM restore via snapshot/restore. Snapshots capture t
 |------|-------------|
 | **Base** | Full memory dump + KVM state from a cold-booted VM |
 | **Diff** | Only dirty pages since last snapshot (smaller, faster) |
-| **PostInit** | Live snapshot taken after warmup commands (VM keeps running) |
 
 ### YAML spec
 
@@ -478,21 +477,16 @@ sandbox:
   memory_mb: 256
   snapshot: "abc123def456"   # hash prefix from `voidbox snapshot list`
 
-# Per-box override + warmup commands
+# Per-box override
 pipeline:
   boxes:
     - name: analyst
       prompt: "analyze data"
       sandbox:
         snapshot: "def789"   # per-box snapshot override
-      warmup:                # commands to run before agent execution
-        commands:
-          - "pip install pandas numpy"
-          - "python -c 'import pandas; print(pandas.__version__)'"
-        timeout_secs: 120
     - name: coder
       prompt: "write code"
-      # no snapshot, no warmup → cold boot (default)
+      # no snapshot → cold boot (default)
 ```
 
 ### Rust API
@@ -500,7 +494,7 @@ pipeline:
 ```rust
 use void_box::agent_box::VoidBox;
 
-// Cold boot (default — no snapshot, no warmup)
+// Cold boot (default — no snapshot)
 let box1 = VoidBox::new("analyst")
     .prompt("analyze data")
     .memory_mb(256)
@@ -510,17 +504,6 @@ let box1 = VoidBox::new("analyst")
 let box2 = VoidBox::new("analyst")
     .prompt("analyze data")
     .snapshot("/path/to/snapshot/dir")   // or hash prefix
-    .build()?;
-
-// Snapshot + warmup (PostInit)
-use void_box::spec::WarmupSpec;
-let box3 = VoidBox::new("analyst")
-    .prompt("analyze data")
-    .snapshot("abc123")
-    .warmup(WarmupSpec {
-        commands: vec!["pip install pandas".into()],
-        timeout_secs: 120,
-    })
     .build()?;
 ```
 
@@ -556,7 +539,6 @@ curl -X POST http://localhost:8080/runs \
 - **No auto-creation** of snapshots during normal runs
 - **No auto-restore** — only if the user passes an explicit path or hash
 - **No env var fallback** — spec or code only
-- **Warmup only runs** if `warmup:` is declared AND a snapshot path is configured
 - **Every new field defaults to `None`** — the system behaves identically to before if untouched
 
 Snapshot cache is stored at `~/.void-box/snapshots/` with LRU eviction support.
@@ -569,7 +551,6 @@ Measured on a single-vCPU, 256 MB VM (Linux/KVM):
 |--------|------|
 | Cold boot | ~12 ms |
 | Snapshot restore | ~2 ms |
-| Live snapshot capture | ~245 ms |
 | **Cold boot → restore speedup** | **~6x** |
 
 ---

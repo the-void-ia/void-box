@@ -7,6 +7,21 @@ use crate::{Error, Result};
 // Re-export from the cross-platform backend module for backward compatibility.
 pub use crate::backend::{ResourceLimits, DEFAULT_COMMAND_ALLOWLIST};
 
+/// Backend type for the virtio-vsock device.
+///
+/// The default `Vhost` backend uses the kernel vhost-vsock module for maximum
+/// performance. The `Userspace` backend processes virtio queues in Rust,
+/// enabling clean snapshot/restore (the kernel vhost module corrupts vring
+/// state during restore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VsockBackendType {
+    /// Kernel vhost-vsock backend (default, fast, requires /dev/vhost-vsock).
+    #[default]
+    Vhost,
+    /// Userspace virtio-vsock backend (supports clean snapshot/restore).
+    Userspace,
+}
+
 /// Security configuration for VoidBox VMs.
 ///
 /// All security features are mandatory by default. No opt-out toggles
@@ -98,6 +113,8 @@ pub struct VoidBoxConfig {
     pub oci_rootfs_disk: Option<PathBuf>,
     /// Enable vsock for host-guest communication
     pub enable_vsock: bool,
+    /// Vsock backend type (Vhost = default, Userspace = for snapshot/restore)
+    pub vsock_backend: VsockBackendType,
     /// Vsock context ID (auto-generated if not specified)
     pub cid: Option<u32>,
     /// Additional kernel command line arguments
@@ -122,6 +139,7 @@ impl Default for VoidBoxConfig {
             oci_rootfs_dev: None,
             oci_rootfs_disk: None,
             enable_vsock: true,
+            vsock_backend: VsockBackendType::default(),
             cid: None,
             extra_cmdline: Vec::new(),
             security: SecurityConfig::default(),
@@ -189,6 +207,12 @@ impl VoidBoxConfig {
         self
     }
 
+    /// Set the vsock backend type
+    pub fn vsock_backend(mut self, backend: VsockBackendType) -> Self {
+        self.vsock_backend = backend;
+        self
+    }
+
     /// Set the vsock CID
     pub fn cid(mut self, cid: u32) -> Self {
         self.cid = Some(cid);
@@ -211,6 +235,8 @@ impl VoidBoxConfig {
             "pci=off".to_string(),
             "nokaslr".to_string(),
             "i8042.noaux".to_string(),
+            "i8042.nokbd".to_string(),
+            "i8042.nopnp".to_string(),
         ];
 
         // Only add nomodules if vsock is NOT enabled (vsock needs modprobe)

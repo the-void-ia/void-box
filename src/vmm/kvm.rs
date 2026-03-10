@@ -215,10 +215,35 @@ impl Vm {
     }
 
     /// Restore the in-kernel irqchip state from a snapshot.
+    ///
+    /// Clears the `remote_irr` bit on all IOAPIC redirection table entries
+    /// before restoring.  For level-triggered entries, `remote_irr` signals
+    /// that an interrupt has been delivered but the guest hasn't sent EOI yet.
+    /// After a snapshot/restore cycle the LAPIC state may not match, so a stale
+    /// `remote_irr` permanently blocks new interrupts on that pin (KVM_IRQ_LINE
+    /// is silently ignored).
     pub fn restore_irqchip(&self, state: &IrqchipState) -> Result<()> {
+        // Restore PIC state faithfully from the snapshot.
         self.set_irqchip_raw(0, &state.pic_master)?;
         self.set_irqchip_raw(1, &state.pic_slave)?;
-        self.set_irqchip_raw(2, &state.ioapic)?;
+
+        // Clear remote_irr bits in the IOAPIC redirtbl before restoring.
+        // Stale remote_irr prevents level-triggered interrupt re-delivery.
+        let mut ioapic_data = state.ioapic.clone();
+        const REDIRTBL_OFFSET: usize = 8 + 24; // chip header + ioapic header
+        const NUM_PINS: usize = 24;
+        for pin in 0..NUM_PINS {
+            let entry_base = REDIRTBL_OFFSET + pin * 8;
+            if entry_base + 2 <= ioapic_data.len() {
+                // remote_irr = bit 14 of the entry = byte 1, bit 6
+                if ioapic_data[entry_base + 1] & 0x40 != 0 {
+                    ioapic_data[entry_base + 1] &= !0x40;
+                    debug!("Cleared remote_irr on IOAPIC pin {}", pin);
+                }
+            }
+        }
+        self.set_irqchip_raw(2, &ioapic_data)?;
+
         debug!("Restored irqchip state");
         Ok(())
     }

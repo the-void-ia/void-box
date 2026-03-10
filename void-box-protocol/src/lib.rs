@@ -133,7 +133,7 @@ pub enum MessageType {
     ExecOutputChunk = 15,
     /// Ack from host (optional flow control)
     ExecOutputAck = 16,
-    /// Guest signals that it is ready for a snapshot (Phase 3: PostInit).
+    /// Guest signals that it is ready for a snapshot.
     SnapshotReady = 17,
 }
 

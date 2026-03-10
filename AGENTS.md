@@ -175,10 +175,9 @@ pattern, e.g. `[workflow:my-flow] step 1/3: "build" running...`.
 
 ## Snapshot / restore
 
-VoidBox supports three snapshot types: **Base** (full dump), **Diff** (dirty pages
-only), and **PostInit** (live capture while VM keeps running). All snapshot
-features are **explicit opt-in** — no snapshot code runs unless the user sets a
-snapshot field.
+VoidBox supports two snapshot types: **Base** (full dump) and **Diff** (dirty pages
+only). All snapshot features are **explicit opt-in** — no snapshot code runs
+unless the user sets a snapshot field.
 
 ### Design principle
 
@@ -193,8 +192,8 @@ Snapshots can be enabled at any layer of the stack:
 | Layer | Field | Where |
 |-------|-------|-------|
 | Builder API | `SandboxBuilder::snapshot(path)` | `src/sandbox/mod.rs` |
-| VoidBox API | `VoidBox::snapshot(path)`, `VoidBox::warmup(spec)` | `src/agent_box.rs` |
-| YAML spec | `sandbox.snapshot`, `warmup.commands` | `src/spec.rs` |
+| VoidBox API | `VoidBox::snapshot(path)` | `src/agent_box.rs` |
+| YAML spec | `sandbox.snapshot` | `src/spec.rs` |
 | Per-box override | `sandbox.snapshot` in `BoxSandboxOverride` | `src/spec.rs` |
 | Runtime | `resolve_snapshot()`, `resolve_box_snapshot()` | `src/runtime.rs` |
 | Daemon API | `CreateRunRequest.snapshot` | `src/daemon.rs` |
@@ -209,34 +208,6 @@ Snapshots can be enabled at any layer of the stack:
 
 Per-box overrides (`resolve_box_snapshot()`) take priority over top-level spec.
 
-### Live snapshot internals (PostInit)
-
-`MicroVm::snapshot_live()` in `src/vmm/mod.rs`:
-
-1. Sets `snapshot_requested: Arc<AtomicBool>` flag
-2. Each vCPU thread checks the flag after every `KVM_RUN` exit (gate in
-   `vcpu_run_loop` in `src/vmm/cpu.rs`)
-3. vCPU captures its own state, then waits on `snapshot_barrier: Arc<Barrier>`
-4. Main thread waits on same barrier → all vCPUs paused
-5. Main thread captures irqchip, PIT, vsock state, dumps memory
-6. Main thread clears flag, releases barrier → vCPUs resume
-
-### Warmup commands
-
-`WarmupSpec` in `src/spec.rs`:
-
-```yaml
-warmup:
-  commands:
-    - "pip install pandas"
-    - "python -c 'import pandas'"
-  timeout_secs: 120
-```
-
-Warmup runs in `VoidBox::run()` (in `src/agent_box.rs`) **before** security
-provisioning and agent execution. Each command runs via `sandbox.exec("sh", ["-c", cmd])`.
-If any command fails (non-zero exit), the entire run fails.
-
 ### Wire protocol
 
 `SnapshotReady = 17` in `void-box-protocol/src/lib.rs`. Guest-agent handles
@@ -249,11 +220,11 @@ connects and round-trips the message.
 | File | Contents |
 |------|----------|
 | `src/vmm/snapshot.rs` | Types, memory dump/restore, diff support, cache/LRU |
-| `src/vmm/mod.rs` | `snapshot()`, `from_snapshot()`, `snapshot_live()` |
-| `src/vmm/cpu.rs` | vCPU state capture/restore, live snapshot gate |
+| `src/vmm/mod.rs` | `snapshot()`, `from_snapshot()`, `snapshot_diff()` |
+| `src/vmm/cpu.rs` | vCPU state capture/restore |
 | `src/sandbox/mod.rs` | `SandboxBuilder::snapshot()` |
-| `src/agent_box.rs` | `VoidBox::snapshot()`, `warmup()`, warmup execution |
-| `src/spec.rs` | `SandboxSpec.snapshot`, `WarmupSpec`, `BoxSandboxOverride.snapshot` |
+| `src/agent_box.rs` | `VoidBox::snapshot()` |
+| `src/spec.rs` | `SandboxSpec.snapshot`, `BoxSandboxOverride.snapshot` |
 | `src/runtime.rs` | `resolve_snapshot()`, `resolve_box_snapshot()` |
 | `src/daemon.rs` | `CreateRunRequest.snapshot` |
 | `src/backend/control_channel.rs` | `wait_for_snapshot_ready()` |
@@ -513,6 +484,41 @@ That production image is for real Claude/OpenClaw runtime paths.
 
 ## Known issues
 
+### Snapshot restore: XCR0 and LAPIC timer
+
+**Root causes of guest crash after snapshot restore** (2-day debugging effort):
+
+1. **Missing XCR0 restore → FPU #GP → kernel panic → reboot loop.**
+   After restore, XCR0 defaults to x87-only (bit 0). The guest kernel's
+   `XRSTORS` instruction references SSE/AVX features in the XSAVE compact
+   format, but those features aren't enabled in XCR0 → General Protection
+   fault → "Bad FPU state detected at restore_fpregs_from_fpstate" → panic →
+   `emergency_restart` writes 0xFE to port 0x64 (keyboard controller reset).
+   **Fix:** Capture `kvm_xcrs` via `KVM_GET_XCRS` and restore via
+   `KVM_SET_XCRS` *before* `KVM_SET_XSAVE`. Added `xcrs` field to
+   `VcpuState` (backward-compatible via `#[serde(default)]`).
+
+2. **LAPIC timer masked in NO_HZ idle → scheduler never runs.**
+   When the guest is idle at snapshot time, the kernel disables the LAPIC
+   timer (LVTT=0x10000, masked, vector=0). After restore the timer stays
+   masked — no tick ever fires, scheduler stalls, vsock never processes
+   packets. **Fix:** Detect masked+vector=0 state and bootstrap a periodic
+   LAPIC timer (mode=periodic, vector=0xEC, TMICT=0x200000, TDCR=divide-by-1).
+
+3. **CID mismatch → guest silently drops vsock packets.**
+   Guest kernel caches CID during virtio-vsock probe at cold boot. If
+   restore assigns a new random CID, the guest drops all incoming packets
+   (dst_cid doesn't match cached value). **Fix:** `snapshot_internal()`
+   stores `self.cid` in the snapshot; `from_snapshot()` reuses that CID.
+
+**Debugging tip:** Guest reboots (port 0x64 write of 0xFE) indicate kernel
+panic, not a hang. Add `panic=-1 loglevel=7 earlyprintk=serial` to kernel
+cmdline and read serial output via `vm.read_serial_output()` to capture the
+actual panic message.
+
+**Key files:** `src/vmm/cpu.rs` (capture/restore order), `src/vmm/mod.rs`
+(CID preservation), `src/vmm/snapshot.rs` (VcpuState with xcrs field).
+
 ### EPERM during OCI layer unpack
 
 Container images (especially multi-layer ones like `alpine/openclaw`) can trigger
@@ -527,9 +533,10 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 
 - `conformance`: command execution, lifecycle, streaming, filesystem primitives.
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.
-- `snapshot_integration`: snapshot capture (cold + live), vCPU state persistence,
-  restore pipeline, VM stop after restore. **Must pass** for any changes to
-  snapshot, restore, vCPU, barrier, or `stop()` code paths.
+- `snapshot_integration`: cold snapshot capture, vCPU state persistence
+  (including XCR0/xsave), restore pipeline, exec on restored VM, VM stop
+  after restore. **Must pass** for any changes to snapshot, restore, vCPU,
+  vsock, or `stop()` code paths. Uses userspace virtio-vsock backend.
 - `e2e_telemetry`: telemetry flow from guest to host pipeline.
 - `e2e_skill_pipeline`: multi-stage skill execution in VM mode.
 - `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs

@@ -12,3 +12,7 @@ pub mod virtio_blk;
 pub mod virtio_net;
 pub mod virtio_vsock;
 pub mod virtio_vsock_mmio;
+pub mod virtio_vsock_userspace;
+pub mod virtqueue;
+pub mod vsock_backend;
+pub mod vsock_connection;

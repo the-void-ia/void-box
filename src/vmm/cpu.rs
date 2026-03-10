@@ -2,7 +2,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use kvm_bindings::{kvm_regs, Msrs, KVM_MAX_CPUID_ENTRIES};
@@ -14,7 +14,7 @@ use crate::devices::serial::SerialDevice;
 use crate::devices::virtio_9p::Virtio9pDevice;
 use crate::devices::virtio_blk::VirtioBlkDevice;
 use crate::devices::virtio_net::VirtioNetDevice;
-use crate::devices::virtio_vsock_mmio::VirtioVsockMmio;
+use crate::devices::vsock_backend::VsockMmioDevice;
 use crate::vmm::kvm::Vm;
 use crate::vmm::snapshot::{kvm_struct_from_bytes, kvm_struct_to_bytes, VcpuState};
 use crate::{Error, Result};
@@ -43,6 +43,9 @@ mod x86_64 {
 }
 
 /// x86_64 MSR indices to capture/restore for snapshots.
+///
+/// **Order matters**: `KVM_GET_MSRS` stops at the first unsupported index.
+/// Essential MSRs come first; optional/KVM-specific ones at the end.
 const SNAPSHOT_MSR_INDICES: &[u32] = &[
     0x0000_0010, // IA32_TSC
     0x0000_0174, // IA32_SYSENTER_CS
@@ -58,6 +61,11 @@ const SNAPSHOT_MSR_INDICES: &[u32] = &[
     0xC000_0101, // IA32_GS_BASE
     0xC000_0102, // IA32_KERNEL_GS_BASE
     0xC000_0103, // IA32_TSC_AUX
+    // KVM paravirt MSRs — must come after essential ones since they may
+    // not be available on all hosts. get_msrs stops at the first error.
+    0x4b56_4d01, // MSR_KVM_SYSTEM_TIME_NEW (kvm-clock)
+    0x4b56_4d00, // MSR_KVM_WALL_CLOCK_NEW
+    0x0000_06E0, // IA32_TSC_DEADLINE (LAPIC deadline timer)
 ];
 
 /// Capture the full register state of a vCPU for snapshotting.
@@ -66,20 +74,24 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
     let sregs = vcpu_fd.get_sregs().map_err(Error::Kvm)?;
     let lapic = vcpu_fd.get_lapic().map_err(Error::Kvm)?;
     let xsave = vcpu_fd.get_xsave().map_err(Error::Kvm)?;
+    let vcpu_events = vcpu_fd.get_vcpu_events().map_err(Error::Kvm)?;
+    let xcrs = vcpu_fd.get_xcrs().map_err(Error::Kvm)?;
 
-    // Capture MSRs
-    let nmsrs = SNAPSHOT_MSR_INDICES.len();
-    let mut msrs =
-        Msrs::new(nmsrs).map_err(|e| Error::Vcpu(format!("Msrs::new({}): {:?}", nmsrs, e)))?;
-    for (i, &index) in SNAPSHOT_MSR_INDICES.iter().enumerate() {
-        msrs.as_mut_slice()[i].index = index;
+    // Capture MSRs — read each individually so unsupported ones don't
+    // prevent reading subsequent MSRs (get_msrs stops at first error).
+    let mut msr_pairs: Vec<(u32, u64)> = Vec::with_capacity(SNAPSHOT_MSR_INDICES.len());
+    for &index in SNAPSHOT_MSR_INDICES {
+        let mut msrs = Msrs::new(1).map_err(|e| Error::Vcpu(format!("Msrs::new(1): {:?}", e)))?;
+        msrs.as_mut_slice()[0].index = index;
+        match vcpu_fd.get_msrs(&mut msrs) {
+            Ok(1) => {
+                msr_pairs.push((msrs.as_slice()[0].index, msrs.as_slice()[0].data));
+            }
+            _ => {
+                debug!("MSR {:#x} not available, skipping", index);
+            }
+        }
     }
-    let read_count = vcpu_fd.get_msrs(&mut msrs).map_err(Error::Kvm)?;
-
-    let msr_pairs: Vec<(u32, u64)> = msrs.as_slice()[..read_count]
-        .iter()
-        .map(|e| (e.index, e.data))
-        .collect();
 
     debug!(
         "Captured vCPU state: regs RIP={:#x}, {} MSRs",
@@ -93,35 +105,191 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
         lapic: kvm_struct_to_bytes(&lapic),
         xsave: kvm_struct_to_bytes(&xsave),
         msrs: msr_pairs,
+        vcpu_events: kvm_struct_to_bytes(&vcpu_events),
+        xcrs: kvm_struct_to_bytes(&xcrs),
     })
 }
 
 /// Restore vCPU register state from a snapshot.
+///
+/// The restore order is critical for correctness on KVM x86_64:
+///
+/// 1. MSRs (except IA32_TSC_DEADLINE) — TSC must be set before LAPIC
+/// 2. sregs (segment registers, control registers, EFER)
+/// 3. LAPIC — sets the timer mode (e.g. TSC-deadline)
+/// 4. IA32_TSC_DEADLINE MSR — MUST come after LAPIC because KVM silently
+///    drops the value if the LAPIC isn't in TSC-deadline mode yet
+/// 5. vcpu_events (pending interrupt/exception delivery state)
+/// 6. xsave (FPU/SSE/AVX state)
+/// 7. regs last (general-purpose registers including RIP)
 pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
-    use kvm_bindings::{kvm_lapic_state, kvm_msr_entry, kvm_sregs, kvm_xsave};
+    use kvm_bindings::{
+        kvm_lapic_state, kvm_msr_entry, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
+    };
+
+    const IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
 
     let regs: kvm_regs = kvm_struct_from_bytes(&state.regs)?;
     let sregs: kvm_sregs = kvm_struct_from_bytes(&state.sregs)?;
     let lapic: kvm_lapic_state = kvm_struct_from_bytes(&state.lapic)?;
     let xsave: kvm_xsave = kvm_struct_from_bytes(&state.xsave)?;
 
-    vcpu_fd.set_sregs(&sregs).map_err(Error::Kvm)?;
-    vcpu_fd.set_regs(&regs).map_err(Error::Kvm)?;
-    vcpu_fd.set_lapic(&lapic).map_err(Error::Kvm)?;
-    vcpu_fd.set_xsave(&xsave).map_err(Error::Kvm)?;
+    // Restore order follows the pattern used by mature VMMs (crosvm, Firecracker):
+    //
+    //   1. MSRs (except TSC_DEADLINE) — TSC base must be set before LAPIC
+    //   2. sregs (segment regs, CR0/CR3/CR4, EFER)
+    //   3. LAPIC — timer mode must be correct before TSC_DEADLINE write
+    //   4. TSC_DEADLINE MSR — MUST come after LAPIC (KVM drops it if LAPIC
+    //      isn't in TSC-deadline mode yet)
+    //   5. vcpu_events (pending interrupt/exception delivery state)
+    //   6. xsave (FPU/SSE/AVX)
+    //   7. regs last (includes RIP — execution resumes here)
+    //   8. KVM_KVMCLOCK_CTRL (tells KVM guest was paused)
+    //
+    // Getting this order wrong is the #1 cause of "lost LAPIC timer" bugs
+    // in Rust VMMs.  See: https://lkml.rescloud.iu.edu/2309.1/04940.html
 
-    // Restore MSRs
-    if !state.msrs.is_empty() {
-        let mut msrs =
-            Msrs::new(state.msrs.len()).map_err(|e| Error::Vcpu(format!("Msrs::new: {:?}", e)))?;
-        for (i, &(index, data)) in state.msrs.iter().enumerate() {
-            msrs.as_mut_slice()[i] = kvm_msr_entry {
-                index,
-                data,
+    // 1. MSRs first (except TSC_DEADLINE — deferred until after LAPIC).
+    let mut tsc_deadline_value: Option<u64> = None;
+    for &(index, data) in &state.msrs {
+        if index == IA32_TSC_DEADLINE {
+            tsc_deadline_value = Some(data);
+            continue; // Deferred to step 4
+        }
+        let mut msrs = Msrs::new(1).map_err(|e| Error::Vcpu(format!("Msrs::new: {:?}", e)))?;
+        msrs.as_mut_slice()[0] = kvm_msr_entry {
+            index,
+            data,
+            ..Default::default()
+        };
+        match vcpu_fd.set_msrs(&msrs) {
+            Ok(_) => {}
+            Err(e) => {
+                debug!("Failed to restore MSR {:#x}: {}", index, e);
+            }
+        }
+    }
+
+    // 2. Special registers (segment regs, CR0/CR3/CR4, EFER)
+    vcpu_fd.set_sregs(&sregs).map_err(Error::Kvm)?;
+
+    // 3. LAPIC — restore faithfully, then fix LVT Timer if needed.
+    //
+    // When the guest is in NO_HZ idle (HLT) at snapshot time, the kernel
+    // masks the LAPIC timer (LVTT = 0x10000: masked, mode=oneshot, vector=0).
+    // After restore, no timer tick will ever fire, so the guest stays in HLT
+    // forever — the scheduler never runs again.
+    //
+    // Fix: set LVT Timer to TSC-deadline mode with LOCAL_TIMER_VECTOR (0xEC)
+    // and unmask it.  Then in step 4, write a near-future TSC_DEADLINE to
+    // fire a single tick that bootstraps tick_nohz_idle_exit → hrtimer →
+    // scheduler.  The kernel's apic_timer_interrupt handler re-arms the
+    // timer and normal operation resumes.
+    let mut lapic = lapic;
+    {
+        let lvt_timer_offset = 0x320;
+        let lvt_timer = u32::from_le_bytes([
+            lapic.regs[lvt_timer_offset] as u8,
+            lapic.regs[lvt_timer_offset + 1] as u8,
+            lapic.regs[lvt_timer_offset + 2] as u8,
+            lapic.regs[lvt_timer_offset + 3] as u8,
+        ]);
+        let timer_masked = (lvt_timer >> 16) & 1;
+        let timer_vector = lvt_timer & 0xFF;
+
+        if timer_masked == 1 && timer_vector == 0 {
+            // Guest was in NO_HZ idle — the timer is masked with vector 0.
+            // Reconfigure to periodic mode with LOCAL_TIMER_VECTOR (0xEC) and
+            // unmask it so the first tick bootstraps the scheduler.
+            //
+            // We use periodic mode (not TSC-deadline) because:
+            //   - The kernel's clockevent state is stale after restore
+            //   - With TSC-deadline, the kernel expects to manage the MSR and
+            //     may never re-arm it after the stale clockevent fires
+            //   - Periodic mode is self-sustaining: the LAPIC hardware
+            //     regenerates ticks from TMICT/TDCR without kernel re-arming
+            //
+            // Once the kernel's timer subsystem initializes, it may switch to
+            // TSC-deadline (if not disabled) and reprogram LVTT accordingly.
+            let new_lvt: u32 = (0b01 << 17) | 0xEC; // Periodic, vector 0xEC, unmasked
+            let bytes = new_lvt.to_le_bytes();
+            lapic.regs[lvt_timer_offset] = bytes[0] as _;
+            lapic.regs[lvt_timer_offset + 1] = bytes[1] as _;
+            lapic.regs[lvt_timer_offset + 2] = bytes[2] as _;
+            lapic.regs[lvt_timer_offset + 3] = bytes[3] as _;
+
+            // Set TMICT (Timer Initial Count) to generate ticks.
+            // With divide-by-1 (TDCR=0xB), a TMICT of ~2M at ~2GHz bus clock
+            // gives roughly 1ms ticks — fast enough to bootstrap the scheduler
+            // but slow enough not to overwhelm a single vCPU.
+            let tmict: u32 = 0x200000; // ~2M counts
+            let tmict_offset = 0x380;
+            let tmict_bytes = tmict.to_le_bytes();
+            lapic.regs[tmict_offset] = tmict_bytes[0] as _;
+            lapic.regs[tmict_offset + 1] = tmict_bytes[1] as _;
+            lapic.regs[tmict_offset + 2] = tmict_bytes[2] as _;
+            lapic.regs[tmict_offset + 3] = tmict_bytes[3] as _;
+
+            // Set TDCR (Timer Divide Configuration) to divide-by-1.
+            let tdcr: u32 = 0x0B; // divide-by-1
+            let tdcr_offset = 0x3E0;
+            let tdcr_bytes = tdcr.to_le_bytes();
+            lapic.regs[tdcr_offset] = tdcr_bytes[0] as _;
+            lapic.regs[tdcr_offset + 1] = tdcr_bytes[1] as _;
+            lapic.regs[tdcr_offset + 2] = tdcr_bytes[2] as _;
+            lapic.regs[tdcr_offset + 3] = tdcr_bytes[3] as _;
+
+            debug!(
+                "Fixed LAPIC LVT Timer: {:#x} -> {:#x} (periodic, vector 0xEC, TMICT={:#x}, TDCR={:#x})",
+                lvt_timer, new_lvt, tmict, tdcr
+            );
+        }
+    }
+    vcpu_fd.set_lapic(&lapic).map_err(Error::Kvm)?;
+
+    // 4. TSC_DEADLINE — restore the snapshot value if non-zero.
+    //    With periodic mode, this is typically unused, but restore faithfully
+    //    in case the kernel was in TSC-deadline mode at snapshot time.
+    if let Some(deadline) = tsc_deadline_value {
+        if deadline != 0 {
+            let mut msrs = Msrs::new(1).map_err(|e| Error::Vcpu(format!("Msrs::new: {:?}", e)))?;
+            msrs.as_mut_slice()[0] = kvm_msr_entry {
+                index: IA32_TSC_DEADLINE,
+                data: deadline,
                 ..Default::default()
             };
+            let _ = vcpu_fd.set_msrs(&msrs);
         }
-        vcpu_fd.set_msrs(&msrs).map_err(Error::Kvm)?;
+    }
+
+    // 5. Restore vcpu_events (interrupt/exception delivery state)
+    if !state.vcpu_events.is_empty() {
+        let events: kvm_vcpu_events = kvm_struct_from_bytes(&state.vcpu_events)?;
+        vcpu_fd.set_vcpu_events(&events).map_err(Error::Kvm)?;
+    }
+
+    // 6a. XCR0 (Extended Control Register) — must come before xsave.
+    //     XCR0 controls which XSAVE features are active (x87, SSE, AVX, etc.).
+    //     Without this, the guest's XRSTORS instruction will #GP because it
+    //     expects features (SSE, AVX) that aren't enabled in the default XCR0.
+    if !state.xcrs.is_empty() {
+        let xcrs: kvm_xcrs = kvm_struct_from_bytes(&state.xcrs)?;
+        vcpu_fd.set_xcrs(&xcrs).map_err(Error::Kvm)?;
+        debug!("Restored XCRs ({} entries)", xcrs.nr_xcrs);
+    }
+
+    // 6b. FPU/SSE/AVX state
+    vcpu_fd.set_xsave(&xsave).map_err(Error::Kvm)?;
+
+    // 7. General-purpose registers last (includes RIP — execution resumes here)
+    vcpu_fd.set_regs(&regs).map_err(Error::Kvm)?;
+
+    // 8. KVM_KVMCLOCK_CTRL — tell KVM the guest was paused so the pvclock
+    //    sets KVM_CLOCK_PAUSED.  The guest kernel reads this on resume and
+    //    adjusts its timers to avoid soft lockup watchdog panics.
+    if let Err(e) = vcpu_fd.kvmclock_ctrl() {
+        // Not fatal — fails with EINVAL if kvm-clock is not active
+        debug!("KVM_KVMCLOCK_CTRL: {} (non-fatal)", e);
     }
 
     debug!("Restored vCPU state: RIP={:#x}", regs.rip);
@@ -159,6 +327,11 @@ impl VcpuHandle {
         self.exit_state.clone()
     }
 
+    /// Get a clone of the pthread_id Arc for passing to other threads.
+    pub fn pthread_id(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.pthread_id.clone()
+    }
+
     /// Send a signal to the vCPU thread to kick it out of KVM_RUN (causes EINTR).
     pub fn kick(&self) {
         let tid = self.pthread_id.load(std::sync::atomic::Ordering::SeqCst);
@@ -175,7 +348,7 @@ impl VcpuHandle {
 /// MMIO device bundle passed into the vCPU run loop for dispatch
 pub struct MmioDevices {
     pub virtio_net: Option<Arc<Mutex<VirtioNetDevice>>>,
-    pub virtio_vsock: Option<Arc<Mutex<VirtioVsockMmio>>>,
+    pub virtio_vsock: Option<Arc<Mutex<dyn VsockMmioDevice>>>,
     pub virtio_9p: Option<Arc<Mutex<Virtio9pDevice>>>,
     pub virtio_blk: Option<Arc<Mutex<VirtioBlkDevice>>>,
 }
@@ -189,8 +362,6 @@ pub fn create_vcpu(
     running: Arc<AtomicBool>,
     serial: SerialDevice,
     mmio_devices: MmioDevices,
-    snapshot_requested: Arc<AtomicBool>,
-    snapshot_barrier: Arc<Barrier>,
 ) -> Result<VcpuHandle> {
     let vcpu_fd = vm.create_vcpu(vcpu_id)?;
     debug!("Created vCPU {}", vcpu_id);
@@ -205,16 +376,7 @@ pub fn create_vcpu(
     configure_regs(&vcpu_fd, entry_point)?;
 
     // Start vCPU thread with state capture on exit
-    spawn_vcpu_thread(
-        vm,
-        vcpu_fd,
-        vcpu_id,
-        running,
-        serial,
-        mmio_devices,
-        snapshot_requested,
-        snapshot_barrier,
-    )
+    spawn_vcpu_thread(vm, vcpu_fd, vcpu_id, running, serial, mmio_devices)
 }
 
 /// Create and start a vCPU with state restored from a snapshot.
@@ -226,29 +388,19 @@ pub fn create_vcpu_restored(
     running: Arc<AtomicBool>,
     serial: SerialDevice,
     mmio_devices: MmioDevices,
-    snapshot_requested: Arc<AtomicBool>,
-    snapshot_barrier: Arc<Barrier>,
 ) -> Result<VcpuHandle> {
     let vcpu_fd = vm.create_vcpu(vcpu_id)?;
     debug!("Created vCPU {} for restore", vcpu_id);
 
-    // Configure CPUID (must be set before restoring registers)
+    // Configure CPUID — required by KVM before setting registers, even on restore.
+    // Uses the host's supported CPUID which should match the original boot.
     configure_cpuid(&vm, &vcpu_fd)?;
 
     // Restore full register state from snapshot
     restore_vcpu_state(&vcpu_fd, state)?;
 
     // Start vCPU thread with state capture on exit
-    spawn_vcpu_thread(
-        vm,
-        vcpu_fd,
-        vcpu_id,
-        running,
-        serial,
-        mmio_devices,
-        snapshot_requested,
-        snapshot_barrier,
-    )
+    spawn_vcpu_thread(vm, vcpu_fd, vcpu_id, running, serial, mmio_devices)
 }
 
 /// Spawn the vCPU thread with state capture.
@@ -267,7 +419,6 @@ pub fn install_vcpu_signal_handler() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_vcpu_thread(
     vm: Arc<Vm>,
     vcpu_fd: VcpuFd,
@@ -275,8 +426,6 @@ fn spawn_vcpu_thread(
     running: Arc<AtomicBool>,
     serial: SerialDevice,
     mmio_devices: MmioDevices,
-    snapshot_requested: Arc<AtomicBool>,
-    snapshot_barrier: Arc<Barrier>,
 ) -> Result<VcpuHandle> {
     let exit_state: Arc<Mutex<Option<VcpuState>>> = Arc::new(Mutex::new(None));
     let exit_state_clone = exit_state.clone();
@@ -299,8 +448,6 @@ fn spawn_vcpu_thread(
                 vm,
                 mmio_devices,
                 exit_state_clone,
-                snapshot_requested,
-                snapshot_barrier,
             );
         })
         .map_err(|e| Error::Vcpu(format!("Failed to spawn vCPU thread: {}", e)))?;
@@ -423,13 +570,13 @@ fn vcpu_run_loop(
     vm: Arc<Vm>,
     mmio_devices: MmioDevices,
     exit_state: Arc<Mutex<Option<VcpuState>>>,
-    snapshot_requested: Arc<AtomicBool>,
-    snapshot_barrier: Arc<Barrier>,
 ) {
     debug!("vCPU {} entering run loop", vcpu_id);
     let guest_memory = vm.guest_memory();
     let mut p9_irq_notified = false;
     let mut blk_irq_notified = false;
+    let mut exit_count: u64 = 0;
+    let mut hlt_count: u64 = 0;
 
     // Block SIGRTMIN on this thread so it can only be delivered during KVM_RUN
     // via KVM_SET_SIGNAL_MASK. This eliminates the race between checking the
@@ -448,27 +595,6 @@ fn vcpu_run_loop(
     }
 
     while running.load(Ordering::SeqCst) {
-        // Live snapshot gate: if the host requested a snapshot, capture
-        // this vCPU's state and wait at the barrier until the host has
-        // finished capturing VM-level state + memory.
-        if snapshot_requested.load(Ordering::SeqCst) {
-            match capture_vcpu_state(&vcpu_fd) {
-                Ok(state) => {
-                    *exit_state.lock().unwrap() = Some(state);
-                }
-                Err(e) => {
-                    debug!(
-                        "vCPU {}: live snapshot state capture failed: {}",
-                        vcpu_id, e
-                    );
-                }
-            }
-            // Wait for host to finish capturing state
-            snapshot_barrier.wait();
-            // Wait for host to signal resume
-            snapshot_barrier.wait();
-            continue;
-        }
         // Device polling/IRQ injection is handled by vCPU0 only to avoid
         // duplicate IRQ storms from multiple vCPU threads.
         if vcpu_id == 0 {
@@ -499,6 +625,7 @@ fn vcpu_run_loop(
 
         match vcpu_fd.run() {
             Ok(exit_reason) => {
+                exit_count += 1;
                 trace!("vCPU {} exit: {:?}", vcpu_id, exit_reason);
 
                 match exit_reason {
@@ -624,10 +751,9 @@ fn vcpu_run_loop(
                         }
                     }
                     VcpuExit::Hlt => {
-                        debug!("vCPU {} halted", vcpu_id);
-                        // Yield briefly so the host networking thread can make
-                        // progress (SLIRP, vsock).  1 ms keeps latency low while
-                        // avoiding a busy-spin.
+                        hlt_count += 1;
+                        debug!("vCPU {} halted (count={})", vcpu_id, hlt_count);
+                        // Yield briefly so host threads can make progress.
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     VcpuExit::Shutdown => {
@@ -655,7 +781,9 @@ fn vcpu_run_loop(
             }
             Err(e) => {
                 if e.errno() == libc::EINTR {
-                    // Interrupted, check if we should stop
+                    // Interrupted by signal (e.g. SIGRTMIN for snapshot).
+                    // This is normal — just re-enter KVM_RUN.
+                    debug!("vCPU {} interrupted (EINTR), exits={}", vcpu_id, exit_count);
                     continue;
                 }
                 error!("vCPU {} run error: {}", vcpu_id, e);
@@ -680,7 +808,7 @@ fn vcpu_run_loop(
     debug!("vCPU {} exiting run loop", vcpu_id);
 }
 
-fn inject_irq(vm_fd: i32, irq: u32) {
+pub(crate) fn inject_irq(vm_fd: i32, irq: u32) {
     #[repr(C)]
     struct KvmIrqLevel {
         irq: u32,
@@ -726,6 +854,9 @@ fn handle_io_out(port: u16, data: &[u8], serial: &mut SerialDevice) {
         for &byte in data {
             serial.write(offset as u8, byte);
         }
+    } else if port == 0x64 && data.first() == Some(&0xFE) {
+        // Keyboard controller reset (reboot attempt) — log it
+        debug!("Guest wrote 0xFE to port 0x64 (reboot via KB controller)");
     } else {
         trace!("Unhandled IO out: port={:#x}, data={:?}", port, data);
     }
@@ -739,6 +870,12 @@ fn handle_io_in(port: u16, data: &mut [u8], serial: &SerialDevice) {
         for byte in data {
             *byte = serial.read(offset as u8);
         }
+    } else if port == 0x64 {
+        // i8042 keyboard controller status register.
+        // Return 0x00: input buffer empty (bit 1=0), output buffer empty (bit 0=0).
+        // Without this, the kernel's i8042 init/reset loops forever waiting for
+        // the controller to become ready.
+        data.iter_mut().for_each(|b| *b = 0x00);
     } else {
         trace!("Unhandled IO in: port={:#x}", port);
         // Return 0xFF for unknown ports

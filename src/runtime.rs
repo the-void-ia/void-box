@@ -569,11 +569,6 @@ fn build_pipeline_box_with_io(
         builder = apply_oci_rootfs(builder, plan);
     }
 
-    // Wire warmup commands (explicit opt-in only)
-    if let Some(ref warmup) = b.warmup {
-        builder = builder.warmup(warmup.clone());
-    }
-
     builder.build()
 }
 
