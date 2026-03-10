@@ -391,6 +391,9 @@ async fn cmd_snapshot_create(args: &[String]) -> Result<(), Box<dyn std::error::
     let snapshot_dir = snapshot::snapshot_dir_for_hash(&config_hash);
     eprintln!("Config hash: {}", &config_hash[..16]);
 
+    // Ensure snapshot directory exists
+    fs::create_dir_all(&snapshot_dir)?;
+
     // Check for existing snapshot
     if snapshot_dir.join("state.bin").exists() {
         eprintln!("Snapshot already exists at {}", snapshot_dir.display());
@@ -401,11 +404,13 @@ async fn cmd_snapshot_create(args: &[String]) -> Result<(), Box<dyn std::error::
         std::process::exit(1);
     }
 
-    // Build VM config
+    // Build VM config — snapshot/restore requires the userspace vsock backend
     let mut config = VoidBoxConfig::new()
         .kernel(&kernel)
         .memory_mb(memory_mb)
-        .vcpus(vcpus);
+        .vcpus(vcpus)
+        .enable_vsock(true)
+        .vsock_backend(void_box::vmm::config::VsockBackendType::Userspace);
     if let Some(ref initramfs) = initramfs {
         config = config.initramfs(initramfs);
     }

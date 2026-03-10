@@ -26,8 +26,8 @@ sandbox:
   vcpus: 4
   network: true
   # Uncomment to restore from a snapshot instead of cold-booting:
-  # snapshot: "4add3d695dbd609b"
-
+  # snapshot: "0cd8c428d11f2bf6"
+  
 llm:
   provider: claude
 
