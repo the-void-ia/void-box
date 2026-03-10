@@ -22,12 +22,15 @@ name: snapshot-pipeline
 
 sandbox:
   mode: auto
-  memory_mb: 256
+  memory_mb: 2048
   vcpus: 1
   network: false
   # Top-level snapshot: all boxes restore from this snapshot by default.
   # Per-box overrides below take priority.
-  # snapshot: "60e3c527"
+  # NOTE: snapshot restore does not yet include networking, so LLM-backed
+  # pipelines that call external APIs (Claude, Ollama via network) cannot
+  # use snapshots until virtio-net restore is implemented.
+  # snapshot: "4add3d695dbd609b"
 
 llm:
   provider: claude

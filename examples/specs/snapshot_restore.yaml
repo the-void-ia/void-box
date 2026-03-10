@@ -20,7 +20,7 @@ name: snapshot_demo
 
 sandbox:
   mode: auto
-  memory_mb: 256
+  memory_mb: 2048
   vcpus: 1
   network: false
   # Restore from a snapshot instead of cold-booting.

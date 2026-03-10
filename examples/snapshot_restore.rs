@@ -44,8 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok().map(PathBuf::from);
 
+    let memory_mb: usize = std::env::var("VOID_BOX_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+
     let snap_config = SnapshotConfig {
-        memory_mb: 256,
+        memory_mb,
         vcpus: 1,
         cid: 0, // overwritten by snapshot_internal()
         vsock_mmio_base: 0xd080_0000,
@@ -55,10 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ═══════════════════════════════════════════════════════════════
     // Step 1: Cold boot
     // ═══════════════════════════════════════════════════════════════
-    println!("=== Step 1: Cold Boot ===");
+    println!("=== Step 1: Cold Boot ({} MB) ===", memory_mb);
 
     let mut cfg = VoidBoxConfig::new()
-        .memory_mb(256)
+        .memory_mb(memory_mb)
         .vcpus(1)
         .kernel(&kernel)
         .enable_vsock(true)
@@ -81,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ═══════════════════════════════════════════════════════════════
     println!("\n=== Step 2: Base Snapshot ===");
 
-    let config_hash = snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1)?;
+    let config_hash = snapshot::compute_config_hash(&kernel, initramfs.as_deref(), memory_mb, 1)?;
 
     // Use the standard snapshot directory so diff restore can find the base
     let base_dir = snapshot::snapshot_dir_for_hash(&config_hash);
@@ -173,8 +178,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  Memory savings: {:>10.1}%      ║", savings);
     println!("╚═══════════════════════════════════╝");
 
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&base_dir);
+    // Print the snapshot hash for use in YAML specs
+    println!("\nSnapshot hash: {}", config_hash);
+    println!("Snapshot dir:  {}", base_dir.display());
+    println!("\nTo use in a YAML spec:");
+    println!("  sandbox:");
+    println!("    snapshot: \"{}\"", &config_hash[..8]);
 
     Ok(())
 }

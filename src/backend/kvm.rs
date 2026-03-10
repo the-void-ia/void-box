@@ -80,9 +80,12 @@ impl VmmBackend for KvmBackend {
                 .try_into()
                 .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
 
+            // Restored VMs always use the userspace vsock backend (Unix socket),
+            // not AF_VSOCK (vhost).  The socket path is /tmp/void-box-vsock-{cid}.sock.
             let cid = self.cid;
+            let socket_path = std::path::PathBuf::from(format!("/tmp/void-box-vsock-{}.sock", cid));
             let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
-                let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
+                let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
             self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
