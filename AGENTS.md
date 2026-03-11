@@ -230,6 +230,8 @@ connects and round-trips the message.
 | `src/backend/control_channel.rs` | `wait_for_snapshot_ready()` |
 | `void-box-protocol/src/lib.rs` | `MessageType::SnapshotReady = 17` |
 | `guest-agent/src/main.rs` | Message type 17 dispatch |
+| `src/backend/vz/snapshot.rs` | `VzSnapshotMeta` sidecar (JSON) for VZ snapshots |
+| `src/backend/vz/backend.rs` | `pause()`, `resume()`, `create_snapshot()`, restore path in `start()` |
 
 ### Security considerations
 
@@ -371,6 +373,11 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+
+# VZ snapshot round-trip (requires test initramfs):
+scripts/build_test_image.sh
+export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
+cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
 ```
 
 `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`)
@@ -537,6 +544,10 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
   (including XCR0/xsave), restore pipeline, exec on restored VM, VM stop
   after restore. **Must pass** for any changes to snapshot, restore, vCPU,
   vsock, or `stop()` code paths. Uses userspace virtio-vsock backend.
+- `snapshot_vz_integration` (macOS only): VZ snapshot round-trip using Apple's
+  `saveMachineStateToURL:`/`restoreMachineStateFromURL:` APIs. Cold boot →
+  exec → snapshot → stop → restore → exec. **Must pass** for VZ backend
+  snapshot/restore changes.
 - `e2e_telemetry`: telemetry flow from guest to host pipeline.
 - `e2e_skill_pipeline`: multi-stage skill execution in VM mode.
 - `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs

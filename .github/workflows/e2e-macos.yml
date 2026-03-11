@@ -86,3 +86,9 @@ jobs:
 
           # Run conformance tests (--ignored to include VM tests, sequential to avoid resource contention)
           cargo test --test conformance -- --ignored --test-threads=1
+
+      - name: Snapshot round-trip
+        env:
+          VOID_BOX_KERNEL: /tmp/void-box-kernel
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1

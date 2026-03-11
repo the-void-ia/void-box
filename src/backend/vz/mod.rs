@@ -12,6 +12,7 @@
 
 mod backend;
 pub mod config;
+pub mod snapshot;
 pub mod vsock;
 
 pub use backend::VzBackend;

@@ -7,8 +7,17 @@
 //!    - `VZVirtioSocketDeviceConfiguration` (for host↔guest control channel)
 //!    - `VZNATNetworkDeviceAttachment` (if networking enabled)
 //!    - `VZVirtioFileSystemDeviceConfiguration` (if shared_dir provided)
+//!
+//!    If `config.snapshot` is `Some`, restores from a VZ snapshot instead of cold-booting.
 //! 2. `exec()`, `write_file()`, etc.: Delegate to `ControlChannel` over vsock fd
 //! 3. `stop()`: Requests VM stop via Virtualization.framework
+//!
+//! ## Snapshot/Restore
+//!
+//! Uses Apple's native `saveMachineStateToURL:` / `restoreMachineStateFromURL:`
+//! APIs (macOS 14+). These handle all CPU + memory state internally. A small
+//! JSON sidecar (`vz_meta.json`) persists our metadata (session_secret, config)
+//! alongside Apple's opaque save file.
 //!
 //! ## Network Security (v1 limitation)
 //!
@@ -24,6 +33,7 @@
 //! **v2 (future)**: Inject iptables rules via `exec()` after boot, or use
 //! macOS `pf` rules per VM.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,6 +49,7 @@ use crate::observe::Observer;
 use crate::ExecOutput;
 
 use super::config;
+use super::snapshot::VzSnapshotMeta;
 use super::vsock::VzSocketStream;
 
 // ObjC imports for Virtualization.framework
@@ -79,6 +90,17 @@ pub struct VzBackend {
     cid: u32,
     /// Active span context for TRACEPARENT propagation.
     span_context: Option<SpanContext>,
+    /// Session secret (kept for snapshot sidecar).
+    session_secret: Option<[u8; 32]>,
+    /// Snapshot of the BackendConfig used in start() (kept for snapshot sidecar).
+    started_config: Option<StartedConfigInfo>,
+}
+
+/// Subset of BackendConfig we need to persist in the snapshot sidecar.
+struct StartedConfigInfo {
+    memory_mb: usize,
+    vcpus: usize,
+    network: bool,
 }
 
 // Safety: The ObjC `vm` and `socket_device` handles are only mutated in
@@ -94,6 +116,48 @@ impl Default for VzBackend {
     }
 }
 
+/// Dispatch a VZ completion-handler operation and wait for the result.
+///
+/// Shared helper for pause/resume/save/restore — all follow the same
+/// pattern: dispatch onto vz_queue, call an ObjC method that takes a
+/// `completionHandler:(NSError*)`, and channel the result back.
+fn dispatch_vz_op<F>(
+    vz_queue: &DispatchRetained<DispatchQueue>,
+    vm_ptr: usize,
+    timeout_secs: u64,
+    op_name: &str,
+    f: F,
+) -> Result<()>
+where
+    F: FnOnce(&VZVirtualMachine, &RcBlock<dyn Fn(*mut objc2_foundation::NSError)>) + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+    let op = op_name.to_string();
+
+    vz_queue.exec_async(move || {
+        let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
+        let tx = std::sync::Mutex::new(Some(tx));
+        let op_clone = op.clone();
+        let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+            let result = if err.is_null() {
+                Ok(())
+            } else {
+                let desc = unsafe { &*err }.localizedDescription().to_string();
+                Err(desc)
+            };
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        f(vm_ref, &handler);
+        let _ = op_clone; // prevent the string from being dropped too early
+    });
+
+    rx.recv_timeout(std::time::Duration::from_secs(timeout_secs))
+        .map_err(|_| crate::Error::Backend(format!("VZ {op_name}: timed out ({timeout_secs}s)")))?
+        .map_err(|e| crate::Error::Backend(format!("VZ {op_name} failed: {e}")))
+}
+
 impl VzBackend {
     /// Create a new, unstarted VzBackend.
     pub fn new() -> Self {
@@ -106,7 +170,194 @@ impl VzBackend {
             running: Arc::new(AtomicBool::new(false)),
             cid: 3, // default; overridden in start()
             span_context: None,
+            session_secret: None,
+            started_config: None,
         }
+    }
+
+    /// Build a `VZVirtualMachineConfiguration` from a `BackendConfig`.
+    ///
+    /// This contains steps 1–7 of the original `start()`: boot loader,
+    /// memory/cpu, vsock, networking, serial, virtiofs, and validation.
+    /// Both cold-boot and snapshot-restore paths call this.
+    fn configure_vm(config: &BackendConfig) -> Result<Retained<VZVirtualMachineConfiguration>> {
+        // 1. Boot loader
+        let kernel_url =
+            NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")));
+        let boot_loader = unsafe {
+            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
+        };
+
+        // Set initramfs
+        if let Some(ref initrd) = config.initramfs {
+            let initrd_url =
+                NSURL::fileURLWithPath(&NSString::from_str(initrd.to_str().unwrap_or("")));
+            unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
+        }
+
+        // Set kernel cmdline
+        let cmdline = config::build_kernel_cmdline(config);
+        unsafe {
+            boot_loader.setCommandLine(&NSString::from_str(&cmdline));
+        }
+        debug!("VzBackend: kernel cmdline = {}", cmdline);
+
+        // 2. VM configuration
+        let vm_config = unsafe { VZVirtualMachineConfiguration::new() };
+        unsafe {
+            vm_config.setBootLoader(Some(&boot_loader));
+            vm_config.setMemorySize(config::memory_bytes(config));
+            vm_config.setCPUCount(config.vcpus);
+        }
+
+        // 3. Virtio socket device (for host↔guest control channel)
+        let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
+        let socket_configs: Retained<NSArray<VZSocketDeviceConfiguration>> =
+            NSArray::arrayWithObject(&vsock_config);
+        unsafe {
+            vm_config.setSocketDevices(&socket_configs);
+        }
+
+        // 4. NAT networking (if enabled)
+        if config.network {
+            let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
+            let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
+            unsafe {
+                net_config.setAttachment(Some(&nat_attachment));
+            }
+            let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
+                NSArray::arrayWithObject(&net_config);
+            unsafe {
+                vm_config.setNetworkDevices(&net_configs);
+            }
+        }
+
+        // 5. Serial console for guest kernel/init output.
+        let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        let stdio_attachment = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&objc2_foundation::NSFileHandle::fileHandleWithStandardError()),
+            )
+        };
+        unsafe {
+            serial_config.setAttachment(Some(&stdio_attachment));
+        }
+        let serial_configs: Retained<NSArray<VZSerialPortConfiguration>> =
+            NSArray::arrayWithObject(&serial_config);
+        unsafe {
+            vm_config.setSerialPorts(&serial_configs);
+        }
+
+        // 6. Shared directories (virtiofs)
+        {
+            let mut fs_configs: Vec<Retained<VZVirtioFileSystemDeviceConfiguration>> = Vec::new();
+
+            // Legacy single shared_dir
+            if let Some(ref shared_dir) = config.shared_dir {
+                if let Some(path_str) = shared_dir.to_str() {
+                    let tag = NSString::from_str("shared");
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+                    let share = unsafe {
+                        VZSharedDirectory::initWithURL_readOnly(
+                            VZSharedDirectory::alloc(),
+                            &url,
+                            false,
+                        )
+                    };
+                    let single = unsafe {
+                        VZSingleDirectoryShare::initWithDirectory(
+                            VZSingleDirectoryShare::alloc(),
+                            &share,
+                        )
+                    };
+                    let fs = unsafe {
+                        VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                            VZVirtioFileSystemDeviceConfiguration::alloc(),
+                            &tag,
+                        )
+                    };
+                    unsafe { fs.setShare(Some(&single)) };
+                    debug!("VzBackend: virtiofs share 'shared' -> {}", path_str);
+                    fs_configs.push(fs);
+                }
+            }
+
+            // Named mounts from config.mounts
+            for (i, mount) in config.mounts.iter().enumerate() {
+                let tag_str = format!("mount{}", i);
+                let tag = NSString::from_str(&tag_str);
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&mount.host_path));
+                let share = unsafe {
+                    VZSharedDirectory::initWithURL_readOnly(
+                        VZSharedDirectory::alloc(),
+                        &url,
+                        mount.read_only,
+                    )
+                };
+                let single = unsafe {
+                    VZSingleDirectoryShare::initWithDirectory(
+                        VZSingleDirectoryShare::alloc(),
+                        &share,
+                    )
+                };
+                let fs = unsafe {
+                    VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                        VZVirtioFileSystemDeviceConfiguration::alloc(),
+                        &tag,
+                    )
+                };
+                unsafe { fs.setShare(Some(&single)) };
+                debug!(
+                    "VzBackend: virtiofs share '{}' -> {} (ro={})",
+                    tag_str, mount.host_path, mount.read_only
+                );
+                fs_configs.push(fs);
+            }
+
+            if !fs_configs.is_empty() {
+                // Build NSArray of VZDirectorySharingDeviceConfiguration
+                let configs_refs: Vec<&VZDirectorySharingDeviceConfiguration> = fs_configs
+                    .iter()
+                    .map(|c| {
+                        // Safety: VZVirtioFileSystemDeviceConfiguration is a subclass of
+                        // VZDirectorySharingDeviceConfiguration
+                        let ptr: *const VZVirtioFileSystemDeviceConfiguration = &**c;
+                        unsafe { &*(ptr as *const VZDirectorySharingDeviceConfiguration) }
+                    })
+                    .collect();
+                let arr = NSArray::from_slice(&configs_refs);
+                unsafe { vm_config.setDirectorySharingDevices(&arr) };
+            }
+        }
+
+        // 7. Validate configuration
+        unsafe {
+            vm_config
+                .validateWithError()
+                .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
+        }
+
+        Ok(vm_config)
+    }
+
+    /// Extract socket device from a running VM and set up the control channel.
+    fn setup_control_channel(&mut self, session_secret: [u8; 32]) {
+        let vm_ref = self.vm.as_ref().unwrap();
+        let socket_devices = unsafe { vm_ref.socketDevices() };
+        let socket_device = socket_devices.objectAtIndex(0);
+        let socket_device: Retained<VZVirtioSocketDevice> =
+            unsafe { Retained::cast_unchecked(socket_device) };
+        let socket_device = SendSyncDevice(socket_device);
+
+        let connector = Self::build_connector(&socket_device, &self.vz_queue);
+        let control_channel = Arc::new(ControlChannel::new(connector, session_secret));
+
+        self.socket_device = Some(socket_device);
+        self.control_channel = Some(control_channel);
+        self.session_secret = Some(session_secret);
+        self.running.store(true, Ordering::SeqCst);
     }
 
     /// Connect to the guest agent via the VZ virtio socket device.
@@ -172,6 +423,129 @@ impl VzBackend {
             Ok(Box::new(stream) as Box<dyn crate::backend::control_channel::GuestStream>)
         })
     }
+
+    /// Pause the running VM.
+    pub fn pause(&self) -> Result<()> {
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| crate::Error::Backend("VM not started".into()))?;
+        let vm_ptr = Retained::as_ptr(vm) as usize;
+        info!("VzBackend: pausing VM");
+        dispatch_vz_op(&self.vz_queue, vm_ptr, 30, "pause", |vm_ref, handler| {
+            unsafe { vm_ref.pauseWithCompletionHandler(handler) };
+        })?;
+        info!("VzBackend: VM paused");
+        Ok(())
+    }
+
+    /// Resume a paused VM.
+    pub fn resume(&self) -> Result<()> {
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| crate::Error::Backend("VM not started".into()))?;
+        let vm_ptr = Retained::as_ptr(vm) as usize;
+        info!("VzBackend: resuming VM");
+        dispatch_vz_op(&self.vz_queue, vm_ptr, 30, "resume", |vm_ref, handler| {
+            unsafe { vm_ref.resumeWithCompletionHandler(handler) };
+        })?;
+        info!("VzBackend: VM resumed");
+        Ok(())
+    }
+
+    /// Create a snapshot of the running VM.
+    ///
+    /// Pauses the VM, saves state to Apple's opaque file + our JSON sidecar,
+    /// then resumes the VM. The snapshot directory will contain:
+    /// - `vm.vzvmsave` — Apple's opaque save file
+    /// - `vz_meta.json` — our sidecar metadata
+    pub fn create_snapshot(&self, dir: &Path) -> Result<()> {
+        let vm = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| crate::Error::Backend("VM not started".into()))?;
+
+        let config_info = self
+            .started_config
+            .as_ref()
+            .ok_or_else(|| crate::Error::Backend("no config info (VM not started?)".into()))?;
+
+        let session_secret = self
+            .session_secret
+            .ok_or_else(|| crate::Error::Backend("no session secret".into()))?;
+
+        std::fs::create_dir_all(dir)
+            .map_err(|e| crate::Error::Snapshot(format!("create snapshot dir: {e}")))?;
+
+        // 1. Pause
+        self.pause()?;
+
+        // 2. Save VM state to Apple's opaque file
+        let save_path = VzSnapshotMeta::save_file_path(dir);
+        let save_url_str = save_path
+            .to_str()
+            .ok_or_else(|| crate::Error::Snapshot("snapshot path is not valid UTF-8".into()))?;
+
+        let vm_ptr = Retained::as_ptr(vm) as usize;
+        let url_string = save_url_str.to_string();
+
+        info!("VzBackend: saving VM state to {}", save_url_str);
+
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        self.vz_queue.exec_async(move || {
+            let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&url_string));
+            let tx = std::sync::Mutex::new(Some(tx));
+            let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                let result = if err.is_null() {
+                    Ok(())
+                } else {
+                    let desc = unsafe { &*err }.localizedDescription().to_string();
+                    Err(desc)
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            });
+            unsafe {
+                vm_ref.saveMachineStateToURL_completionHandler(&url, &handler);
+            }
+        });
+
+        let save_result = rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .map_err(|_| crate::Error::Snapshot("VM save: timed out (120s)".into()))
+            .and_then(|r| r.map_err(|e| crate::Error::Snapshot(format!("VM save failed: {e}"))));
+
+        if let Err(e) = &save_result {
+            error!("VzBackend: save failed, resuming VM: {}", e);
+            let _ = self.resume();
+            return Err(save_result.unwrap_err());
+        }
+
+        info!("VzBackend: VM state saved");
+
+        // 3. Save our sidecar metadata
+        let meta = VzSnapshotMeta {
+            session_secret: session_secret.to_vec(),
+            memory_mb: config_info.memory_mb,
+            vcpus: config_info.vcpus,
+            network: config_info.network,
+            cid: self.cid,
+        };
+        if let Err(e) = meta.save(dir) {
+            error!("VzBackend: sidecar save failed, resuming VM: {}", e);
+            let _ = self.resume();
+            return Err(e);
+        }
+
+        // 4. Resume
+        self.resume()?;
+
+        info!("VzBackend: snapshot created at {}", dir.display());
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -181,182 +555,122 @@ impl VmmBackend for VzBackend {
         // synchronously via block_in_place to avoid holding them across
         // an .await point.
         tokio::task::block_in_place(|| {
+            // ---------------------------------------------------------------
+            // Snapshot restore path
+            // ---------------------------------------------------------------
+            if let Some(ref snapshot_dir) = config.snapshot {
+                info!(
+                    "VzBackend: restoring VM from snapshot {}",
+                    snapshot_dir.display()
+                );
+
+                // 1. Load sidecar metadata
+                let meta = VzSnapshotMeta::load(snapshot_dir)?;
+                let session_secret: [u8; 32] =
+                    meta.session_secret.as_slice().try_into().map_err(|_| {
+                        crate::Error::Snapshot("invalid session_secret length in snapshot".into())
+                    })?;
+
+                // 2. Build VM configuration (same setup as cold boot)
+                let vm_config = Self::configure_vm(&config)?;
+
+                // 3. Create VM on the VZ queue
+                let vm = unsafe {
+                    VZVirtualMachine::initWithConfiguration_queue(
+                        VZVirtualMachine::alloc(),
+                        &vm_config,
+                        &self.vz_queue,
+                    )
+                };
+                self.vm = Some(vm);
+
+                // 4. Restore VM state from Apple's save file
+                let save_path = VzSnapshotMeta::save_file_path(snapshot_dir);
+                let save_url_str = save_path.to_str().ok_or_else(|| {
+                    crate::Error::Snapshot("snapshot path is not valid UTF-8".into())
+                })?;
+                let url_string = save_url_str.to_string();
+
+                let vm_ptr = Retained::as_ptr(self.vm.as_ref().unwrap()) as usize;
+
+                let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+                let vz_queue = self.vz_queue.clone();
+                vz_queue.exec_async(move || {
+                    let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(&url_string));
+                    let tx = std::sync::Mutex::new(Some(tx));
+                    let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                        let result = if err.is_null() {
+                            Ok(())
+                        } else {
+                            let desc = unsafe { &*err }.localizedDescription().to_string();
+                            Err(desc)
+                        };
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(result);
+                        }
+                    });
+                    unsafe {
+                        vm_ref.restoreMachineStateFromURL_completionHandler(&url, &handler);
+                    }
+                });
+
+                if let Err(e) = rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .map_err(|_| crate::Error::Backend("VM restore: timed out (60s)".into()))
+                    .and_then(|r| {
+                        r.map_err(|e| crate::Error::Backend(format!("VM restore failed: {e}")))
+                    })
+                {
+                    self.vm = None;
+                    return Err(e);
+                }
+
+                info!("VzBackend: VM state restored, resuming");
+
+                // 5. Resume the VM (restore leaves it in Paused state)
+                let vm_ptr = Retained::as_ptr(self.vm.as_ref().unwrap()) as usize;
+                dispatch_vz_op(
+                    &self.vz_queue,
+                    vm_ptr,
+                    30,
+                    "resume (post-restore)",
+                    |vm_ref, handler| {
+                        unsafe { vm_ref.resumeWithCompletionHandler(handler) };
+                    },
+                )?;
+
+                info!("VzBackend: VM resumed after restore");
+
+                // 6. Set up socket device + control channel
+                self.cid = meta.cid;
+                self.started_config = Some(StartedConfigInfo {
+                    memory_mb: meta.memory_mb,
+                    vcpus: meta.vcpus,
+                    network: meta.network,
+                });
+                self.setup_control_channel(session_secret);
+
+                return Ok(());
+            }
+
+            // ---------------------------------------------------------------
+            // Cold-boot path
+            // ---------------------------------------------------------------
             info!(
                 "VzBackend: starting VM (memory={}MB, vcpus={})",
                 config.memory_mb, config.vcpus
             );
 
-            // 1. Boot loader
-            let kernel_url =
-                NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")));
-            let boot_loader = unsafe {
-                VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
-            };
+            let vm_config = Self::configure_vm(&config)?;
 
-            // Set initramfs
-            if let Some(ref initrd) = config.initramfs {
-                let initrd_url =
-                    NSURL::fileURLWithPath(&NSString::from_str(initrd.to_str().unwrap_or("")));
-                unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
-            }
-
-            // Set kernel cmdline
-            let cmdline = config::build_kernel_cmdline(&config);
-            unsafe {
-                boot_loader.setCommandLine(&NSString::from_str(&cmdline));
-            }
-            debug!("VzBackend: kernel cmdline = {}", cmdline);
-
-            // 2. VM configuration
-            let vm_config = unsafe { VZVirtualMachineConfiguration::new() };
-            unsafe {
-                vm_config.setBootLoader(Some(&boot_loader));
-                vm_config.setMemorySize(config::memory_bytes(&config));
-                vm_config.setCPUCount(config.vcpus);
-            }
-
-            // 3. Virtio socket device (for host↔guest control channel)
-            let vsock_config = unsafe { VZVirtioSocketDeviceConfiguration::new() };
-            let socket_configs: Retained<NSArray<VZSocketDeviceConfiguration>> =
-                NSArray::arrayWithObject(&vsock_config);
-            unsafe {
-                vm_config.setSocketDevices(&socket_configs);
-            }
-
-            // 4. NAT networking (if enabled)
-            if config.network {
-                let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
-                let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-                unsafe {
-                    net_config.setAttachment(Some(&nat_attachment));
-                }
-                let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
-                    NSArray::arrayWithObject(&net_config);
-                unsafe {
-                    vm_config.setNetworkDevices(&net_configs);
-                }
-            }
-
-            // 5. Serial console for guest kernel/init output.
-            // Attaches to the host process's stdout/stderr for debugging.
-            let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
-            let stdio_attachment = unsafe {
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    None,
-                    Some(&objc2_foundation::NSFileHandle::fileHandleWithStandardError()),
-                )
-            };
-            unsafe {
-                serial_config.setAttachment(Some(&stdio_attachment));
-            }
-            let serial_configs: Retained<NSArray<VZSerialPortConfiguration>> =
-                NSArray::arrayWithObject(&serial_config);
-            unsafe {
-                vm_config.setSerialPorts(&serial_configs);
-            }
-
-            // 6. Shared directories (virtiofs)
-            {
-                let mut fs_configs: Vec<Retained<VZVirtioFileSystemDeviceConfiguration>> =
-                    Vec::new();
-
-                // Legacy single shared_dir
-                if let Some(ref shared_dir) = config.shared_dir {
-                    if let Some(path_str) = shared_dir.to_str() {
-                        let tag = NSString::from_str("shared");
-                        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
-                        let share = unsafe {
-                            VZSharedDirectory::initWithURL_readOnly(
-                                VZSharedDirectory::alloc(),
-                                &url,
-                                false,
-                            )
-                        };
-                        let single = unsafe {
-                            VZSingleDirectoryShare::initWithDirectory(
-                                VZSingleDirectoryShare::alloc(),
-                                &share,
-                            )
-                        };
-                        let fs = unsafe {
-                            VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                                VZVirtioFileSystemDeviceConfiguration::alloc(),
-                                &tag,
-                            )
-                        };
-                        unsafe { fs.setShare(Some(&single)) };
-                        debug!("VzBackend: virtiofs share 'shared' -> {}", path_str);
-                        fs_configs.push(fs);
-                    }
-                }
-
-                // Named mounts from config.mounts
-                for (i, mount) in config.mounts.iter().enumerate() {
-                    let tag_str = format!("mount{}", i);
-                    let tag = NSString::from_str(&tag_str);
-                    let url = NSURL::fileURLWithPath(&NSString::from_str(&mount.host_path));
-                    let share = unsafe {
-                        VZSharedDirectory::initWithURL_readOnly(
-                            VZSharedDirectory::alloc(),
-                            &url,
-                            mount.read_only,
-                        )
-                    };
-                    let single = unsafe {
-                        VZSingleDirectoryShare::initWithDirectory(
-                            VZSingleDirectoryShare::alloc(),
-                            &share,
-                        )
-                    };
-                    let fs = unsafe {
-                        VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                            VZVirtioFileSystemDeviceConfiguration::alloc(),
-                            &tag,
-                        )
-                    };
-                    unsafe { fs.setShare(Some(&single)) };
-                    debug!(
-                        "VzBackend: virtiofs share '{}' -> {} (ro={})",
-                        tag_str, mount.host_path, mount.read_only
-                    );
-                    fs_configs.push(fs);
-                }
-
-                if !fs_configs.is_empty() {
-                    // Build NSArray of VZDirectorySharingDeviceConfiguration
-                    let configs_refs: Vec<&VZDirectorySharingDeviceConfiguration> = fs_configs
-                        .iter()
-                        .map(|c| {
-                            // Safety: VZVirtioFileSystemDeviceConfiguration is a subclass of
-                            // VZDirectorySharingDeviceConfiguration
-                            let ptr: *const VZVirtioFileSystemDeviceConfiguration = &**c;
-                            unsafe { &*(ptr as *const VZDirectorySharingDeviceConfiguration) }
-                        })
-                        .collect();
-                    let arr = NSArray::from_slice(&configs_refs);
-                    unsafe { vm_config.setDirectorySharingDevices(&arr) };
-                }
-            }
-
-            // 7. Validate configuration
-            unsafe {
-                vm_config
-                    .validateWithError()
-                    .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
-            }
-
-            // 7. Create and start the VM on a dedicated serial dispatch queue.
+            // Create and start the VM on a dedicated serial dispatch queue.
             //
             // VZVirtualMachine requires all operations (start, stop,
             // connectToPort) to happen on the queue it was created on.
             // Using a dedicated GCD serial queue means completion handlers
             // fire on GCD-managed threads without needing to pump any run
             // loop — essential for tokio-based CLI apps.
-            //
-            // We must also dispatch startWithCompletionHandler onto the
-            // VZ queue since "every operation on the virtual machine must
-            // be done on that queue."
             let vm = unsafe {
                 VZVirtualMachine::initWithConfiguration_queue(
                     VZVirtualMachine::alloc(),
@@ -371,66 +685,25 @@ impl VmmBackend for VzBackend {
             // local `vm`, leaving the async closure with a dangling pointer.
             self.vm = Some(vm);
 
-            let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
-
-            // Dispatch the start call onto the VZ queue.
-            // Safety: we pass the VM as a raw pointer to avoid the !Send
-            // constraint. This is safe because the VM was created on this
-            // queue, we only access it from this queue, and the Retained in
-            // self.vm keeps the object alive for the duration.
             let vm_ptr = Retained::as_ptr(self.vm.as_ref().unwrap()) as usize;
-            self.vz_queue.exec_async(move || {
-                let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
-                let tx = std::sync::Mutex::new(Some(tx));
-                let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                    let result = if err.is_null() {
-                        Ok(())
-                    } else {
-                        let desc = unsafe { &*err }.localizedDescription().to_string();
-                        Err(desc)
-                    };
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(result);
-                    }
-                });
-                unsafe {
-                    vm_ref.startWithCompletionHandler(&handler);
-                }
-            });
-
-            if let Err(e) = rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .map_err(|_| crate::Error::Backend("VM start: timed out (30s)".into()))
-                .and_then(|r| {
-                    r.map_err(|e| crate::Error::Backend(format!("VM start failed: {}", e)))
-                })
-            {
+            dispatch_vz_op(&self.vz_queue, vm_ptr, 30, "start", |vm_ref, handler| {
+                unsafe { vm_ref.startWithCompletionHandler(handler) };
+            })
+            .inspect_err(|_| {
                 // Start failed — clear the stored VM so stop() doesn't
                 // try to use a half-started machine.
                 self.vm = None;
-                return Err(e);
-            }
+            })?;
 
             info!("VzBackend: VM started successfully");
 
-            // 8. Get the socket device for vsock connections
-            let vm_ref = self.vm.as_ref().unwrap();
-            let socket_devices = unsafe { vm_ref.socketDevices() };
-            let socket_device = socket_devices.objectAtIndex(0);
-            let socket_device: Retained<VZVirtioSocketDevice> =
-                unsafe { Retained::cast_unchecked(socket_device) };
-            let socket_device = SendSyncDevice(socket_device);
-
-            // 9. Build the control channel
-            let connector = Self::build_connector(&socket_device, &self.vz_queue);
-            let control_channel = Arc::new(ControlChannel::new(
-                connector,
-                config.security.session_secret,
-            ));
-
-            self.socket_device = Some(socket_device);
-            self.control_channel = Some(control_channel);
-            self.running.store(true, Ordering::SeqCst);
+            // Store config info for snapshot sidecar
+            self.started_config = Some(StartedConfigInfo {
+                memory_mb: config.memory_mb,
+                vcpus: config.vcpus,
+                network: config.network,
+            });
+            self.setup_control_channel(config.security.session_secret);
 
             Ok(())
         })
@@ -594,32 +867,12 @@ impl VmmBackend for VzBackend {
             if let Some(ref vm) = self.vm {
                 info!("VzBackend: stopping VM");
 
-                let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
-
                 let vm_ptr = Retained::as_ptr(vm) as usize;
-                self.vz_queue.exec_async(move || {
-                    let vm_ref = unsafe { &*(vm_ptr as *const VZVirtualMachine) };
-                    let tx = std::sync::Mutex::new(Some(tx));
-                    let handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                        let result = if err.is_null() {
-                            Ok(())
-                        } else {
-                            let desc = unsafe { &*err }.localizedDescription().to_string();
-                            Err(desc)
-                        };
-                        if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(result);
-                        }
-                    });
-                    unsafe {
-                        vm_ref.stopWithCompletionHandler(&handler);
-                    }
-                });
-
-                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                    Ok(Ok(())) => info!("VzBackend: VM stopped"),
-                    Ok(Err(e)) => error!("VzBackend: VM stop error: {}", e),
-                    Err(_) => error!("VzBackend: VM stop timed out or channel closed"),
+                match dispatch_vz_op(&self.vz_queue, vm_ptr, 10, "stop", |vm_ref, handler| {
+                    unsafe { vm_ref.stopWithCompletionHandler(handler) };
+                }) {
+                    Ok(()) => info!("VzBackend: VM stopped"),
+                    Err(e) => error!("VzBackend: VM stop error: {}", e),
                 }
             }
 
