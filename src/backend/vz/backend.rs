@@ -7,6 +7,7 @@
 //!    - `VZVirtioSocketDeviceConfiguration` (for host↔guest control channel)
 //!    - `VZNATNetworkDeviceAttachment` (if networking enabled)
 //!    - `VZVirtioFileSystemDeviceConfiguration` (if shared_dir provided)
+//!
 //!    If `config.snapshot` is `Some`, restores from a VZ snapshot instead of cold-booting.
 //! 2. `exec()`, `write_file()`, etc.: Delegate to `ControlChannel` over vsock fd
 //! 3. `stop()`: Requests VM stop via Virtualization.framework
@@ -688,11 +689,10 @@ impl VmmBackend for VzBackend {
             dispatch_vz_op(&self.vz_queue, vm_ptr, 30, "start", |vm_ref, handler| {
                 unsafe { vm_ref.startWithCompletionHandler(handler) };
             })
-            .map_err(|e| {
+            .inspect_err(|_| {
                 // Start failed — clear the stored VM so stop() doesn't
                 // try to use a half-started machine.
                 self.vm = None;
-                e
             })?;
 
             info!("VzBackend: VM started successfully");
