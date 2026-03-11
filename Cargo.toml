@@ -53,6 +53,7 @@ void-box-protocol = { path = "void-box-protocol" }
 voidbox-oci = { path = "voidbox-oci" }
 libc = "0.2"
 byteorder = "1"
+sha2 = "0.10"
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -70,9 +71,6 @@ event-manager = "0.4"
 
 # SLIRP networking (smoltcp-based user-mode networking)
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
-
-# Stable hashing for OCI disk cache keys and snapshot config hashes
-sha2 = "0.10"
 
 # Binary serialization for VM snapshot state
 bincode = "1"
