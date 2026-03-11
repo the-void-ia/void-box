@@ -29,15 +29,22 @@
 //! cargo run --example snapshot_restore
 //! ```
 
-use std::path::PathBuf;
-use std::time::Instant;
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("snapshot_restore example requires Linux with /dev/kvm");
+    std::process::exit(1);
+}
 
-use void_box::vmm::config::{VoidBoxConfig, VsockBackendType};
-use void_box::vmm::snapshot::{self, SnapshotConfig, VmSnapshot};
-use void_box::vmm::MicroVm;
-
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use void_box::vmm::config::{VoidBoxConfig, VsockBackendType};
+    use void_box::vmm::snapshot::{self, SnapshotConfig, VmSnapshot};
+    use void_box::vmm::MicroVm;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
