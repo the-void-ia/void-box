@@ -13,7 +13,7 @@ use crate::devices::virtio_vsock::VsockStream;
 use crate::guest::protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, TelemetrySubscribeRequest,
 };
-use crate::observe::telemetry::TelemetryAggregator;
+use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
 use crate::vmm::config::{SecurityConfig, VoidBoxConfig};
@@ -264,6 +264,7 @@ impl VmmBackend for KvmBackend {
         &mut self,
         observer: Observer,
         opts: TelemetrySubscribeRequest,
+        ring_buffer: Option<TelemetryBuffer>,
     ) -> Result<Arc<TelemetryAggregator>> {
         let cc = self
             .control_channel
@@ -271,7 +272,10 @@ impl VmmBackend for KvmBackend {
             .ok_or(Error::VmNotRunning)?
             .clone();
 
-        let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
+        let aggregator = Arc::new(match ring_buffer {
+            Some(rb) => TelemetryAggregator::with_ring_buffer(observer, self.cid, rb),
+            None => TelemetryAggregator::new(observer, self.cid),
+        });
         let agg_clone = aggregator.clone();
 
         tokio::spawn(async move {

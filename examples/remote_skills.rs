@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Running Box (mock mode) ---");
     println!();
 
-    let result = dev_box.run(None).await?;
+    let result = dev_box.run(None, None).await?;
 
     println!();
     println!("--- Result ---");

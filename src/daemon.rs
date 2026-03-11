@@ -414,6 +414,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
     let state_bg = state.clone();
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
+    let telemetry_rb = ring_buffer.clone();
     tokio::spawn(async move {
         // Stage event channel: execution code sends RunEvents through this sender,
         // and the collector task pushes them into RunState.
@@ -448,12 +449,26 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                 Ok(mut spec) => {
                     spec.sandbox.snapshot = req.snapshot;
                     crate::runtime::apply_llm_overrides_from_env(&mut spec);
-                    crate::runtime::run_spec(&spec, req.input, policy_bg, Some(stage_tx)).await
+                    crate::runtime::run_spec(
+                        &spec,
+                        req.input,
+                        policy_bg,
+                        Some(stage_tx),
+                        Some(telemetry_rb),
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             }
         } else {
-            run_file(&path, req.input, policy_bg, Some(stage_tx)).await
+            run_file(
+                &path,
+                req.input,
+                policy_bg,
+                Some(stage_tx),
+                Some(telemetry_rb),
+            )
+            .await
         };
 
         // Wait for collector to drain remaining events

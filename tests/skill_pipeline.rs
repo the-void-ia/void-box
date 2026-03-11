@@ -30,7 +30,7 @@ async fn test_provision_local_skill_file() {
 
     assert_eq!(ab.skills.len(), 2);
 
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "data_analyst");
     assert!(!result.claude_result.is_error);
 }
@@ -53,7 +53,7 @@ async fn test_provision_mcp_skill() {
 
     assert_eq!(ab.skills.len(), 2);
 
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "mcp_box");
     assert!(!result.claude_result.is_error);
 }
@@ -73,7 +73,7 @@ async fn test_provision_cli_skill() {
 
     assert_eq!(ab.skills.len(), 2);
 
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "cli_box");
 }
 
@@ -101,7 +101,7 @@ async fn test_provision_mixed_skills() {
     assert_eq!(ab.skills.len(), 5);
 
     // Should succeed even though remote fetch will 404 (fallback kicks in)
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "mixed_box");
     assert!(!result.claude_result.is_error);
 }
@@ -122,7 +122,7 @@ async fn test_provision_remote_skill_fallback() {
         .unwrap();
 
     // The Box should run successfully -- fallback content is written instead
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "fallback_box");
     assert!(!result.claude_result.is_error);
 }
@@ -144,7 +144,7 @@ async fn test_remote_skill_provision_live() {
         .build()
         .unwrap();
 
-    let result = ab.run(None).await.unwrap();
+    let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "live_fetch_box");
     assert!(!result.claude_result.is_error);
 }
@@ -349,7 +349,7 @@ async fn test_agent_box_with_input_data() {
         .unwrap();
 
     let input = br#"{"symbols": ["AAPL"], "data": []}"#;
-    let result = ab.run(Some(input)).await.unwrap();
+    let result = ab.run(Some(input), None).await.unwrap();
 
     assert_eq!(result.box_name, "processor");
     assert!(!result.claude_result.is_error);

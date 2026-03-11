@@ -860,7 +860,7 @@ workflow:
     let spec_path = dir.path().join("alpine-resolve.yaml");
     std::fs::write(&spec_path, yaml).unwrap();
 
-    let report = match void_box::runtime::run_file(&spec_path, None, None, None).await {
+    let report = match void_box::runtime::run_file(&spec_path, None, None, None, None).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("runtime_run_file_resolves_oci_image: failed: {e}");

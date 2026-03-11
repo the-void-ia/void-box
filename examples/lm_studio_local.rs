@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Run --
     println!("--- Running agent ---");
-    let result = agent_box.run(None).await?;
+    let result = agent_box.run(None, None).await?;
 
     // -- Results --
     println!();

@@ -33,7 +33,7 @@ use crate::backend::control_channel::{ControlChannel, GuestConnector};
 use crate::backend::{BackendConfig, VmmBackend};
 use crate::error::Result;
 use crate::guest::protocol::{ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest};
-use crate::observe::telemetry::TelemetryAggregator;
+use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
 use crate::ExecOutput;
@@ -557,6 +557,7 @@ impl VmmBackend for VzBackend {
         &mut self,
         observer: Observer,
         opts: TelemetrySubscribeRequest,
+        ring_buffer: Option<TelemetryBuffer>,
     ) -> Result<Arc<TelemetryAggregator>> {
         let cc = self
             .control_channel
@@ -564,7 +565,10 @@ impl VmmBackend for VzBackend {
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?
             .clone();
 
-        let aggregator = Arc::new(TelemetryAggregator::new(observer, self.cid));
+        let aggregator = Arc::new(match ring_buffer {
+            Some(rb) => TelemetryAggregator::with_ring_buffer(observer, self.cid, rb),
+            None => TelemetryAggregator::new(observer, self.cid),
+        });
         let agg_clone = aggregator.clone();
 
         tokio::task::spawn_blocking(move || {

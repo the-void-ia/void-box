@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 pub use local::LocalSandbox;
 
-use crate::observe::ObserveConfig;
+use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
+use crate::observe::{ObserveConfig, Observer};
 use crate::{Error, ExecOutput, Result};
 
 /// Sandbox configuration
@@ -563,6 +564,23 @@ Build a production guest image with claude-code and set VOID_BOX_INITRAMFS: \
         ))
     }
 
+    /// Start guest telemetry collection (CPU, memory, IO metrics).
+    ///
+    /// For local sandboxes this subscribes to the guest-agent at 1s intervals.
+    /// For mock sandboxes this returns a no-op aggregator.
+    pub async fn start_telemetry(
+        &self,
+        ring_buffer: Option<TelemetryBuffer>,
+    ) -> Result<Arc<TelemetryAggregator>> {
+        match &self.inner {
+            SandboxInner::Local(local) => local.start_telemetry(ring_buffer).await,
+            SandboxInner::Mock(_) => {
+                let observer = Observer::new(ObserveConfig::default());
+                Ok(Arc::new(TelemetryAggregator::new(observer, 0_u32)))
+            }
+        }
+    }
+
     /// Get sandbox configuration
     pub fn config(&self) -> &SandboxConfig {
         &self.config
@@ -988,6 +1006,16 @@ mod tests {
 
         let output = sandbox.exec("anything", &[]).await.unwrap();
         assert_eq!(output.stdout, b"custom output");
+    }
+
+    #[tokio::test]
+    async fn test_mock_sandbox_start_telemetry() {
+        let sandbox = Sandbox::mock().build().unwrap();
+
+        // start_telemetry on mock returns a no-op aggregator
+        let agg = sandbox.start_telemetry(None).await.unwrap();
+        assert_eq!(agg.cid(), 0);
+        assert!(agg.latest_batch().is_none());
     }
 
     #[test]
