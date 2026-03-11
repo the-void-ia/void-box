@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
+use crate::vmm::arch;
 use crate::{Error, Result};
 
 /// Snapshot format version for forward compatibility.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// Default snapshot storage directory.
 pub fn default_snapshot_dir() -> PathBuf {
@@ -52,43 +53,6 @@ pub struct SnapshotConfig {
     pub network: bool,
 }
 
-/// Serializable vCPU state (raw bytes of KVM structs).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VcpuState {
-    /// `kvm_regs` as raw bytes.
-    pub regs: Vec<u8>,
-    /// `kvm_sregs` as raw bytes.
-    pub sregs: Vec<u8>,
-    /// `kvm_lapic_state` as raw bytes.
-    pub lapic: Vec<u8>,
-    /// `kvm_xsave` as raw bytes.
-    pub xsave: Vec<u8>,
-    /// MSR (index, value) pairs.
-    pub msrs: Vec<(u32, u64)>,
-    /// `kvm_vcpu_events` as raw bytes (interrupt/exception delivery state).
-    #[serde(default)]
-    pub vcpu_events: Vec<u8>,
-    /// `kvm_xcrs` as raw bytes (XCR0 — controls which XSAVE features are active).
-    #[serde(default)]
-    pub xcrs: Vec<u8>,
-    /// `kvm_mp_state` as a u32 (MP state: RUNNABLE, HALTED, etc.).
-    /// Critical for SMP restore — without it, secondary vCPUs resume in
-    /// wrong state (RUNNABLE instead of HALTED) causing kernel deadlocks.
-    #[serde(default)]
-    pub mp_state: Option<u32>,
-}
-
-/// IRQ chip state (PIC master + PIC slave + IOAPIC) as raw bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IrqchipState {
-    /// Raw bytes of `kvm_irqchip` with chip_id = 0 (PIC master).
-    pub pic_master: Vec<u8>,
-    /// Raw bytes of `kvm_irqchip` with chip_id = 1 (PIC slave).
-    pub pic_slave: Vec<u8>,
-    /// Raw bytes of `kvm_irqchip` with chip_id = 2 (IOAPIC).
-    pub ioapic: Vec<u8>,
-}
-
 /// Snapshot of a single virtio queue's software state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueSnapshotState {
@@ -99,11 +63,9 @@ pub struct QueueSnapshotState {
     pub driver_addr: u64,
     pub device_addr: u64,
     /// Userspace backend only: last consumed available-ring index.
-    /// `None` for the vhost kernel backend (kernel tracks this internally).
     #[serde(default)]
     pub last_avail_idx: Option<u16>,
     /// Userspace backend only: last produced used-ring index.
-    /// `None` for the vhost kernel backend.
     #[serde(default)]
     pub last_used_idx: Option<u16>,
 }
@@ -144,12 +106,12 @@ pub struct VmSnapshot {
     pub version: u32,
     /// None for base, Some(hash) for diff snapshots.
     pub parent_id: Option<String>,
-    /// Per-vCPU register state.
-    pub vcpu_states: Vec<VcpuState>,
-    /// In-kernel irqchip state.
-    pub irqchip: IrqchipState,
-    /// PIT state as raw bytes of `kvm_pit_state2`.
-    pub pit: Vec<u8>,
+    /// Per-vCPU register state (arch-specific).
+    pub vcpu_states: Vec<arch::VcpuState>,
+    /// In-kernel interrupt controller state (arch-specific).
+    pub irqchip: arch::IrqchipState,
+    /// Arch-specific VM state (PIT + KVM clock on x86, empty on aarch64).
+    pub arch_state: arch::ArchVmState,
     /// Virtio-vsock device state.
     pub vsock_state: VsockSnapshotState,
     /// Hardware config at snapshot time.
@@ -160,11 +122,6 @@ pub struct VmSnapshot {
     pub snapshot_type: SnapshotType,
     /// Session secret that the guest-agent expects (from kernel cmdline).
     pub session_secret: Vec<u8>,
-    /// KVM clock data (`kvm_clock_data` as raw bytes) for TSC synchronization.
-    /// Critical for SMP restore — without it, secondary CPUs may spin
-    /// forever waiting for time sync.
-    #[serde(default)]
-    pub clock: Vec<u8>,
     /// Virtio-net device state (None if networking was disabled).
     #[serde(default)]
     pub net_state: Option<NetSnapshotState>,
@@ -302,13 +259,6 @@ pub fn restore_memory(memory: &GuestMemoryMmap, path: &Path) -> Result<()> {
 pub const PAGE_SIZE: usize = 4096;
 
 /// Header for a diff memory file.
-///
-/// The file format is:
-/// 1. `DiffMemoryHeader` serialized with bincode
-/// 2. For each dirty page (in order): 4096 bytes of page data
-///
-/// `dirty_page_indices` lists the absolute page index within the guest
-/// memory for each dirty page, in ascending order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffMemoryHeader {
     /// Total guest memory size in bytes (must match base).
@@ -318,22 +268,15 @@ pub struct DiffMemoryHeader {
 }
 
 /// Dump only dirty guest memory pages to a diff file.
-///
-/// `dirty_bitmaps` is the output of `Vm::get_dirty_bitmap()`: a list of
-/// `(slot, bitmap)` pairs where each bit represents one 4 KiB page.
-///
-/// The resulting file contains a `DiffMemoryHeader` followed by the raw
-/// bytes of each dirty page, in page-index order.
 pub fn dump_memory_diff(
     memory: &GuestMemoryMmap,
     dirty_bitmaps: &[(u32, Vec<u64>)],
     path: &Path,
 ) -> Result<()> {
-    // Compute total memory size and collect dirty page indices
     let total_memory_size: u64 = memory.iter().map(|r| r.len()).sum();
     let mut dirty_page_indices: Vec<u64> = Vec::new();
 
-    let mut page_offset: u64 = 0; // running page offset across regions
+    let mut page_offset: u64 = 0;
     for (_slot, bitmap) in dirty_bitmaps {
         for (word_idx, &word) in bitmap.iter().enumerate() {
             if word == 0 {
@@ -346,8 +289,6 @@ pub fn dump_memory_diff(
                 }
             }
         }
-        // Advance page_offset by the number of pages this slot covers.
-        // Each word in bitmap covers 64 pages.
         let pages_in_slot = bitmap.len() as u64 * 64;
         page_offset += pages_in_slot;
     }
@@ -362,11 +303,9 @@ pub fn dump_memory_diff(
     let mut file = fs::File::create(path)?;
     let header_bytes = bincode::serialize(&header)
         .map_err(|e| Error::Snapshot(format!("serialize diff header: {}", e)))?;
-    // Write header length (u64 LE) then header bytes, so we can parse them back
     file.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
     file.write_all(&header_bytes)?;
 
-    // Write dirty pages
     for &page_idx in &dirty_page_indices {
         let guest_offset = page_idx * PAGE_SIZE as u64;
         let host_addr = memory
@@ -389,18 +328,13 @@ pub fn dump_memory_diff(
     Ok(())
 }
 
-/// Restore guest memory from a diff file, applying dirty pages on top of
-/// the current (base-restored) memory.
-///
-/// Precondition: the base memory has already been restored via [`restore_memory`].
+/// Restore guest memory from a diff file.
 pub fn restore_memory_diff(memory: &GuestMemoryMmap, path: &Path) -> Result<()> {
     let mut file = fs::File::open(path)
         .map_err(|e| Error::Snapshot(format!("open diff memory file {}: {}", path.display(), e)))?;
 
-    // Read header
     let header = read_diff_header(&mut file)?;
 
-    // Read and apply each dirty page
     let mut page_buf = vec![0u8; PAGE_SIZE];
     for &page_idx in &header.dirty_page_indices {
         use std::io::Read;
@@ -420,20 +354,16 @@ pub fn restore_memory_diff(memory: &GuestMemoryMmap, path: &Path) -> Result<()> 
 }
 
 /// Merge a base memory file with a diff file, producing a full memory file.
-///
-/// The output file can be restored with [`restore_memory`].
 pub fn merge_snapshots(
     base_mem_path: &Path,
     diff_mem_path: &Path,
     output_path: &Path,
 ) -> Result<()> {
-    // Read the diff header
     let mut diff_file = fs::File::open(diff_mem_path).map_err(|e| {
         Error::Snapshot(format!("open diff file {}: {}", diff_mem_path.display(), e))
     })?;
     let header = read_diff_header(&mut diff_file)?;
 
-    // Copy base to output
     fs::copy(base_mem_path, output_path).map_err(|e| {
         Error::Snapshot(format!(
             "copy base {} to {}: {}",
@@ -443,13 +373,11 @@ pub fn merge_snapshots(
         ))
     })?;
 
-    // Open output for in-place patching
     let mut output = fs::OpenOptions::new()
         .write(true)
         .open(output_path)
         .map_err(|e| Error::Snapshot(format!("open output {}: {}", output_path.display(), e)))?;
 
-    // Apply each dirty page at its correct offset
     let mut page_buf = vec![0u8; PAGE_SIZE];
     for &page_idx in &header.dirty_page_indices {
         use std::io::{Read, Seek, SeekFrom};
@@ -479,7 +407,6 @@ pub fn merge_snapshots(
 /// Read the `DiffMemoryHeader` from the beginning of a diff memory file.
 fn read_diff_header(file: &mut fs::File) -> Result<DiffMemoryHeader> {
     use std::io::Read;
-    // Read header length
     let mut len_buf = [0u8; 8];
     file.read_exact(&mut len_buf)
         .map_err(|e| Error::Snapshot(format!("read diff header length: {}", e)))?;
@@ -505,9 +432,6 @@ fn read_diff_header(file: &mut fs::File) -> Result<DiffMemoryHeader> {
 // ---------------------------------------------------------------------------
 
 /// Compute a cache key for a diff/layered snapshot.
-///
-/// The key is a SHA-256 hash of: `base_config_hash + layer_name + content_hash`.
-/// Two VMs with the same base, layer name, and content produce the same key.
 pub fn compute_layer_hash(base_config_hash: &str, layer_name: &str, content_hash: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_config_hash.as_bytes());
@@ -522,8 +446,6 @@ pub fn compute_layer_hash(base_config_hash: &str, layer_name: &str, content_hash
 }
 
 /// Find a cached snapshot matching the given layer hash.
-///
-/// Returns the snapshot directory if a valid snapshot exists for this hash.
 pub fn find_cached_snapshot(layer_hash: &str) -> Option<PathBuf> {
     let dir = snapshot_dir_for_hash(layer_hash);
     if dir.join("state.bin").exists() {
@@ -596,7 +518,6 @@ pub fn cache_stats() -> Result<CacheStats> {
         });
     }
 
-    // Sort by modification time (oldest first) for LRU
     entries.sort_by_key(|e| e.modified);
 
     Ok(CacheStats {
@@ -607,8 +528,6 @@ pub fn cache_stats() -> Result<CacheStats> {
 }
 
 /// Evict snapshots using LRU until total cache size is under `max_bytes`.
-///
-/// Returns the number of snapshots evicted.
 pub fn evict_lru(max_bytes: u64) -> Result<usize> {
     let mut stats = cache_stats()?;
     let mut evicted = 0;
@@ -634,7 +553,6 @@ pub fn evict_lru(max_bytes: u64) -> Result<usize> {
     Ok(evicted)
 }
 
-/// Compute total size of a directory recursively.
 fn dir_size_recursive(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
@@ -658,9 +576,6 @@ fn dir_size_recursive(path: &Path) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Compute a deterministic hash of the VM configuration.
-///
-/// The hash covers kernel binary, initramfs binary, memory size, and vCPU count.
-/// Two VMs with the same config_hash can share snapshots.
 pub fn compute_config_hash(
     kernel: &Path,
     initramfs: Option<&Path>,
@@ -768,9 +683,6 @@ pub fn delete_snapshot(hash_prefix: &str) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// Convert a fixed-size `repr(C)` struct to a byte vector.
-///
-/// # Safety
-/// The caller must ensure `T` is a plain-old-data type with no pointers.
 pub fn kvm_struct_to_bytes<T: Sized>(val: &T) -> Vec<u8> {
     unsafe {
         std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>()).to_vec()
@@ -778,10 +690,6 @@ pub fn kvm_struct_to_bytes<T: Sized>(val: &T) -> Vec<u8> {
 }
 
 /// Restore a fixed-size `repr(C)` struct from a byte slice.
-///
-/// # Safety
-/// The caller must ensure `T` is a plain-old-data type and that `bytes`
-/// was produced by [`kvm_struct_to_bytes`] for the same type.
 pub fn kvm_struct_from_bytes<T: Sized>(bytes: &[u8]) -> Result<T> {
     let expected = std::mem::size_of::<T>();
     if bytes.len() != expected {
@@ -819,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_state_serde_roundtrip() {
-        let state = VcpuState {
+        let state = arch::VcpuState {
             regs: vec![1, 2, 3, 4],
             sregs: vec![5, 6, 7, 8],
             lapic: vec![9, 10],
@@ -830,7 +738,7 @@ mod tests {
             mp_state: Some(0),
         };
         let bytes = bincode::serialize(&state).unwrap();
-        let restored: VcpuState = bincode::deserialize(&bytes).unwrap();
+        let restored: arch::VcpuState = bincode::deserialize(&bytes).unwrap();
         assert_eq!(state.regs, restored.regs);
         assert_eq!(state.msrs, restored.msrs);
     }
@@ -872,7 +780,7 @@ mod tests {
         let snap = VmSnapshot {
             version: SNAPSHOT_VERSION,
             parent_id: None,
-            vcpu_states: vec![VcpuState {
+            vcpu_states: vec![arch::VcpuState {
                 regs: vec![0; 16],
                 sregs: vec![0; 32],
                 lapic: vec![0; 8],
@@ -882,12 +790,15 @@ mod tests {
                 xcrs: vec![],
                 mp_state: Some(0),
             }],
-            irqchip: IrqchipState {
+            irqchip: arch::IrqchipState {
                 pic_master: vec![0; 64],
                 pic_slave: vec![0; 64],
                 ioapic: vec![0; 128],
             },
-            pit: vec![0; 32],
+            arch_state: arch::ArchVmState {
+                pit: vec![0; 32],
+                clock: vec![],
+            },
             vsock_state: VsockSnapshotState {
                 device_features: 1 << 32,
                 driver_features: 1 << 32,
@@ -917,7 +828,6 @@ mod tests {
             config_hash: "abc123".into(),
             snapshot_type: SnapshotType::Base,
             session_secret: vec![0xAA; 32],
-            clock: vec![],
             net_state: None,
         };
         let bytes = bincode::serialize(&snap).unwrap();
@@ -944,35 +854,28 @@ mod tests {
     fn test_diff_memory_dump_and_restore() {
         use vm_memory::GuestAddress;
 
-        // Create memory with 4 pages (16 KiB)
         let page_count = 4;
         let mem_size = page_count * PAGE_SIZE;
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
 
-        // Write distinct patterns to each page
         for i in 0..page_count {
             let pattern = vec![(i as u8).wrapping_mul(37); PAGE_SIZE];
             vm_memory::Bytes::write(&memory, &pattern, GuestAddress((i * PAGE_SIZE) as u64))
                 .unwrap();
         }
 
-        // Simulate dirty bitmap: pages 1 and 3 are dirty (bit 1 and bit 3)
         let bitmap_word = (1u64 << 1) | (1u64 << 3);
         let dirty_bitmaps = vec![(0u32, vec![bitmap_word])];
 
         let dir = tempfile::tempdir().unwrap();
         let diff_path = dir.path().join("test.diff");
 
-        // Dump diff
         dump_memory_diff(&memory, &dirty_bitmaps, &diff_path).unwrap();
 
-        // Create fresh memory and write base content (all zeros)
         let memory2 = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
 
-        // Restore diff onto fresh memory
         restore_memory_diff(&memory2, &diff_path).unwrap();
 
-        // Pages 1 and 3 should have the original pattern; pages 0 and 2 should be zeros
         for i in 0..page_count {
             let mut buf = vec![0u8; PAGE_SIZE];
             vm_memory::Bytes::read(&memory2, &mut buf, GuestAddress((i * PAGE_SIZE) as u64))
@@ -995,7 +898,6 @@ mod tests {
         let diff_path = dir.path().join("diff.mem");
         let merged_path = dir.path().join("merged.mem");
 
-        // Create base: 4 pages of distinct content
         let page_count = 4;
         let mem_size = page_count * PAGE_SIZE;
         let base_data: Vec<u8> = (0..page_count)
@@ -1003,14 +905,11 @@ mod tests {
             .collect();
         fs::write(&base_path, &base_data).unwrap();
 
-        // Create diff memory with modified pages 0 and 2
         let memory =
             GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), mem_size)]).unwrap();
 
-        // Write base content first
         vm_memory::Bytes::write(&memory, &base_data, vm_memory::GuestAddress(0)).unwrap();
 
-        // Modify pages 0 and 2
         let page0_new = vec![0xFF; PAGE_SIZE];
         let page2_new = vec![0xBB; PAGE_SIZE];
         vm_memory::Bytes::write(&memory, &page0_new, vm_memory::GuestAddress(0)).unwrap();
@@ -1025,31 +924,25 @@ mod tests {
         let dirty_bitmaps = vec![(0u32, vec![bitmap_word])];
         dump_memory_diff(&memory, &dirty_bitmaps, &diff_path).unwrap();
 
-        // Merge
         merge_snapshots(&base_path, &diff_path, &merged_path).unwrap();
 
-        // Verify merged content
         let merged = fs::read(&merged_path).unwrap();
         assert_eq!(merged.len(), mem_size);
 
-        // Page 0: should be 0xFF (from diff)
         assert!(
             merged[..PAGE_SIZE].iter().all(|&b| b == 0xFF),
             "page 0 should be 0xFF"
         );
-        // Page 1: should be 0xA1 (from base, unchanged)
         assert!(
             merged[PAGE_SIZE..2 * PAGE_SIZE].iter().all(|&b| b == 0xA1),
             "page 1 should be 0xA1"
         );
-        // Page 2: should be 0xBB (from diff)
         assert!(
             merged[2 * PAGE_SIZE..3 * PAGE_SIZE]
                 .iter()
                 .all(|&b| b == 0xBB),
             "page 2 should be 0xBB"
         );
-        // Page 3: should be 0xA3 (from base, unchanged)
         assert!(
             merged[3 * PAGE_SIZE..4 * PAGE_SIZE]
                 .iter()
@@ -1082,22 +975,18 @@ mod tests {
 
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
 
-        // Write test pattern
         let pattern: Vec<u8> = (0..4096u16).map(|i| (i % 256) as u8).collect();
         vm_memory::Bytes::write(&memory, &pattern, GuestAddress(0)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let mem_path = dir.path().join("test.mem");
 
-        // Dump
         dump_memory(&memory, &mem_path).unwrap();
         assert_eq!(fs::metadata(&mem_path).unwrap().len(), 4096);
 
-        // Create fresh memory and restore into it
         let memory2 = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
         restore_memory(&memory2, &mem_path).unwrap();
 
-        // Verify contents match
         let mut buf = vec![0u8; 4096];
         vm_memory::Bytes::read(&memory2, &mut buf, GuestAddress(0)).unwrap();
         assert_eq!(buf, pattern);

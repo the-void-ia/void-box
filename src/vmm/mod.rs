@@ -6,6 +6,7 @@
 //! - vCPU configuration and execution
 //! - Kernel loading and boot parameter setup
 
+pub mod arch;
 pub mod boot;
 pub mod config;
 pub mod cpu;
@@ -519,17 +520,10 @@ impl MicroVm {
             }
         }
 
-        // 3. Restore in-kernel irqchip (PIC + IOAPIC).
-        //    PIT is NOT restored: the LAPIC TSC-deadline timer (set in
-        //    restore_vcpu_state) provides the bootstrap tick.  PIT's periodic
-        //    IRQ 0 through PIC can collide with vsock IRQ 11 during softirq
-        //    processing, causing spinlock deadlocks on single-vCPU VMs.
-        vm.restore_irqchip(&snap.irqchip)?;
-
-        // 3b. Restore KVM clock (TSC synchronization for SMP)
-        if !snap.clock.is_empty() {
-            vm.restore_clock(&snap.clock)?;
-        }
+        // 3. Restore in-kernel interrupt controller + arch state.
+        use crate::vmm::arch::{Arch, CurrentArch};
+        CurrentArch::restore_irqchip(&vm, &snap.irqchip)?;
+        CurrentArch::restore_arch_vm_state(&vm, &snap.arch_state)?;
 
         // 4. Serial device (fresh — no state to restore)
         let (serial_tx, serial_rx) = mpsc::channel(4096);
@@ -867,9 +861,9 @@ impl MicroVm {
         }
 
         // 4. Capture VM-level state (vm_fd is still valid)
-        let irqchip = self.vm.capture_irqchip()?;
-        let pit = self.vm.capture_pit()?;
-        let clock = self.vm.capture_clock()?;
+        use crate::vmm::arch::{Arch, CurrentArch};
+        let irqchip = CurrentArch::capture_irqchip(&self.vm)?;
+        let arch_state = CurrentArch::capture_arch_vm_state(&self.vm)?;
 
         // 5. Capture vsock device state
         let vsock_state = if let Some(ref vsock_mmio) = self.virtio_vsock_mmio {
@@ -934,7 +928,7 @@ impl MicroVm {
             parent_id,
             vcpu_states,
             irqchip,
-            pit,
+            arch_state,
             vsock_state,
             config,
             config_hash,
@@ -944,7 +938,6 @@ impl MicroVm {
                 snapshot::SnapshotType::Base
             },
             session_secret,
-            clock,
             net_state,
         };
         snap.save(snapshot_dir)?;
