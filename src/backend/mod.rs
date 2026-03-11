@@ -78,6 +78,57 @@ pub struct BackendConfig {
     pub snapshot: Option<PathBuf>,
 }
 
+impl BackendConfig {
+    /// Create a minimal `BackendConfig` with sensible defaults.
+    ///
+    /// Only requires the fields that have no reasonable default (kernel path,
+    /// memory, vCPUs). Everything else is set to safe defaults with vsock
+    /// enabled and the default command allowlist.
+    pub fn minimal(kernel: impl Into<PathBuf>, memory_mb: usize, vcpus: usize) -> Self {
+        let mut session_secret = [0u8; 32];
+        getrandom::fill(&mut session_secret).expect("getrandom");
+        Self {
+            memory_mb,
+            vcpus,
+            kernel: kernel.into(),
+            initramfs: None,
+            rootfs: None,
+            network: false,
+            enable_vsock: true,
+            shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
+            env: Vec::new(),
+            security: BackendSecurityConfig {
+                session_secret,
+                command_allowlist: DEFAULT_COMMAND_ALLOWLIST
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                network_deny_list: Vec::new(),
+                max_connections_per_second: 0,
+                max_concurrent_connections: 0,
+                seccomp: false,
+            },
+            snapshot: None,
+        }
+    }
+
+    /// Set the initramfs path.
+    pub fn initramfs(mut self, path: impl Into<PathBuf>) -> Self {
+        self.initramfs = Some(path.into());
+        self
+    }
+
+    /// Enable or disable networking.
+    pub fn network(mut self, enabled: bool) -> Self {
+        self.network = enabled;
+        self
+    }
+}
+
 /// Security-relevant settings for the backend.
 #[derive(Debug, Clone)]
 pub struct BackendSecurityConfig {

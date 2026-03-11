@@ -19,10 +19,11 @@ use crate::{Error, Result};
 /// Snapshot format version for forward compatibility.
 pub const SNAPSHOT_VERSION: u32 = 2;
 
-/// Default snapshot storage directory.
-pub fn default_snapshot_dir() -> PathBuf {
-    dirs_snapshot_base()
-}
+// Re-export cross-platform snapshot utilities from `snapshot_store`.
+pub use crate::snapshot_store::{
+    compute_config_hash, default_snapshot_dir, delete_snapshot, list_snapshots,
+    snapshot_dir_for_hash, snapshot_exists, SnapshotInfo, SnapshotType,
+};
 
 fn dirs_snapshot_base() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -33,14 +34,7 @@ fn dirs_snapshot_base() -> PathBuf {
 // Types
 // ---------------------------------------------------------------------------
 
-/// Snapshot type discriminator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SnapshotType {
-    /// Full base snapshot from a cold-booted VM.
-    Base,
-    /// Differential snapshot on top of a base.
-    Diff,
-}
+// SnapshotType re-exported from snapshot_store above.
 
 /// Hardware configuration captured at snapshot time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,115 +647,8 @@ fn dir_size_recursive(path: &Path) -> u64 {
     total
 }
 
-// ---------------------------------------------------------------------------
-// Config hash
-// ---------------------------------------------------------------------------
-
-/// Compute a deterministic hash of the VM configuration.
-///
-/// The hash covers kernel binary, initramfs binary, memory size, and vCPU count.
-/// Two VMs with the same config_hash can share snapshots.
-pub fn compute_config_hash(
-    kernel: &Path,
-    initramfs: Option<&Path>,
-    memory_mb: usize,
-    vcpus: usize,
-) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let kernel_data = fs::read(kernel)
-        .map_err(|e| Error::Snapshot(format!("read kernel {}: {}", kernel.display(), e)))?;
-    hasher.update(&kernel_data);
-    if let Some(initramfs) = initramfs {
-        let initramfs_data = fs::read(initramfs).map_err(|e| {
-            Error::Snapshot(format!("read initramfs {}: {}", initramfs.display(), e))
-        })?;
-        hasher.update(&initramfs_data);
-    }
-    hasher.update(memory_mb.to_le_bytes());
-    hasher.update(vcpus.to_le_bytes());
-    let hash = hasher.finalize();
-    Ok(hash
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>())
-}
-
-/// Resolve the snapshot directory for a given config hash.
-pub fn snapshot_dir_for_hash(config_hash: &str) -> PathBuf {
-    dirs_snapshot_base().join(&config_hash[..16.min(config_hash.len())])
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot listing / deletion
-// ---------------------------------------------------------------------------
-
-/// Information about a stored snapshot (for listing).
-#[derive(Debug)]
-pub struct SnapshotInfo {
-    pub config_hash: String,
-    pub snapshot_type: SnapshotType,
-    pub memory_mb: usize,
-    pub vcpus: usize,
-    pub dir: PathBuf,
-    pub memory_file_size: u64,
-}
-
-/// List all stored snapshots.
-pub fn list_snapshots() -> Result<Vec<SnapshotInfo>> {
-    let base = dirs_snapshot_base();
-    if !base.exists() {
-        return Ok(Vec::new());
-    }
-    let mut infos = Vec::new();
-    for entry in fs::read_dir(&base)? {
-        let entry = entry?;
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let state_path = dir.join("state.bin");
-        if !state_path.exists() {
-            continue;
-        }
-        match VmSnapshot::load(&dir) {
-            Ok(snap) => {
-                let mem_size = fs::metadata(VmSnapshot::memory_path(&dir))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                infos.push(SnapshotInfo {
-                    config_hash: snap.config_hash,
-                    snapshot_type: snap.snapshot_type,
-                    memory_mb: snap.config.memory_mb,
-                    vcpus: snap.config.vcpus,
-                    dir,
-                    memory_file_size: mem_size,
-                });
-            }
-            Err(e) => {
-                debug!("Skipping invalid snapshot {}: {}", dir.display(), e);
-            }
-        }
-    }
-    Ok(infos)
-}
-
-/// Delete a snapshot by its config hash prefix.
-pub fn delete_snapshot(hash_prefix: &str) -> Result<bool> {
-    let base = dirs_snapshot_base();
-    if !base.exists() {
-        return Ok(false);
-    }
-    for entry in fs::read_dir(&base)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(hash_prefix) || hash_prefix.starts_with(&name) {
-            fs::remove_dir_all(entry.path())?;
-            info!("Deleted snapshot {}", entry.path().display());
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+// Config hash, snapshot_dir_for_hash, SnapshotInfo, list_snapshots,
+// delete_snapshot are all re-exported from snapshot_store at the top.
 
 // ---------------------------------------------------------------------------
 // Raw byte helpers for KVM struct serialization

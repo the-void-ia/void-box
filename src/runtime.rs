@@ -768,20 +768,19 @@ async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
 /// Returns `Some(path)` only if the spec explicitly declares a snapshot.
 /// No auto-detection, no env var fallback — snapshots are off unless
 /// the user explicitly sets `sandbox.snapshot` in the spec.
-#[cfg(target_os = "linux")]
 fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
     let hash = spec.sandbox.snapshot.as_deref()?;
     if hash.is_empty() {
         return None;
     }
     // Resolve hash prefix to a snapshot directory
-    let dir = crate::vmm::snapshot::snapshot_dir_for_hash(hash);
-    if dir.join("state.bin").exists() {
+    let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
+    if crate::snapshot_store::snapshot_exists(&dir) {
         Some(dir)
     } else {
         // Treat as a literal path
         let path = PathBuf::from(hash);
-        if path.join("state.bin").exists() {
+        if crate::snapshot_store::snapshot_exists(&path) {
             Some(path)
         } else {
             eprintln!(
@@ -794,13 +793,7 @@ fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn resolve_snapshot(_spec: &RunSpec) -> Option<PathBuf> {
-    None
-}
-
 /// Resolve per-box snapshot override, falling back to the top-level spec.
-#[cfg(target_os = "linux")]
 fn resolve_box_snapshot(
     box_override: Option<&BoxSandboxOverride>,
     spec: &RunSpec,
@@ -809,12 +802,12 @@ fn resolve_box_snapshot(
     if let Some(ov) = box_override {
         if let Some(ref hash) = ov.snapshot {
             if !hash.is_empty() {
-                let dir = crate::vmm::snapshot::snapshot_dir_for_hash(hash);
-                if dir.join("state.bin").exists() {
+                let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
+                if crate::snapshot_store::snapshot_exists(&dir) {
                     return Some(dir);
                 }
                 let path = PathBuf::from(hash);
-                if path.join("state.bin").exists() {
+                if crate::snapshot_store::snapshot_exists(&path) {
                     return Some(path);
                 }
                 eprintln!("[void-box] Per-box snapshot '{}' not found", hash);
@@ -824,14 +817,6 @@ fn resolve_box_snapshot(
     }
     // Fall back to top-level spec
     resolve_snapshot(spec)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn resolve_box_snapshot(
-    _box_override: Option<&BoxSandboxOverride>,
-    _spec: &RunSpec,
-) -> Option<PathBuf> {
-    None
 }
 
 fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {

@@ -83,6 +83,9 @@ pub mod observe;
 pub mod sandbox;
 pub mod workflow;
 
+// Cross-platform snapshot directory management
+pub mod snapshot_store;
+
 // Agent(Skills) + Isolation = VoidBox
 pub mod agent_box;
 pub mod artifacts;

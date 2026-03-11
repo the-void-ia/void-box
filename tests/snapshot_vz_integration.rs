@@ -24,6 +24,7 @@ mod vm_preflight;
 use void_box::backend::vz::snapshot::VzSnapshotMeta;
 use void_box::backend::vz::VzBackend;
 use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
+use void_box::snapshot_store;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -188,4 +189,153 @@ async fn snapshot_vz_round_trip() {
     eprintln!("  Restore:     {:>10.1?}", restore_time);
     eprintln!("  Speedup:     {:>10.1}x", speedup);
     eprintln!("==============================");
+}
+
+// ---------------------------------------------------------------------------
+// CLI-level tests: snapshot_store list / delete / exists with VZ snapshots
+// ---------------------------------------------------------------------------
+
+/// Boot a VM, create a snapshot into the standard snapshot directory, then
+/// verify `snapshot_store::list_snapshots()` discovers it with correct metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn snapshot_vz_cli_create_and_list() {
+    let config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    let kernel = config.kernel.clone();
+    let initramfs = config.initramfs.clone();
+
+    // --- Cold boot ---
+    eprintln!("[vz_cli_list] Booting VM...");
+    let mut backend = VzBackend::new();
+    if let Err(e) = backend.start(config).await {
+        eprintln!("[vz_cli_list] start failed: {e}");
+        return;
+    }
+
+    let output = backend
+        .exec("echo", &["ready"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed");
+    assert!(output.success());
+
+    // --- Create snapshot into the standard directory ---
+    let config_hash = snapshot_store::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1)
+        .expect("compute_config_hash");
+    let snap_dir = snapshot_store::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
+
+    eprintln!(
+        "[vz_cli_list] Taking snapshot (hash={})...",
+        &config_hash[..16]
+    );
+    tokio::task::block_in_place(|| backend.create_snapshot(&snap_dir))
+        .expect("create_snapshot failed");
+
+    // --- Verify snapshot_exists recognizes VZ snapshot ---
+    assert!(
+        snapshot_store::snapshot_exists(&snap_dir),
+        "snapshot_exists must return true for VZ snapshot"
+    );
+
+    // --- Verify list_snapshots() finds it ---
+    let snapshots = snapshot_store::list_snapshots().expect("list_snapshots");
+    let found = snapshots.iter().find(|s| s.dir == snap_dir);
+    assert!(
+        found.is_some(),
+        "list_snapshots must include the VZ snapshot we just created"
+    );
+
+    let info = found.unwrap();
+    assert_eq!(info.memory_mb, 256);
+    assert_eq!(info.vcpus, 1);
+    assert_eq!(info.snapshot_type, snapshot_store::SnapshotType::Base);
+    eprintln!(
+        "[vz_cli_list] Found VZ snapshot: hash={}, memory={}MB, vcpus={}",
+        info.config_hash, info.memory_mb, info.vcpus
+    );
+
+    // Cleanup
+    backend.stop().await.expect("stop failed");
+    let _ = std::fs::remove_dir_all(&snap_dir);
+}
+
+/// Create a VZ snapshot, delete it via `snapshot_store::delete_snapshot()`,
+/// and verify it is gone from both the filesystem and `list_snapshots()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn snapshot_vz_cli_delete() {
+    let config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    let kernel = config.kernel.clone();
+    let initramfs = config.initramfs.clone();
+
+    // --- Cold boot ---
+    eprintln!("[vz_cli_delete] Booting VM...");
+    let mut backend = VzBackend::new();
+    if let Err(e) = backend.start(config).await {
+        eprintln!("[vz_cli_delete] start failed: {e}");
+        return;
+    }
+
+    let output = backend
+        .exec("echo", &["ready"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed");
+    assert!(output.success());
+
+    // --- Snapshot ---
+    let config_hash = snapshot_store::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1)
+        .expect("compute_config_hash");
+    let snap_dir = snapshot_store::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
+
+    eprintln!("[vz_cli_delete] Taking snapshot...");
+    tokio::task::block_in_place(|| backend.create_snapshot(&snap_dir))
+        .expect("create_snapshot failed");
+
+    // Verify it exists before delete
+    assert!(snap_dir.exists(), "snapshot dir must exist before delete");
+    assert!(snapshot_store::snapshot_exists(&snap_dir));
+    let snapshots = snapshot_store::list_snapshots().expect("list before delete");
+    assert!(
+        snapshots.iter().any(|s| s.dir == snap_dir),
+        "snapshot must be listed before delete"
+    );
+
+    // --- Delete ---
+    let hash_prefix = &config_hash[..8];
+    eprintln!(
+        "[vz_cli_delete] Deleting snapshot (prefix={})...",
+        hash_prefix
+    );
+    let deleted = snapshot_store::delete_snapshot(hash_prefix).expect("delete_snapshot");
+    assert!(deleted, "delete_snapshot must return true");
+
+    // Verify it is gone
+    assert!(
+        !snap_dir.exists(),
+        "snapshot dir must be removed after delete"
+    );
+    let snapshots_after = snapshot_store::list_snapshots().expect("list after delete");
+    assert!(
+        !snapshots_after.iter().any(|s| s.dir == snap_dir),
+        "snapshot must not be listed after delete"
+    );
+    eprintln!("[vz_cli_delete] Snapshot deleted and verified gone");
+
+    // Cleanup
+    backend.stop().await.expect("stop failed");
 }
