@@ -1308,7 +1308,9 @@ fn install_seccomp_filter() -> Result<()> {
         libc::SYS_read,
         libc::SYS_write,
         libc::SYS_ioctl, // KVM ioctls
+        #[cfg(target_arch = "x86_64")]
         libc::SYS_epoll_wait,
+        libc::SYS_epoll_pwait,
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_create1,
         libc::SYS_socket, // AF_VSOCK, AF_INET
@@ -1339,6 +1341,7 @@ fn install_seccomp_filter() -> Result<()> {
         libc::SYS_rt_sigprocmask,
         libc::SYS_sigaltstack,
         libc::SYS_getrandom,
+        #[cfg(target_arch = "x86_64")]
         libc::SYS_poll,
         libc::SYS_ppoll,
         libc::SYS_eventfd2,

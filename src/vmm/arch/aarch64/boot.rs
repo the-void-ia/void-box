@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::Path;
 
 use tracing::debug;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress};
 
 use crate::vmm::kvm::Vm;
 use crate::vmm::memory::write_to_guest;

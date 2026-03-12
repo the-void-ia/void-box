@@ -85,7 +85,10 @@ fn timer_reg_ids() -> Vec<u64> {
 /// Calls `KVM_ARM_VCPU_INIT` then sets the entry point (PC) and DTB address (x0).
 pub fn configure_vcpu(vcpu_fd: &VcpuFd, _vcpu_id: u64, entry_point: u64, vm: &Vm) -> Result<()> {
     // Get the preferred target for this VM.
-    let kvi = vm.vm_fd().get_preferred_target().map_err(Error::Kvm)?;
+    let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+    vm.vm_fd()
+        .get_preferred_target(&mut kvi)
+        .map_err(Error::Kvm)?;
 
     // Initialize the vCPU with the preferred target.
     vcpu_fd.vcpu_init(&kvi).map_err(Error::Kvm)?;

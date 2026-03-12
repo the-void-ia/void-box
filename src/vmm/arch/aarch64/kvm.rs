@@ -72,8 +72,9 @@ pub fn setup_vm(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
 /// Create a GICv3 via KVM_CREATE_DEVICE.
 fn create_gicv3(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
     use kvm_bindings::{
-        kvm_create_device, kvm_device_attr, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_TYPE_ARM_VGIC_V3,
-        KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
+        kvm_create_device, kvm_device_attr,
+        kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3 as KVM_DEV_TYPE_ARM_VGIC_V3,
+        KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
     };
 
     let mut device = kvm_create_device {
@@ -127,8 +128,9 @@ fn create_gicv3(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
 /// Create a GICv2 via KVM_CREATE_DEVICE.
 fn create_gicv2(vm_fd: &VmFd) -> Result<()> {
     use kvm_bindings::{
-        kvm_create_device, kvm_device_attr, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_TYPE_ARM_VGIC_V2,
-        KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST,
+        kvm_create_device, kvm_device_attr,
+        kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2 as KVM_DEV_TYPE_ARM_VGIC_V2,
+        KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_VGIC_V2_ADDR_TYPE_CPU, KVM_VGIC_V2_ADDR_TYPE_DIST,
     };
 
     let mut device = kvm_create_device {
