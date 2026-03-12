@@ -70,7 +70,7 @@ pub fn setup_vm(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
 }
 
 /// Create a GICv3 via KVM_CREATE_DEVICE.
-fn create_gicv3(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
+fn create_gicv3(vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
     use kvm_bindings::{
         kvm_create_device, kvm_device_attr,
         kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3 as KVM_DEV_TYPE_ARM_VGIC_V3,

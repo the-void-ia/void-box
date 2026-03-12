@@ -18,7 +18,7 @@ const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
 const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
 const KVM_REG_ARM_CORE: u64 = 0x0010_0000_0000_0000;
 const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000_0000_0000;
-const KVM_REG_ARM64_SVE: u64 = 0x0015_0000_0000_0000;
+const _KVM_REG_ARM64_SVE: u64 = 0x0015_0000_0000_0000;
 
 /// Encode a core register ID by its offset in `kvm_regs` (in u64 units).
 const fn core_reg(offset: u64) -> u64 {
