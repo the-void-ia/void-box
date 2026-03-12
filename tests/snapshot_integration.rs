@@ -607,11 +607,27 @@ async fn snapshot_multi_vcpu() {
         num_vcpus
     );
     for (i, state) in snap.vcpu_states.iter().enumerate() {
-        assert!(!state.regs.is_empty(), "vCPU {} regs must be captured", i);
-        assert!(!state.sregs.is_empty(), "vCPU {} sregs must be captured", i);
-        assert!(!state.lapic.is_empty(), "vCPU {} LAPIC must be captured", i);
-        assert!(!state.xsave.is_empty(), "vCPU {} xsave must be captured", i);
-        assert!(!state.xcrs.is_empty(), "vCPU {} XCRs must be captured", i);
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(!state.regs.is_empty(), "vCPU {} regs must be captured", i);
+            assert!(!state.sregs.is_empty(), "vCPU {} sregs must be captured", i);
+            assert!(!state.lapic.is_empty(), "vCPU {} LAPIC must be captured", i);
+            assert!(!state.xsave.is_empty(), "vCPU {} xsave must be captured", i);
+            assert!(!state.xcrs.is_empty(), "vCPU {} XCRs must be captured", i);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(
+                !state.core_regs.is_empty(),
+                "vCPU {} core_regs must be captured",
+                i
+            );
+            assert!(
+                !state.system_regs.is_empty(),
+                "vCPU {} system_regs must be captured",
+                i
+            );
+        }
     }
     eprintln!(
         "[multi_vcpu] Snapshot has {} vCPU states (all validated)",

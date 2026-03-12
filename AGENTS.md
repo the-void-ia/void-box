@@ -355,7 +355,7 @@ x86_64 host without waiting for CI:
 
 CFLAGS_aarch64_unknown_linux_gnu="--sysroot=/usr/aarch64-redhat-linux/sys-root/fc43" \
   RUSTFLAGS="-D warnings" \
-  cargo check --target aarch64-unknown-linux-gnu -p void-box --lib
+  cargo check --target aarch64-unknown-linux-gnu -p void-box --lib --tests
 ```
 
 Common aarch64 pitfalls:
