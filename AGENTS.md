@@ -343,6 +343,30 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+### aarch64 cross-check (required when touching `src/vmm/arch/aarch64/` or arch-neutral VMM code)
+
+CI runs on native aarch64 (`ubuntu-24.04-arm`). To catch issues locally from an
+x86_64 host without waiting for CI:
+
+```bash
+# One-time setup (Fedora):
+#   sudo dnf install -y gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+#   rustup target add aarch64-unknown-linux-gnu
+
+CFLAGS_aarch64_unknown_linux_gnu="--sysroot=/usr/aarch64-redhat-linux/sys-root/fc43" \
+  RUSTFLAGS="-D warnings" \
+  cargo check --target aarch64-unknown-linux-gnu -p void-box --lib
+```
+
+Common aarch64 pitfalls:
+- `kvm-bindings` constants use `kvm_device_type_` prefix (e.g.
+  `kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3`, not `KVM_DEV_TYPE_ARM_VGIC_V3`).
+- `kvm-ioctls` `get_preferred_target()` takes `&mut kvm_vcpu_init` out-param.
+- `libc::SYS_epoll_wait` and `libc::SYS_poll` don't exist on aarch64 — use
+  `SYS_epoll_pwait` and `SYS_ppoll`.
+- Unused variables/imports that are only used on x86_64 become errors with
+  `-D warnings` on aarch64.
+
 ### VM suites (required for VM/OCI/OpenClaw changes)
 
 Linux (KVM):
