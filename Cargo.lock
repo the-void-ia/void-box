@@ -2118,6 +2118,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 
 [[package]]
+name = "vm-fdt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
+
+[[package]]
 name = "vm-memory"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2195,6 +2201,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "virtio-bindings",
+ "vm-fdt",
  "vm-memory",
  "vm-superio",
  "vmm-sys-util 0.12.1",

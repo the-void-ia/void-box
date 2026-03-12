@@ -1,55 +1,17 @@
-//! KVM setup and VM management
+//! KVM setup and VM management.
+//!
+//! Architecture-specific setup (irqchip, PIT, GIC) is handled by the
+//! [`arch`](crate::vmm::arch) module.
 
-use kvm_bindings::{
-    kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
-    KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
-};
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
 use tracing::debug;
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
-use crate::vmm::snapshot::{kvm_struct_from_bytes, kvm_struct_to_bytes, IrqchipState};
+use crate::vmm::arch::{Arch, CurrentArch};
 use crate::{Error, Result};
 
-/// x86_64 memory layout constants
-pub mod layout {
-    use vm_memory::GuestAddress;
-
-    /// Start of RAM
-    pub const RAM_START: GuestAddress = GuestAddress(0);
-
-    /// Start of the MMIO gap (for legacy devices)
-    pub const MMIO_GAP_START: u64 = 0xD000_0000; // 3.25 GB
-
-    /// End of the MMIO gap
-    pub const MMIO_GAP_END: u64 = 0x1_0000_0000; // 4 GB
-
-    /// High RAM start (above 4GB)
-    pub const HIGH_RAM_START: GuestAddress = GuestAddress(0x1_0000_0000);
-
-    /// Kernel load address
-    pub const KERNEL_LOAD_ADDR: GuestAddress = GuestAddress(0x0100_0000); // 16 MB
-
-    /// Initramfs load address
-    pub const INITRAMFS_LOAD_ADDR: GuestAddress = GuestAddress(0x0400_0000); // 64 MB
-
-    /// Boot parameters (zero page) address
-    pub const BOOT_PARAMS_ADDR: GuestAddress = GuestAddress(0x0000_7000);
-
-    /// Kernel command line address
-    pub const CMDLINE_ADDR: GuestAddress = GuestAddress(0x0002_0000);
-
-    /// Maximum kernel command line size
-    pub const CMDLINE_MAX_SIZE: usize = 4096;
-
-    /// PCI MMIO space start
-    pub const PCI_MMIO_START: u64 = 0xC000_0000;
-
-    /// PCI MMIO space size
-    pub const PCI_MMIO_SIZE: u64 = 0x1000_0000; // 256 MB
-}
-
-/// Represents a KVM virtual machine
+/// Represents a KVM virtual machine.
 pub struct Vm {
     /// KVM system handle
     kvm: Kvm,
@@ -62,8 +24,16 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Create a new KVM VM with the specified memory size
+    /// Create a new KVM VM with the specified memory size.
+    ///
+    /// Also performs arch-specific setup (irqchip + PIT on x86, GIC on aarch64)
+    /// via [`CurrentArch::setup_vm`].
     pub fn new(memory_mb: usize) -> Result<Self> {
+        Self::with_vcpu_count(memory_mb, 1)
+    }
+
+    /// Create a new KVM VM, passing the vCPU count for arch-specific setup.
+    pub fn with_vcpu_count(memory_mb: usize, vcpu_count: usize) -> Result<Self> {
         let memory_size = (memory_mb as u64) * 1024 * 1024;
 
         // Open /dev/kvm
@@ -91,22 +61,13 @@ impl Vm {
         // Register memory with KVM
         vm.register_memory()?;
 
-        // Create irqchip (for interrupt handling)
-        vm.vm_fd.create_irq_chip().map_err(Error::Kvm)?;
-        debug!("Created IRQ chip");
-
-        // Create PIT (Programmable Interval Timer)
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        vm.vm_fd.create_pit2(pit_config).map_err(Error::Kvm)?;
-        debug!("Created PIT");
+        // Arch-specific VM setup (irqchip + PIT on x86, GIC on aarch64)
+        CurrentArch::setup_vm(&vm.vm_fd, vcpu_count)?;
 
         Ok(vm)
     }
 
-    /// Check that required KVM extensions are available
+    /// Check that required KVM extensions are available.
     fn check_extensions(kvm: &Kvm) -> Result<()> {
         use kvm_ioctls::Cap;
 
@@ -122,19 +83,22 @@ impl Vm {
         Ok(())
     }
 
-    /// Create guest memory regions
+    /// Create guest memory regions based on the current arch layout.
     fn create_guest_memory(memory_size: u64) -> Result<GuestMemoryMmap> {
-        // For simplicity, create a single memory region below the MMIO gap
-        // For larger VMs, we'd need to split around the gap
-        let effective_size = std::cmp::min(memory_size, layout::MMIO_GAP_START);
+        let layout = CurrentArch::memory_layout();
+        let effective_size = if let Some(gap_start) = layout.mmio_gap_start {
+            std::cmp::min(memory_size, gap_start - layout.ram_start)
+        } else {
+            memory_size
+        };
 
-        let mem_region = (layout::RAM_START, effective_size as usize);
+        let mem_region = (GuestAddress(layout.ram_start), effective_size as usize);
 
         GuestMemoryMmap::from_ranges(&[mem_region])
             .map_err(|e| Error::Memory(format!("Failed to create guest memory: {}", e)))
     }
 
-    /// Register memory regions with KVM
+    /// Register memory regions with KVM.
     fn register_memory(&self) -> Result<()> {
         for (index, region) in self.guest_memory.iter().enumerate() {
             let memory_region = kvm_userspace_memory_region {
@@ -148,8 +112,6 @@ impl Vm {
                 flags: 0,
             };
 
-            // SAFETY: We're passing a valid memory region that will remain valid
-            // for the lifetime of the VM
             unsafe {
                 self.vm_fd
                     .set_user_memory_region(memory_region)
@@ -167,128 +129,36 @@ impl Vm {
         Ok(())
     }
 
-    /// Get reference to the KVM handle
+    /// Get reference to the KVM handle.
     pub fn kvm(&self) -> &Kvm {
         &self.kvm
     }
 
-    /// Get reference to the VM file descriptor
+    /// Get reference to the VM file descriptor.
     pub fn vm_fd(&self) -> &VmFd {
         &self.vm_fd
     }
 
-    /// Get reference to guest memory
+    /// Get reference to guest memory.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
     }
 
-    /// Get memory size in bytes
+    /// Get memory size in bytes.
     pub fn memory_size(&self) -> u64 {
         self.memory_size
     }
 
-    /// Create a vCPU for this VM
+    /// Create a vCPU for this VM.
     pub fn create_vcpu(&self, id: u64) -> Result<kvm_ioctls::VcpuFd> {
         self.vm_fd.create_vcpu(id).map_err(Error::Kvm)
     }
 
     // ------------------------------------------------------------------
-    // Snapshot: IRQchip + PIT capture / restore
-    // ------------------------------------------------------------------
-
-    /// Capture the in-kernel irqchip state (PIC master, PIC slave, IOAPIC).
-    pub fn capture_irqchip(&self) -> Result<IrqchipState> {
-        let pic_master = self.get_irqchip_raw(0)?; // KVM_IRQCHIP_PIC_MASTER
-        let pic_slave = self.get_irqchip_raw(1)?; // KVM_IRQCHIP_PIC_SLAVE
-        let ioapic = self.get_irqchip_raw(2)?; // KVM_IRQCHIP_IOAPIC
-        debug!(
-            "Captured irqchip state ({} + {} + {} bytes)",
-            pic_master.len(),
-            pic_slave.len(),
-            ioapic.len()
-        );
-        Ok(IrqchipState {
-            pic_master,
-            pic_slave,
-            ioapic,
-        })
-    }
-
-    /// Restore the in-kernel irqchip state from a snapshot.
-    ///
-    /// Clears the `remote_irr` bit on all IOAPIC redirection table entries
-    /// before restoring.  For level-triggered entries, `remote_irr` signals
-    /// that an interrupt has been delivered but the guest hasn't sent EOI yet.
-    /// After a snapshot/restore cycle the LAPIC state may not match, so a stale
-    /// `remote_irr` permanently blocks new interrupts on that pin (KVM_IRQ_LINE
-    /// is silently ignored).
-    pub fn restore_irqchip(&self, state: &IrqchipState) -> Result<()> {
-        // Restore PIC state faithfully from the snapshot.
-        self.set_irqchip_raw(0, &state.pic_master)?;
-        self.set_irqchip_raw(1, &state.pic_slave)?;
-
-        // Clear remote_irr bits in the IOAPIC redirtbl before restoring.
-        // Stale remote_irr prevents level-triggered interrupt re-delivery.
-        let mut ioapic_data = state.ioapic.clone();
-        const REDIRTBL_OFFSET: usize = 8 + 24; // chip header + ioapic header
-        const NUM_PINS: usize = 24;
-        for pin in 0..NUM_PINS {
-            let entry_base = REDIRTBL_OFFSET + pin * 8;
-            if entry_base + 2 <= ioapic_data.len() {
-                // remote_irr = bit 14 of the entry = byte 1, bit 6
-                if ioapic_data[entry_base + 1] & 0x40 != 0 {
-                    ioapic_data[entry_base + 1] &= !0x40;
-                    debug!("Cleared remote_irr on IOAPIC pin {}", pin);
-                }
-            }
-        }
-        self.set_irqchip_raw(2, &ioapic_data)?;
-
-        debug!("Restored irqchip state");
-        Ok(())
-    }
-
-    /// Capture PIT (Programmable Interval Timer) state.
-    pub fn capture_pit(&self) -> Result<Vec<u8>> {
-        let pit = self.vm_fd.get_pit2().map_err(Error::Kvm)?;
-        let bytes = kvm_struct_to_bytes(&pit);
-        debug!("Captured PIT state ({} bytes)", bytes.len());
-        Ok(bytes)
-    }
-
-    /// Restore PIT state from a snapshot.
-    pub fn restore_pit(&self, data: &[u8]) -> Result<()> {
-        let pit: kvm_pit_state2 = kvm_struct_from_bytes(data)?;
-        self.vm_fd.set_pit2(&pit).map_err(Error::Kvm)?;
-        debug!("Restored PIT state");
-        Ok(())
-    }
-
-    /// Capture KVM clock state for snapshot.
-    pub fn capture_clock(&self) -> Result<Vec<u8>> {
-        let clock = self.vm_fd.get_clock().map_err(Error::Kvm)?;
-        let bytes = kvm_struct_to_bytes(&clock);
-        debug!("Captured KVM clock ({} bytes)", bytes.len());
-        Ok(bytes)
-    }
-
-    /// Restore KVM clock state from a snapshot.
-    pub fn restore_clock(&self, data: &[u8]) -> Result<()> {
-        use kvm_bindings::kvm_clock_data;
-        let clock: kvm_clock_data = kvm_struct_from_bytes(data)?;
-        self.vm_fd.set_clock(&clock).map_err(Error::Kvm)?;
-        debug!("Restored KVM clock");
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------
-    // Snapshot: dirty page tracking
+    // Dirty page tracking (arch-neutral)
     // ------------------------------------------------------------------
 
     /// Enable dirty page logging on all memory regions.
-    ///
-    /// After this call, KVM tracks which guest pages are written to.
-    /// Use `get_dirty_bitmap` to retrieve the bitmap of modified pages.
     pub fn enable_dirty_log(&self) -> Result<()> {
         for (index, region) in self.guest_memory.iter().enumerate() {
             let memory_region = kvm_userspace_memory_region {
@@ -319,8 +189,6 @@ impl Vm {
     }
 
     /// Disable dirty page logging on all memory regions.
-    ///
-    /// Re-registers memory regions without the `KVM_MEM_LOG_DIRTY_PAGES` flag.
     pub fn disable_dirty_log(&self) -> Result<()> {
         for (index, region) in self.guest_memory.iter().enumerate() {
             let memory_region = kvm_userspace_memory_region {
@@ -345,12 +213,6 @@ impl Vm {
     }
 
     /// Retrieve the dirty page bitmap for all memory slots.
-    ///
-    /// Returns a vector of `(slot_index, bitmap)` pairs. Each bit in the
-    /// bitmap corresponds to one 4 KiB page: bit N = 1 means page N was
-    /// written since the last `get_dirty_bitmap` or `enable_dirty_log` call.
-    ///
-    /// The bitmap is a `Vec<u64>` where each u64 covers 64 pages (256 KiB).
     pub fn get_dirty_bitmap(&self) -> Result<Vec<(u32, Vec<u64>)>> {
         let mut result = Vec::new();
         for (index, region) in self.guest_memory.iter().enumerate() {
@@ -371,22 +233,6 @@ impl Vm {
         }
         Ok(result)
     }
-
-    fn get_irqchip_raw(&self, chip_id: u32) -> Result<Vec<u8>> {
-        let mut chip = kvm_irqchip {
-            chip_id,
-            ..Default::default()
-        };
-        self.vm_fd.get_irqchip(&mut chip).map_err(Error::Kvm)?;
-        Ok(kvm_struct_to_bytes(&chip))
-    }
-
-    fn set_irqchip_raw(&self, chip_id: u32, data: &[u8]) -> Result<()> {
-        let mut chip: kvm_irqchip = kvm_struct_from_bytes(data)?;
-        chip.chip_id = chip_id; // ensure chip_id matches
-        self.vm_fd.set_irqchip(&chip).map_err(Error::Kvm)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -401,10 +247,9 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_constants() {
-        // Verify memory layout makes sense
-        assert!(layout::KERNEL_LOAD_ADDR.raw_value() > layout::BOOT_PARAMS_ADDR.raw_value());
-        assert!(layout::INITRAMFS_LOAD_ADDR.raw_value() > layout::KERNEL_LOAD_ADDR.raw_value());
-        const { assert!(layout::MMIO_GAP_START < layout::MMIO_GAP_END) };
+    fn test_memory_layout() {
+        let layout = CurrentArch::memory_layout();
+        // RAM start should be valid
+        assert!(layout.ram_start < u64::MAX);
     }
 }

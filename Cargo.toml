@@ -75,6 +75,9 @@ smoltcp = { version = "0.11", default-features = false, features = ["std", "medi
 # Binary serialization for VM snapshot state
 bincode = "1"
 
+# Device Tree Blob generation for aarch64 boot
+vm-fdt = "0.3"
+
 # Security (Linux-specific)
 seccompiler = "0.4"
 ipnet = "2"
