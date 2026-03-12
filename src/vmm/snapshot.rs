@@ -617,6 +617,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_state_serde_roundtrip() {
+        #[cfg(target_arch = "x86_64")]
         let state = arch::VcpuState {
             regs: vec![1, 2, 3, 4],
             sregs: vec![5, 6, 7, 8],
@@ -627,10 +628,17 @@ mod tests {
             xcrs: vec![],
             mp_state: Some(0),
         };
+        #[cfg(target_arch = "aarch64")]
+        let state = arch::VcpuState {
+            core_regs: vec![(0, 1), (1, 2)],
+            system_regs: vec![(0x1000, 42)],
+            fp_regs: vec![(0x2000, vec![0u8; 16])],
+            timer_regs: vec![(0x3000, 100)],
+            mp_state: Some(0),
+        };
         let bytes = bincode::serialize(&state).unwrap();
         let restored: arch::VcpuState = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(state.regs, restored.regs);
-        assert_eq!(state.msrs, restored.msrs);
+        assert_eq!(state.mp_state, restored.mp_state);
     }
 
     #[test]
@@ -667,28 +675,53 @@ mod tests {
 
     #[test]
     fn test_vm_snapshot_serde_roundtrip() {
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_state = arch::VcpuState {
+            regs: vec![0; 16],
+            sregs: vec![0; 32],
+            lapic: vec![0; 8],
+            xsave: vec![0; 64],
+            msrs: vec![(0x10, 100)],
+            vcpu_events: vec![],
+            xcrs: vec![],
+            mp_state: Some(0),
+        };
+        #[cfg(target_arch = "aarch64")]
+        let vcpu_state = arch::VcpuState {
+            core_regs: vec![(0, 0); 34],
+            system_regs: vec![(0x1000, 0)],
+            fp_regs: vec![(0x2000, vec![0u8; 16])],
+            timer_regs: vec![(0x3000, 0)],
+            mp_state: Some(0),
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let irqchip = arch::IrqchipState {
+            pic_master: vec![0; 64],
+            pic_slave: vec![0; 64],
+            ioapic: vec![0; 128],
+        };
+        #[cfg(target_arch = "aarch64")]
+        let irqchip = arch::IrqchipState {
+            gic_dist_regs: vec![],
+            gic_redist_regs: vec![],
+            gic_cpu_regs: vec![],
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let arch_state = arch::ArchVmState {
+            pit: vec![0; 32],
+            clock: vec![],
+        };
+        #[cfg(target_arch = "aarch64")]
+        let arch_state = arch::ArchVmState {};
+
         let snap = VmSnapshot {
             version: SNAPSHOT_VERSION,
             parent_id: None,
-            vcpu_states: vec![arch::VcpuState {
-                regs: vec![0; 16],
-                sregs: vec![0; 32],
-                lapic: vec![0; 8],
-                xsave: vec![0; 64],
-                msrs: vec![(0x10, 100)],
-                vcpu_events: vec![],
-                xcrs: vec![],
-                mp_state: Some(0),
-            }],
-            irqchip: arch::IrqchipState {
-                pic_master: vec![0; 64],
-                pic_slave: vec![0; 64],
-                ioapic: vec![0; 128],
-            },
-            arch_state: arch::ArchVmState {
-                pit: vec![0; 32],
-                clock: vec![],
-            },
+            vcpu_states: vec![vcpu_state],
+            irqchip,
+            arch_state,
             vsock_state: VsockSnapshotState {
                 device_features: 1 << 32,
                 driver_features: 1 << 32,

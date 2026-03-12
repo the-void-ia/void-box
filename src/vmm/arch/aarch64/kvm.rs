@@ -185,7 +185,7 @@ fn create_gicv2(vm_fd: &VmFd) -> Result<()> {
 /// redistributor registers via KVM_DEV_ARM_VGIC_GRP_DIST_REGS and
 /// KVM_DEV_ARM_VGIC_GRP_REDIST_REGS device attributes. This is a minimal
 /// implementation that captures the essential state.
-pub fn capture_irqchip(vm: &Vm) -> Result<IrqchipState> {
+pub fn capture_irqchip(_vm: &Vm) -> Result<IrqchipState> {
     // TODO: Implement full GIC register capture via KVM_GET_DEVICE_ATTR
     // This requires tracking the GIC device fd and iterating over register groups.
     debug!("Captured aarch64 GIC state (stub)");
@@ -197,7 +197,7 @@ pub fn capture_irqchip(vm: &Vm) -> Result<IrqchipState> {
 }
 
 /// Restore GIC state from a snapshot.
-pub fn restore_irqchip(vm: &Vm, state: &IrqchipState) -> Result<()> {
+pub fn restore_irqchip(_vm: &Vm, _state: &IrqchipState) -> Result<()> {
     // TODO: Implement full GIC register restore via KVM_SET_DEVICE_ATTR
     debug!("Restored aarch64 GIC state (stub)");
     Ok(())
