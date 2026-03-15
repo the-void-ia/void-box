@@ -31,6 +31,7 @@
 //! - Avoid duplicating stage loops in `Pipeline` vs `ObservablePipeline`.
 //! - If you change carry semantics or fan-out merge format, update module docs and tests.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -41,7 +42,7 @@ use crate::observe::claude::{create_otel_spans, ClaudeExecResult};
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::observe::tracer::SpanStatus;
 use crate::observe::{ObserveConfig, ObservedResult, Observer};
-use crate::persistence::RunEvent;
+use crate::persistence::{PersistenceProvider, RunEvent};
 
 /// Result of running a full pipeline.
 #[derive(Debug)]
@@ -208,6 +209,29 @@ impl Pipeline {
         .await
     }
 
+    /// Execute the pipeline with stage events and artifact persistence.
+    ///
+    /// Like [`run_with_stage_tx`](Self::run_with_stage_tx) but also persists
+    /// each stage's `file_output` via the given [`PersistenceProvider`].
+    pub async fn run_with_artifacts(
+        self,
+        stage_tx: Option<UnboundedSender<RunEvent>>,
+        telemetry_buffer: Option<TelemetryBuffer>,
+        run_id: String,
+        provider: Arc<dyn PersistenceProvider>,
+    ) -> crate::Result<PipelineResult> {
+        let mut hook = ArtifactPersisterHook { run_id, provider };
+        run_pipeline_core(
+            self.name,
+            self.stages,
+            &mut hook,
+            None,
+            stage_tx,
+            telemetry_buffer,
+        )
+        .await
+    }
+
     /// Attach observability to this pipeline.
     ///
     /// Returns an [`ObservablePipeline`] whose `run()` / `run_streaming()` methods
@@ -245,6 +269,25 @@ impl Pipeline {
 /// multi-threaded runtimes (e.g. `tokio::spawn`).
 trait OutputHook: Send {
     fn on_stage_result(&mut self, box_name: &str, result: &StageResult);
+}
+
+/// Hook that persists `file_output` artifacts after each stage.
+pub struct ArtifactPersisterHook {
+    pub run_id: String,
+    pub provider: Arc<dyn PersistenceProvider>,
+}
+
+impl OutputHook for ArtifactPersisterHook {
+    fn on_stage_result(&mut self, box_name: &str, result: &StageResult) {
+        if let Some(ref data) = result.file_output {
+            if let Err(e) = self
+                .provider
+                .save_stage_artifact(&self.run_id, box_name, data)
+            {
+                tracing::warn!("failed to persist artifact for stage {}: {}", box_name, e);
+            }
+        }
+    }
 }
 
 /// No-op hook for `Pipeline::run()` (no streaming output).

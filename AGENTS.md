@@ -5,6 +5,14 @@ guest agent from initramfs, optionally performs an OCI root switch, and exposes
 a host↔guest API over vsock. This file covers architecture, testing, validation,
 and debugging guidance for agents working on the project.
 
+## Code intelligence
+
+**Always prefer LSP operations** (`goToDefinition`, `findReferences`, `hover`,
+`documentSymbol`, `workspaceSymbol`, etc.) over Grep/Glob for code navigation.
+LSP provides compiler-aware results that understand types, scopes, and cross-file
+relationships. Fall back to Grep/Glob only for pattern-based searches LSP doesn't
+cover (comments, config files, non-Rust files).
+
 ## Platform parity
 
 **Contributions must work on both Linux (KVM) and macOS (VZ).** Validate on both
