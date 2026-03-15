@@ -860,13 +860,14 @@ workflow:
     let spec_path = dir.path().join("alpine-resolve.yaml");
     std::fs::write(&spec_path, yaml).unwrap();
 
-    let report = match void_box::runtime::run_file(&spec_path, None, None, None, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("runtime_run_file_resolves_oci_image: failed: {e}");
-            return;
-        }
-    };
+    let report =
+        match void_box::runtime::run_file(&spec_path, None, None, None, None, None, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("runtime_run_file_resolves_oci_image: failed: {e}");
+                return;
+            }
+        };
 
     // The mock sandbox's echo returns "resolved-ok\n".
     // The important part is that run_file succeeded, which means

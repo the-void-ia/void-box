@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -57,10 +58,21 @@ pub async fn run_file(
     policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
     telemetry_buffer: Option<TelemetryBuffer>,
+    provider: Option<Arc<dyn crate::persistence::PersistenceProvider>>,
+    run_id: Option<&str>,
 ) -> Result<RunReport> {
     let mut spec = load_spec(path)?;
     apply_llm_overrides_from_env(&mut spec);
-    run_spec(&spec, input, policy, stage_tx, telemetry_buffer).await
+    run_spec(
+        &spec,
+        input,
+        policy,
+        stage_tx,
+        telemetry_buffer,
+        provider,
+        run_id,
+    )
+    .await
 }
 
 pub async fn run_spec(
@@ -69,10 +81,25 @@ pub async fn run_spec(
     policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
     telemetry_buffer: Option<TelemetryBuffer>,
+    provider: Option<Arc<dyn crate::persistence::PersistenceProvider>>,
+    run_id: Option<&str>,
 ) -> Result<RunReport> {
     match spec.kind {
-        RunKind::Agent => run_agent(spec, input, stage_tx, telemetry_buffer).await,
-        RunKind::Pipeline => run_pipeline(spec, input, policy, stage_tx, telemetry_buffer).await,
+        RunKind::Agent => {
+            run_agent(spec, input, stage_tx, telemetry_buffer, provider, run_id).await
+        }
+        RunKind::Pipeline => {
+            run_pipeline(
+                spec,
+                input,
+                policy,
+                stage_tx,
+                telemetry_buffer,
+                provider,
+                run_id,
+            )
+            .await
+        }
         RunKind::Workflow => run_workflow(spec, input, policy, stage_tx).await,
     }
 }
@@ -89,6 +116,8 @@ async fn run_agent(
     input: Option<String>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
     telemetry_buffer: Option<TelemetryBuffer>,
+    provider: Option<Arc<dyn crate::persistence::PersistenceProvider>>,
+    run_id: Option<&str>,
 ) -> Result<RunReport> {
     let agent = spec
         .agent
@@ -149,6 +178,15 @@ async fn run_agent(
         .run(input.as_deref().map(str::as_bytes), telemetry_buffer)
         .await?;
 
+    // Persist file_output artifact if provider is available
+    if let (Some(ref prov), Some(rid)) = (&provider, run_id) {
+        if let Some(ref data) = stage.file_output {
+            if let Err(e) = prov.save_stage_artifact(rid, &spec.name, data) {
+                tracing::warn!("failed to persist artifact for agent {}: {}", spec.name, e);
+            }
+        }
+    }
+
     // Prefer the JSONL result_text, but fall back to file_output when
     // claude-code is killed before emitting the result event.
     let output = if !stage.claude_result.result_text.is_empty() {
@@ -205,10 +243,12 @@ async fn run_agent(
 
 async fn run_pipeline(
     spec: &RunSpec,
-    input: Option<String>,
+    _input: Option<String>,
     _policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
     telemetry_buffer: Option<TelemetryBuffer>,
+    provider: Option<Arc<dyn crate::persistence::PersistenceProvider>>,
+    run_id: Option<&str>,
 ) -> Result<RunReport> {
     let pipeline = spec
         .pipeline
@@ -340,12 +380,12 @@ async fn run_pipeline(
         }
     }
 
-    let result = if let Some(i) = input {
-        // lightweight input injection: prefix into first box prompt
-        let _ = i;
-        p.run_with_stage_tx(stage_tx, telemetry_buffer).await?
-    } else {
-        p.run_with_stage_tx(stage_tx, telemetry_buffer).await?
+    let result = match (provider, run_id) {
+        (Some(prov), Some(rid)) => {
+            p.run_with_artifacts(stage_tx, telemetry_buffer, rid.to_string(), prov)
+                .await?
+        }
+        _ => p.run_with_stage_tx(stage_tx, telemetry_buffer).await?,
     };
 
     let output = result.output.clone();

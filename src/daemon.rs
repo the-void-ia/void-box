@@ -133,14 +133,15 @@ async fn handle_stream(
         ""
     };
 
-    let (status, payload) = route_request(method, path, query, body, state).await;
-    let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    let (status, content_type, payload) = route_request(method, path, query, body, state).await;
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
+        content_type,
         payload.len(),
-        payload
     );
-    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&payload).await?;
     Ok(())
 }
 
@@ -155,64 +156,77 @@ fn parse_query_param(query: Option<&str>, key: &str) -> Option<String> {
     })
 }
 
+/// Wraps a JSON `(status, body)` tuple into `(status, content_type, bytes)`.
+fn as_json((status, body): (String, String)) -> (String, String, Vec<u8>) {
+    (status, "application/json".to_string(), body.into_bytes())
+}
+
 async fn route_request(
     method: &str,
     path: &str,
     query: Option<&str>,
     body: &str,
     state: AppState,
-) -> (String, String) {
+) -> (String, String, Vec<u8>) {
     match (method, path) {
-        ("GET", "/v1/health") => (
+        ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
             serde_json::to_string(&Health {
                 status: "ok",
                 persistence: state.provider.name(),
             })
             .unwrap_or_else(|_| "{}".into()),
-        ),
-        ("POST", "/v1/runs") => create_run(body, state).await,
-        ("GET", "/v1/runs") => list_runs(query, state).await,
+        )),
+        ("POST", "/v1/runs") => as_json(create_run(body, state).await),
+        ("GET", "/v1/runs") => as_json(list_runs(query, state).await),
         _ => {
             if let Some(id) = path.strip_prefix("/v1/runs/") {
+                // /v1/runs/{run_id}/stages/{stage_name}/output-file
+                if let Some(rest) = id.strip_suffix("/output-file") {
+                    if let Some((run_id, stage_name)) = rest.rsplit_once("/stages/") {
+                        if method == "GET" {
+                            return get_stage_output_file(run_id, stage_name, state).await;
+                        }
+                    }
+                }
                 if let Some(id) = id.strip_suffix("/stages") {
                     if method == "GET" {
-                        return get_stages(id, state).await;
+                        return as_json(get_stages(id, state).await);
                     }
                 }
                 if let Some(id) = id.strip_suffix("/telemetry") {
                     if method == "GET" {
-                        return get_telemetry(id, query, state).await;
+                        return as_json(get_telemetry(id, query, state).await);
                     }
                 }
                 if let Some(id) = id.strip_suffix("/events") {
-                    return get_events(id, query, state).await;
+                    return as_json(get_events(id, query, state).await);
                 }
                 if let Some(id) = id.strip_suffix("/cancel") {
                     if method == "POST" {
-                        return cancel_run(id, body, state).await;
+                        return as_json(cancel_run(id, body, state).await);
                     }
                 }
                 if method == "GET" {
-                    return get_run(id, query, state).await;
+                    return as_json(get_run(id, query, state).await);
                 }
             }
 
             if let Some(id) = path.strip_prefix("/v1/sessions/") {
                 if let Some(id) = id.strip_suffix("/messages") {
                     if method == "GET" {
-                        return get_session_messages(id, state).await;
+                        return as_json(get_session_messages(id, state).await);
                     }
                     if method == "POST" {
-                        return append_session_message(id, body, state).await;
+                        return as_json(append_session_message(id, body, state).await);
                     }
                 }
             }
 
-            (
+            as_json((
                 "404 Not Found".to_string(),
                 ApiError::not_found("route not found").to_json(),
-            )
+            ))
         }
     }
 }
@@ -415,6 +429,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
     let telemetry_rb = ring_buffer.clone();
+    let provider_bg = state.provider.clone();
     tokio::spawn(async move {
         // Stage event channel: execution code sends RunEvents through this sender,
         // and the collector task pushes them into RunState.
@@ -455,6 +470,8 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                         policy_bg,
                         Some(stage_tx),
                         Some(telemetry_rb),
+                        Some(provider_bg.clone()),
+                        Some(&run_id_bg),
                     )
                     .await
                 }
@@ -467,6 +484,8 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                 policy_bg,
                 Some(stage_tx),
                 Some(telemetry_rb),
+                Some(provider_bg),
+                Some(&run_id_bg),
             )
             .await
         };
@@ -1263,6 +1282,42 @@ fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, 
             format!("oci:{}:{}", image, mount),
         )),
     }
+}
+
+async fn get_stage_output_file(
+    run_id: &str,
+    stage_name: &str,
+    state: AppState,
+) -> (String, String, Vec<u8>) {
+    let data = match state.provider.load_stage_artifact(run_id, stage_name) {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            return as_json((
+                "404 Not Found".to_string(),
+                ApiError::not_found(format!(
+                    "no output file for run '{}' stage '{}'",
+                    run_id, stage_name
+                ))
+                .to_json(),
+            ));
+        }
+        Err(e) => {
+            return as_json((
+                "500 Internal Server Error".to_string(),
+                ApiError::internal(format!("failed to load artifact: {e}")).to_json(),
+            ));
+        }
+    };
+
+    let content_type = if serde_json::from_slice::<serde_json::Value>(&data).is_ok() {
+        "application/json"
+    } else if std::str::from_utf8(&data).is_ok() {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    };
+
+    ("200 OK".to_string(), content_type.to_string(), data)
 }
 
 fn kind_name(kind: &RunKind) -> &'static str {

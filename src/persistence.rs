@@ -146,6 +146,13 @@ pub trait PersistenceProvider: Send + Sync {
     fn save_run(&self, run: &RunState) -> Result<()>;
     fn append_session_message(&self, session_id: &str, message: &SessionMessage) -> Result<()>;
     fn load_session_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
+
+    fn save_stage_artifact(&self, _run_id: &str, _stage_name: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn load_stage_artifact(&self, _run_id: &str, _stage_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 pub fn provider_from_env() -> Arc<dyn PersistenceProvider> {
@@ -191,6 +198,10 @@ impl DiskPersistenceProvider {
 
     fn sessions_dir(&self) -> PathBuf {
         self.state_dir.join("sessions")
+    }
+
+    fn artifacts_dir(&self) -> PathBuf {
+        self.state_dir.join("artifacts")
     }
 
     fn ensure_dirs(&self) -> Result<()> {
@@ -296,6 +307,32 @@ impl PersistenceProvider for DiskPersistenceProvider {
         }
 
         Ok(out)
+    }
+
+    fn save_stage_artifact(&self, run_id: &str, stage_name: &str, data: &[u8]) -> Result<()> {
+        let dir = self.artifacts_dir().join(run_id).join(stage_name);
+        fs::create_dir_all(&dir)
+            .map_err(|e| Error::Config(format!("failed to create artifact dir: {e}")))?;
+        let path = dir.join("output.json");
+        fs::write(&path, data).map_err(|e| {
+            Error::Config(format!("failed writing artifact {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
+
+    fn load_stage_artifact(&self, run_id: &str, stage_name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self
+            .artifacts_dir()
+            .join(run_id)
+            .join(stage_name)
+            .join("output.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path).map_err(|e| {
+            Error::Config(format!("failed reading artifact {}: {e}", path.display()))
+        })?;
+        Ok(Some(data))
     }
 }
 
@@ -684,6 +721,29 @@ mod tests {
         assert_eq!(legacy_to_v2_event_type("stage.completed"), "StageSucceeded");
         assert_eq!(legacy_to_v2_event_type("stage.failed"), "StageFailed");
         assert_eq!(legacy_to_v2_event_type("stage.skipped"), "StageSkipped");
+    }
+
+    #[test]
+    fn test_stage_artifact_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+        let data = br#"{"result": "ok"}"#;
+
+        provider
+            .save_stage_artifact("run-1", "build", data)
+            .unwrap();
+        let loaded = provider.load_stage_artifact("run-1", "build").unwrap();
+        assert_eq!(loaded.as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn test_stage_artifact_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+        let loaded = provider
+            .load_stage_artifact("no-such-run", "no-stage")
+            .unwrap();
+        assert!(loaded.is_none());
     }
 
     #[test]
