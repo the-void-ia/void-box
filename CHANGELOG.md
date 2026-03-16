@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-03-16
+
+### Added
+- **Snapshot/Restore** for KVM: base and diff snapshots with multi-vCPU support, userspace virtio-vsock backend
+- **Snapshot/Restore** for Apple Virtualization.framework (macOS VZ)
+- **aarch64 architecture support** for snapshots via `Arch` trait refactor
+- **Guest telemetry** buffering and host metrics collection
+- **Daemon lifecycle events**: `StageQueued`, `StageStarted`, `StageSucceeded`, `StageFailed`, `StageSkipped`
+- **Persist stage `file_output`** artifacts to disk after completion
+- `GET /v1/runs/{run_id}/stages/{stage_name}/output-file` daemon endpoint for retrieving stage output files
+- **Pipeline I/O wiring** with mount-based inputs/outputs
+- **Host directory mounts** via 9p (Linux) and virtiofs (macOS) with RW/RO support
+- Shell installer (`scripts/install.sh`)
+- DEB and RPM packaging via nfpm
+- Homebrew tap distribution (macOS)
+- **Structured logging** via `tracing` with `StructuredLogger`
+- Startup banner
+- `snapshot_store` module centralizing snapshot utilities
+- Snapshot CLI: `create`, `list`, `delete`, diff snapshots
+- Virtio-net snapshot and restore
+- OCI guest image distribution via GHCR (multi-arch: amd64 + arm64)
+- macOS native support via Virtualization.framework
+- LM Studio provider support and OpenClaw Telegram example
+
+### Changed
+- Unified pipeline execution loop (`run_pipeline_core`)
+- Daemon `route_request` returns `(status, content_type, body)` for binary responses
+- Rust MSRV bumped to 1.85
+- Quinn-proto updated to v0.11.14
+- Renamed `e2e_mount_9p` to `e2e_mount` with expanded virtiofs support
+- Refactored module loading logic with optional 9p kernel modules
+- Replaced `info!` logging with `debug!` for reduced noise
+
+### Fixed
+- Snapshot restore: XCR0 / LAPIC timer / CID mismatch issues
+- EPERM-resilient OCI layer unpack
+- macOS VZ examples and Apple Silicon support
+- Duplicate directory creation in artifact management
+- aarch64 musl cross-linker path in guest-image workflow
+- Diamond dependency conflict with virtio and vm-memory crates
+- BusyBox inclusion in CI guest image
+
 ## [0.1.0] - 2026-02-19
 
 ### Added
@@ -88,5 +130,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automated release builds
 - Documentation generation
 
-[Unreleased]: https://github.com/the-void-ia/void-box/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/the-void-ia/void-box/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/the-void-ia/void-box/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/the-void-ia/void-box/releases/tag/v0.1.0
