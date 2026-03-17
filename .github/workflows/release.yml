@@ -34,17 +34,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools cpio gzip xz-utils zstd
 
-      - name: Install aarch64 musl cross-compiler
+      - name: Install aarch64 cross-linker
         if: matrix.arch == 'aarch64'
         run: |
-          curl -fsSL --retry 3 --retry-delay 5 \
-            -o /tmp/aarch64-linux-musl-cross.tgz \
-            https://more.musl.cc/10/x86_64-linux-musl/aarch64-linux-musl-cross.tgz \
-            || curl -fsSL --retry 3 --retry-delay 5 \
-              -o /tmp/aarch64-linux-musl-cross.tgz \
-              https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # Rust ships musl libc for the musl target and passes -nostdlib,
+          # so the GNU cross-compiler works fine as a linker driver.
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
       - name: Download static busybox
         run: |
@@ -70,7 +66,9 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -sfL --retry 3 --retry-delay 5 https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz \
+          NFPM_VERSION=2.45.1
+          curl -sfL --retry 3 --retry-delay 5 \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_linux_amd64.tar.gz" \
             -o /tmp/nfpm.tar.gz
           tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
 
@@ -115,6 +113,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
 
       - name: Install musl cross-compiler
         run: |
