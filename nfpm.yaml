@@ -37,10 +37,8 @@ contents:
 
 overrides:
   deb:
-    depends:
-      - qemu-system-x86 | qemu-system-arm
     recommends:
       - busybox-static
   rpm:
-    depends:
-      - qemu-kvm
+    recommends:
+      - busybox
