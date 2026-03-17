@@ -38,9 +38,12 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          # Rust ships musl libc for the musl target and passes -nostdlib,
-          # so the GNU cross-compiler works fine as a linker driver.
+          # Use the GNU cross-compiler as linker and C compiler for the musl target.
+          # Disable FORTIFY_SOURCE because glibc headers define __memcpy_chk etc.
+          # which don't exist in musl.
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE' >> "$GITHUB_ENV"
 
       - name: Download static busybox
         run: |
@@ -68,7 +71,7 @@ jobs:
         run: |
           NFPM_VERSION=2.45.1
           curl -sfL --retry 3 --retry-delay 5 \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_linux_amd64.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             -o /tmp/nfpm.tar.gz
           tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
 
@@ -129,7 +132,7 @@ jobs:
           export CLAUDE_CODE_VERSION="${{ env.CLAUDE_CODE_VERSION }}"
           export VOID_BOX_KMOD_VERSION=6.8.0-51
           export VOID_BOX_KMOD_UPLOAD=52
-          ARCH=aarch64 scripts/build_claude_rootfs.sh
+          OUT_CPIO=/tmp/rootfs.cpio.gz ARCH=aarch64 scripts/build_claude_rootfs.sh
 
       - name: Download kernel
         run: |

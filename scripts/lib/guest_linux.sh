@@ -8,9 +8,18 @@
 install_claude_code_libs_linux() {
   local bin="${CLAUDE_CODE_BIN:-}"
   [[ -n "$bin" && -f "$bin" ]] || return 0
-  if file -L "$bin" | grep -q "dynamically linked"; then
+  if ! file -L "$bin" | grep -q "dynamically linked"; then
+    return 0
+  fi
+
+  # Check if we can inspect the binary with ldd (fails for cross-compiled binaries)
+  if ldd "$bin" &>/dev/null; then
     echo "[void-box] Detected dynamically linked binary -- copying shared libraries..."
     copy_shared_libs "$bin"
+  else
+    echo "[void-box] Cross-compiled binary detected -- downloading shared libraries from packages..."
+    source "$SCRIPT_DIR/guest_macos.sh" 2>/dev/null || true
+    install_claude_code_libs_macos
   fi
 }
 
