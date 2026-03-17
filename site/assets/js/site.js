@@ -98,4 +98,14 @@
       history.replaceState(null, '', id);
     });
   }
+  // Scroll fade-in
+  var faders = document.querySelectorAll('.fade-in');
+  if (faders.length && 'IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function(entries) {
+      entries.forEach(function(e) {
+        if (e.isIntersecting) { e.target.classList.add('visible'); obs.unobserve(e.target); }
+      });
+    }, { threshold: 0.15 });
+    for (var i = 0; i < faders.length; i++) obs.observe(faders[i]);
+  }
 })();

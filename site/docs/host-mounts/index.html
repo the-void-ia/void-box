@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Host Mounts | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-YRRVNN7VM4');
+</script>
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../../guides/">Guides</a><a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<main class="doc-main wrap">
+<div class="doc-layout">
+<aside class="doc-sidebar">
+  <nav>
+    <strong>Docs</strong>
+    <a href="../architecture/">Architecture</a>
+    <a href="../runtime/">Runtime Model</a>
+    <a href="../cli-tui/">CLI + TUI</a>
+    <a href="../events-observability/">Events + Observability</a>
+    <a href="../oci-containers/">OCI Containers</a>
+    <a href="../snapshots/">Snapshots</a>
+    <a href="../host-mounts/">Host Mounts</a>
+    <a href="../security/">Security</a>
+    <a href="../wire-protocol/">Wire Protocol</a>
+  </nav>
+</aside>
+<div class="doc-content">
+<section>
+<div class="kicker">Host Mounts</div>
+<h1>Mount Host Directories into Guest VMs</h1>
+<p>VoidBox can mount host directories into the guest VM using <code>sandbox.mounts</code>. Each mount specifies a <code>host</code> path, a <code>guest</code> mount point, and a <code>mode</code> (<code>"ro"</code> or <code>"rw"</code>, default <code>"ro"</code>).</p>
+<p>Read-write mounts write directly to the host directory &mdash; data persists across VM restarts since the host directory survives. This is the primary mechanism for stateful workloads.</p>
+</section>
+
+<section>
+<h2>Transport</h2>
+<div class="grid-2">
+  <article class="card">
+    <h3>Linux/KVM</h3>
+    <p><strong>9p</strong> (virtio-9p) &mdash; kernel-based 9P filesystem protocol over virtio transport.</p>
+  </article>
+  <article class="card">
+    <h3>macOS/VZ</h3>
+    <p><strong>virtiofs</strong> &mdash; Apple Virtualization.framework native shared directory support.</p>
+  </article>
+</div>
+</section>
+
+<section>
+<h2>Mount Configuration</h2>
+<p>Each mount entry has three fields:</p>
+<table>
+  <thead><tr><th>Field</th><th>Description</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td><code>host</code></td><td>Path on the host filesystem</td><td>(required)</td></tr>
+    <tr><td><code>guest</code></td><td>Mount point inside the guest VM</td><td>(required)</td></tr>
+    <tr><td><code>mode</code></td><td><code>"ro"</code> (read-only) or <code>"rw"</code> (read-write)</td><td><code>"ro"</code></td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>YAML Example</h2>
+<div class="code-wrap">
+<div class="code-head">sandbox.mounts</div>
+<pre><code>sandbox:
+  mounts:
+    - host: ./data
+      guest: /data
+      mode: rw        # persistent &mdash; host directory survives VM restarts
+    - host: ./config
+      guest: /config
+      mode: ro        # read-only (default)</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Use Cases</h2>
+<div class="grid-2">
+  <article class="card">
+    <h3>Stateful Workloads</h3>
+    <p>Use <code>mode: rw</code> mounts to persist agent output, databases, or generated artifacts across VM restarts. The host directory is the source of truth.</p>
+  </article>
+  <article class="card">
+    <h3>Shared Configuration</h3>
+    <p>Use <code>mode: ro</code> mounts to inject configuration files, credentials, or reference data into the guest without risk of modification.</p>
+  </article>
+</div>
+<div class="grid-2">
+  <article class="card">
+    <h3>Persistent Data</h3>
+    <p>Mount a host directory as <code>rw</code> to collect logs, results, or checkpoint files that survive VM lifecycle. Ideal for long-running pipelines.</p>
+  </article>
+  <article class="card">
+    <h3>Development Workflow</h3>
+    <p>Mount your project source tree as <code>ro</code> to let the agent read and analyze code without modifying the host copy.</p>
+  </article>
+</div>
+</section>
+</div>
+</div>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

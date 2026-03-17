@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Snapshots | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-YRRVNN7VM4');
+</script>
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../../guides/">Guides</a><a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<main class="doc-main wrap">
+<div class="doc-layout">
+<aside class="doc-sidebar">
+  <nav>
+    <strong>Docs</strong>
+    <a href="../architecture/">Architecture</a>
+    <a href="../runtime/">Runtime Model</a>
+    <a href="../cli-tui/">CLI + TUI</a>
+    <a href="../events-observability/">Events + Observability</a>
+    <a href="../oci-containers/">OCI Containers</a>
+    <a href="../snapshots/">Snapshots</a>
+    <a href="../host-mounts/">Host Mounts</a>
+    <a href="../security/">Security</a>
+    <a href="../wire-protocol/">Wire Protocol</a>
+  </nav>
+</aside>
+<div class="doc-content">
+<section>
+<div class="kicker">Snapshots</div>
+<h1>Sub-Second VM Restore</h1>
+<p>VoidBox supports sub-second VM restore via snapshot/restore. Snapshots capture the full VM state (vCPU registers, memory, devices) and restore via COW <code>mmap</code> &mdash; the guest resumes execution without re-booting the kernel or re-running initialization.</p>
+<div class="card"><p><strong>All snapshot features are explicit opt-in only.</strong> If you never set a snapshot field, the system behaves exactly as before &mdash; cold boot, zero snapshot code runs.</p></div>
+</section>
+
+<section>
+<h2>Snapshot Types</h2>
+<table>
+  <thead><tr><th>Type</th><th>When Created</th><th>Contents</th><th>Use Case</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Base</strong></td><td>After cold boot, VM stopped</td><td>Full memory dump + all KVM state</td><td>Golden image for repeated boots</td></tr>
+    <tr><td><strong>Diff</strong></td><td>After dirty tracking enabled, VM stopped</td><td>Only modified pages since base</td><td>Layered caching (base + delta)</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>YAML Spec</h2>
+<div class="grid-2">
+  <article class="card">
+    <h3>Top-level snapshot</h3>
+    <pre><code># Applies to all boxes
+sandbox:
+  memory_mb: 256
+  snapshot: "abc123def456"</code></pre>
+  </article>
+  <article class="card">
+    <h3>Per-box override</h3>
+    <pre><code>pipeline:
+  boxes:
+    - name: analyst
+      prompt: "analyze data"
+      sandbox:
+        snapshot: "def789"
+    - name: coder
+      prompt: "write code"
+      # no snapshot = cold boot</code></pre>
+  </article>
+</div>
+</section>
+
+<section>
+<h2>Rust API</h2>
+<div class="code-wrap">
+<div class="code-head">Rust</div>
+<pre><code>use void_box::agent_box::VoidBox;
+
+// Cold boot (default &mdash; no snapshot)
+let box1 = VoidBox::new("analyst")
+    .prompt("analyze data")
+    .memory_mb(256)
+    .build()?;
+
+// Restore from snapshot (explicit opt-in)
+let box2 = VoidBox::new("analyst")
+    .prompt("analyze data")
+    .snapshot("/path/to/snapshot/dir")   // or hash prefix
+    .build()?;</code></pre>
+</div>
+</section>
+
+<section>
+<h2>CLI Commands</h2>
+<div class="code-wrap">
+<div class="code-head">Shell</div>
+<pre><code># Create a snapshot from a running VM
+voidbox snapshot create --config-hash &lt;hash&gt;
+
+# List stored snapshots
+voidbox snapshot list
+
+# Delete a snapshot
+voidbox snapshot delete &lt;hash-prefix&gt;
+
+# Run with a snapshot (via spec)
+voidbox run --file spec.yaml   # spec has sandbox.snapshot set</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Daemon API</h2>
+<div class="code-wrap">
+<div class="code-head">code-run</div>
+<pre><code># POST /runs with snapshot override
+curl -X POST http://localhost:8080/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"file": "workflow.yaml", "snapshot": "abc123def456"}'</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Design Principles</h2>
+<ul>
+  <li><strong>No snapshot field set</strong> &rarr; cold boot, zero snapshot code runs</li>
+  <li><strong>No auto-detection</strong> of existing snapshots</li>
+  <li><strong>No auto-creation</strong> of snapshots during normal runs</li>
+  <li><strong>No auto-restore</strong> &mdash; only if the user passes an explicit path or hash</li>
+  <li><strong>No env var fallback</strong> &mdash; spec or code only</li>
+  <li><strong>Every new field defaults to <code>None</code></strong> &mdash; the system behaves identically to before if untouched</li>
+</ul>
+</section>
+
+<section>
+<h2>Performance Benchmarks</h2>
+<p>Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:</p>
+<table>
+  <thead><tr><th>Phase</th><th>Time</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Cold boot</td><td>~10 ms</td><td></td></tr>
+    <tr><td>Base snapshot</td><td>~420 ms</td><td>Full 256 MB memory dump</td></tr>
+    <tr><td>Base restore</td><td>~1.3 ms</td><td>COW mmap, lazy page loading</td></tr>
+    <tr><td>Diff snapshot</td><td>~270 ms</td><td>Only dirty pages (~1.5 MB, 0.6% of RAM)</td></tr>
+    <tr><td>Diff restore</td><td>~3 ms</td><td>Base COW mmap + dirty page overlay</td></tr>
+    <tr><td><strong>Base speedup</strong></td><td><strong>~8x</strong></td><td>Cold boot / base restore</td></tr>
+    <tr><td><strong>Diff savings</strong></td><td><strong>99.4%</strong></td><td>Memory file size reduction</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>Storage Layout</h2>
+<pre><code>~/.void-box/snapshots/
+  &lt;hash-prefix&gt;/        # first 16 chars of config hash
+      state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
+      memory.mem         # full memory dump (base)
+      memory.diff        # dirty pages only (diff snapshots)</code></pre>
+</section>
+
+<section>
+<h2>Restore Flow</h2>
+<p>The 7-step restore process:</p>
+<div class="code-wrap">
+<div class="code-head">Restore sequence</div>
+<pre><code>1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, PIT, vsock, config)
+2. Vm::new(memory_mb)              Create KVM VM with matching memory size
+3. restore_memory(mem, path)       COW mmap(MAP_PRIVATE|MAP_FIXED) &mdash; lazy page loading
+4. vm.restore_irqchip(state)       Restore PIC master/slave + IOAPIC
+5. VirtioVsockMmio::restore()      Restore vsock device registers (userspace backend)
+6. create_vcpu_restored(state)     Per-vCPU restore (see register restore order below)
+7. vCPU threads resume             Guest continues execution from snapshot point</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Memory Restore</h2>
+<p>Memory restore uses kernel <code>MAP_PRIVATE</code> lazy page loading &mdash; pages are demand-faulted from the file, writes create anonymous copies. No userfaultfd required.</p>
+</section>
+
+<section>
+<h2>vCPU Register Restore Order</h2>
+<p>The restore sequence in <code>cpu.rs</code> is order-sensitive. Getting it wrong causes silent guest crashes (kernel panic &rarr; reboot via port 0x64).</p>
+<div class="code-wrap">
+<div class="code-head">Register restore order (7-step, order-sensitive)</div>
+<pre><code>1. MSRs              KVM_SET_MSRS
+2. sregs             KVM_SET_SREGS (segment regs, CR0/CR3/CR4)
+3. LAPIC             KVM_SET_LAPIC + periodic timer bootstrap (see below)
+4. vcpu_events       KVM_SET_VCPU_EVENTS (exception/interrupt state)
+5. XCRs (XCR0)       KVM_SET_XCRS &mdash; MUST come before xsave
+6. xsave (FPU/SSE)   KVM_SET_XSAVE &mdash; depends on XCR0 for feature mask
+7. regs              KVM_SET_REGS (GP registers, RIP, RFLAGS)</code></pre>
+</div>
+<div class="card"><p><strong>XCR0 restore is critical.</strong> XCR0 controls which XSAVE features (x87, SSE, AVX) are active. Without it, the guest's <code>XRSTORS</code> instruction triggers a #GP because the default XCR0 only enables x87, but the guest's XSAVE area references SSE/AVX features.</p></div>
+</section>
+
+<section>
+<h2>LAPIC Timer Bootstrap</h2>
+<p>When the guest was idle (NO_HZ) at snapshot time, the LAPIC timer is masked with vector=0 (LVTT=0x10000). After restore, no timer interrupt ever fires, so the scheduler never runs. The restore code detects this state and bootstraps a periodic LAPIC timer (mode=periodic, vector=0xEC, TMICT=0x200000, TDCR=divide-by-1) to kick the scheduler back to life.</p>
+</section>
+
+<section>
+<h2>Vsock Backend for Snapshot</h2>
+<p>The <strong>userspace</strong> virtio-vsock backend must be used for VMs that will be snapshotted. The kernel vhost backend (<code>/dev/vhost-vsock</code>) does not expose internal vring indices, making queue state capture incomplete. The userspace backend tracks <code>last_avail_idx</code>/<code>last_used_idx</code> directly, ensuring clean snapshot/restore of the virtqueue state.</p>
+</section>
+
+<section>
+<h2>CID Preservation</h2>
+<p>The snapshot stores the VM's actual CID (assigned at cold boot). On restore, the same CID is reused &mdash; the guest kernel caches the CID during virtio-vsock probe and silently drops packets with mismatched <code>dst_cid</code>.</p>
+</section>
+
+<section>
+<h2>Opt-in Plumbing</h2>
+<p>Every layer has an optional snapshot field that defaults to <code>None</code>:</p>
+<table>
+  <thead><tr><th>Layer</th><th>Field</th><th>Type</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td><code>SandboxBuilder</code></td><td><code>.snapshot(path)</code></td><td><code>Option&lt;PathBuf&gt;</code></td><td><code>None</code></td></tr>
+    <tr><td><code>BoxConfig</code></td><td><code>snapshot</code></td><td><code>Option&lt;PathBuf&gt;</code></td><td><code>None</code></td></tr>
+    <tr><td><code>SandboxSpec</code> (YAML)</td><td><code>sandbox.snapshot</code></td><td><code>Option&lt;String&gt;</code></td><td><code>None</code></td></tr>
+    <tr><td><code>BoxSandboxOverride</code></td><td><code>sandbox.snapshot</code></td><td><code>Option&lt;String&gt;</code></td><td><code>None</code></td></tr>
+    <tr><td><code>CreateRunRequest</code> (API)</td><td><code>snapshot</code></td><td><code>Option&lt;String&gt;</code></td><td><code>None</code></td></tr>
+  </tbody>
+</table>
+<p>Resolution chain: per-box override &rarr; top-level spec &rarr; <code>None</code> (cold boot).</p>
+</section>
+
+<section>
+<h2>Snapshot Resolution</h2>
+<p>When a snapshot string is provided, the runtime resolves it as:</p>
+<ol>
+  <li><strong>Hash prefix</strong> &rarr; <code>~/.void-box/snapshots/&lt;prefix&gt;/</code> (if <code>state.bin</code> exists)</li>
+  <li><strong>Literal path</strong> &rarr; treat as directory path (if <code>state.bin</code> exists)</li>
+  <li><strong>Neither</strong> &rarr; warning printed, cold boot</li>
+</ol>
+<p>No env var fallback, no auto-detection.</p>
+</section>
+
+<section>
+<h2>Cache Management</h2>
+<ul>
+  <li><strong>LRU eviction</strong>: <code>evict_lru(max_bytes)</code> removes oldest snapshots first</li>
+  <li><strong>Layer hashing</strong>: <code>compute_layer_hash(base, layer, content)</code> for deterministic cache keys</li>
+  <li><strong>Listing</strong>: <code>list_snapshots()</code> / <code>voidbox snapshot list</code></li>
+  <li><strong>Deletion</strong>: <code>delete_snapshot(prefix)</code> / <code>voidbox snapshot delete &lt;prefix&gt;</code></li>
+</ul>
+<p>Snapshot cache is stored at <code>~/.void-box/snapshots/</code>.</p>
+</section>
+
+<section>
+<h2>Security Considerations</h2>
+<p>Snapshot cloning shares identical VM state across restored instances:</p>
+<ul>
+  <li><strong>RNG entropy</strong>: Restored VMs inherit the same <code>/dev/urandom</code> pool. Mitigated by: fresh CID per restore, hardware <code>RDRAND</code> re-seeding on <code>rdtsc</code>.</li>
+  <li><strong>ASLR</strong>: Clones share guest page table layout. Mitigated by: short-lived tasks, no direct network addressability (SLIRP NAT), command allowlist limiting attack surface.</li>
+  <li><strong>Session isolation</strong>: Restored VMs reuse the snapshot's stored session secret for vsock authentication (the secret is baked into the guest's kernel cmdline in snapshot memory). Per-restore secret rotation would require guest-side support.</li>
+</ul>
+</section>
+</div>
+</div>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

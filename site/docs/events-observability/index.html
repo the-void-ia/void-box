@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>void-box events and observability</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<title>Events + Observability | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
 <script>
@@ -12,28 +12,154 @@
   gtag('config', 'G-YRRVNN7VM4');
 </script>
 </head><body>
-<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../architecture/">Architecture</a><a href="../cli-tui/">CLI/TUI</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+<nav class="top">
+  <a href="../">Docs</a>
+  <a href="../../guides/">Guides</a>
+  <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+  <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+</nav>
+</div></header>
+
 <main class="doc-main wrap">
+  <div class="doc-layout">
+    <aside class="doc-sidebar">
+      <nav>
+        <strong>Docs</strong>
+        <a href="../architecture/">Architecture</a>
+        <a href="../runtime/">Runtime Model</a>
+        <a href="../cli-tui/">CLI + TUI</a>
+        <a class="active" href="../events-observability/">Events + Observability</a>
+        <a href="../oci-containers/">OCI Containers</a>
+        <a href="../snapshots/">Snapshots</a>
+        <a href="../host-mounts/">Host Mounts</a>
+        <a href="../security/">Security</a>
+        <a href="../wire-protocol/">Wire Protocol</a>
+      </nav>
+    </aside>
+    <div class="doc-content">
+
 <section>
 <div class="kicker">Events + Observability</div>
 <h1>Run Event Model</h1>
-<p>VoidBox events are designed to keep capability and boundary context explicit for every action.</p>
-<div class="card"><h3>Identity fields</h3><p><code>run_id</code>, <code>box_name</code>, <code>skill_id</code>, <code>environment_id</code>, <code>mode</code>, <code>stream</code>, <code>seq</code>.</p></div>
+<p>Every pipeline run in VoidBox is fully instrumented. The event system provides structured identity fields on every action, OTLP-compatible traces and metrics, and structured logs -- all designed to keep capability and boundary context explicit.</p>
 </section>
+
+<section>
+<h2>Identity Fields</h2>
+<article class="card">
+  <h3>Every event carries these fields</h3>
+  <p><code>run_id</code> -- unique identifier for the pipeline run.<br>
+  <code>box_name</code> -- the VoidBox that emitted the event.<br>
+  <code>skill_id</code> -- which skill is active.<br>
+  <code>environment_id</code> -- the execution environment (VM) identifier.<br>
+  <code>mode</code> -- execution mode (single, pipeline, workflow).<br>
+  <code>stream</code> -- output stream (stdout, stderr).<br>
+  <code>seq</code> -- monotonic sequence number for ordering.</p>
+</article>
+</section>
+
 <section>
 <h2>Core Event Types</h2>
-<ul>
-  <li><code>run.started</code>, <code>run.finished</code>, <code>run.failed</code>, <code>run.cancelled</code></li>
-  <li><code>env.provisioned</code></li>
-  <li><code>skill.mounted</code></li>
-  <li><code>box.started</code>, <code>workflow.planned</code></li>
-  <li><code>log.chunk</code>, <code>log.closed</code></li>
-</ul>
+<table>
+  <thead>
+    <tr><th>Event</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>run.started</code></td><td>Pipeline run has begun execution.</td></tr>
+    <tr><td><code>run.finished</code></td><td>Pipeline run completed successfully.</td></tr>
+    <tr><td><code>run.failed</code></td><td>Pipeline run failed with an error.</td></tr>
+    <tr><td><code>run.cancelled</code></td><td>Pipeline run was cancelled by the user.</td></tr>
+    <tr><td><code>env.provisioned</code></td><td>Guest environment has been provisioned (skills, config, mounts).</td></tr>
+    <tr><td><code>skill.mounted</code></td><td>A skill has been written to the guest filesystem.</td></tr>
+    <tr><td><code>box.started</code></td><td>A VoidBox has started execution within a stage.</td></tr>
+    <tr><td><code>workflow.planned</code></td><td>A workflow planner has generated a pipeline plan.</td></tr>
+    <tr><td><code>log.chunk</code></td><td>A chunk of streaming output from the guest (stdout/stderr).</td></tr>
+    <tr><td><code>log.closed</code></td><td>The output stream for a box has closed.</td></tr>
+  </tbody>
+</table>
 </section>
+
+<section>
+<h2>Trace Structure</h2>
+<p>VoidBox emits OpenTelemetry-compatible traces that capture the full execution hierarchy:</p>
+<pre><code>Pipeline span
+  └─ Stage 1 span (box_name="data_analyst")
+       ├─ tool_call event: Read("input.json")
+       ├─ tool_call event: Bash("curl ...")
+       └─ attributes: tokens_in, tokens_out, cost_usd, model
+  └─ Stage 2 span (box_name="quant_analyst")
+       └─ ...</code></pre>
+<p>Each stage span includes attributes for token counts, cost, model used, and individual tool call events. Fan-out stages create parallel child spans under the same pipeline parent.</p>
+<img src="../../assets/img/void-box-tracing-5.png" alt="VoidBox tracing visualization" style="max-width:100%;margin:1.5rem 0;" />
+</section>
+
+<section>
+<h2>Instrumentation</h2>
+<div class="grid-2">
+  <article class="card">
+    <h3>OTLP Traces</h3>
+    <p>Full distributed traces exported via OTLP gRPC. Pipeline, stage, and tool-call spans with rich attributes for token usage, cost, model, and timing.</p>
+  </article>
+  <article class="card">
+    <h3>Metrics</h3>
+    <p>Token counts (input/output), cost in USD, execution duration, and VM lifecycle timing. Exported as OTLP metrics alongside traces.</p>
+  </article>
+  <article class="card">
+    <h3>Structured Logs</h3>
+    <p>All log output is prefixed with <code>[vm:NAME]</code> for easy filtering. Stream-json output from claude-code is parsed into structured events.</p>
+  </article>
+  <article class="card">
+    <h3>Guest Telemetry</h3>
+    <p>The guest-agent reads <code>/proc/stat</code> and <code>/proc/meminfo</code> periodically, sending <code>TelemetryBatch</code> messages over vsock. The host-side <code>TelemetryAggregator</code> ingests these and exports as OTLP metrics.</p>
+  </article>
+</div>
+</section>
+
+<section>
+<h2>Configuration</h2>
+<table>
+  <thead>
+    <tr><th>Env var</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>VOIDBOX_OTLP_ENDPOINT</code></td><td>OTLP gRPC endpoint (e.g. <code>http://localhost:4317</code>)</td></tr>
+    <tr><td><code>OTEL_SERVICE_NAME</code></td><td>Service name for traces (default: <code>void-box</code>)</td></tr>
+  </tbody>
+</table>
+<p>OpenTelemetry support is enabled at compile time:</p>
+<pre><code>cargo build --features opentelemetry</code></pre>
+<p>For a full OTLP setup walkthrough with Jaeger or Grafana, see the <a href="../../guides/observability-setup/">Observability Setup guide</a>.</p>
+</section>
+
+<section>
+<h2>Guest Telemetry Pipeline</h2>
+<p>The guest-side telemetry pipeline works independently from the host tracing system:</p>
+<ol>
+  <li>The guest-agent periodically reads <code>/proc/stat</code> (CPU usage) and <code>/proc/meminfo</code> (memory usage).</li>
+  <li>Readings are batched into a <code>TelemetryBatch</code> message and sent to the host over the vsock channel.</li>
+  <li>The host-side <code>TelemetryAggregator</code> receives batches, computes deltas, and exports them as OTLP metrics.</li>
+</ol>
+<p>This gives visibility into guest resource consumption without any instrumentation inside the workload itself.</p>
+</section>
+
 <section>
 <h2>Persistence Providers</h2>
-<p>Daemon run/session state uses a provider abstraction: <code>disk</code> (default), plus example adapters for <code>sqlite</code> and <code>valkey</code>.</p>
+<p>Daemon run and session state uses a provider abstraction, allowing different storage backends:</p>
+<div class="grid-2">
+  <article class="card">
+    <h3>Disk (default)</h3>
+    <p>File-based persistence. Run state and events are stored as JSON files on the local filesystem. No external dependencies.</p>
+  </article>
+  <article class="card">
+    <h3>SQLite / Valkey</h3>
+    <p>Adapter implementations for <code>sqlite</code> and <code>valkey</code> (Redis-compatible) backends. Useful for shared state in multi-node deployments.</p>
+  </article>
+</div>
 </section>
+
+    </div>
+  </div>
 </main>
 <footer><div class="wrap"><a href="../">← Docs</a></div></footer>
 <script src="../../assets/js/site.js"></script>

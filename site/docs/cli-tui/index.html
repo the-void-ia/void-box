@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>void-box cli and tui</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<title>CLI + TUI | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
 <script>
@@ -12,32 +12,105 @@
   gtag('config', 'G-YRRVNN7VM4');
 </script>
 </head><body>
-<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../runtime/">Runtime</a><a href="../events-observability/">Events</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+<nav class="top">
+  <a href="../">Docs</a>
+  <a href="../../guides/">Guides</a>
+  <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+  <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+</nav>
+</div></header>
+
 <main class="doc-main wrap">
+  <div class="doc-layout">
+    <aside class="doc-sidebar">
+      <nav>
+        <strong>Docs</strong>
+        <a href="../architecture/">Architecture</a>
+        <a href="../runtime/">Runtime Model</a>
+        <a class="active" href="../cli-tui/">CLI + TUI</a>
+        <a href="../events-observability/">Events + Observability</a>
+        <a href="../oci-containers/">OCI Containers</a>
+        <a href="../snapshots/">Snapshots</a>
+        <a href="../host-mounts/">Host Mounts</a>
+        <a href="../security/">Security</a>
+        <a href="../wire-protocol/">Wire Protocol</a>
+      </nav>
+    </aside>
+    <div class="doc-content">
+
 <section>
 <div class="kicker">CLI / TUI</div>
 <h1>Current Interface Surface</h1>
-<p>The CLI provides run/validate/status/log flows and a TUI command mode layered on daemon HTTP endpoints.</p>
-<div class="grid-2">
-  <article class="card"><h3>CLI Commands</h3><p><code>serve</code>, <code>run</code>, <code>validate</code>, <code>status</code>, <code>logs</code>, <code>tui</code></p></article>
-  <article class="card"><h3>TUI Commands</h3><p><code>/run</code>, <code>/input</code>, <code>/status</code>, <code>/logs</code>, <code>/cancel</code>, <code>/history</code></p></article>
-</div>
+<p>The CLI provides run/validate/status/log flows. The TUI layers an interactive command mode on top of the daemon HTTP endpoints. Both communicate with the same daemon process.</p>
 </section>
+
 <section>
-<h2>Daemon APIs used by TUI</h2>
-<ul>
-  <li><code>POST /v1/runs</code></li>
-  <li><code>GET /v1/runs/:id</code></li>
-  <li><code>GET /v1/runs/:id/events</code></li>
-  <li><code>POST /v1/runs/:id/cancel</code></li>
-  <li><code>POST /v1/sessions/:id/messages</code></li>
-  <li><code>GET /v1/sessions/:id/messages</code></li>
-</ul>
+<h2>CLI Commands</h2>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>voidbox serve</code></td><td>Start the daemon HTTP server. All other commands (except <code>validate</code>) require the daemon to be running.</td></tr>
+    <tr><td><code>voidbox run --file &lt;spec&gt;</code></td><td>Execute a spec file (agent, pipeline, or workflow). Submits the run to the daemon and streams events to stdout.</td></tr>
+    <tr><td><code>voidbox validate --file &lt;spec&gt;</code></td><td>Validate a spec file without running it. Checks schema, skill references, and sandbox configuration for errors.</td></tr>
+    <tr><td><code>voidbox status</code></td><td>Show daemon status and active runs. Displays run IDs, current stage, and elapsed time.</td></tr>
+    <tr><td><code>voidbox logs &lt;run-id&gt;</code></td><td>Stream logs for a specific run. Follows the event stream until the run completes or is cancelled.</td></tr>
+    <tr><td><code>voidbox tui</code></td><td>Launch the interactive TUI interface. Connects to the daemon and provides a command prompt for managing runs.</td></tr>
+    <tr><td><code>voidbox snapshot create --config-hash &lt;hash&gt;</code></td><td>Create a snapshot from a running or stopped VM, keyed by its configuration hash.</td></tr>
+    <tr><td><code>voidbox snapshot list</code></td><td>List all stored snapshots with their hash prefixes, sizes, and creation timestamps.</td></tr>
+    <tr><td><code>voidbox snapshot delete &lt;hash-prefix&gt;</code></td><td>Delete a snapshot by its hash prefix. Removes the state file and memory dumps.</td></tr>
+  </tbody>
+</table>
 </section>
+
+<section>
+<h2>Daemon API Endpoints</h2>
+<p>The daemon exposes an HTTP API used by both the CLI and TUI. These endpoints are also available for direct integration:</p>
+<table>
+  <thead>
+    <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>POST</code></td><td><code>/v1/runs</code></td><td>Create a new run. Accepts a spec payload and returns a run ID.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id</code></td><td>Get run status. Returns current state, stage progress, and timing information.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id/events</code></td><td>Stream run events via Server-Sent Events (SSE). Provides real-time progress updates.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/runs/:id/cancel</code></td><td>Cancel a running run. Sends SIGKILL to the guest process and tears down the VM.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Send a message to an active session. Used for interactive/conversational workflows.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Get session messages. Returns the full message history for a session.</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>TUI Commands</h2>
+<p>The TUI provides an interactive command prompt connected to the daemon. Available commands:</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>/run</code></td><td>Start a new run from a spec file or inline definition.</td></tr>
+    <tr><td><code>/input</code></td><td>Send input to an active interactive session.</td></tr>
+    <tr><td><code>/status</code></td><td>Display the status of all active and recent runs.</td></tr>
+    <tr><td><code>/logs</code></td><td>Stream logs for a specific run ID.</td></tr>
+    <tr><td><code>/cancel</code></td><td>Cancel a running run by its ID.</td></tr>
+    <tr><td><code>/history</code></td><td>Show the history of completed runs with their results.</td></tr>
+  </tbody>
+</table>
+</section>
+
 <section>
 <h2>Known UX Gap</h2>
-<p>Current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX can be layered on top of event streaming APIs.</p>
+<article class="card">
+  <h3>Minimal but Functional</h3>
+  <p>The current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX is planned and can be layered on top of the existing SSE event streaming APIs without changes to the daemon.</p>
+</article>
 </section>
+
+    </div>
+  </div>
 </main>
 <footer><div class="wrap"><a href="../">← Docs</a></div></footer>
 <script src="../../assets/js/site.js"></script>

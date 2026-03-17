@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>void-box architecture</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<title>Architecture | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
 <script>
@@ -12,24 +12,199 @@
   gtag('config', 'G-YRRVNN7VM4');
 </script>
 </head><body>
-<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../runtime/">Runtime</a><a href="../events-observability/">Events</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+<nav class="top">
+  <a href="../">Docs</a>
+  <a href="../../guides/">Guides</a>
+  <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+  <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+</nav>
+</div></header>
+
 <main class="doc-main wrap">
+  <div class="doc-layout">
+    <aside class="doc-sidebar">
+      <nav>
+        <strong>Docs</strong>
+        <a class="active" href="../architecture/">Architecture</a>
+        <a href="../runtime/">Runtime Model</a>
+        <a href="../cli-tui/">CLI + TUI</a>
+        <a href="../events-observability/">Events + Observability</a>
+        <a href="../oci-containers/">OCI Containers</a>
+        <a href="../snapshots/">Snapshots</a>
+        <a href="../host-mounts/">Host Mounts</a>
+        <a href="../security/">Security</a>
+        <a href="../wire-protocol/">Wire Protocol</a>
+      </nav>
+    </aside>
+    <div class="doc-content">
+
 <section>
 <div class="kicker">Architecture</div>
 <h1>Agent(Skills) + Isolation Boundary</h1>
-<p>VoidBox composes declared skills with a hardware-isolated execution environment. Each run is provisioned through host orchestration and enforced by guest runtime controls.</p>
+<p>void-box is a composable agent runtime where each agent runs in a hardware-isolated micro-VM. On Linux this uses KVM; on macOS (Apple Silicon) it uses Virtualization.framework (VZ). The core equation is:</p>
+<pre><code>VoidBox = Agent(Skills) + Isolation</code></pre>
+<p>A <strong>VoidBox</strong> binds declared skills (MCP servers, CLI tools, procedural knowledge files, reasoning engines) to an isolated execution environment. Boxes compose into pipelines where output flows between stages, each in a fresh VM.</p>
+</section>
+
+<section>
+<h2>Component Diagram</h2>
+<pre><code>┌──────────────────────────────────────────────────────────────────┐
+│ User / Daemon / CLI                                              │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ VoidBox (agent_box.rs)                                   │    │
+│  │  name: "analyst"                                         │    │
+│  │  prompt: "Analyze AAPL..."                               │    │
+│  │  skills: [claude-code, financial-data.md, market-mcp]    │    │
+│  │  config: memory=1024MB, vcpus=1, network=true            │    │
+│  └─────────────────────┬────────────────────────────────────┘    │
+│                        │ resolve_guest_image() → .build() → .run()
+│  ┌─────────────────────▼───────────────────────────────────┐     │
+│  │ OCI Client (voidbox-oci/)                               │     │
+│  │  guest image → kernel + initramfs  (auto-pull, cached)  │     │
+│  │  base image  → rootfs              (pivot_root)         │     │
+│  │  OCI skills  → read-only mounts    (/skills/...)        │     │
+│  │  cache: ~/.voidbox/oci/{blobs,rootfs,guest}/            │     │
+│  └─────────────────────┬───────────────────────────────────┘     │
+│                        │                                         │
+│  ┌─────────────────────▼───────────────────────────────────┐     │
+│  │ Sandbox (sandbox/)                                      │     │
+│  │  ┌─────────────┐  ┌──────────────┐                      │     │
+│  │  │ MockSandbox │  │ LocalSandbox │                      │     │
+│  │  │ (testing)   │  │ (KVM / VZ)   │                      │     │
+│  │  └─────────────┘  └──────┬───────┘                      │     │
+│  └──────────────────────────┼──────────────────────────────┘     │
+│                             │                                    │
+│  ┌──────────────────────────▼──────────────────────────────┐     │
+│  │ MicroVm (vmm/)                                          │     │
+│  │  ┌────────┐ ┌────────┐ ┌─────────────┐ ┌──────────────┐ │     │
+│  │  │ KVM VM │ │ vCPU   │ │ VsockDevice │ │ VirtioNet    │ │     │
+│  │  │        │ │ thread │ │ (AF_VSOCK)  │ │ (SLIRP)      │ │     │
+│  │  └────────┘ └────────┘ └───────┬─────┘ └───────┬──────┘ │     │
+│  │  Linux/KVM: virtio-blk (OCI rootfs)            │        │     │
+│  │  9p/virtiofs: skills + host mounts             │        │     │
+│  │  Seccomp-BPF on VMM thread    │               │        │     │
+│  └────────────────────────────────┼───────────────┼────────┘     │
+│                                   │               │              │
+└═══════════════════════════════════╪═══════════════╪══════════════┘
+              Hardware Isolation    │               │
+                                    │ vsock:1234    │ SLIRP NAT
+┌───────────────────────────────────▼───────────────▼───────────────┐
+│ Guest VM (Linux kernel)                                           │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │ guest-agent (PID 1)                                          │ │
+│  │  - Authenticates via session secret (kernel cmdline)         │ │
+│  │  - Reads /etc/voidbox/allowed_commands.json                  │ │
+│  │  - Reads /etc/voidbox/resource_limits.json                   │ │
+│  │  - Applies setrlimit + command allowlist                     │ │
+│  │  - Drops privileges to uid:1000                              │ │
+│  │  - Listens on vsock port 1234                                │ │
+│  │  - pivot_root to OCI rootfs (if sandbox.image set)           │ │
+│  └────────────────────────┬─────────────────────────────────────┘ │
+│                           │ fork+exec                             │
+│  ┌────────────────────────▼─────────────────────────────────────┐ │
+│  │ claude-code (or claudio mock)                                │ │
+│  │  --output-format stream-json                                 │ │
+│  │  --dangerously-skip-permissions                              │ │
+│  │  Skills: ~/.claude/skills/*.md                               │ │
+│  │  MCP:    ~/.claude/mcp.json                                  │ │
+│  │  OCI skills: /skills/{python,go,...} (read-only mounts)      │ │
+│  │  LLM:    Claude API / Ollama (via SLIRP → host:11434)        │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  eth0: 10.0.2.15/24  gw: 10.0.2.2  dns: 10.0.2.3                  │
+└───────────────────────────────────────────────────────────────────┘</code></pre>
+</section>
+
+<section>
+<h2>Data Flow</h2>
+
+<h3>Single VoidBox Execution</h3>
+<pre><code>1. VoidBox::new("name")           User declares skills, prompt, config
+       │
+2. resolve_guest_image()          Resolve kernel + initramfs (5-step chain)
+       │                          Pulls from GHCR if no local paths found
+       │
+3. .build()                       Creates Sandbox (mock or local VM backend: KVM/VZ)
+       │                          Mounts OCI rootfs + skill images if configured
+       │
+4. .run(input)                    Execution begins
+       │
+   ├─ provision_security()        Write resource limits + allowlist to /etc/voidbox/
+   ├─ provision_skills()          Write SKILL.md files to ~/.claude/skills/
+   │                              Write mcp.json to ~/.claude/
+   ├─ write input                 Write /workspace/input.json (if piped from previous stage)
+   │
+   ├─ sandbox.exec_claude()       Send ExecRequest over vsock
+   │       │
+   │   [vsock port 1234]
+   │       │
+   │   guest-agent receives       Validates session secret
+   │       │                      Checks command allowlist
+   │       │                      Applies resource limits (setrlimit)
+   │       │                      Drops privileges (uid:1000)
+   │       │
+   │   fork+exec claude-code      Runs with --output-format stream-json
+   │       │
+   │   claude-code executes       Reads skills, calls LLM, uses tools
+   │       │
+   │   ExecResponse sent          stdout/stderr/exit_code over vsock
+   │       │
+   ├─ parse stream-json           Extract ClaudeExecResult (tokens, cost, tools)
+   ├─ read output file            /workspace/output.json
+   │
+5. StageResult                    box_name, claude_result, file_output</code></pre>
+
+<h3>Pipeline Execution</h3>
+<pre><code>Pipeline::named("analysis", box1)
+    .pipe(box2)                    Sequential: box1.output → box2.input
+    .fan_out(vec![box3, box4])     Parallel: both receive box2.output
+    .pipe(box5)                    Sequential: merged [box3, box4] → box5.input
+    .run()
+
+Stage flow:
+  box1.run(None)          → carry_data = output bytes
+  box2.run(carry_data)    → carry_data = output bytes
+  [box3, box4].run(carry) → carry_data = JSON array merge
+  box5.run(carry_data)    → PipelineResult</code></pre>
+<p>For parallel stages (<code>fan_out</code>), each box runs in a separate <code>tokio::task::JoinSet</code>. Their outputs are merged as a JSON array for the next stage.</p>
+</section>
+
+<section>
+<h2>Network Layout (SLIRP)</h2>
+<p>void-box uses smoltcp-based usermode networking (SLIRP) -- no root, no TAP devices, no bridge configuration.</p>
+<pre><code>Guest VM                                    Host
+┌─────────────────────┐                    ┌──────────────────┐
+│ eth0: 10.0.2.15/24  │                    │                  │
+│ gw:   10.0.2.2      │── virtio-net ──────│ SLIRP stack      │
+│ dns:  10.0.2.3      │   (MMIO)           │ (smoltcp)        │
+└─────────────────────┘                    │                  │
+                                           │ 10.0.2.2 → NAT   │
+                                           │   → 127.0.0.1    │
+                                           └──────────────────┘</code></pre>
+<ul>
+  <li><strong>Guest IP:</strong> <code>10.0.2.15/24</code></li>
+  <li><strong>Gateway:</strong> <code>10.0.2.2</code> (mapped to host <code>127.0.0.1</code>)</li>
+  <li><strong>DNS:</strong> <code>10.0.2.3</code> (forwarded to host resolver)</li>
+  <li>Outbound TCP/UDP is NATed through the host</li>
+  <li>The guest reaches host services (Ollama on <code>:11434</code>) via <code>10.0.2.2</code></li>
+</ul>
+</section>
+
+<section>
+<h2>Key Layers</h2>
 <div class="grid-2">
   <article class="card"><h3>Host Layer</h3><p>CLI/daemon orchestrates runs, provisions skills/config, manages KVM VM lifecycle, and records run events.</p></article>
-  <article class="card"><h3>Guest Layer</h3><p>`guest-agent` authenticates host requests, enforces command allowlist + rlimits, drops privilege, then executes `claude-code`.</p></article>
-  <article class="card"><h3>Communication</h3><p>vsock protocol frames requests/responses and supports streaming chunks plus telemetry.</p></article>
-  <article class="card"><h3>Security Model</h3><p>KVM isolation + seccomp + session auth + policy controls + controlled networking.</p></article>
+  <article class="card"><h3>Guest Layer</h3><p><code>guest-agent</code> authenticates host requests, enforces command allowlist + rlimits, drops privilege, then executes <code>claude-code</code>.</p></article>
+  <article class="card"><h3>Communication</h3><p>vsock protocol frames requests/responses and supports streaming chunks plus telemetry. See the <a href="../wire-protocol/">Wire Protocol</a> page for frame format details.</p></article>
+  <article class="card"><h3>Security Model</h3><p>KVM isolation + seccomp + session auth + policy controls + controlled networking. See the <a href="../security/">Security</a> page for defense-in-depth details.</p></article>
 </div>
 </section>
-<section>
-<h2>Execution Flow</h2>
-<pre><code>spec -> env provision -> skill mount -> claude-code run -> events/report</code></pre>
-<p>For pipelines, stages compose sequentially and in fan-out mode with explicit failure boundaries per stage.</p>
-</section>
+
+    </div>
+  </div>
 </main>
 <footer><div class="wrap"><a href="../">← Docs</a></div></footer>
 <script src="../../assets/js/site.js"></script>

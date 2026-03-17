@@ -24,12 +24,12 @@
 <br>
 
 <p align="center">
-  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="https://the-void-ia.github.io/void-box/docs/architecture/">Architecture</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#oci-container-support">OCI Support</a> ·
-  <a href="#host-mounts">Host Mounts</a> ·
-  <a href="#snapshots">Snapshots</a> ·
-  <a href="#observability">Observability</a>
+  <a href="https://the-void-ia.github.io/void-box/docs/oci-containers/">OCI Support</a> ·
+  <a href="https://the-void-ia.github.io/void-box/docs/host-mounts/">Host Mounts</a> ·
+  <a href="https://the-void-ia.github.io/void-box/docs/snapshots/">Snapshots</a> ·
+  <a href="https://the-void-ia.github.io/void-box/guides/observability-setup/">Observability</a>
 </p>
 
 <p align="center">
@@ -46,48 +46,29 @@
 
 ## What You Get
 
-- **Isolated execution** — Each stage runs inside its own micro-VM boundary (not shared-process containers).
+- **Isolated execution** — Each stage runs inside its own micro-VM boundary, not shared-process containers.
 - **Policy-enforced runtime** — Command allowlists, resource limits, seccomp-BPF, and controlled network egress.
 - **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
-- **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude (default) or Ollama via Claude-compatible provider mode.
-- **OCI-native** — Auto-pulls guest images (kernel + initramfs) from GHCR on first run. Mount container images as base OS or as skill providers — no local build steps required.
+- **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude or Ollama via provider mode.
+- **OCI-native** — Auto-pulls guest images from GHCR; mount container images as base OS or skill providers.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
-- **Persistent host mounts** — Share host directories into guest VMs via 9p/virtiofs with explicit read-only or read-write mode. Data in `mode: rw` mounts persists across VM restarts.
+- **Persistent host mounts** — Share host directories into guest VMs via 9p/virtiofs with read-only or read-write mode.
 - **No root required** — Usermode SLIRP networking via smoltcp (no TAP devices).
 
 > Isolation is the primitive. Pipelines are compositions of bounded execution environments.
 
 ## Why Not Containers?
 
-Containers share a host kernel.
-
-For general application isolation, this is often sufficient.
-For AI agents executing tools, code, and external integrations, it creates shared failure domains.
-
-In a shared-process model:
-
-- Tool execution and agent runtime share the same kernel.
-- Escape surfaces are reduced, but not eliminated.
-- Resource isolation depends on cgroups and cooperative enforcement.
-
-VoidBox binds each agent stage to its own micro-VM boundary.
-
-Isolation is enforced by hardware virtualization — not advisory process controls.
+Containers share a host kernel — sufficient for general isolation, but AI agents executing tools, code, and external integrations create shared failure domains. VoidBox binds each agent stage to its own micro-VM boundary, enforced by hardware virtualization rather than advisory process controls. See [Architecture](https://the-void-ia.github.io/void-box/docs/architecture/) ([source](docs/architecture.md)) for the full security model.
 
 ---
 
 ## Quick Start
 
-### 1. Add dependency
-
 ```bash
 cargo add void-box
 ```
-
-### 2. Define skills and build a VoidBox
-
-#### Rust API
 
 ```rust
 use void_box::agent_box::VoidBox;
@@ -105,14 +86,12 @@ let reasoning = Skill::agent("claude-code")
 let researcher = VoidBox::new("hn_researcher")
     .skill(hn_api)
     .skill(reasoning)
-    .llm(LlmProvider::ollama("qwen3-coder")) // claude-code runtime using Ollama backend
+    .llm(LlmProvider::ollama("qwen3-coder"))
     .memory_mb(1024)
     .network(true)
     .prompt("Analyze top HN stories for AI engineering trends")
     .build()?;
 ```
-
-#### Or use a YAML spec
 
 ```yaml
 # hackernews_agent.yaml
@@ -137,421 +116,38 @@ agent:
   timeout_secs: 600
 ```
 
-### 3. Run
-
-```rust
-// Rust API
-let result = researcher.run(None).await?;
-println!("{}", result.claude_result.result_text);
-```
-
 ```bash
-# Or via CLI with a YAML spec
 voidbox run --file hackernews_agent.yaml
 ```
 
 ---
-## Architecture
 
-```
-┌───────────────────────────────────────────────────────┐
-│ Host                                                  │
-│  VoidBox Engine / Pipeline Orchestrator               │
-│                                                       │
-│  ┌─────────────────────────────────────────────────┐  │
-│  │ OCI Client (~/.voidbox/oci/)                    │  │
-│  │  guest image → kernel + initramfs (auto-pull)   │  │
-│  │  base image  → rootfs (pivot_root)              │  │
-│  │  OCI skills  → read-only mounts                 │  │
-│  └─────────────────────┬───────────────────────────┘  │
-│                        │                              │
-│  ┌─────────────────────▼───────────────────────────┐  │
-│  │ VMM (KVM / Virtualization.framework)            │  │
-│  │  vsock ←→ guest-agent (PID 1)                   │  │
-│  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
-│  │  Linux/KVM: virtio-blk ←→ OCI base rootfs       │  │
-│  │  9p/virtiofs ←→ skills + host mounts            │  │
-│  │  Snapshot: base/diff → ~/.void-box/snapshots    │  │
-│  └─────────────────────────────────────────────────┘  │
-│                                                       │
-│  Seccomp-BPF │ OTLP export                            │
-└──────────────┼────────────────────────────────────────┘
-     Hardware  │  Isolation
-═══════════════╪════════════════════════════════════════
-               │
-┌──────────────▼──────────────────────────────────────────┐
-│ Guest VM (Linux)                                        │
-│  guest-agent: auth, allowlist, rlimits                  │
-│  claude-code runtime (Claude API or Ollama backend)     │
-│  OCI rootfs (pivot_root) + skill mounts (/skills/...)   │
-└─────────────────────────────────────────────────────────┘
-```
-
-See [docs/architecture.md](docs/architecture.md) for the full component diagram, wire protocol, and security model.
-
-## Observability
-
-Every pipeline run is fully instrumented out of the box. Each VM stage emits
-spans and metrics via OTLP, giving you end-to-end visibility across isolated
-execution boundaries — from pipeline orchestration down to individual tool calls
-inside each micro-VM.
-
-<p align="center">
-  <img src="site/assets/img/void-box-tracing-5.png" alt="Pipeline trace waterfall in Grafana Tempo" width="800">
-</p>
-
-- **OTLP traces** — Per-box spans, tool call events, pipeline-level trace
-- **Metrics** — Token counts, cost, duration per stage
-- **Structured logs** — `[vm:NAME]` prefixed, trace-correlated
-- **Guest telemetry** — procfs metrics (CPU, memory) exported to host via vsock
-
-Enable with `--features opentelemetry` and set `VOIDBOX_OTLP_ENDPOINT`.
-See the [playground](playground/) for a ready-to-run stack with Grafana, Tempo, and Prometheus.
-
-## Running & Testing
-
-### KVM mode (zero-setup)
-
-On a Linux host with `/dev/kvm`, VoidBox auto-pulls a pre-built guest image (kernel + initramfs) from GHCR on first run. No manual build steps required:
-
-```bash
-# Just works — guest image is pulled and cached automatically
-ANTHROPIC_API_KEY=sk-ant-xxx \
-cargo run --bin voidbox -- run --file examples/specs/oci/agent.yaml
-
-# Or with Ollama
-cargo run --bin voidbox -- run --file examples/specs/oci/workflow.yaml
-```
-
-The guest image (`ghcr.io/the-void-ia/voidbox-guest`) contains the kernel and initramfs with guest-agent, busybox, and common tools. It's cached at `~/.voidbox/oci/guest/` after the first pull.
-
-**Resolution order** — VoidBox resolves the kernel/initramfs using:
-
-1. `sandbox.kernel` / `sandbox.initramfs` in the spec (explicit paths)
-2. `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` env vars
-3. `sandbox.guest_image` in the spec (explicit OCI ref)
-4. Default: `ghcr.io/the-void-ia/voidbox-guest:v{version}` (auto-pull)
-5. Mock fallback when `mode: auto`
-
-To use a custom guest image or disable auto-pull:
-
-```yaml
-sandbox:
-  # Use a specific guest image
-  guest_image: "ghcr.io/the-void-ia/voidbox-guest:latest"
-
-  # Or disable auto-pull (empty string)
-  # guest_image: ""
-```
-
-### KVM mode (manual build)
-
-If you prefer to build the guest image locally:
-
-```bash
-# Build base guest initramfs (guest-agent + tools; no required Claude bundle)
-scripts/build_guest_image.sh
-
-# Download a kernel
-scripts/download_kernel.sh
-
-# Run with explicit paths
-ANTHROPIC_API_KEY=sk-ant-xxx \
-VOID_BOX_KERNEL=target/vmlinuz-amd64 \
-VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
-cargo run --example trading_pipeline
-```
-
-For a production Claude-capable initramfs, use:
-
-```bash
-# Build production rootfs/initramfs with native claude-code + CA certs + sandbox user
-scripts/build_claude_rootfs.sh
-```
-
-Script intent summary:
-
-- `scripts/build_guest_image.sh`: base runtime image for general VM/OCI work.
-- `scripts/build_claude_rootfs.sh`: production image for direct Claude runtime in guest.
-- `scripts/build_test_image.sh`: deterministic test image with `claudio` mock.
-
-### Mock mode (no KVM required)
-
-```bash
-cargo run --example quick_demo
-cargo run --example trading_pipeline
-cargo run --example parallel_pipeline
-```
-
-### macOS mode (Apple Silicon)
-
-VoidBox runs natively on Apple Silicon Macs using Apple's Virtualization.framework — no Docker or Linux VM required.
-
-**One-time setup:**
-
-```bash
-# Install the musl cross-compilation toolchain (compiles from source, ~30 min first time)
-brew install filosottile/musl-cross/musl-cross
-
-# Add the Rust target for Linux ARM64
-rustup target add aarch64-unknown-linux-musl
-```
-
-**Build and run:**
-
-```bash
-# Download an ARM64 Linux kernel (cached in target/)
-scripts/download_kernel.sh
-
-# Build the guest initramfs (cross-compiles guest-agent, downloads claude-code + busybox)
-scripts/build_claude_rootfs.sh
-
-# Build the example and sign it with the virtualization entitlement
-cargo build --example ollama_local
-codesign --force --sign - --entitlements voidbox.entitlements target/debug/examples/ollama_local
-
-# Run (Ollama must be listening on 0.0.0.0:11434)
-OLLAMA_MODEL=qwen3-coder \
-VOID_BOX_KERNEL=target/vmlinux-arm64 \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-target/debug/examples/ollama_local
-```
-
-> **Note:** Every `cargo build` invalidates the code signature. Re-run `codesign` after each rebuild.
-
-When using the `voidbox` CLI, `cargo run` automatically codesigns before executing (via `.cargo/config.toml` runner). Just run:
-
-```bash
-cargo run --bin voidbox -- run --file examples/specs/oci/guest-image-workflow.yaml
-```
-
-If running the binary directly (e.g. `./target/debug/voidbox`), codesign manually first:
-
-```bash
-codesign --force --sign - --entitlements voidbox.entitlements target/debug/voidbox
-```
-
-### Parallel pipeline with per-box models
-
-```bash
-OLLAMA_MODEL=phi4-mini \
-OLLAMA_MODEL_QUANT=qwen3-coder \
-OLLAMA_MODEL_SENTIMENT=phi4-mini \
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --example parallel_pipeline
-```
-
-### Tests
-
-```bash
-cargo test --lib                      # Unit tests
-cargo test --test skill_pipeline      # Integration tests (mock)
-cargo test --test integration         # Integration tests
-
-# E2E (requires KVM + test initramfs)
-scripts/build_test_image.sh
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-```
-
----
-
-## OCI Container Support
-
-VoidBox supports OCI container images in three ways:
-
-1. **`sandbox.guest_image`** — Pre-built kernel + initramfs distributed as an OCI image. Auto-pulled from GHCR on first run (no local build needed). See [KVM mode (zero-setup)](#kvm-mode-zero-setup).
-2. **`sandbox.image`** — Use a container image as the base OS for the entire sandbox. The guest-agent performs `pivot_root` at boot, replacing the initramfs root with an overlayfs backed by the OCI image. On Linux/KVM, VoidBox builds a cached ext4 disk artifact from the extracted OCI rootfs and attaches it as `virtio-blk` (`/dev/vda` in guest). On macOS/VZ, the OCI rootfs remains directory-mounted via virtiofs.
-3. **OCI skills** — Mount additional container images as read-only tool providers at arbitrary guest paths. This lets you compose language runtimes (Python, Go, Java, etc.) without baking them into the initramfs.
-
-Images are pulled from Docker Hub, GHCR, or any OCI-compliant registry and cached locally at `~/.voidbox/oci/`. OCI base rootfs transport is platform-specific (`virtio-blk` on Linux/KVM, virtiofs directory mount on macOS/VZ), while OCI skills and host mounts use `9p/virtiofs` shares.
-
-### Example: OCI skills
-
-Mount Python, Go, and Java into a single agent — no `sandbox.image` needed:
-
-```yaml
-# examples/specs/oci/skills.yaml
-api_version: v1
-kind: agent
-name: multi-tool-agent
-
-sandbox:
-  mode: auto
-  memory_mb: 2048
-  vcpus: 2
-  network: true
-
-llm:
-  provider: ollama
-  model: "qwen2.5-coder:7b"
-
-agent:
-  prompt: >
-    You have Python, Go, and Java available as mounted skills.
-    Set up PATH to include the skill binaries:
-      export PATH=/skills/python/usr/local/bin:/skills/go/usr/local/go/bin:/skills/java/bin:$PATH
-
-    Write a "Hello from <language>" one-liner in each language and run all three.
-    Report which versions are installed.
-  skills:
-    - "agent:claude-code"
-    - image: "python:3.12-slim"
-      mount: "/skills/python"
-    - image: "golang:1.23-alpine"
-      mount: "/skills/go"
-    - image: "eclipse-temurin:21-jdk-alpine"
-      mount: "/skills/java"
-  timeout_secs: 300
-```
-
-Run it:
-
-```bash
-# Linux (KVM)
-VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
-
-# macOS (Virtualization.framework) — requires initramfs already built (see "macOS mode" above)
-VOID_BOX_KERNEL=target/vmlinux-arm64 \
-VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-cargo run --bin voidbox -- run --file examples/specs/oci/skills.yaml
-```
-
-More OCI examples in [`examples/specs/oci/`](examples/specs/oci/):
-
-| Spec | Description |
-|------|-------------|
-| `agent.yaml` | Single agent with `sandbox.image: python:3.12-slim` |
-| `workflow.yaml` | Workflow with `sandbox.image: alpine:3.20` (no LLM) |
-| `pipeline.yaml` | Multi-language pipeline: Python base + Go and Java OCI skills |
-| `skills.yaml` | OCI skills only (Python, Go, Java) mounted into default initramfs |
-| `guest-image-workflow.yaml` | Workflow using `sandbox.guest_image` for auto-pulled kernel + initramfs (on macOS, codesign required; gzip kernel is auto-decompressed for VZ) |
-
-OpenClaw examples and runbook:
-
-- [`examples/openclaw/README.md`](examples/openclaw/README.md)
-
-## Host Mounts
-
-VoidBox can mount host directories into the guest VM using `sandbox.mounts`. Each mount specifies a `host` path, a `guest` mount point, and a `mode` (`"ro"` or `"rw"`, default `"ro"`).
-
-Read-write mounts write directly to the host directory — data persists across VM restarts since the host directory survives. This is the primary mechanism for stateful workloads.
-
-Transport is platform-specific: **9p** (virtio-9p) on Linux/KVM, **virtiofs** on macOS/VZ.
-
-```yaml
-sandbox:
-  mounts:
-    - host: ./data
-      guest: /data
-      mode: rw        # persistent — host directory survives VM restarts
-    - host: ./config
-      guest: /config
-      mode: ro        # read-only (default)
-```
-
----
-
-## Snapshots
-
-VoidBox supports sub-second VM restore via snapshot/restore. Snapshots capture the full VM state (vCPU registers, memory, devices) and restore via COW `mmap` — the guest resumes execution without re-booting the kernel or re-running initialization.
-
-**All snapshot features are explicit opt-in only.** If you never set a snapshot field, the system behaves exactly as before — cold boot, zero snapshot code runs.
-
-### Snapshot types
-
-| Type | Description |
-|------|-------------|
-| **Base** | Full memory dump + KVM state from a cold-booted VM |
-| **Diff** | Only dirty pages since last snapshot (smaller, faster) |
-
-### YAML spec
-
-```yaml
-# Top-level snapshot — applies to all boxes
-sandbox:
-  memory_mb: 256
-  snapshot: "abc123def456"   # hash prefix from `voidbox snapshot list`
-
-# Per-box override
-pipeline:
-  boxes:
-    - name: analyst
-      prompt: "analyze data"
-      sandbox:
-        snapshot: "def789"   # per-box snapshot override
-    - name: coder
-      prompt: "write code"
-      # no snapshot → cold boot (default)
-```
-
-### Rust API
-
-```rust
-use void_box::agent_box::VoidBox;
-
-// Cold boot (default — no snapshot)
-let box1 = VoidBox::new("analyst")
-    .prompt("analyze data")
-    .memory_mb(256)
-    .build()?;
-
-// Restore from snapshot (explicit opt-in)
-let box2 = VoidBox::new("analyst")
-    .prompt("analyze data")
-    .snapshot("/path/to/snapshot/dir")   // or hash prefix
-    .build()?;
-```
-
-### CLI
-
-```bash
-# Create a snapshot from a running VM
-voidbox snapshot create --config-hash <hash>
-
-# List stored snapshots
-voidbox snapshot list
-
-# Delete a snapshot
-voidbox snapshot delete <hash-prefix>
-
-# Run with a snapshot (via spec)
-voidbox run --file spec.yaml   # spec has sandbox.snapshot set
-```
-
-### Daemon API
-
-```bash
-# POST /runs with snapshot override
-curl -X POST http://localhost:8080/runs \
-  -H 'Content-Type: application/json' \
-  -d '{"file": "workflow.yaml", "snapshot": "abc123def456"}'
-```
-
-### Design principles
-
-- **No snapshot field set** → cold boot, zero snapshot code runs
-- **No auto-detection** of existing snapshots
-- **No auto-creation** of snapshots during normal runs
-- **No auto-restore** — only if the user passes an explicit path or hash
-- **No env var fallback** — spec or code only
-- **Every new field defaults to `None`** — the system behaves identically to before if untouched
-
-Snapshot cache is stored at `~/.void-box/snapshots/` with LRU eviction support.
-
-### Benchmarks
-
-Measured on a single-vCPU, 256 MB VM (Linux/KVM):
-
-| Metric | Time |
-|--------|------|
-| Cold boot | ~12 ms |
-| Snapshot restore | ~2 ms |
-| **Cold boot → restore speedup** | **~6x** |
+## Documentation
+
+| | |
+|---|---|
+| **[Architecture](https://the-void-ia.github.io/void-box/docs/architecture/)** | Component diagram, data flow, security model |
+| **[Runtime Model](https://the-void-ia.github.io/void-box/docs/runtime/)** | Claude Code runtime, LLM providers, skill types |
+| **[CLI + TUI](https://the-void-ia.github.io/void-box/docs/cli-tui/)** | Command reference, daemon API endpoints |
+| **[Events + Observability](https://the-void-ia.github.io/void-box/docs/events-observability/)** | Event types, OTLP traces, metrics |
+| **[OCI Containers](https://the-void-ia.github.io/void-box/docs/oci-containers/)** | Guest images, base images, OCI skills |
+| **[Snapshots](https://the-void-ia.github.io/void-box/docs/snapshots/)** | Sub-second VM restore, snapshot types |
+| **[Host Mounts](https://the-void-ia.github.io/void-box/docs/host-mounts/)** | 9p/virtiofs host directory sharing |
+| **[Security](https://the-void-ia.github.io/void-box/docs/security/)** | Defense in depth, session auth, seccomp |
+| **[Wire Protocol](https://the-void-ia.github.io/void-box/docs/wire-protocol/)** | vsock framing, message types |
+
+### Guides
+
+| | |
+|---|---|
+| **[Getting Started](https://the-void-ia.github.io/void-box/guides/getting-started/)** | Install, first agent, first run |
+| **[Running on Linux](https://the-void-ia.github.io/void-box/guides/running-on-linux/)** | KVM setup, manual build, mock mode, tests |
+| **[Running on macOS](https://the-void-ia.github.io/void-box/guides/running-on-macos/)** | Apple Silicon, Virtualization.framework |
+| **[Observability Setup](https://the-void-ia.github.io/void-box/guides/observability-setup/)** | OTLP config, Grafana playground |
+| **[AI Agent Sandboxing](https://the-void-ia.github.io/void-box/guides/ai-agent-sandboxing/)** | Isolated micro-VM agent execution |
+| **[Pipeline Composition](https://the-void-ia.github.io/void-box/guides/pipeline-composition/)** | Multi-stage pipelines with .pipe() and .fan_out() |
+| **[YAML Specs](https://the-void-ia.github.io/void-box/guides/yaml-specs/)** | Declarative agent/pipeline definitions |
+| **[Local LLMs](https://the-void-ia.github.io/void-box/guides/ollama-local/)** | Ollama integration via SLIRP networking |
 
 ---
 

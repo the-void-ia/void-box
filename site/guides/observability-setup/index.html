@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Observability Setup | Void-Box</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-YRRVNN7VM4');
+  </script>
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../docs/">Docs</a>
+        <a href="../">Guides</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Observability Setup</h1>
+      <p>Every pipeline run is fully instrumented out of the box. Each VM stage emits spans and metrics via OTLP, giving you end-to-end visibility across isolated execution boundaries &mdash; from pipeline orchestration down to individual tool calls inside each micro-VM.</p>
+
+      <p align="center">
+        <img src="../../assets/img/void-box-tracing-5.png" alt="Pipeline trace waterfall in Grafana Tempo" style="max-width:100%;border-radius:8px;" />
+      </p>
+
+      <h2>What's Included</h2>
+      <div class="card">
+        <ul>
+          <li><strong>OTLP traces</strong> &mdash; Per-box spans, tool call events, pipeline-level trace context.</li>
+          <li><strong>Metrics</strong> &mdash; Token counts, cost, and duration per stage.</li>
+          <li><strong>Structured logs</strong> &mdash; <code>[vm:NAME]</code> prefixed and trace-correlated for easy filtering.</li>
+          <li><strong>Guest telemetry</strong> &mdash; procfs metrics (CPU, memory) exported from the guest to the host via vsock.</li>
+        </ul>
+      </div>
+
+      <h2>Enable OTLP</h2>
+      <p>Build with the <code>opentelemetry</code> feature flag and set the OTLP endpoint:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo build --features opentelemetry</code></pre>
+      </div>
+
+      <p>Then set the endpoint environment variable when running:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>VOIDBOX_OTLP_ENDPOINT=http://localhost:4317 \
+cargo run --bin voidbox -- run --file agent.yaml</code></pre>
+      </div>
+
+      <h2>Configuration</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>Environment Variable</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>VOIDBOX_OTLP_ENDPOINT</code></td><td>OTLP gRPC endpoint (e.g. <code>http://localhost:4317</code>)</td></tr>
+            <tr><td><code>OTEL_SERVICE_NAME</code></td><td>Service name for traces (default: <code>void-box</code>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Trace Structure</h2>
+      <p>Traces follow a hierarchical structure from the pipeline level down to individual tool calls within each VM stage:</p>
+<pre><code>Pipeline span
+  └─ Stage 1 span (box_name="data_analyst")
+       ├─ tool_call event: Read("input.json")
+       ├─ tool_call event: Bash("curl ...")
+       └─ attributes: tokens_in, tokens_out, cost_usd, model
+  └─ Stage 2 span (box_name="quant_analyst")
+       └─ ...</code></pre>
+      <p>Each stage span carries attributes for token counts, cost, model used, and duration. Tool call events are recorded as span events within the stage span.</p>
+
+      <h2>Guest Telemetry</h2>
+      <p>The guest-agent inside each micro-VM periodically reads <code>/proc/stat</code> and <code>/proc/meminfo</code>, then sends <code>TelemetryBatch</code> messages over vsock to the host. On the host side, the <code>TelemetryAggregator</code> ingests these batches and exports them as OTLP metrics.</p>
+      <div class="card">
+        <p>Guest telemetry gives you per-VM resource utilization without any agent-side instrumentation. CPU and memory metrics flow automatically as long as the guest-agent is running.</p>
+      </div>
+
+      <h2>Playground</h2>
+      <p>The repository includes a ready-to-run observability stack in the <code>playground/</code> directory with pre-configured:</p>
+      <ul>
+        <li><strong>Grafana</strong> &mdash; Dashboards for pipeline traces and metrics.</li>
+        <li><strong>Tempo</strong> &mdash; Distributed trace backend for OTLP ingestion.</li>
+        <li><strong>Prometheus</strong> &mdash; Metrics collection and storage.</li>
+      </ul>
+      <p>See the <a href="https://github.com/the-void-ia/void-box/tree/main/playground" target="_blank" rel="noreferrer"><code>playground/</code></a> directory in the repository for setup instructions.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">&larr; Guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
