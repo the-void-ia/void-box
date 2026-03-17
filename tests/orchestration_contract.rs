@@ -472,10 +472,6 @@ fn from_event_id_missing_marker_returns_all() {
         r#"{"file":"nonexistent.yaml","run_id":"resume-missing"}"#,
     );
 
-    // Get all events
-    let (_, all_events) = http_request(addr, "GET", "/v1/runs/resume-missing/events", "");
-    let all_events = all_events.as_array().unwrap();
-
     // Resume with a non-existent event_id → should return all
     let (_, resumed) = http_request(
         addr,
@@ -484,6 +480,10 @@ fn from_event_id_missing_marker_returns_all() {
         "",
     );
     let resumed = resumed.as_array().unwrap();
+
+    // Get all events (after resume call to avoid race with async event emission)
+    let (_, all_events) = http_request(addr, "GET", "/v1/runs/resume-missing/events", "");
+    let all_events = all_events.as_array().unwrap();
     assert_eq!(resumed.len(), all_events.len());
 }
 

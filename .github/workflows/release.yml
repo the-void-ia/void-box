@@ -37,7 +37,13 @@ jobs:
       - name: Install aarch64 musl cross-compiler
         if: matrix.arch == 'aarch64'
         run: |
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+          curl -fsSL --retry 3 --retry-delay 5 \
+            -o /tmp/aarch64-linux-musl-cross.tgz \
+            https://more.musl.cc/10/x86_64-linux-musl/aarch64-linux-musl-cross.tgz \
+            || curl -fsSL --retry 3 --retry-delay 5 \
+              -o /tmp/aarch64-linux-musl-cross.tgz \
+              https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Download static busybox
