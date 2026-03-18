@@ -473,13 +473,21 @@ footer a:hover { color: var(--accent); text-decoration: none; }
 }
 
 /* Equal-height demo grid */
+.grid-2 > div {
+  display: flex;
+  flex-direction: column;
+}
 .grid-2 .demo {
   max-width: none;
   margin: 0;
+  flex: 1;
+  display: flex;
 }
 .grid-2 .demo img, .grid-2 .demo video {
   width: 100%;
-  height: auto;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
 }
 
 /* ── Install section ── */
