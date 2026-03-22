@@ -181,11 +181,20 @@ async fn route_request(
         ("GET", "/v1/runs") => as_json(list_runs(query, state).await),
         _ => {
             if let Some(id) = path.strip_prefix("/v1/runs/") {
+                // /v1/runs/{run_id}/stages/{stage_name}/artifacts/{artifact_name}
+                if let Some((rest, artifact_name)) = id.rsplit_once("/artifacts/") {
+                    if let Some((run_id, stage_name)) = rest.rsplit_once("/stages/") {
+                        if method == "GET" {
+                            return get_named_artifact(run_id, stage_name, artifact_name, state)
+                                .await;
+                        }
+                    }
+                }
                 // /v1/runs/{run_id}/stages/{stage_name}/output-file
                 if let Some(rest) = id.strip_suffix("/output-file") {
                     if let Some((run_id, stage_name)) = rest.rsplit_once("/stages/") {
                         if method == "GET" {
-                            return get_stage_output_file(run_id, stage_name, state).await;
+                            return get_stage_output_file(run_id, stage_name, query, state).await;
                         }
                     }
                 }
@@ -229,6 +238,282 @@ async fn route_request(
             ))
         }
     }
+}
+
+/// Reason for publication failure, used to wire into run failure.
+#[derive(Debug)]
+enum PublicationFailureReason {
+    StructuredOutputMissing(String),
+    StructuredOutputMalformed(String),
+}
+
+fn build_artifact_publication(
+    run_id: &str,
+    provider: &Arc<dyn PersistenceProvider>,
+    events: &[RunEvent],
+    report: Option<&crate::runtime::RunReport>,
+) -> (
+    crate::persistence::ArtifactPublication,
+    Option<PublicationFailureReason>,
+) {
+    use crate::persistence::{
+        ArtifactManifestEntry, ArtifactPublication, ArtifactPublicationStatus,
+    };
+
+    // Collect stages that reached a terminal state (completed, failed, skipped)
+    // and separately track which ones completed successfully.
+    let mut completed_stages: Vec<String> = Vec::new();
+    let mut any_stage_ran = false;
+    for ev in events {
+        if let Some(ref sn) = ev.stage_name {
+            match ev.event_type.as_str() {
+                "stage.completed" => {
+                    if !completed_stages.contains(sn) {
+                        completed_stages.push(sn.clone());
+                    }
+                    any_stage_ran = true;
+                }
+                "stage.started" | "stage.failed" | "stage.skipped" => {
+                    any_stage_ran = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // No stages ran at all (e.g. spec load failure) — nothing to publish
+    if !any_stage_ran {
+        return (
+            ArtifactPublication {
+                status: ArtifactPublicationStatus::NotStarted,
+                published_at: None,
+                manifest: Vec::new(),
+            },
+            None,
+        );
+    }
+
+    // If stages ran but none completed, output is missing only for runs that
+    // are expected to publish structured output.
+    if completed_stages.is_empty() {
+        if !requires_structured_output(report) {
+            return (
+                ArtifactPublication {
+                    status: ArtifactPublicationStatus::NotStarted,
+                    published_at: None,
+                    manifest: Vec::new(),
+                },
+                None,
+            );
+        }
+        return (
+            ArtifactPublication {
+                status: ArtifactPublicationStatus::Failed,
+                published_at: None,
+                manifest: Vec::new(),
+            },
+            Some(PublicationFailureReason::StructuredOutputMissing(
+                "no stages completed successfully".to_string(),
+            )),
+        );
+    }
+
+    let mut manifest = Vec::new();
+
+    for stage in &completed_stages {
+        let data = match provider.load_stage_artifact(run_id, stage) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                if !requires_structured_output(report) {
+                    continue;
+                }
+                // Stage completed but no artifact — structured output missing
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMissing(format!(
+                        "stage '{}' completed without result.json",
+                        stage
+                    ))),
+                );
+            }
+            Err(_) => {
+                if !requires_structured_output(report) {
+                    continue;
+                }
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMissing(format!(
+                        "failed to load artifact for stage '{}'",
+                        stage
+                    ))),
+                );
+            }
+        };
+
+        let parsed = match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(v) => v,
+            Err(_) => {
+                if !requires_structured_output(report) {
+                    // Non-orchestration run with non-JSON output — skip validation
+                    continue;
+                }
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMalformed(
+                        format!("result.json for stage '{}' is not valid JSON", stage),
+                    )),
+                );
+            }
+        };
+
+        if parsed.get("status").is_none() {
+            if !requires_structured_output(report) {
+                // Non-orchestration run with JSON missing status — skip validation
+                continue;
+            }
+            return (
+                ArtifactPublication {
+                    status: ArtifactPublicationStatus::Failed,
+                    published_at: None,
+                    manifest: Vec::new(),
+                },
+                Some(PublicationFailureReason::StructuredOutputMalformed(
+                    format!(
+                        "result.json for stage '{}' is missing required 'status' field",
+                        stage
+                    ),
+                )),
+            );
+        }
+
+        manifest.push(ArtifactManifestEntry {
+            name: "result.json".to_string(),
+            stage: stage.clone(),
+            media_type: "application/json".to_string(),
+            size_bytes: Some(data.len() as u64),
+            retrieval_path: format!("/v1/runs/{}/stages/{}/output-file", run_id, stage),
+        });
+
+        if let Some(artifacts) = parsed.get("artifacts").and_then(|a| a.as_array()) {
+            for art in artifacts {
+                let name = art.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                let media_type = art
+                    .get("media_type")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                if !name.is_empty() {
+                    let size = provider
+                        .load_named_artifact(run_id, stage, name)
+                        .ok()
+                        .flatten()
+                        .map(|d| d.len() as u64);
+                    manifest.push(ArtifactManifestEntry {
+                        name: name.to_string(),
+                        stage: stage.clone(),
+                        media_type: media_type.to_string(),
+                        size_bytes: size,
+                        retrieval_path: format!(
+                            "/v1/runs/{}/stages/{}/artifacts/{}",
+                            run_id, stage, name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    (
+        ArtifactPublication {
+            status: if manifest.is_empty() {
+                ArtifactPublicationStatus::NotStarted
+            } else {
+                ArtifactPublicationStatus::Published
+            },
+            published_at: if manifest.is_empty() {
+                None
+            } else {
+                Some(now_rfc3339())
+            },
+            manifest,
+        },
+        None,
+    )
+}
+
+fn requires_structured_output(report: Option<&crate::runtime::RunReport>) -> bool {
+    match report {
+        Some(report) if report.kind == "workflow" => report.stages <= 1,
+        Some(report) if report.kind == "agent" || report.kind == "pipeline" => true,
+        _ => false,
+    }
+}
+
+fn build_stage_states(events: &[RunEvent]) -> HashMap<String, crate::persistence::StageState> {
+    let mut states: HashMap<String, crate::persistence::StageState> = HashMap::new();
+    for ev in events {
+        let Some(ref sn) = ev.stage_name else {
+            continue;
+        };
+        match ev.event_type.as_str() {
+            "stage.started" => {
+                states.insert(
+                    sn.clone(),
+                    crate::persistence::StageState {
+                        status: "running".to_string(),
+                        started_at: ev.timestamp.clone(),
+                        completed_at: None,
+                    },
+                );
+            }
+            "stage.completed" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "succeeded".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "succeeded".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            "stage.failed" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "failed".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "failed".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            "stage.skipped" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "skipped".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "skipped".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            _ => {}
+        }
+    }
+    states
 }
 
 async fn create_run(body: &str, state: AppState) -> (String, String) {
@@ -345,6 +630,9 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             active_microvm_count: 0,
             policy: req.policy.clone(),
             terminal_event_id: None,
+            finished_at: None,
+            stage_states: None,
+            artifact_publication: None,
         };
 
         let _ = state.provider.save_run(&run);
@@ -573,7 +861,46 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     r.events.push(failed_event);
                 }
             }
-            r.updated_at = Some(now_rfc3339());
+            let now_ts = now_rfc3339();
+            r.finished_at = Some(now_ts.clone());
+            r.stage_states = Some(build_stage_states(&r.events));
+            let (publication, pub_failure) = build_artifact_publication(
+                &run_id_bg,
+                &state_bg.provider,
+                &r.events,
+                r.report.as_ref(),
+            );
+            r.artifact_publication = Some(publication);
+
+            // Publication failure flips a successful run to failed
+            if let Some(reason) = pub_failure {
+                if r.status == RunStatus::Succeeded {
+                    let (error_msg, event_msg) = match reason {
+                        PublicationFailureReason::StructuredOutputMissing(ref msg) => (
+                            msg.clone(),
+                            format!("run failed: structured output missing: {msg}"),
+                        ),
+                        PublicationFailureReason::StructuredOutputMalformed(ref msg) => (
+                            msg.clone(),
+                            format!("run failed: structured output malformed: {msg}"),
+                        ),
+                    };
+                    let failed_event = event_with_seq(
+                        &run_id_bg,
+                        "error",
+                        "run.failed",
+                        event_msg,
+                        r.events.len() as u64,
+                        attempt,
+                    );
+                    r.terminal_event_id = failed_event.event_id.clone();
+                    r.status = RunStatus::Failed;
+                    r.error = Some(error_msg);
+                    r.events.push(failed_event);
+                }
+            }
+
+            r.updated_at = Some(now_ts);
             let _ = state_bg.provider.save_run(r);
         }
     });
@@ -781,7 +1108,13 @@ async fn cancel_run(id: &str, body: &str, state: AppState) -> (String, String) {
         let terminal_event_id = cancel_event.event_id.clone();
         r.terminal_event_id = terminal_event_id.clone();
         r.events.push(cancel_event);
-        r.updated_at = Some(now_rfc3339());
+        let now_ts = now_rfc3339();
+        r.finished_at = Some(now_ts.clone());
+        r.stage_states = Some(build_stage_states(&r.events));
+        let (publication, _) =
+            build_artifact_publication(id, &state.provider, &r.events, r.report.as_ref());
+        r.artifact_publication = Some(publication);
+        r.updated_at = Some(now_ts);
         let _ = state.provider.save_run(r);
 
         (
@@ -1284,14 +1617,87 @@ fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, 
     }
 }
 
+async fn get_named_artifact(
+    run_id: &str,
+    stage_name: &str,
+    artifact_name: &str,
+    state: AppState,
+) -> (String, String, Vec<u8>) {
+    // Check run exists
+    {
+        let runs = state.runs.lock().await;
+        if !runs.contains_key(run_id) {
+            return as_json((
+                "404 Not Found".to_string(),
+                ApiError::not_found(format!("run '{run_id}' not found")).to_json(),
+            ));
+        }
+
+        // Check if artifact publication is still in progress
+        if let Some(r) = runs.get(run_id) {
+            if let Some(ref pub_state) = r.artifact_publication {
+                if pub_state.status == crate::persistence::ArtifactPublicationStatus::Publishing {
+                    return as_json((
+                        "409 Conflict".to_string(),
+                        ApiError::artifact_publication_incomplete(format!(
+                            "artifact publication in progress for run '{run_id}'"
+                        ))
+                        .to_json(),
+                    ));
+                }
+            }
+        }
+    }
+
+    match state
+        .provider
+        .load_named_artifact(run_id, stage_name, artifact_name)
+    {
+        Ok(Some(data)) => {
+            let content_type = if serde_json::from_slice::<serde_json::Value>(&data).is_ok() {
+                "application/json"
+            } else if std::str::from_utf8(&data).is_ok() {
+                "text/plain"
+            } else {
+                "application/octet-stream"
+            };
+            ("200 OK".to_string(), content_type.to_string(), data)
+        }
+        Ok(None) => as_json((
+            "404 Not Found".to_string(),
+            ApiError::artifact_not_found(format!(
+                "artifact '{artifact_name}' not found for run '{run_id}' stage '{stage_name}'"
+            ))
+            .to_json(),
+        )),
+        Err(e) => as_json((
+            "500 Internal Server Error".to_string(),
+            ApiError::internal(format!("failed to load artifact: {e}")).to_json(),
+        )),
+    }
+}
+
 async fn get_stage_output_file(
     run_id: &str,
     stage_name: &str,
+    _query: Option<&str>,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
     let data = match state.provider.load_stage_artifact(run_id, stage_name) {
         Ok(Some(data)) => data,
         Ok(None) => {
+            // Check if the run exists to differentiate error codes
+            let runs = state.runs.lock().await;
+            if runs.contains_key(run_id) {
+                return as_json((
+                    "404 Not Found".to_string(),
+                    ApiError::structured_output_missing(format!(
+                        "stage '{}' completed without result.json for run '{}'",
+                        stage_name, run_id
+                    ))
+                    .to_json(),
+                ));
+            }
             return as_json((
                 "404 Not Found".to_string(),
                 ApiError::not_found(format!(
@@ -1309,15 +1715,30 @@ async fn get_stage_output_file(
         }
     };
 
-    let content_type = if serde_json::from_slice::<serde_json::Value>(&data).is_ok() {
-        "application/json"
-    } else if std::str::from_utf8(&data).is_ok() {
-        "text/plain"
-    } else {
-        "application/octet-stream"
-    };
-
-    ("200 OK".to_string(), content_type.to_string(), data)
+    // Validate structured output: must be valid JSON with a "status" field
+    match serde_json::from_slice::<serde_json::Value>(&data) {
+        Ok(val) => {
+            if val.get("status").is_none() {
+                return as_json((
+                    "422 Unprocessable Entity".to_string(),
+                    ApiError::structured_output_malformed(format!(
+                        "result.json for run '{}' stage '{}' is missing required 'status' field",
+                        run_id, stage_name
+                    ))
+                    .to_json(),
+                ));
+            }
+            ("200 OK".to_string(), "application/json".to_string(), data)
+        }
+        Err(_) => as_json((
+            "422 Unprocessable Entity".to_string(),
+            ApiError::structured_output_malformed(format!(
+                "result.json for run '{}' stage '{}' is not valid JSON",
+                run_id, stage_name
+            ))
+            .to_json(),
+        )),
+    }
 }
 
 fn kind_name(kind: &RunKind) -> &'static str {

@@ -17,6 +17,12 @@ pub enum ApiErrorCode {
     ResourceLimitExceeded,
     InvalidParams,
     InternalError,
+    StructuredOutputMissing,
+    StructuredOutputMalformed,
+    ArtifactNotFound,
+    ArtifactPublicationIncomplete,
+    ArtifactStoreUnavailable,
+    RetrievalTimeout,
 }
 
 /// Structured API error response: `{"code":"NOT_FOUND","message":"...","retryable":false}`.
@@ -79,6 +85,54 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: ApiErrorCode::InternalError,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn structured_output_missing(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::StructuredOutputMissing,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn structured_output_malformed(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::StructuredOutputMalformed,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn artifact_not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::ArtifactNotFound,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn artifact_publication_incomplete(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::ArtifactPublicationIncomplete,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn artifact_store_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::ArtifactStoreUnavailable,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn retrieval_timeout(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::RetrievalTimeout,
             message: message.into(),
             retryable: true,
         }

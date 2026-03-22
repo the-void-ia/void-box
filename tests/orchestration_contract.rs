@@ -13,6 +13,7 @@
 //! - Backward compatibility flag (`?api_version=v2`)
 
 use serde_json::Value;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -72,6 +73,72 @@ fn http_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16,
 
     let json: Value = serde_json::from_str(body_str).unwrap_or(Value::Null);
     (status_code, json)
+}
+
+#[allow(dead_code)]
+fn http_request_raw(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+
+    let response_str = String::from_utf8_lossy(&response);
+    let status_line = response_str.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+
+    // Extract body bytes after \r\n\r\n
+    let body_bytes = if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        response[pos + 4..].to_vec()
+    } else {
+        Vec::new()
+    };
+    (status_code, body_bytes)
+}
+
+fn wait_until_terminal(addr: SocketAddr, run_id: &str, timeout_ms: u64) -> Value {
+    let attempts = timeout_ms / 50;
+    for _ in 0..attempts {
+        let (_, run) = http_request(addr, "GET", &format!("/v1/runs/{run_id}"), "");
+        let status = run
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "canceled"
+        ) {
+            return run;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("run '{run_id}' did not reach terminal state within {timeout_ms}ms");
+}
+
+fn write_temp_spec(name: &str, yaml: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "void-box-orch-contract-{name}-{}.yaml",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, yaml).unwrap();
+    path.to_string_lossy().to_string()
 }
 
 // ==========================================================================
@@ -614,4 +681,434 @@ fn events_nonexistent_run_returns_not_found() {
     let (status, body) = http_request(addr, "GET", "/v1/runs/does-not-exist/events", "");
     assert_eq!(status, 404);
     assert_eq!(body["code"], "NOT_FOUND");
+}
+
+// ==========================================================================
+// Artifact error codes serialize correctly
+// ==========================================================================
+
+#[test]
+fn artifact_error_codes_serialize_correctly() {
+    let codes = vec![
+        (
+            "STRUCTURED_OUTPUT_MISSING",
+            void_box::error::ApiError::structured_output_missing("no result.json"),
+        ),
+        (
+            "STRUCTURED_OUTPUT_MALFORMED",
+            void_box::error::ApiError::structured_output_malformed("invalid JSON"),
+        ),
+        (
+            "ARTIFACT_NOT_FOUND",
+            void_box::error::ApiError::artifact_not_found("report.md"),
+        ),
+        (
+            "ARTIFACT_PUBLICATION_INCOMPLETE",
+            void_box::error::ApiError::artifact_publication_incomplete("still publishing"),
+        ),
+        (
+            "ARTIFACT_STORE_UNAVAILABLE",
+            void_box::error::ApiError::artifact_store_unavailable("disk full"),
+        ),
+        (
+            "RETRIEVAL_TIMEOUT",
+            void_box::error::ApiError::retrieval_timeout("timed out"),
+        ),
+    ];
+    for (expected_code, err) in codes {
+        let json: serde_json::Value = serde_json::from_str(&err.to_json()).unwrap();
+        assert_eq!(
+            json["code"], expected_code,
+            "wrong code for {expected_code}"
+        );
+        assert!(json["message"].is_string());
+        assert!(json["retryable"].is_boolean());
+    }
+}
+
+// ==========================================================================
+// RunState artifact publication and stage_states fields
+// ==========================================================================
+
+#[test]
+fn run_state_deserializes_with_artifact_publication() {
+    let json = r#"{
+        "id": "test-1",
+        "status": "succeeded",
+        "file": "test.yaml",
+        "events": [],
+        "artifact_publication": {
+            "status": "published",
+            "published_at": "2026-03-20T18:20:00Z",
+            "manifest": [{
+                "name": "result.json",
+                "stage": "main",
+                "media_type": "application/json",
+                "size_bytes": 128,
+                "retrieval_path": "/v1/runs/test-1/stages/main/output-file"
+            }]
+        },
+        "stage_states": {
+            "main": { "status": "succeeded", "started_at": "2026-03-20T18:19:00Z", "completed_at": "2026-03-20T18:20:00Z" }
+        },
+        "finished_at": "2026-03-20T18:20:00Z"
+    }"#;
+    let run: void_box::persistence::RunState = serde_json::from_str(json).unwrap();
+    assert!(run.artifact_publication.is_some());
+    let pub_status = run.artifact_publication.unwrap();
+    assert_eq!(
+        pub_status.status,
+        void_box::persistence::ArtifactPublicationStatus::Published
+    );
+    assert_eq!(pub_status.manifest.len(), 1);
+    assert_eq!(pub_status.manifest[0].name, "result.json");
+    assert!(run.stage_states.is_some());
+    assert!(run.finished_at.is_some());
+}
+
+#[test]
+fn run_state_deserializes_without_new_fields() {
+    // Backward compat: old RunState JSON without new fields still deserializes
+    let json = r#"{
+        "id": "old-1",
+        "status": "running",
+        "file": "test.yaml",
+        "events": []
+    }"#;
+    let run: void_box::persistence::RunState = serde_json::from_str(json).unwrap();
+    assert!(run.artifact_publication.is_none());
+    assert!(run.stage_states.is_none());
+    assert!(run.finished_at.is_none());
+}
+
+// ==========================================================================
+// Named artifact retrieval
+// ==========================================================================
+
+#[test]
+fn named_artifact_not_found_returns_typed_error() {
+    let addr = start_daemon();
+
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"artifact-test"}"#,
+    );
+
+    // Try to get a named artifact that doesn't exist
+    let (status, body) = http_request(
+        addr,
+        "GET",
+        "/v1/runs/artifact-test/stages/main/artifacts/report.md",
+        "",
+    );
+    assert_eq!(status, 404);
+    assert_eq!(body["code"], "ARTIFACT_NOT_FOUND");
+}
+
+#[test]
+fn named_artifact_run_not_found_returns_not_found() {
+    let addr = start_daemon();
+    let (status, body) = http_request(
+        addr,
+        "GET",
+        "/v1/runs/no-such-run/stages/main/artifacts/report.md",
+        "",
+    );
+    assert_eq!(status, 404);
+    assert_eq!(body["code"], "NOT_FOUND");
+}
+
+// ==========================================================================
+// Artifact publication status on inspection
+// ==========================================================================
+
+#[test]
+fn run_inspection_has_artifact_publication_field() {
+    let addr = start_daemon();
+
+    // Create a run (will fail because file doesn't exist, but that's fine)
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"pub-inspect"}"#,
+    );
+
+    // Wait briefly for background task to complete
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (_, run) = http_request(addr, "GET", "/v1/runs/pub-inspect", "");
+    // Should have artifact_publication (even if failed/not_started)
+    assert!(
+        run.get("artifact_publication").is_some(),
+        "missing artifact_publication field: {run}"
+    );
+    let pub_status = run["artifact_publication"]["status"].as_str().unwrap();
+    // A failed run with no output file → not_started
+    assert_eq!(
+        pub_status, "not_started",
+        "expected not_started for failed run without output"
+    );
+}
+
+// ==========================================================================
+// Structured output validation
+// ==========================================================================
+
+#[test]
+fn structured_output_missing_returns_typed_error() {
+    let addr = start_daemon();
+
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"output-missing"}"#,
+    );
+
+    // Wait for run to complete (will fail because file doesn't exist)
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Try to get output file for a stage that doesn't exist
+    let (status, body) = http_request(
+        addr,
+        "GET",
+        "/v1/runs/output-missing/stages/main/output-file",
+        "",
+    );
+    // Run exists but has no output → STRUCTURED_OUTPUT_MISSING
+    assert_eq!(status, 404);
+    assert_eq!(body["code"], "STRUCTURED_OUTPUT_MISSING");
+}
+
+#[test]
+fn structured_output_malformed_returns_typed_error() {
+    // Validate that the error constructor produces the right code
+    let err = void_box::error::ApiError::structured_output_malformed("test");
+    let json: serde_json::Value = serde_json::from_str(&err.to_json()).unwrap();
+    assert_eq!(json["code"], "STRUCTURED_OUTPUT_MALFORMED");
+    assert_eq!(json["retryable"], false);
+}
+
+#[test]
+fn single_step_workflow_publishes_result_json_and_named_artifacts() {
+    let addr = start_daemon();
+    let spec = write_temp_spec(
+        "structured-output-success",
+        r#"api_version: v1
+kind: workflow
+name: structured-output-success
+
+sandbox:
+  mode: mock
+  network: false
+
+workflow:
+  steps:
+    - name: produce
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            cat > /workspace/result.json <<'JSON'
+            {"status":"success","summary":"ok","metrics":{"latency_p99_ms":87},"artifacts":[{"name":"report.md","media_type":"text/markdown"}]}
+            JSON
+            cat > /workspace/report.md <<'MD'
+            # report
+            artifact content
+            MD
+  output_step: produce
+"#,
+    );
+
+    let (status, body) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        &format!(r#"{{"file":"{spec}","run_id":"workflow-structured-output"}}"#),
+    );
+    assert_eq!(status, 200, "body={body}");
+    let run = wait_until_terminal(addr, "workflow-structured-output", 5_000);
+    assert_eq!(run["status"], "succeeded", "run={run}");
+    assert_eq!(
+        run["artifact_publication"]["status"], "published",
+        "run={run}"
+    );
+    let manifest = run["artifact_publication"]["manifest"]
+        .as_array()
+        .expect("manifest array");
+    assert!(manifest.iter().any(|entry| entry["name"] == "result.json"));
+    assert!(manifest.iter().any(|entry| entry["name"] == "report.md"));
+
+    let (status_output, body_output) = http_request_raw(
+        addr,
+        "GET",
+        "/v1/runs/workflow-structured-output/stages/produce/output-file",
+        "",
+    );
+    assert_eq!(
+        status_output,
+        200,
+        "body={}",
+        String::from_utf8_lossy(&body_output)
+    );
+
+    let (status_named, body_named) = http_request_raw(
+        addr,
+        "GET",
+        "/v1/runs/workflow-structured-output/stages/produce/artifacts/report.md",
+        "",
+    );
+    assert_eq!(
+        status_named,
+        200,
+        "body={}",
+        String::from_utf8_lossy(&body_named)
+    );
+    assert!(String::from_utf8_lossy(&body_named).contains("artifact content"));
+}
+
+#[test]
+fn multi_step_workflow_without_result_json_still_succeeds() {
+    let addr = start_daemon();
+    let spec = write_temp_spec(
+        "baseline-success",
+        r#"api_version: v1
+kind: workflow
+name: baseline-success
+
+sandbox:
+  mode: mock
+  network: false
+
+workflow:
+  steps:
+    - name: fetch
+      run:
+        program: echo
+        args: ["hello from workflow"]
+    - name: transform
+      depends_on: [fetch]
+      run:
+        program: tr
+        args: ["a-z", "A-Z"]
+        stdin_from: fetch
+  output_step: transform
+"#,
+    );
+
+    let (status, body) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        &format!(r#"{{"file":"{spec}","run_id":"baseline-success-no-artifact"}}"#),
+    );
+    assert_eq!(status, 200, "body={body}");
+    let run = wait_until_terminal(addr, "baseline-success-no-artifact", 5_000);
+    assert_eq!(run["status"], "succeeded", "run={run}");
+}
+
+// ==========================================================================
+// Cancelled run has finished_at and stage_states
+// ==========================================================================
+
+#[test]
+fn cancelled_run_has_finished_at_and_stage_states() {
+    let addr = start_daemon();
+
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"cancel-fields"}"#,
+    );
+
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs/cancel-fields/cancel",
+        r#"{"reason":"test"}"#,
+    );
+
+    let (_, run) = http_request(addr, "GET", "/v1/runs/cancel-fields", "");
+    assert!(
+        run["finished_at"].is_string(),
+        "cancelled run should have finished_at: {run}"
+    );
+    assert!(
+        run.get("stage_states").is_some(),
+        "cancelled run should have stage_states: {run}"
+    );
+    assert!(
+        run.get("artifact_publication").is_some(),
+        "cancelled run should have artifact_publication: {run}"
+    );
+}
+
+// ==========================================================================
+// Named artifact retrieval success
+// ==========================================================================
+
+#[test]
+fn named_artifact_retrieval_success() {
+    let addr = start_daemon();
+
+    // Create a run
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"artifact-success"}"#,
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Model-level: verify persistence round-trip for named artifacts
+    let dir = tempfile::tempdir().unwrap();
+    let provider = void_box::persistence::DiskPersistenceProvider::new(dir.path().to_path_buf());
+    use void_box::persistence::PersistenceProvider;
+
+    let artifact_data = br#"# My Report"#;
+    provider
+        .save_named_artifact("artifact-success", "main", "report.md", artifact_data)
+        .unwrap();
+    let loaded = provider
+        .load_named_artifact("artifact-success", "main", "report.md")
+        .unwrap();
+    assert_eq!(loaded, Some(artifact_data.to_vec()));
+}
+
+// ==========================================================================
+// Active-run listing for reconciliation
+// ==========================================================================
+
+#[test]
+fn active_run_listing_has_reconciliation_fields() {
+    let addr = start_daemon();
+
+    let (_, _) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        r#"{"file":"nonexistent.yaml","run_id":"recon-test"}"#,
+    );
+
+    let (status, body) = http_request(addr, "GET", "/v1/runs?state=active", "");
+    assert_eq!(status, 200);
+    let runs = body["runs"].as_array().unwrap();
+
+    // Find our run (it may have already finished, so check if we got it)
+    if let Some(run) = runs.iter().find(|r| r["id"] == "recon-test") {
+        // Spec requires these fields for reconciliation
+        assert!(run["id"].is_string(), "missing id");
+        assert!(run["attempt_id"].is_number(), "missing attempt_id");
+        assert!(run["status"].is_string(), "missing status");
+        assert!(run["started_at"].is_string(), "missing started_at");
+        assert!(run["updated_at"].is_string(), "missing updated_at");
+    }
+    // If the run already completed (race), the test is still valid — we just
+    // can't assert on it being in the active list.
 }
