@@ -16,7 +16,7 @@ pub enum SnapshotCommand {
         #[arg(long)]
         initramfs: Option<PathBuf>,
         /// Memory size in MB.
-        #[arg(long, default_value = "128")]
+        #[arg(long, default_value = "512")]
         memory: usize,
         /// Number of vCPUs.
         #[arg(long, default_value = "1")]
@@ -307,8 +307,7 @@ async fn cmd_snapshot_create_macos(
         start.elapsed().as_millis()
     );
 
-    eprintln!("Pausing VM and creating snapshot...");
-    backend.pause()?;
+    eprintln!("Creating snapshot...");
     backend.create_snapshot(&snapshot_dir)?;
     let total_ms = start.elapsed().as_millis();
 

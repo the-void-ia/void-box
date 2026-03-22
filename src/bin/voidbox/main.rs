@@ -924,7 +924,7 @@ mod cli_parse_tests {
                 } => {
                     assert_eq!(kernel, PathBuf::from("/k/vmlinux"));
                     assert!(initramfs.is_none());
-                    assert_eq!(memory, 128);
+                    assert_eq!(memory, 512);
                     assert_eq!(vcpus, 1);
                     assert!(!diff);
                 }

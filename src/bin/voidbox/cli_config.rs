@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use void_box::snapshot_store;
+
 /// Resolved filesystem paths used by the CLI.
 #[derive(Debug, Clone)]
 pub struct CliPaths {
@@ -71,7 +73,7 @@ impl CliPaths {
         Self {
             state_dir,
             log_dir: data_dir.join("log"),
-            snapshot_dir: data_dir.join("snapshots"),
+            snapshot_dir: snapshot_store::default_snapshot_dir(),
             config_dir,
         }
     }

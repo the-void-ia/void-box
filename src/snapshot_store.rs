@@ -136,14 +136,14 @@ pub fn compute_config_hash(
 
 /// Resolve the snapshot directory for a given config hash.
 pub fn snapshot_dir_for_hash(config_hash: &str) -> PathBuf {
-    dirs_snapshot_base().join(&config_hash[..16.min(config_hash.len())])
+    default_snapshot_dir().join(&config_hash[..16.min(config_hash.len())])
 }
 
 /// List all stored snapshots (both KVM and VZ).
 ///
 /// KVM snapshots are identified by `state.bin`, VZ snapshots by `vz_meta.json`.
 pub fn list_snapshots() -> Result<Vec<SnapshotInfo>> {
-    let base = dirs_snapshot_base();
+    let base = default_snapshot_dir();
     if !base.exists() {
         return Ok(Vec::new());
     }
@@ -272,7 +272,7 @@ fn load_vz_snapshot_info(dir: &Path) -> Option<SnapshotInfo> {
 
 /// Delete a snapshot by its config hash prefix.
 pub fn delete_snapshot(hash_prefix: &str) -> Result<bool> {
-    let base = dirs_snapshot_base();
+    let base = default_snapshot_dir();
     if !base.exists() {
         return Ok(false);
     }
