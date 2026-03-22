@@ -18,7 +18,7 @@
   <a href="https://github.com/the-void-ia/void-box/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License">
   </a>
-  <img src="https://img.shields.io/badge/rust-1.83%2B-orange?style=flat-square&logo=rust" alt="Rust 1.83+">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square&logo=rust" alt="Rust 1.88+">
 </div>
 
 <br>
