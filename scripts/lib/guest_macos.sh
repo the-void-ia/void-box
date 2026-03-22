@@ -142,6 +142,36 @@ install_kernel_modules_macos() {
   echo "[void-box] Downloading Ubuntu ARM64 kernel modules (${kmod_version}-generic)..."
   if curl -fsSL "$kmod_url" -o "$tmp/modules.deb"; then
     (cd "$tmp" && ar x modules.deb)
+
+    # Ubuntu ships data.tar, data.tar.zst, or data.tar.xz — not always plain data.tar.
+    # (Same pattern as scripts/download_kernel.sh and guest_linux.sh.)
+    local data_tarball
+    data_tarball=$(find "$tmp" -maxdepth 1 -name 'data.tar*' -print | head -1)
+    local data_tar=""
+    if [[ -z "$data_tarball" ]]; then
+      echo "[void-box] WARNING: no data.tar* in linux-modules .deb — vsock will not work"
+    else
+      case "$data_tarball" in
+        *.zst)
+          data_tar="$tmp/data-extracted.tar"
+          if ! zstd -d "$data_tarball" -o "$data_tar" --force -q 2>/dev/null; then
+            echo "[void-box] WARNING: zstd decompress of data tarball failed (install zstd?)"
+            data_tar=""
+          fi
+          ;;
+        *.xz)
+          data_tar="$tmp/data-extracted.tar"
+          if ! xz -dc "$data_tarball" >"$data_tar" 2>/dev/null; then
+            echo "[void-box] WARNING: xz decompress of data tarball failed"
+            data_tar=""
+          fi
+          ;;
+        *)
+          data_tar="$data_tarball"
+          ;;
+      esac
+    fi
+
     local vsock_modules=(
       "lib/modules/${kmod_version}-generic/kernel/net/vmw_vsock/vsock.ko.zst"
       "lib/modules/${kmod_version}-generic/kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.zst"
@@ -153,17 +183,25 @@ install_kernel_modules_macos() {
     local overlay_modules=(
       "lib/modules/${kmod_version}-generic/kernel/fs/overlayfs/overlay.ko.zst"
     )
-    for mod_path in "${vsock_modules[@]}" "${virtiofs_modules[@]}" "${overlay_modules[@]}"; do
-      local mod_name
-      mod_name=$(basename "$mod_path" .zst)
-      tar xf "$tmp/data.tar" -C "$tmp" "./$mod_path" 2>/dev/null || true
-      if [[ -f "$tmp/$mod_path" ]]; then
-        zstd -d "$tmp/$mod_path" -o "$dest/$mod_name" --force -q
-        echo "[void-box] Installed kernel module: $mod_name"
-      else
-        echo "[void-box] WARNING: $mod_name not found in modules package"
-      fi
-    done
+
+    if [[ -n "$data_tar" && -f "$data_tar" ]]; then
+      for mod_path in "${vsock_modules[@]}" "${virtiofs_modules[@]}" "${overlay_modules[@]}"; do
+        local mod_name
+        mod_name=$(basename "$mod_path" .zst)
+        tar xf "$data_tar" -C "$tmp" "./$mod_path" 2>/dev/null || true
+        if [[ -f "$tmp/$mod_path" ]]; then
+          zstd -d "$tmp/$mod_path" -o "$dest/$mod_name" --force -q
+          echo "[void-box] Installed kernel module: $mod_name"
+        else
+          echo "[void-box] WARNING: $mod_name not found in modules package"
+        fi
+      done
+    fi
+
+    if [[ ! -f "$dest/vsock.ko" ]]; then
+      echo "[void-box] ERROR: vsock.ko missing under $dest — host↔guest vsock will not work."
+      echo "[void-box] Fix: ensure VOID_BOX_KMOD_VERSION/VOID_BOX_KMOD_UPLOAD match scripts/download_kernel.sh KERNEL_VER/KERNEL_UPLOAD, then rebuild initramfs."
+    fi
   else
     echo "[void-box] WARNING: failed to download kernel modules -- vsock may not work"
   fi

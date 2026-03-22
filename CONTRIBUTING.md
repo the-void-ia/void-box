@@ -230,7 +230,7 @@ void-box/
 │   ├── lib.rs              # Main library entry point
 │   ├── artifacts.rs        # Artifact management
 │   ├── bin/
-│   │   └── voidbox.rs      # CLI tool
+│   │   └── voidbox/        # CLI tool
 │   ├── sandbox/            # Sandbox abstraction
 │   ├── workflow/           # Workflow engine
 │   ├── observe/            # Observability layer

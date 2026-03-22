@@ -116,6 +116,27 @@ impl Default for VzBackend {
     }
 }
 
+/// Format a Virtualization.framework [`NSError`] with domain, code, and any
+/// extra keys Apple populates (`localizedFailureReason`, etc.). The generic
+/// `localizedDescription` alone is often useless (e.g. "Internal Virtualization error").
+fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
+    if err.is_null() {
+        return "(null NSError)".to_string();
+    }
+    let e = unsafe { &*err };
+    let domain = e.domain().to_string();
+    let code = e.code();
+    let desc = e.localizedDescription().to_string();
+    let mut out = format!("{desc} (domain={domain}, code={code})");
+    if let Some(reason) = e.localizedFailureReason() {
+        out.push_str(&format!("; failure_reason={reason}"));
+    }
+    if let Some(sugg) = e.localizedRecoverySuggestion() {
+        out.push_str(&format!("; recovery_suggestion={sugg}"));
+    }
+    out
+}
+
 /// Dispatch a VZ completion-handler operation and wait for the result.
 ///
 /// Shared helper for pause/resume/save/restore — all follow the same
@@ -142,8 +163,7 @@ where
             let result = if err.is_null() {
                 Ok(())
             } else {
-                let desc = unsafe { &*err }.localizedDescription().to_string();
-                Err(desc)
+                Err(format_vz_ns_error(err))
             };
             if let Some(tx) = tx.lock().unwrap().take() {
                 let _ = tx.send(result);
@@ -386,7 +406,7 @@ impl VzBackend {
                     move |connection: *mut VZVirtioSocketConnection,
                           err: *mut objc2_foundation::NSError| {
                         if !err.is_null() {
-                            let desc = unsafe { &*err }.localizedDescription().to_string();
+                            let desc = format_vz_ns_error(err);
                             debug!("VZ vsock connectToPort: error = {}", desc);
                             let _ = tx.send(Err(desc));
                             return;
@@ -501,8 +521,7 @@ impl VzBackend {
                 let result = if err.is_null() {
                     Ok(())
                 } else {
-                    let desc = unsafe { &*err }.localizedDescription().to_string();
-                    Err(desc)
+                    Err(format_vz_ns_error(err))
                 };
                 if let Some(tx) = tx.lock().unwrap().take() {
                     let _ = tx.send(result);
@@ -603,8 +622,7 @@ impl VmmBackend for VzBackend {
                         let result = if err.is_null() {
                             Ok(())
                         } else {
-                            let desc = unsafe { &*err }.localizedDescription().to_string();
-                            Err(desc)
+                            Err(format_vz_ns_error(err))
                         };
                         if let Some(tx) = tx.lock().unwrap().take() {
                             let _ = tx.send(result);

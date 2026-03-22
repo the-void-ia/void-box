@@ -154,11 +154,14 @@ pipeline and won't carry trace context or attributes.
 | `.warn()` | Partial failures, degraded conditions |
 | `.error()` | Step/workflow failures |
 
-**CLI subscriber:** `src/bin/voidbox.rs` initializes `tracing_subscriber` with
-`EnvFilter` defaulting to `"info"`. Override at runtime with:
+**CLI subscriber:** `src/bin/voidbox/main.rs` initializes `tracing_subscriber` with
+`EnvFilter` from the resolved log level (see `src/bin/voidbox/cli_config.rs` for merge order).
+Override at runtime with `VOIDBOX_LOG_LEVEL` or `--log-level`, or set `RUST_LOG` when no explicit
+CLI/config level is set:
 
 ```bash
-RUST_LOG=debug cargo run --bin voidbox -- run --file spec.yaml
+VOIDBOX_LOG_LEVEL=debug cargo run --bin voidbox -- run --file spec.yaml
+# RUST_LOG also applies when VOIDBOX_LOG_LEVEL / config omit log_level
 ```
 
 **Convention:** Workflow progress messages use the `[workflow:<name>]` prefix
@@ -171,7 +174,8 @@ pattern, e.g. `[workflow:my-flow] step 1/3: "build" running...`.
 | `src/observe/logs.rs` | `StructuredLogger`, `LogConfig`, `LogEntry`, `LogLevel` |
 | `src/observe/mod.rs` | `Observer` (owns logger), `SpanGuard` (RAII span + logging) |
 | `src/workflow/scheduler.rs` | Step progress logging via `observer.logger()` |
-| `src/bin/voidbox.rs` | CLI `tracing_subscriber` + `EnvFilter` setup |
+| `src/bin/voidbox/main.rs` | CLI `tracing_subscriber` + `EnvFilter` setup |
+| `src/bin/voidbox/cli_config.rs` | CLI config merge (`VOIDBOX_*`, YAML, `--log-level`) |
 
 ### Key source files
 

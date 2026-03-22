@@ -42,45 +42,73 @@
 <section>
 <div class="kicker">CLI / TUI</div>
 <h1>Current Interface Surface</h1>
-<p>The CLI provides run/validate/status/log flows. The TUI layers an interactive command mode on top of the daemon HTTP endpoints. Both communicate with the same daemon process.</p>
+<p><strong>Local (no HTTP daemon):</strong> <code>voidbox run --file …</code> executes a spec <em>in-process</em> on the host. Validation, inspection, snapshot file management, and <code>config</code> also run locally.</p>
+<p><strong>Daemon:</strong> <code>voidbox serve</code> starts the HTTP API (default bind <code>127.0.0.1:43100</code>). Remote-only commands <code>status</code>, <code>logs</code>, and <code>tui</code> talk to that server. Set <code>VOIDBOX_DAEMON_URL</code> or use <code>--daemon</code> to override the default <code>http://127.0.0.1:43100</code>.</p>
+<p>The TUI is an interactive client over the same HTTP API as those remote commands.</p>
 </section>
 
 <section>
-<h2>CLI Commands</h2>
+<h2>CLI — local commands</h2>
+<p>These do not require <code>voidbox serve</code>.</p>
 <table>
   <thead>
     <tr><th>Command</th><th>Description</th></tr>
   </thead>
   <tbody>
-    <tr><td><code>voidbox serve</code></td><td>Start the daemon HTTP server. All other commands (except <code>validate</code>) require the daemon to be running.</td></tr>
-    <tr><td><code>voidbox run --file &lt;spec&gt;</code></td><td>Execute a spec file (agent, pipeline, or workflow). Submits the run to the daemon and streams events to stdout.</td></tr>
-    <tr><td><code>voidbox validate --file &lt;spec&gt;</code></td><td>Validate a spec file without running it. Checks schema, skill references, and sandbox configuration for errors.</td></tr>
-    <tr><td><code>voidbox status</code></td><td>Show daemon status and active runs. Displays run IDs, current stage, and elapsed time.</td></tr>
-    <tr><td><code>voidbox logs &lt;run-id&gt;</code></td><td>Stream logs for a specific run. Follows the event stream until the run completes or is cancelled.</td></tr>
-    <tr><td><code>voidbox tui</code></td><td>Launch the interactive TUI interface. Connects to the daemon and provides a command prompt for managing runs.</td></tr>
-    <tr><td><code>voidbox snapshot create --config-hash &lt;hash&gt;</code></td><td>Create a snapshot from a running or stopped VM, keyed by its configuration hash.</td></tr>
-    <tr><td><code>voidbox snapshot list</code></td><td>List all stored snapshots with their hash prefixes, sizes, and creation timestamps.</td></tr>
-    <tr><td><code>voidbox snapshot delete &lt;hash-prefix&gt;</code></td><td>Delete a snapshot by its hash prefix. Removes the state file and memory dumps.</td></tr>
+    <tr><td><code>voidbox run --file &lt;spec&gt;</code></td><td>Run a spec (agent, pipeline, or workflow) in-process. Optional <code>--input</code>. Output respects global <code>--output</code> (human or JSON).</td></tr>
+    <tr><td><code>voidbox validate --file &lt;spec&gt;</code></td><td>Validate a spec without executing it.</td></tr>
+    <tr><td><code>voidbox inspect --file &lt;spec&gt;</code></td><td>Validate and print resolved sandbox-related configuration.</td></tr>
+    <tr><td><code>voidbox skills --file &lt;spec&gt;</code></td><td>List skills declared in the spec.</td></tr>
+    <tr><td><code>voidbox snapshot create --kernel &lt;path&gt;</code></td><td>Create a base snapshot after a cold boot (optional <code>--initramfs</code>, <code>--memory</code>, <code>--vcpus</code>; <code>--diff</code> for a delta on top of an existing base). Configuration hash is derived from kernel/initramfs/memory/vcpus — there is no <code>--config-hash</code> flag.</td></tr>
+    <tr><td><code>voidbox snapshot list</code></td><td>List stored snapshots (hash prefixes and metadata).</td></tr>
+    <tr><td><code>voidbox snapshot delete &lt;hash-prefix&gt;</code></td><td>Delete a snapshot by hash prefix.</td></tr>
+    <tr><td><code>voidbox config init</code></td><td>Write a template config to <code>~/.config/voidbox/config.yaml</code> (XDG paths apply).</td></tr>
+    <tr><td><code>voidbox config validate</code></td><td>Validate and print the merged CLI configuration.</td></tr>
+    <tr><td><code>voidbox version</code></td><td>Print version information.</td></tr>
+    <tr><td><code>voidbox exec …</code></td><td>Legacy sandbox exec (deprecated); prefer <code>voidbox run --file …</code>.</td></tr>
   </tbody>
 </table>
 </section>
 
 <section>
+<h2>CLI — daemon and remote-only commands</h2>
+<p>Start the server with <code>voidbox serve</code> (optional <code>--listen</code>, default <code>127.0.0.1:43100</code>). Then:</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>voidbox status --run-id &lt;id&gt;</code></td><td>Fetch JSON status for <strong>one</strong> run. Optional <code>--daemon &lt;url&gt;</code>.</td></tr>
+    <tr><td><code>voidbox logs --run-id &lt;id&gt;</code></td><td>Fetch the run&rsquo;s events payload as JSON (single HTTP GET). Optional <code>--daemon</code>. For live updates, poll the API or use a client that reads <code>/v1/runs/:id/events</code> repeatedly.</td></tr>
+    <tr><td><code>voidbox tui</code></td><td>Interactive TUI; optional <code>--file</code> to start a run via the daemon, <code>--session</code>, <code>--daemon</code>, <code>--logo-ascii</code>.</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>Global options and configuration</h2>
+<p>On any subcommand: <code>--output human|json</code>, <code>--no-banner</code>, <code>--log-level</code> (or env <code>VOIDBOX_LOG_LEVEL</code>). Log level and paths also merge from <code>~/.config/voidbox/config.yaml</code>, <code>/etc/voidbox/config.yaml</code>, and <code>VOIDBOX_CONFIG</code>; see <code>voidbox config validate</code>.</p>
+</section>
+
+<section>
 <h2>Daemon API Endpoints</h2>
-<p>The daemon exposes an HTTP API used by both the CLI and TUI. These endpoints are also available for direct integration:</p>
+<p>The daemon exposes JSON over HTTP. Default base URL <code>http://127.0.0.1:43100</code>. Selected routes:</p>
 <table>
   <thead>
     <tr><th>Method</th><th>Path</th><th>Description</th></tr>
   </thead>
   <tbody>
-    <tr><td><code>POST</code></td><td><code>/v1/runs</code></td><td>Create a new run. Accepts a spec payload and returns a run ID.</td></tr>
-    <tr><td><code>GET</code></td><td><code>/v1/runs/:id</code></td><td>Get run status. Returns current state, stage progress, and timing information.</td></tr>
-    <tr><td><code>GET</code></td><td><code>/v1/runs/:id/events</code></td><td>Stream run events via Server-Sent Events (SSE). Provides real-time progress updates.</td></tr>
-    <tr><td><code>POST</code></td><td><code>/v1/runs/:id/cancel</code></td><td>Cancel a running run. Sends SIGKILL to the guest process and tears down the VM.</td></tr>
-    <tr><td><code>POST</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Send a message to an active session. Used for interactive/conversational workflows.</td></tr>
-    <tr><td><code>GET</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Get session messages. Returns the full message history for a session.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/health</code></td><td>Health check and persistence backend name.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/runs</code></td><td>Create a run. JSON body includes <code>file</code>, optional <code>input</code>, <code>snapshot</code>, etc. Returns <code>run_id</code>.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs</code></td><td>List runs. Optional query <code>?state=active</code> or <code>terminal</code>.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id</code></td><td>Get run status and metadata.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id/events</code></td><td>Get run events as a JSON array (optional query <code>from_event_id</code>).</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/runs/:id/cancel</code></td><td>Cancel a run.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Append a session message.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Get session message history.</td></tr>
   </tbody>
 </table>
+<p>Additional routes include run stages, telemetry, and stage output files under <code>/v1/runs/…</code> — see the daemon implementation in the repository.</p>
 </section>
 
 <section>
@@ -105,7 +133,7 @@
 <h2>Known UX Gap</h2>
 <article class="card">
   <h3>Minimal but Functional</h3>
-  <p>The current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX is planned and can be layered on top of the existing SSE event streaming APIs without changes to the daemon.</p>
+  <p>The current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX is planned and can be layered on top of the existing <code>/v1/runs/:id/events</code> JSON APIs without changes to the daemon.</p>
 </article>
 </section>
 

@@ -25,7 +25,8 @@
 
 <p align="center">
   <a href="https://the-void-ia.github.io/void-box/docs/architecture/">Architecture</a> ·
-  <a href="#quick-start">Quick Start</a> ·
+  <a href="#install-the-voidbox-cli">Install</a> ·
+  <a href="#quick-start">Quick Start</a> (<a href="#using-the-cli">CLI</a> · <a href="#using-the-rust-library">Rust</a>) ·
   <a href="https://the-void-ia.github.io/void-box/docs/oci-containers/">OCI Support</a> ·
   <a href="https://the-void-ia.github.io/void-box/docs/host-mounts/">Host Mounts</a> ·
   <a href="https://the-void-ia.github.io/void-box/docs/snapshots/">Snapshots</a> ·
@@ -64,7 +65,87 @@ Containers share a host kernel — sufficient for general isolation, but AI agen
 
 ---
 
+## Install the `voidbox` CLI
+
+Each [release](https://github.com/the-void-ia/void-box/releases) ships **`voidbox`** together with a **kernel** and **initramfs** so you can run workloads out of the box.
+
+### Shell installer (Linux & macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/the-void-ia/void-box/main/scripts/install.sh | sh
+```
+
+Installs to `/usr/local/bin` and `/usr/local/lib/voidbox/`. For a specific version: `VERSION=v0.1.2 curl -fsSL ... | sh`.
+
+### Homebrew (macOS)
+
+```bash
+brew tap the-void-ia/tap
+brew install voidbox
+```
+
+### Debian / Ubuntu
+
+Download the `.deb` for your CPU (`amd64` or `arm64`) from [Releases](https://github.com/the-void-ia/void-box/releases). Example for v0.1.2 on amd64:
+
+```bash
+curl -fsSLO https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox_0.1.2_amd64.deb
+sudo dpkg -i voidbox_0.1.2_amd64.deb
+```
+
+### Fedora / RHEL
+
+```bash
+sudo rpm -i https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox-0.1.2-1.x86_64.rpm
+```
+
+Use the matching `.rpm` name from [Releases](https://github.com/the-void-ia/void-box/releases) for your version and architecture.
+
+### Next steps
+
+| | |
+|---|---|
+| **[Getting Started](https://the-void-ia.github.io/void-box/guides/getting-started/)** | First run, environment variables, API keys |
+| **[Install (site)](https://the-void-ia.github.io/void-box/)** | Copy-paste install block and direct tarball links |
+
+If you use Rust already, you can also `cargo install void-box` for the CLI only — pair it with kernel and initramfs from a [release tarball](https://github.com/the-void-ia/void-box/releases) or another install method above.
+
+---
+
 ## Quick Start
+
+### Using the CLI
+
+With [`voidbox`](#install-the-voidbox-cli) on your `PATH`, run an agent from a YAML spec. From a clone of this repository:
+
+```bash
+voidbox run --file examples/hackernews/hackernews_agent.yaml
+```
+
+**CLI overview:** `voidbox run`, `validate`, `inspect`, `skills`, `snapshot`, and `config` run locally and do not require a background server. For HTTP remote control, start `voidbox serve` (default `127.0.0.1:43100`), then use `status`, `logs`, or `tui` against that daemon. Full command reference: [CLI + TUI](https://the-void-ia.github.io/void-box/docs/cli-tui/).
+
+The full spec lives in [`examples/hackernews/hackernews_agent.yaml`](examples/hackernews/hackernews_agent.yaml). A minimal shape looks like:
+
+```yaml
+api_version: v1
+kind: agent
+name: hn_researcher
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  network: true
+llm:
+  provider: claude
+agent:
+  prompt: "Your task…"
+  skills:
+    - "file:examples/hackernews/skills/hackernews-api.md"
+  timeout_secs: 600
+```
+
+### Using the Rust library
+
+Add the crate and build a `VoidBox` in code:
 
 ```bash
 cargo add void-box
@@ -91,33 +172,6 @@ let researcher = VoidBox::new("hn_researcher")
     .network(true)
     .prompt("Analyze top HN stories for AI engineering trends")
     .build()?;
-```
-
-```yaml
-# hackernews_agent.yaml
-api_version: v1
-kind: agent
-name: hn_researcher
-
-sandbox:
-  mode: auto
-  memory_mb: 1024
-  network: true
-
-llm:
-  provider: ollama
-  model: qwen3-coder
-
-agent:
-  prompt: "Analyze top HN stories for AI engineering trends"
-  skills:
-    - "file:skills/hackernews-api.md"
-    - "agent:claude-code"
-  timeout_secs: 600
-```
-
-```bash
-voidbox run --file hackernews_agent.yaml
 ```
 
 ---
