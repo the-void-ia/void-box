@@ -13,13 +13,67 @@ use tracing::debug;
 use crate::{Error, Result};
 
 /// Default snapshot storage directory.
+///
+/// Checks `VOIDBOX_HOME` first, then falls back to `$HOME/.void-box/snapshots`.
 pub fn default_snapshot_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("VOIDBOX_HOME") {
+        return PathBuf::from(home).join("snapshots");
+    }
     dirs_snapshot_base()
 }
 
 fn dirs_snapshot_base() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".void-box").join("snapshots")
+}
+
+/// Resolve the snapshot directory for a given config hash using a custom base.
+pub fn snapshot_dir_for_hash_in(base: &Path, config_hash: &str) -> PathBuf {
+    base.join(&config_hash[..16.min(config_hash.len())])
+}
+
+/// List all stored snapshots under a custom base directory.
+pub fn list_snapshots_in(base: &Path) -> Result<Vec<SnapshotInfo>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let mut infos = Vec::new();
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if dir.join("state.bin").exists() {
+            if let Some(info) = load_kvm_snapshot_info(&dir) {
+                infos.push(info);
+            }
+            continue;
+        }
+        if dir.join("vz_meta.json").exists() {
+            if let Some(info) = load_vz_snapshot_info(&dir) {
+                infos.push(info);
+            }
+        }
+    }
+    Ok(infos)
+}
+
+/// Delete a snapshot by hash prefix under a custom base directory.
+pub fn delete_snapshot_in(base: &Path, hash_prefix: &str) -> Result<bool> {
+    if !base.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(hash_prefix) || hash_prefix.starts_with(&name) {
+            fs::remove_dir_all(entry.path())?;
+            tracing::info!("Deleted snapshot {}", entry.path().display());
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Snapshot type discriminator.
@@ -29,6 +83,15 @@ pub enum SnapshotType {
     Base,
     /// Differential snapshot on top of a base.
     Diff,
+}
+
+impl std::fmt::Display for SnapshotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotType::Base => f.write_str("base"),
+            SnapshotType::Diff => f.write_str("diff"),
+        }
+    }
 }
 
 /// Information about a stored snapshot (for listing).

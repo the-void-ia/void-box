@@ -97,8 +97,11 @@ let box2 = VoidBox::new("analyst")
 <h2>CLI Commands</h2>
 <div class="code-wrap">
 <div class="code-head">Shell</div>
-<pre><code># Create a snapshot from a running VM
-voidbox snapshot create --config-hash &lt;hash&gt;
+<pre><code># Create a base snapshot after cold boot (kernel required; initramfs optional)
+voidbox snapshot create --kernel /path/to/vmlinuz --initramfs /path/to/initramfs.cpio.gz
+
+# Optional: layered diff snapshot once a base exists for the same config hash
+voidbox snapshot create --kernel /path/to/vmlinuz --initramfs /path/to/initramfs.cpio.gz --diff
 
 # List stored snapshots
 voidbox snapshot list
@@ -115,8 +118,8 @@ voidbox run --file spec.yaml   # spec has sandbox.snapshot set</code></pre>
 <h2>Daemon API</h2>
 <div class="code-wrap">
 <div class="code-head">code-run</div>
-<pre><code># POST /runs with snapshot override
-curl -X POST http://localhost:8080/runs \
+<pre><code># POST /v1/runs with snapshot override (daemon default: 127.0.0.1:43100)
+curl -X POST http://127.0.0.1:43100/v1/runs \
   -H 'Content-Type: application/json' \
   -d '{"file": "workflow.yaml", "snapshot": "abc123def456"}'</code></pre>
 </div>

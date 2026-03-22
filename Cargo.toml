@@ -42,6 +42,10 @@ getrandom = "0.3"
 uuid = { version = "1", features = ["v7"] }
 humantime = "2"
 
+# CLI
+clap = { version = "4", features = ["derive", "cargo", "env"] }
+tracing-appender = "0.2"
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"
@@ -102,6 +106,7 @@ voidbox-oci = { path = "voidbox-oci" }
 # OTel testing support (in-memory exporters for assertions)
 opentelemetry = { version = "0.31" }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+httpmock = "0.8.2"
 
 [features]
 default = []
@@ -110,7 +115,7 @@ opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 
 [[bin]]
 name = "voidbox"
-path = "src/bin/voidbox.rs"
+path = "src/bin/voidbox/main.rs"
 
 
 [[example]]
