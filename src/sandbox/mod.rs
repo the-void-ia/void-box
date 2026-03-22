@@ -781,6 +781,7 @@ pub struct MockSandbox {
     #[allow(dead_code)]
     config: SandboxConfig,
     responses: std::sync::Mutex<Vec<ExecOutput>>,
+    files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl MockSandbox {
@@ -789,6 +790,7 @@ impl MockSandbox {
         Self {
             config,
             responses: std::sync::Mutex::new(Vec::new()),
+            files: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -818,12 +820,16 @@ impl MockSandbox {
             }
             "cat" => {
                 if stdin.is_empty() && !args.is_empty() {
-                    // Reading file - simulate not found
-                    Ok(ExecOutput::new(
-                        Vec::new(),
-                        b"cat: file not found\n".to_vec(),
-                        1,
-                    ))
+                    let path = normalize_mock_path(args[0]);
+                    if let Some(data) = self.files.lock().unwrap().get(&path).cloned() {
+                        Ok(ExecOutput::new(data, Vec::new(), 0))
+                    } else {
+                        Ok(ExecOutput::new(
+                            Vec::new(),
+                            b"cat: file not found\n".to_vec(),
+                            1,
+                        ))
+                    }
                 } else {
                     // cat with stdin - echo it back
                     Ok(ExecOutput::new(stdin.to_vec(), Vec::new(), 0))
@@ -848,8 +854,21 @@ impl MockSandbox {
                 }
             }
             "test" => {
-                // Simulate test command (always fail for -e in simulation)
-                Ok(ExecOutput::new(Vec::new(), Vec::new(), 1))
+                if args.len() == 2 && args[0] == "-e" {
+                    let path = normalize_mock_path(args[1]);
+                    let exists = self.files.lock().unwrap().contains_key(&path);
+                    Ok(ExecOutput::new(
+                        Vec::new(),
+                        Vec::new(),
+                        if exists { 0 } else { 1 },
+                    ))
+                } else {
+                    Ok(ExecOutput::new(Vec::new(), Vec::new(), 1))
+                }
+            }
+            "sh" if args.len() >= 2 && args[0] == "-lc" => {
+                let script = args[1];
+                self.run_mock_shell_script(script)
             }
             "sha256sum" => {
                 // Simulate sha256sum (returns a fake hash)
@@ -931,6 +950,59 @@ impl MockSandbox {
                 Ok(ExecOutput::new(Vec::new(), Vec::new(), 0))
             }
         }
+    }
+
+    fn run_mock_shell_script(&self, script: &str) -> Result<ExecOutput> {
+        let mut stdout = Vec::new();
+        let lines: Vec<&str> = script.lines().collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if let Some(rest) = line.strip_prefix("echo ") {
+                let text = rest.trim_matches('"').trim_matches('\'');
+                stdout.extend_from_slice(text.as_bytes());
+                stdout.push(b'\n');
+                i += 1;
+                continue;
+            }
+
+            if let Some((path, marker)) = parse_heredoc_write(line) {
+                let mut body = Vec::new();
+                i += 1;
+                while i < lines.len() && lines[i].trim() != marker {
+                    body.extend_from_slice(lines[i].as_bytes());
+                    body.push(b'\n');
+                    i += 1;
+                }
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(normalize_mock_path(&path), body);
+                i += 1;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        Ok(ExecOutput::new(stdout, Vec::new(), 0))
+    }
+}
+
+fn parse_heredoc_write(line: &str) -> Option<(String, &str)> {
+    let prefix = "cat > ";
+    let rest = line.strip_prefix(prefix)?;
+    let (path, marker_part) = rest.split_once("<<")?;
+    let path = path.trim().to_string();
+    let marker = marker_part.trim().trim_matches('\'').trim_matches('"');
+    Some((path, marker))
+}
+
+fn normalize_mock_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/workspace/{path}")
     }
 }
 

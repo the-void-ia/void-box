@@ -75,6 +75,43 @@ pub struct RunEvent {
     pub event_type_v2: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPublicationStatus {
+    NotStarted,
+    Publishing,
+    Published,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactManifestEntry {
+    pub name: String,
+    pub stage: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    pub retrieval_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPublication {
+    pub status: ArtifactPublicationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub manifest: Vec<ArtifactManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageState {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
     pub id: String,
@@ -102,6 +139,12 @@ pub struct RunState {
     pub policy: Option<RunPolicy>,
     #[serde(default)]
     pub terminal_event_id: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub stage_states: Option<HashMap<String, StageState>>,
+    #[serde(default)]
+    pub artifact_publication: Option<ArtifactPublication>,
 }
 
 fn default_attempt_id() -> u64 {
@@ -152,6 +195,26 @@ pub trait PersistenceProvider: Send + Sync {
     }
     fn load_stage_artifact(&self, _run_id: &str, _stage_name: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+    fn save_named_artifact(
+        &self,
+        _run_id: &str,
+        _stage_name: &str,
+        _name: &str,
+        _data: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn load_named_artifact(
+        &self,
+        _run_id: &str,
+        _stage_name: &str,
+        _name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn list_stage_artifacts(&self, _run_id: &str, _stage_name: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -333,6 +396,72 @@ impl PersistenceProvider for DiskPersistenceProvider {
             Error::Config(format!("failed reading artifact {}: {e}", path.display()))
         })?;
         Ok(Some(data))
+    }
+
+    fn save_named_artifact(
+        &self,
+        run_id: &str,
+        stage_name: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        if name.contains("..") || name.contains('/') || name.contains('\\') || name.is_empty() {
+            return Err(Error::Config(format!("invalid artifact name: {name}")));
+        }
+        let dir = self.artifacts_dir().join(run_id).join(stage_name);
+        fs::create_dir_all(&dir)
+            .map_err(|e| Error::Config(format!("failed to create artifact dir: {e}")))?;
+        let path = dir.join(name);
+        fs::write(&path, data).map_err(|e| {
+            Error::Config(format!(
+                "failed writing named artifact {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn load_named_artifact(
+        &self,
+        run_id: &str,
+        stage_name: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if name.contains("..") || name.contains('/') || name.contains('\\') || name.is_empty() {
+            return Err(Error::Config(format!("invalid artifact name: {name}")));
+        }
+        let path = self
+            .artifacts_dir()
+            .join(run_id)
+            .join(stage_name)
+            .join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path).map_err(|e| {
+            Error::Config(format!(
+                "failed reading named artifact {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Some(data))
+    }
+
+    fn list_stage_artifacts(&self, run_id: &str, stage_name: &str) -> Result<Vec<String>> {
+        let dir = self.artifacts_dir().join(run_id).join(stage_name);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| Error::Config(format!("failed reading artifact dir: {e}")))?
+        {
+            let entry = entry.map_err(|e| Error::Config(format!("read_dir entry error: {e}")))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
     }
 }
 
@@ -747,6 +876,46 @@ mod tests {
     }
 
     #[test]
+    fn test_named_artifact_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+        let data = b"# Report\nAll good";
+        provider
+            .save_named_artifact("run-1", "main", "report.md", data)
+            .unwrap();
+        let loaded = provider
+            .load_named_artifact("run-1", "main", "report.md")
+            .unwrap();
+        assert_eq!(loaded, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn test_named_artifact_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+        let loaded = provider
+            .load_named_artifact("run-x", "main", "missing.md")
+            .unwrap();
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn test_list_stage_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+        provider
+            .save_named_artifact("run-1", "main", "report.md", b"data1")
+            .unwrap();
+        provider
+            .save_named_artifact("run-1", "main", "metrics.json", b"data2")
+            .unwrap();
+        let names = provider.list_stage_artifacts("run-1", "main").unwrap();
+        assert!(names.contains(&"report.md".to_string()));
+        assert!(names.contains(&"metrics.json".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
     fn test_run_status_terminal() {
         assert!(RunStatus::Succeeded.is_terminal());
         assert!(RunStatus::Failed.is_terminal());
@@ -754,5 +923,66 @@ mod tests {
         assert!(!RunStatus::Pending.is_terminal());
         assert!(!RunStatus::Starting.is_terminal());
         assert!(!RunStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn test_run_state_round_trip_with_artifact_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = DiskPersistenceProvider::new(dir.path().to_path_buf());
+
+        let mut stage_states = HashMap::new();
+        stage_states.insert(
+            "main".to_string(),
+            StageState {
+                status: "succeeded".to_string(),
+                started_at: Some("2026-03-20T18:19:00Z".to_string()),
+                completed_at: Some("2026-03-20T18:20:00Z".to_string()),
+            },
+        );
+
+        let run = RunState {
+            id: "round-trip-test".to_string(),
+            status: RunStatus::Succeeded,
+            file: "test.yaml".to_string(),
+            report: None,
+            error: None,
+            events: Vec::new(),
+            attempt_id: 1,
+            started_at: Some("2026-03-20T18:19:00Z".to_string()),
+            updated_at: Some("2026-03-20T18:20:00Z".to_string()),
+            terminal_reason: None,
+            exit_code: Some(0),
+            active_stage_count: 0,
+            active_microvm_count: 0,
+            policy: None,
+            terminal_event_id: Some("evt_123".to_string()),
+            finished_at: Some("2026-03-20T18:20:00Z".to_string()),
+            stage_states: Some(stage_states),
+            artifact_publication: Some(ArtifactPublication {
+                status: ArtifactPublicationStatus::Published,
+                published_at: Some("2026-03-20T18:20:00Z".to_string()),
+                manifest: vec![ArtifactManifestEntry {
+                    name: "result.json".to_string(),
+                    stage: "main".to_string(),
+                    media_type: "application/json".to_string(),
+                    size_bytes: Some(128),
+                    retrieval_path: "/v1/runs/round-trip-test/stages/main/output-file".to_string(),
+                }],
+            }),
+        };
+
+        provider.save_run(&run).unwrap();
+
+        let loaded = provider.load_runs().unwrap();
+        let loaded_run = loaded.get("round-trip-test").unwrap();
+        assert_eq!(loaded_run.finished_at, run.finished_at);
+        assert!(loaded_run.stage_states.is_some());
+        let ss = loaded_run.stage_states.as_ref().unwrap();
+        assert_eq!(ss.get("main").unwrap().status, "succeeded");
+        assert!(loaded_run.artifact_publication.is_some());
+        let ap = loaded_run.artifact_publication.as_ref().unwrap();
+        assert_eq!(ap.status, ArtifactPublicationStatus::Published);
+        assert_eq!(ap.manifest.len(), 1);
+        assert_eq!(ap.manifest[0].name, "result.json");
     }
 }
