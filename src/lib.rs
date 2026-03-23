@@ -94,6 +94,7 @@ pub mod llm;
 pub mod persistence;
 pub mod pipeline;
 pub mod runtime;
+pub mod sidecar;
 pub mod skill;
 pub mod spec;
 
