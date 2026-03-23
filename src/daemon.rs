@@ -1047,27 +1047,56 @@ fn apply_v2_event_names(events: &[RunEvent]) -> Vec<RunEvent> {
 }
 
 async fn get_run(id: &str, query: Option<&str>, state: AppState) -> (String, String) {
-    let runs = state.runs.lock().await;
-    if let Some(r) = runs.get(id) {
-        if is_api_v2(query) {
-            let mut run = r.clone();
-            run.events = apply_v2_event_names(&run.events);
-            (
-                "200 OK".to_string(),
-                serde_json::to_string(&run).unwrap_or_else(|_| "{}".into()),
-            )
+    // Serialize the run while holding the runs lock, then drop it before
+    // acquiring the sidecar_handles lock to avoid lock-order issues.
+    let run_json: Option<serde_json::Value> = {
+        let runs = state.runs.lock().await;
+        if let Some(r) = runs.get(id) {
+            let value = if is_api_v2(query) {
+                let mut run = r.clone();
+                run.events = apply_v2_event_names(&run.events);
+                serde_json::to_value(&run).unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            };
+            Some(value)
         } else {
-            (
-                "200 OK".to_string(),
-                serde_json::to_string(r).unwrap_or_else(|_| "{}".into()),
-            )
+            None
         }
-    } else {
-        (
+    };
+
+    let Some(mut run_value) = run_json else {
+        return (
             "404 Not Found".to_string(),
             ApiError::not_found(format!("run '{id}' not found")).to_json(),
-        )
+        );
+    };
+
+    // Append sidecar health if a handle exists for this run.
+    let sidecar_info: Option<serde_json::Value> = {
+        let handles = state.sidecar_handles.lock().await;
+        if let Some(handle) = handles.get(id) {
+            let (buffer_depth, inbox_version) = handle.state_snapshot().await;
+            Some(json!({
+                "status": "ok",
+                "buffer_depth": buffer_depth,
+                "inbox_version": inbox_version
+            }))
+        } else {
+            None
+        }
+    };
+
+    if let Some(sidecar) = sidecar_info {
+        if let serde_json::Value::Object(ref mut map) = run_value {
+            map.insert("sidecar".to_string(), sidecar);
+        }
     }
+
+    (
+        "200 OK".to_string(),
+        serde_json::to_string(&run_value).unwrap_or_else(|_| "{}".into()),
+    )
 }
 
 async fn get_events(id: &str, query: Option<&str>, state: AppState) -> (String, String) {
