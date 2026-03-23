@@ -69,6 +69,10 @@ impl SidecarState {
         &self.peers
     }
 
+    pub fn inbox_mut(&mut self) -> Option<&mut InboxSnapshot> {
+        self.inbox.as_mut()
+    }
+
     pub fn load_inbox(&mut self, snapshot: InboxSnapshot) {
         self.iteration_intent_count = 0;
         self.content_hashes.clear();

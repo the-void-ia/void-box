@@ -23,6 +23,8 @@ pub enum ApiErrorCode {
     ArtifactPublicationIncomplete,
     ArtifactStoreUnavailable,
     RetrievalTimeout,
+    PayloadTooLarge,
+    TooManyRequests,
 }
 
 /// Structured API error response: `{"code":"NOT_FOUND","message":"...","retryable":false}`.
@@ -133,6 +135,22 @@ impl ApiError {
     pub fn retrieval_timeout(message: impl Into<String>) -> Self {
         Self {
             code: ApiErrorCode::RetrievalTimeout,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::PayloadTooLarge,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::TooManyRequests,
             message: message.into(),
             retryable: true,
         }
