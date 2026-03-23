@@ -109,6 +109,14 @@ pub struct ObserveSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagingSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider_bridge: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub prompt: String,
     #[serde(default)]
@@ -117,6 +125,8 @@ pub struct AgentSpec {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub output_file: Option<String>,
+    #[serde(default)]
+    pub messaging: Option<MessagingSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +438,65 @@ workflow:
         let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
         let err = validate_spec(&spec).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn agent_spec_with_messaging() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  mode: mock
+agent:
+  prompt: "test prompt"
+  messaging:
+    enabled: true
+    provider_bridge: claude_channels
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let agent = spec.agent.unwrap();
+        let messaging = agent.messaging.unwrap();
+        assert!(messaging.enabled);
+        assert_eq!(
+            messaging.provider_bridge.as_deref(),
+            Some("claude_channels")
+        );
+    }
+
+    #[test]
+    fn agent_spec_without_messaging_defaults_to_none() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  mode: mock
+agent:
+  prompt: "test prompt"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let agent = spec.agent.unwrap();
+        assert!(agent.messaging.is_none());
+    }
+
+    #[test]
+    fn agent_spec_messaging_enabled_false_by_default() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test-agent
+sandbox:
+  mode: mock
+agent:
+  prompt: "test prompt"
+  messaging: {}
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let agent = spec.agent.unwrap();
+        let messaging = agent.messaging.unwrap();
+        assert!(!messaging.enabled);
+        assert!(messaging.provider_bridge.is_none());
     }
 
     #[test]
