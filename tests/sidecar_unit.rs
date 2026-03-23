@@ -81,3 +81,275 @@ fn stamped_intent_includes_auto_fields() {
     assert!(json.contains("\"intent_id\":\"int-1\""));
     assert!(json.contains("\"iteration\":3"));
 }
+
+use void_box::sidecar::SidecarState;
+
+#[test]
+fn state_starts_empty() {
+    let state = SidecarState::new("run-1", "exec-1", "c-1", vec!["c-2".into()]);
+    assert_eq!(state.inbox_version(), 0);
+    assert_eq!(state.buffer_depth(), 0);
+    assert_eq!(state.current_iteration(), 0);
+}
+
+#[test]
+fn load_inbox_sets_version_and_iteration() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 5,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 3,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+    assert_eq!(state.inbox_version(), 5);
+    assert_eq!(state.current_iteration(), 3);
+}
+
+#[test]
+fn accept_intent_stamps_iteration_and_candidate() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 2,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    let submitted = void_box::sidecar::SubmittedIntent {
+        kind: "proposal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "test"}),
+        priority: "normal".into(),
+    };
+    let result = state.accept_intent(submitted, None);
+    assert!(result.is_ok());
+    let stamped = result.unwrap();
+    assert_eq!(stamped.iteration, 2);
+    assert_eq!(stamped.from_candidate_id, "c-1");
+    assert!(!stamped.intent_id.is_empty());
+    assert_eq!(state.buffer_depth(), 1);
+}
+
+#[test]
+fn rejects_intent_over_per_iteration_limit() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    for i in 0..3 {
+        let submitted = void_box::sidecar::SubmittedIntent {
+            kind: "proposal".into(),
+            audience: "broadcast".into(),
+            payload: serde_json::json!({"summary_text": format!("intent {i}")}),
+            priority: "normal".into(),
+        };
+        assert!(state.accept_intent(submitted, None).is_ok());
+    }
+    // 4th should fail
+    let submitted = void_box::sidecar::SubmittedIntent {
+        kind: "signal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "too many"}),
+        priority: "normal".into(),
+    };
+    let result = state.accept_intent(submitted, None);
+    assert!(result.is_err());
+}
+
+#[test]
+fn rejects_oversized_payload() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    let big_text = "x".repeat(5000);
+    let submitted = void_box::sidecar::SubmittedIntent {
+        kind: "proposal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": big_text}),
+        priority: "normal".into(),
+    };
+    let result = state.accept_intent(submitted, None);
+    assert!(result.is_err());
+}
+
+#[test]
+fn drain_clears_buffer() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    let submitted = void_box::sidecar::SubmittedIntent {
+        kind: "signal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "hello"}),
+        priority: "normal".into(),
+    };
+    state.accept_intent(submitted, None).unwrap();
+    assert_eq!(state.buffer_depth(), 1);
+
+    let drained = state.drain_intents();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(state.buffer_depth(), 0);
+
+    // Second drain returns empty
+    let drained2 = state.drain_intents();
+    assert!(drained2.is_empty());
+}
+
+#[test]
+fn dedup_by_content_hash() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    let intent = void_box::sidecar::SubmittedIntent {
+        kind: "proposal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "same content"}),
+        priority: "normal".into(),
+    };
+    assert!(state.accept_intent(intent.clone(), None).is_ok());
+    // Same content should be deduped — not counted against limit
+    assert!(state.accept_intent(intent, None).is_ok());
+    assert_eq!(state.buffer_depth(), 1);
+}
+
+#[test]
+fn idempotency_key_dedup() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot);
+
+    let intent1 = void_box::sidecar::SubmittedIntent {
+        kind: "proposal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "first"}),
+        priority: "normal".into(),
+    };
+    let intent2 = void_box::sidecar::SubmittedIntent {
+        kind: "signal".into(),
+        audience: "leader".into(),
+        payload: serde_json::json!({"summary_text": "different"}),
+        priority: "high".into(),
+    };
+    let key = Some("same-key".to_string());
+    assert!(state.accept_intent(intent1, key.clone()).is_ok());
+    // Same idempotency key → returns ok but no new intent
+    assert!(state.accept_intent(intent2, key).is_ok());
+    assert_eq!(state.buffer_depth(), 1);
+}
+
+#[test]
+fn new_inbox_resets_iteration_counters() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot1 = void_box::sidecar::InboxSnapshot {
+        version: 1,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 1,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot1);
+
+    // Fill up to limit
+    for i in 0..3 {
+        let submitted = void_box::sidecar::SubmittedIntent {
+            kind: "proposal".into(),
+            audience: "broadcast".into(),
+            payload: serde_json::json!({"summary_text": format!("intent {i}")}),
+            priority: "normal".into(),
+        };
+        assert!(state.accept_intent(submitted, None).is_ok());
+    }
+
+    // Drain and load new inbox → counters reset
+    state.drain_intents();
+    let snapshot2 = void_box::sidecar::InboxSnapshot {
+        version: 2,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 2,
+        entries: vec![],
+    };
+    state.load_inbox(snapshot2);
+    assert_eq!(state.current_iteration(), 2);
+
+    // Can accept intents again
+    let submitted = void_box::sidecar::SubmittedIntent {
+        kind: "proposal".into(),
+        audience: "broadcast".into(),
+        payload: serde_json::json!({"summary_text": "new iteration"}),
+        priority: "normal".into(),
+    };
+    assert!(state.accept_intent(submitted, None).is_ok());
+}
+
+#[test]
+fn incremental_inbox_query() {
+    let mut state = SidecarState::new("run-1", "exec-1", "c-1", vec![]);
+    let snapshot = void_box::sidecar::InboxSnapshot {
+        version: 3,
+        execution_id: "exec-1".into(),
+        candidate_id: "c-1".into(),
+        iteration: 2,
+        entries: vec![
+            void_box::sidecar::InboxEntry {
+                message_id: "msg-1".into(),
+                from_candidate_id: "c-2".into(),
+                kind: "proposal".into(),
+                payload: serde_json::json!({"summary_text": "A"}),
+            },
+            void_box::sidecar::InboxEntry {
+                message_id: "msg-2".into(),
+                from_candidate_id: "c-3".into(),
+                kind: "signal".into(),
+                payload: serde_json::json!({"summary_text": "B"}),
+            },
+        ],
+    };
+    state.load_inbox(snapshot);
+
+    // Full inbox
+    let full = state.get_inbox(None);
+    assert_eq!(full.entries.len(), 2);
+    assert_eq!(full.version, 3);
+
+    // Incremental: since version 3 → no new entries
+    let incremental = state.get_inbox(Some(3));
+    assert!(incremental.entries.is_empty());
+}
