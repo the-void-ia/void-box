@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::error::ApiError;
 use crate::sidecar::state::{IntentRejection, SidecarState};
@@ -89,6 +89,13 @@ pub async fn start_sidecar(
         run_server(listener, server_state, shutdown_rx).await;
     });
 
+    info!(
+        run_id,
+        addr = %addr,
+        sidecar_version = SIDECAR_VERSION,
+        "sidecar started"
+    );
+
     Ok(SidecarHandle {
         addr,
         state,
@@ -106,10 +113,10 @@ async fn run_server(
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _peer)) => {
+                    Ok((stream, peer)) => {
                         let st = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_stream(stream, st).await {
+                            if let Err(e) = handle_stream(stream, peer, st).await {
                                 debug!("sidecar connection error: {e}");
                             }
                         });
@@ -121,7 +128,14 @@ async fn run_server(
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    debug!("sidecar server shutting down");
+                    let st = state.lock().await;
+                    info!(
+                        run_id = %st.run_id(),
+                        buffered_intents = st.buffer_depth(),
+                        uptime_ms = st.uptime_ms(),
+                        "sidecar stopping"
+                    );
+                    drop(st);
                     break;
                 }
             }
@@ -135,6 +149,7 @@ async fn run_server(
 
 async fn handle_stream(
     mut stream: TcpStream,
+    peer: SocketAddr,
     state: Arc<Mutex<SidecarState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the full request (headers + body) respecting Content-Length.
@@ -220,7 +235,8 @@ async fn handle_stream(
     // Parse Idempotency-Key header
     let idempotency_key = parse_header(&headers_str, "idempotency-key");
 
-    let (status, response_body) = route(method, path, query, &body, idempotency_key, &state).await;
+    let (status, response_body) =
+        route(method, path, query, &body, idempotency_key, peer, &state).await;
     send_response(&mut stream, status, &response_body).await?;
 
     Ok(())
@@ -295,10 +311,11 @@ async fn route(
     query: Option<&str>,
     body: &str,
     idempotency_key: Option<String>,
+    peer: SocketAddr,
     state: &Arc<Mutex<SidecarState>>,
 ) -> (&'static str, String) {
     match (method, path) {
-        ("GET", "/v1/health") => handle_health(state).await,
+        ("GET", "/v1/health") => handle_health(peer, state).await,
         ("GET", "/v1/inbox") => handle_get_inbox(query, state).await,
         ("POST", "/v1/intents") => handle_post_intents(body, idempotency_key, state).await,
         ("GET", "/v1/context") => handle_get_context(state).await,
@@ -313,8 +330,16 @@ async fn route(
     }
 }
 
-async fn handle_health(state: &Arc<Mutex<SidecarState>>) -> (&'static str, String) {
+async fn handle_health(
+    peer: SocketAddr,
+    state: &Arc<Mutex<SidecarState>>,
+) -> (&'static str, String) {
     let st = state.lock().await;
+    debug!(
+        run_id = %st.run_id(),
+        client_addr = %peer,
+        "health check served"
+    );
     let health = SidecarHealth {
         status: "ok".into(),
         sidecar_version: SIDECAR_VERSION.into(),

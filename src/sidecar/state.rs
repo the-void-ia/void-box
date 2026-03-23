@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use tracing::{debug, info, warn};
+
 use super::types::{InboxSnapshot, StampedIntent, SubmittedIntent};
 
 const MAX_INTENTS_PER_ITERATION: usize = 3;
@@ -77,6 +79,14 @@ impl SidecarState {
         self.iteration_intent_count = 0;
         self.content_hashes.clear();
         self.idempotency_keys.clear();
+        let snapshot_bytes = serde_json::to_vec(&snapshot).map(|v| v.len()).unwrap_or(0);
+        info!(
+            run_id = %self.run_id,
+            iteration = snapshot.iteration,
+            entry_count = snapshot.entries.len(),
+            snapshot_bytes,
+            "inbox loaded"
+        );
         self.inbox = Some(snapshot);
     }
 
@@ -114,7 +124,14 @@ impl SidecarState {
         // Idempotency key dedup
         if let Some(ref key) = idempotency_key {
             if let Some(&idx) = self.idempotency_keys.get(key) {
-                return Ok(self.intent_buffer[idx].clone());
+                let existing = self.intent_buffer[idx].clone();
+                debug!(
+                    run_id = %self.run_id,
+                    intent_id = %existing.intent_id,
+                    dedup_key = %key,
+                    "intent deduplicated"
+                );
+                return Ok(existing);
             }
         }
 
@@ -129,6 +146,12 @@ impl SidecarState {
                 compute_content_hash(&i.payload, &i.audience, i.iteration) == content_hash
             });
             if let Some(existing) = existing {
+                debug!(
+                    run_id = %self.run_id,
+                    intent_id = %existing.intent_id,
+                    dedup_key = "content_hash",
+                    "intent deduplicated"
+                );
                 return Ok(existing.clone());
             }
         }
@@ -137,11 +160,21 @@ impl SidecarState {
         let payload_bytes =
             serde_json::to_vec(&submitted.payload).map_err(|_| IntentRejection::PayloadTooLarge)?;
         if payload_bytes.len() > MAX_INTENT_PAYLOAD_BYTES {
+            warn!(
+                run_id = %self.run_id,
+                reason = "payload_too_large",
+                "intent rejected"
+            );
             return Err(IntentRejection::PayloadTooLarge);
         }
 
         // Per-iteration limit
         if self.iteration_intent_count >= MAX_INTENTS_PER_ITERATION {
+            warn!(
+                run_id = %self.run_id,
+                reason = "max_per_iteration",
+                "intent rejected"
+            );
             return Err(IntentRejection::MaxPerIteration);
         }
 
@@ -156,6 +189,15 @@ impl SidecarState {
             priority: submitted.priority,
             ttl_iterations: DEFAULT_TTL_ITERATIONS,
         };
+
+        info!(
+            run_id = %self.run_id,
+            intent_id = %stamped.intent_id,
+            kind = %stamped.kind,
+            audience = %stamped.audience,
+            payload_bytes = payload_bytes.len(),
+            "intent accepted"
+        );
 
         let idx = self.intent_buffer.len();
         self.intent_buffer.push(stamped.clone());
@@ -174,6 +216,11 @@ impl SidecarState {
         self.content_hashes.clear();
         self.idempotency_keys.clear();
         // Do NOT reset iteration_intent_count — that resets on inbox load
+        info!(
+            run_id = %self.run_id,
+            intent_count = drained.len(),
+            "intents drained"
+        );
         drained
     }
 }
