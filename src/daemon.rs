@@ -29,6 +29,7 @@ struct AppState {
             >,
         >,
     >,
+    sidecar_handles: Arc<Mutex<HashMap<String, crate::sidecar::SidecarHandle>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +91,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         runs: Arc::new(Mutex::new(initial_runs)),
         provider,
         telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
+        sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let listener = TcpListener::bind(addr).await?;
@@ -214,6 +216,24 @@ async fn route_request(
                 if let Some(id) = id.strip_suffix("/cancel") {
                     if method == "POST" {
                         return as_json(cancel_run(id, body, state).await);
+                    }
+                }
+                // PUT /v1/runs/{id}/inbox
+                if let Some(run_id) = id.strip_suffix("/inbox") {
+                    if method == "PUT" {
+                        return as_json(push_inbox(run_id, body, state).await);
+                    }
+                }
+                // GET /v1/runs/{id}/intents
+                if let Some(run_id) = id.strip_suffix("/intents") {
+                    if method == "GET" {
+                        return as_json(drain_intents(run_id, state).await);
+                    }
+                }
+                // POST /v1/runs/{id}/messages
+                if let Some(run_id) = id.strip_suffix("/messages") {
+                    if method == "POST" {
+                        return as_json(push_message(run_id, body, state).await);
                     }
                 }
                 if method == "GET" {
@@ -516,6 +536,66 @@ fn build_stage_states(events: &[RunEvent]) -> HashMap<String, crate::persistence
     states
 }
 
+async fn push_inbox(run_id: &str, body: &str, state: AppState) -> (String, String) {
+    let snapshot: crate::sidecar::InboxSnapshot = match serde_json::from_str(body) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "400 Bad Request".into(),
+                ApiError::invalid_params(e.to_string()).to_json(),
+            )
+        }
+    };
+    let handles = state.sidecar_handles.lock().await;
+    match handles.get(run_id) {
+        Some(handle) => {
+            handle.load_inbox(snapshot).await;
+            ("200 OK".into(), r#"{"ok":true}"#.into())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
+    }
+}
+
+async fn drain_intents(run_id: &str, state: AppState) -> (String, String) {
+    let handles = state.sidecar_handles.lock().await;
+    match handles.get(run_id) {
+        Some(handle) => {
+            let intents = handle.drain_intents().await;
+            ("200 OK".into(), serde_json::to_string(&intents).unwrap())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
+    }
+}
+
+async fn push_message(run_id: &str, body: &str, state: AppState) -> (String, String) {
+    let entry: crate::sidecar::InboxEntry = match serde_json::from_str(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                "400 Bad Request".into(),
+                ApiError::invalid_params(e.to_string()).to_json(),
+            )
+        }
+    };
+    let handles = state.sidecar_handles.lock().await;
+    match handles.get(run_id) {
+        Some(handle) => {
+            handle.push_message(entry).await;
+            ("200 OK".into(), r#"{"ok":true}"#.into())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
+    }
+}
+
 async fn create_run(body: &str, state: AppState) -> (String, String) {
     let req: CreateRunRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -550,8 +630,16 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
     let environment_id = format!("env-{}", run_id);
 
     let mut planned_events = Vec::new();
+    let mut messaging_enabled = false;
     match crate::spec::load_spec(PathBuf::from(&req.file).as_path()) {
-        Ok(spec) => planned_events = plan_events_from_spec(&run_id, &environment_id, &spec),
+        Ok(spec) => {
+            messaging_enabled = spec
+                .agent
+                .as_ref()
+                .and_then(|a| a.messaging.as_ref())
+                .is_some_and(|m| m.enabled);
+            planned_events = plan_events_from_spec(&run_id, &environment_id, &spec);
+        }
         Err(e) => planned_events.push(event(
             &run_id,
             "warn",
@@ -658,6 +746,23 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
     {
         let mut bufs = state.telemetry_buffers.lock().await;
         bufs.insert(run_id.clone(), ring_buffer.clone());
+    }
+
+    // Start sidecar if messaging is enabled
+    if messaging_enabled {
+        let sidecar_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        match crate::sidecar::start_sidecar(&run_id, &run_id, &run_id, vec![], sidecar_addr).await {
+            Ok(handle) => {
+                state
+                    .sidecar_handles
+                    .lock()
+                    .await
+                    .insert(run_id.clone(), handle);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to start sidecar for {}: {}", run_id, e);
+            }
+        }
     }
 
     // Spawn host metrics collection task (1s interval)
@@ -903,6 +1008,13 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             r.updated_at = Some(now_ts);
             let _ = state_bg.provider.save_run(r);
         }
+        // Drop the runs lock before acquiring sidecar_handles lock
+        drop(runs);
+
+        // Clean up sidecar if one was started for this run
+        if let Some(handle) = state_bg.sidecar_handles.lock().await.remove(&run_id_bg) {
+            handle.stop().await;
+        }
     });
 
     (
@@ -1116,12 +1228,20 @@ async fn cancel_run(id: &str, body: &str, state: AppState) -> (String, String) {
         r.artifact_publication = Some(publication);
         r.updated_at = Some(now_ts);
         let _ = state.provider.save_run(r);
+        let response_status = r.status.clone();
+        // Drop the runs lock before acquiring sidecar_handles lock
+        drop(runs);
+
+        // Clean up sidecar if one was started for this run
+        if let Some(handle) = state.sidecar_handles.lock().await.remove(id) {
+            handle.stop().await;
+        }
 
         (
             "200 OK".to_string(),
             serde_json::to_string(&CancelRunResponse {
                 run_id: id.to_string(),
-                state: r.status.clone(),
+                state: response_status,
                 terminal_event_id,
             })
             .unwrap_or_else(|_| "{}".into()),
