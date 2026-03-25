@@ -250,6 +250,7 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "gzip",
     "ip",
     "test",
+    "void-message",
 ];
 
 /// Per-process resource limits applied in the guest via `setrlimit`.

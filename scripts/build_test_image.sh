@@ -59,6 +59,11 @@ echo "[test-image] Building claudio (release, static, target=$GUEST_TARGET)..."
 cargo build --release -p claudio --target "$GUEST_TARGET"
 CLAUDIO_BIN="target/$GUEST_TARGET/release/claudio"
 
+# ---- Build void-message (sidecar CLI, static musl) ----
+echo "[test-image] Building void-message (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-message --target "$GUEST_TARGET"
+VOID_MESSAGE_BIN="target/$GUEST_TARGET/release/void-message"
+
 # ---- Assemble rootfs ----
 echo "[test-image] Preparing rootfs at: $OUT_DIR"
 rm -rf "$OUT_DIR"
@@ -74,6 +79,11 @@ cp "$GUEST_AGENT_BIN" "$OUT_DIR/sbin/guest-agent"
 echo "[test-image] Installing claudio as /usr/local/bin/claude-code..."
 cp "$CLAUDIO_BIN" "$OUT_DIR/usr/local/bin/claude-code"
 chmod +x "$OUT_DIR/usr/local/bin/claude-code"
+
+# void-message CLI for sidecar messaging
+echo "[test-image] Installing void-message as /usr/local/bin/void-message..."
+cp "$VOID_MESSAGE_BIN" "$OUT_DIR/usr/local/bin/void-message"
+chmod +x "$OUT_DIR/usr/local/bin/void-message"
 
 # ---- BusyBox for /bin/sh ----
 # Auto-detect a static busybox if BUSYBOX is not explicitly set.
