@@ -838,10 +838,16 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     .get(&run_id)
                     .map(|h| h.addr().port());
                 if let Some(port) = sidecar_port {
+                    // Inject sidecar URL as env var for void-message CLI
+                    spec.sandbox.env.insert(
+                        "VOID_SIDECAR_URL".to_string(),
+                        format!("http://10.0.2.2:{}", port),
+                    );
+                    // Inject messaging skill (documents the CLI, not raw HTTP)
                     if let Some(ref mut agent) = spec.agent {
                         agent.skills.push(crate::spec::SkillEntry::Inline {
                             name: "void-messaging".into(),
-                            content: crate::sidecar::messaging_skill_content(port),
+                            content: crate::sidecar::messaging_skill_content(),
                         });
                     }
                 }

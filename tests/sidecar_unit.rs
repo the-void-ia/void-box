@@ -355,26 +355,20 @@ fn incremental_inbox_query() {
 }
 
 #[test]
-fn messaging_skill_content_includes_port() {
-    let content = void_box::sidecar::messaging_skill_content(8090);
-    assert!(content.contains("http://10.0.2.2:8090/v1/inbox"));
-    assert!(content.contains("http://10.0.2.2:8090/v1/intents"));
-    assert!(content.contains("http://10.0.2.2:8090/v1/context"));
-    assert!(content.contains("http://10.0.2.2:8090/v1/health"));
+fn messaging_skill_content_documents_cli() {
+    let content = void_box::sidecar::messaging_skill_content();
+    assert!(content.contains("void-message context"));
+    assert!(content.contains("void-message inbox"));
+    assert!(content.contains("void-message send"));
     assert!(content.contains("proposal"));
     assert!(content.contains("signal"));
     assert!(content.contains("evaluation"));
     assert!(content.contains("broadcast"));
     assert!(content.contains("leader"));
-}
-
-#[test]
-fn messaging_skill_content_varies_by_port() {
-    let c1 = void_box::sidecar::messaging_skill_content(9000);
-    let c2 = void_box::sidecar::messaging_skill_content(9001);
-    assert!(c1.contains("9000"));
-    assert!(c2.contains("9001"));
-    assert!(!c1.contains("9001"));
+    // Should NOT contain raw HTTP instructions
+    assert!(!content.contains("curl"));
+    assert!(!content.contains("wget"));
+    assert!(!content.contains("http://10.0.2.2"));
 }
 
 #[test]

@@ -432,7 +432,7 @@ async fn claudio_discovers_injected_messaging_skill() {
         return;
     }
 
-    // Start sidecar to get a real port for the skill content
+    // Start sidecar (skill content is now static, but we need the handle for cleanup)
     let handle = sidecar::start_sidecar(
         "run-skill-inject",
         "exec-skill-inject",
@@ -443,8 +443,7 @@ async fn claudio_discovers_injected_messaging_skill() {
     .await
     .expect("failed to start sidecar");
 
-    let port = handle.addr().port();
-    let skill_content = sidecar::messaging_skill_content(port);
+    let skill_content = sidecar::messaging_skill_content();
 
     // Build VoidBox with inline messaging skill + claudio
     let ab = match VoidBox::new("skill-inject-test")
