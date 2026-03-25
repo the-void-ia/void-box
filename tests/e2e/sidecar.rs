@@ -395,3 +395,101 @@ async fn guest_full_agent_flow() {
 
     handle.stop().await;
 }
+
+// ===========================================================================
+// Test 5: Skill injection — claudio discovers the provisioned messaging skill
+// ===========================================================================
+
+/// Build a VoidBox with an inline messaging skill and claudio (mock claude-code).
+/// Claudio scans /home/sandbox/.claude/skills/*.md on startup and reports
+/// discovered skills in its output. This test verifies the full provisioning
+/// pipeline: SkillKind::Inline → provision_skills → guest filesystem → claudio
+/// discovery.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires KVM + kernel/initramfs + network"]
+async fn claudio_discovers_injected_messaging_skill() {
+    use void_box::agent_box::VoidBox;
+    use void_box::skill::Skill;
+
+    if vm_preflight::require_kvm_usable().is_err() {
+        eprintln!("skipping: KVM not available");
+        return;
+    }
+    if vm_preflight::require_vsock_usable().is_err() {
+        eprintln!("skipping: vsock not available");
+        return;
+    }
+    let (kernel, initramfs) = match kvm_artifacts() {
+        Some(a) => a,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
+        eprintln!("skipping: kernel/initramfs not found");
+        return;
+    }
+
+    // Start sidecar to get a real port for the skill content
+    let handle = sidecar::start_sidecar(
+        "run-skill-inject",
+        "exec-skill-inject",
+        "c-1",
+        vec![],
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let skill_content = sidecar::messaging_skill_content(port);
+
+    // Build VoidBox with inline messaging skill + claudio
+    let ab = match VoidBox::new("skill-inject-test")
+        .kernel(&kernel)
+        .initramfs(&initramfs)
+        .memory_mb(256)
+        .network(true)
+        .skill(Skill::inline("void-messaging", &skill_content))
+        .skill(Skill::agent("claude-code"))
+        .prompt("Check your available skills and tell me what you found.")
+        .timeout_secs(60)
+        .build()
+    {
+        Ok(ab) => ab,
+        Err(e) => {
+            eprintln!("skipping: failed to build VoidBox: {e}");
+            handle.stop().await;
+            return;
+        }
+    };
+
+    // Run claudio — it scans skills dir and reports discoveries
+    let result = match ab.run(None, None).await {
+        Ok(r) => r,
+        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
+            eprintln!("skipping: guest control channel unavailable: {msg}");
+            handle.stop().await;
+            return;
+        }
+        Err(e) => {
+            handle.stop().await;
+            panic!("VoidBox::run failed: {e}");
+        }
+    };
+
+    eprintln!("claudio result_text: {}", result.claude_result.result_text);
+
+    // Claudio should have discovered the void-messaging skill file
+    // It reports discovered skills in the result text
+    assert!(
+        result.claude_result.result_text.contains("void-messaging"),
+        "claudio should discover void-messaging skill, got: {}",
+        result.claude_result.result_text
+    );
+
+    handle.stop().await;
+    eprintln!("PASSED: claudio_discovers_injected_messaging_skill");
+}
