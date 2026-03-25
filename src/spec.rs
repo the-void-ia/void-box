@@ -222,6 +222,8 @@ pub enum SkillEntry {
         #[serde(default = "default_oci_readonly")]
         readonly: bool,
     },
+    /// Inline skill with content provided directly (not from YAML, used programmatically).
+    Inline { name: String, content: String },
 }
 
 fn default_oci_readonly() -> bool {

@@ -14,7 +14,6 @@ use crate::persistence::{
     generate_event_id, legacy_to_v2_event_type, now_ms, now_rfc3339, provider_from_env,
     PersistenceProvider, RunEvent, RunState, RunStatus, SessionMessage,
 };
-use crate::runtime::run_file;
 use crate::spec::{RunKind, RunSpec};
 
 #[derive(Clone)]
@@ -629,16 +628,19 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         .unwrap_or_else(|| format!("run-{}", now_ms()));
     let environment_id = format!("env-{}", run_id);
 
+    // Load and prepare the spec once. The loaded spec (if successful) is passed
+    // into the background task — no double-loading, no leaked channels.
+    let loaded_spec = crate::spec::load_spec(PathBuf::from(&req.file).as_path());
     let mut planned_events = Vec::new();
     let mut messaging_enabled = false;
-    match crate::spec::load_spec(PathBuf::from(&req.file).as_path()) {
+    match &loaded_spec {
         Ok(spec) => {
             messaging_enabled = spec
                 .agent
                 .as_ref()
                 .and_then(|a| a.messaging.as_ref())
                 .is_some_and(|m| m.enabled);
-            planned_events = plan_events_from_spec(&run_id, &environment_id, &spec);
+            planned_events = plan_events_from_spec(&run_id, &environment_id, spec);
         }
         Err(e) => planned_events.push(event(
             &run_id,
@@ -818,6 +820,38 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         }
     });
 
+    // Prepare the spec before spawning the background task: apply overrides,
+    // inject snapshot config, and add messaging skill if sidecar is active.
+    // This keeps the background task simple — it just calls run_spec.
+    let prepared_spec = match loaded_spec {
+        Ok(mut spec) => {
+            if req.snapshot.is_some() {
+                spec.sandbox.snapshot = req.snapshot.clone();
+            }
+            crate::runtime::apply_llm_overrides_from_env(&mut spec);
+
+            if messaging_enabled {
+                let sidecar_port = state
+                    .sidecar_handles
+                    .lock()
+                    .await
+                    .get(&run_id)
+                    .map(|h| h.addr().port());
+                if let Some(port) = sidecar_port {
+                    if let Some(ref mut agent) = spec.agent {
+                        agent.skills.push(crate::spec::SkillEntry::Inline {
+                            name: "void-messaging".into(),
+                            content: crate::sidecar::messaging_skill_content(port),
+                        });
+                    }
+                }
+            }
+
+            Ok(spec)
+        }
+        Err(e) => Err(e),
+    };
+
     let state_bg = state.clone();
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
@@ -850,37 +884,27 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             }
         });
 
-        let path = PathBuf::from(&req.file);
-        // If the request specifies a snapshot, override the spec before running.
-        let result = if req.snapshot.is_some() {
-            match crate::spec::load_spec(&path) {
-                Ok(mut spec) => {
-                    spec.sandbox.snapshot = req.snapshot;
-                    crate::runtime::apply_llm_overrides_from_env(&mut spec);
-                    crate::runtime::run_spec(
-                        &spec,
-                        req.input,
-                        policy_bg,
-                        Some(stage_tx),
-                        Some(telemetry_rb),
-                        Some(provider_bg.clone()),
-                        Some(&run_id_bg),
-                    )
-                    .await
-                }
-                Err(e) => Err(e),
+        // run_spec always consumes stage_tx (even on failure), so the
+        // collector task will exit cleanly when the channel closes.
+        let result = match prepared_spec {
+            Ok(spec) => {
+                crate::runtime::run_spec(
+                    &spec,
+                    req.input,
+                    policy_bg,
+                    Some(stage_tx),
+                    Some(telemetry_rb),
+                    Some(provider_bg),
+                    Some(&run_id_bg),
+                )
+                .await
             }
-        } else {
-            run_file(
-                &path,
-                req.input,
-                policy_bg,
-                Some(stage_tx),
-                Some(telemetry_rb),
-                Some(provider_bg),
-                Some(&run_id_bg),
-            )
-            .await
+            Err(e) => {
+                // Spec failed to load — run_spec is not called, so we must
+                // drop stage_tx explicitly to close the channel.
+                drop(stage_tx);
+                Err(e)
+            }
         };
 
         // Wait for collector to drain remaining events
@@ -1762,6 +1786,11 @@ fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, 
             "oci".to_string(),
             image.clone(),
             format!("oci:{}:{}", image, mount),
+        )),
+        crate::spec::SkillEntry::Inline { name, .. } => Some((
+            "inline".to_string(),
+            name.clone(),
+            format!("inline:{}", name),
         )),
     }
 }

@@ -486,6 +486,17 @@ impl VoidBox {
                         tag, skill.name, profile_path
                     );
                 }
+                SkillKind::Inline { content } => {
+                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
+                    sandbox.write_file(&guest_path, content.as_bytes()).await?;
+                    eprintln!(
+                        "[vm:{}] Installing inline skill '{}' ({} bytes) -> {}",
+                        tag,
+                        skill.name,
+                        content.len(),
+                        guest_path
+                    );
+                }
             }
         }
 

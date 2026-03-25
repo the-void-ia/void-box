@@ -87,6 +87,12 @@ pub enum SkillKind {
         /// Whether the mount is read-only (default: true)
         readonly: bool,
     },
+    /// Inline skill -- content provided directly, not from a file.
+    /// Written to the guest as a SKILL.md file.
+    Inline {
+        /// Skill content (typically markdown)
+        content: String,
+    },
 }
 
 impl Skill {
@@ -188,6 +194,17 @@ impl Skill {
         Self {
             kind: SkillKind::File { path },
             name,
+            description_text: None,
+        }
+    }
+
+    /// Create an inline skill with content provided directly.
+    pub fn inline(name: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            kind: SkillKind::Inline {
+                content: content.into(),
+            },
+            name: name.into(),
             description_text: None,
         }
     }

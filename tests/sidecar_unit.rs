@@ -353,3 +353,39 @@ fn incremental_inbox_query() {
     let incremental = state.get_inbox(Some(3));
     assert!(incremental.entries.is_empty());
 }
+
+#[test]
+fn messaging_skill_content_includes_port() {
+    let content = void_box::sidecar::messaging_skill_content(8090);
+    assert!(content.contains("http://10.0.2.2:8090/v1/inbox"));
+    assert!(content.contains("http://10.0.2.2:8090/v1/intents"));
+    assert!(content.contains("http://10.0.2.2:8090/v1/context"));
+    assert!(content.contains("http://10.0.2.2:8090/v1/health"));
+    assert!(content.contains("proposal"));
+    assert!(content.contains("signal"));
+    assert!(content.contains("evaluation"));
+    assert!(content.contains("broadcast"));
+    assert!(content.contains("leader"));
+}
+
+#[test]
+fn messaging_skill_content_varies_by_port() {
+    let c1 = void_box::sidecar::messaging_skill_content(9000);
+    let c2 = void_box::sidecar::messaging_skill_content(9001);
+    assert!(c1.contains("9000"));
+    assert!(c2.contains("9001"));
+    assert!(!c1.contains("9001"));
+}
+
+#[test]
+fn inline_skill_constructs_correctly() {
+    let skill = void_box::skill::Skill::inline("test-skill", "# Test\nHello world");
+    assert_eq!(skill.name, "test-skill");
+    match skill.kind {
+        void_box::skill::SkillKind::Inline { ref content } => {
+            assert!(content.contains("# Test"));
+            assert!(content.contains("Hello world"));
+        }
+        _ => panic!("expected Inline kind"),
+    }
+}

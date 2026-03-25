@@ -1094,6 +1094,7 @@ fn parse_skill_entry(entry: &SkillEntry) -> Result<Skill> {
             }
             Ok(skill)
         }
+        SkillEntry::Inline { name, content } => Ok(Skill::inline(name, content)),
     }
 }
 
