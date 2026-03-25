@@ -492,3 +492,94 @@ async fn claudio_discovers_injected_messaging_skill() {
     handle.stop().await;
     eprintln!("PASSED: claudio_discovers_injected_messaging_skill");
 }
+
+// ===========================================================================
+// Test 6: void-message CLI works from inside the guest VM
+// ===========================================================================
+
+/// Boot a real VM and run void-message CLI commands from inside the guest.
+/// Requires the test initramfs to include void-message binary
+/// (rebuild with scripts/build_test_image.sh after adding void-message).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires KVM + kernel/initramfs with void-message"]
+async fn guest_uses_void_message_cli() {
+    let backend = match start_backend().await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let handle = sidecar::start_sidecar(
+        "run-cli-e2e",
+        "exec-cli-e2e",
+        "c-1",
+        vec!["c-2".into()],
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let sidecar_url = format!("http://10.0.2.2:{port}");
+
+    // Load inbox
+    handle
+        .load_inbox(sidecar::InboxSnapshot {
+            version: 1,
+            execution_id: "exec-cli-e2e".into(),
+            candidate_id: "c-1".into(),
+            iteration: 1,
+            entries: vec![sidecar::InboxEntry {
+                message_id: "msg-1".into(),
+                from_candidate_id: "c-2".into(),
+                kind: "proposal".into(),
+                payload: serde_json::json!({"summary_text": "approach A"}),
+            }],
+        })
+        .await;
+
+    // Test: void-message health
+    let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message health");
+    let out = guest_sh(&*backend, &script).await;
+    let Some(out) = out else {
+        eprintln!("skipping: void-message not in initramfs (rebuild test image)");
+        handle.stop().await;
+        return;
+    };
+    if !out.success() {
+        eprintln!("skipping: void-message not available: {}", out.stderr_str());
+        handle.stop().await;
+        return;
+    }
+    let health: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
+    assert_eq!(health["status"], "ok");
+
+    // Test: void-message context
+    let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message context");
+    let out = guest_sh(&*backend, &script).await.unwrap();
+    assert!(out.success(), "context failed: {}", out.stderr_str());
+    let ctx: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
+    assert_eq!(ctx["candidate_id"], "c-1");
+
+    // Test: void-message inbox
+    let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message inbox");
+    let out = guest_sh(&*backend, &script).await.unwrap();
+    assert!(out.success(), "inbox failed: {}", out.stderr_str());
+    let inbox: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
+    assert_eq!(inbox["entries"].as_array().unwrap().len(), 1);
+
+    // Test: void-message send
+    let script = format!(
+        "VOID_SIDECAR_URL={sidecar_url} void-message send --kind signal --audience broadcast --summary 'cli e2e works'"
+    );
+    let out = guest_sh(&*backend, &script).await.unwrap();
+    assert!(out.success(), "send failed: {}", out.stderr_str());
+
+    // Verify intent received by sidecar
+    let drained = handle.drain_intents().await;
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].kind, "signal");
+
+    handle.stop().await;
+    eprintln!("PASSED: guest_uses_void_message_cli");
+}
