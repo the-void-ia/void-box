@@ -147,7 +147,7 @@ name = "oci_integration"
 path = "tests/oci_integration.rs"
 
 [workspace]
-members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci"]
+members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message"]
 
 # guest-agent builds as a tiny static init binary for the guest initramfs.
 # Use `cargo build -p guest-agent --release` with these workspace-level settings.
@@ -157,4 +157,7 @@ members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci"]
 opt-level = "z"
 
 [profile.release.package.claudio]
+opt-level = "z"
+
+[profile.release.package.void-message]
 opt-level = "z"
