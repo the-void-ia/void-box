@@ -385,7 +385,7 @@ impl LocalSandbox {
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
         backend
-            .exec_streaming("claude-code", args, &env, None, timeout_secs)
+            .exec_streaming("claude-code", args, &env, Some("/workspace"), timeout_secs)
             .await
     }
 
