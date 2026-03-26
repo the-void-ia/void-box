@@ -135,6 +135,10 @@ name = "e2e_sidecar"
 path = "tests/e2e/sidecar.rs"
 
 [[test]]
+name = "e2e_claude_mcp"
+path = "tests/e2e/claude_mcp.rs"
+
+[[test]]
 name = "orchestration_contract"
 path = "tests/orchestration_contract.rs"
 
