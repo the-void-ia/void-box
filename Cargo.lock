@@ -2229,6 +2229,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "void-box",
+]
+
+[[package]]
+name = "void-message"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "void-box",
+]
+
+[[package]]
 name = "voidbox-oci"
 version = "0.1.2"
 dependencies = [
