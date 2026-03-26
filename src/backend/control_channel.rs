@@ -382,7 +382,7 @@ impl ControlChannel {
         }
 
         let mut delay = Duration::from_millis(100);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         let mut attempt: u32 = 0;
 
         loop {

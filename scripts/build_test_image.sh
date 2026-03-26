@@ -113,7 +113,8 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
     ln -sf busybox "$OUT_DIR/bin/sh"
     for cmd in echo cat env tr test ls mkdir rm cp mv pwd id hostname \
                dd stat chmod wc touch head tail grep sed awk sort uniq \
-               uname date df du find xargs; do
+               uname date df du find xargs ip ifconfig route which \
+               basename dirname readlink realpath sleep; do
         ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
 else

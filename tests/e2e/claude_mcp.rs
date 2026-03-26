@@ -116,7 +116,7 @@ async fn real_claude_uses_void_mcp_tools() {
     let ab = match VoidBox::new("real-claude-mcp-test")
         .kernel(&kernel)
         .initramfs(&initramfs)
-        .memory_mb(512)
+        .memory_mb(3072)
         .network(true)
         .skill(
             Skill::mcp("void-mcp")
@@ -264,7 +264,7 @@ async fn diagnostic_void_mcp_starts_in_guest() {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).unwrap();
     let config = BackendConfig {
-        memory_mb: 256,
+        memory_mb: 3072,
         vcpus: 1,
         kernel,
         initramfs: Some(initramfs),
@@ -297,7 +297,17 @@ async fn diagnostic_void_mcp_starts_in_guest() {
 
     // Test 1: void-mcp binary exists
     let out = backend
-        .exec("sh", &["-c", "which void-mcp"], &[], &[], None, Some(10))
+        .exec(
+            "sh",
+            &[
+                "-c",
+                "test -x /usr/local/bin/void-mcp && echo /usr/local/bin/void-mcp",
+            ],
+            &[],
+            &[],
+            None,
+            Some(10),
+        )
         .await;
     match &out {
         Ok(o) if o.success() => eprintln!("void-mcp found at: {}", o.stdout_str().trim()),

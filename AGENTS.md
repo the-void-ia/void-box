@@ -523,6 +523,35 @@ That production image is for real Claude/OpenClaw runtime paths.
 
 ## Known issues
 
+### Vsock control channel timeout with large initramfs or missing `ip`
+
+**Symptom:** `control_channel: deadline reached (connect or handshake)` — the
+host connects via AF_VSOCK but gets `ECONNRESET` on every attempt.
+
+**Root causes (two independent issues):**
+
+1. **Missing `ip` binary → `Command::new("ip").output()` hangs PID 1.**
+   The guest-agent's `setup_network()` calls `run_cmd("ip", ...)` which
+   internally does `fork+execvp`. When `ip` is not in PATH (e.g. no busybox
+   symlink), `execvp` fails — but in the minimal initramfs PID 1 environment,
+   the Rust `Command::output()` call can hang indefinitely instead of returning
+   `Err(ENOENT)`. The guest-agent never reaches `create_vsock_listener()`.
+   **Fix:** Ensure `ip` (and `which`) are included as busybox symlinks in the
+   initramfs (`scripts/build_test_image.sh`).
+
+2. **Large production initramfs (100+ MB) exceeds boot timeout.**
+   The control channel allows 4 s boot wait + 30 s connect deadline (34 s total).
+   A 100 MB+ initramfs (with real `claude-code`, glibc, git, etc.) takes longer
+   to decompress, load modules, and complete network setup — especially with only
+   256 MB of guest RAM. **Fix:** Use at least **3 GB** of guest memory for
+   production initramfs (`memory_mb(3072)`) so the kernel can decompress and
+   boot within the timeout window.
+
+**Debugging tip:** Boot a `MicroVm` directly with `loglevel=7` in the kernel
+cmdline and read `vm.read_serial_output()` to see guest-agent progress messages.
+With `loglevel=0`, `/dev/kmsg` writes don't reach the serial console. Increase
+the serial channel buffer from 4096 to 65536 if kernel messages overflow it.
+
 ### Snapshot restore: XCR0 and LAPIC timer
 
 **Root causes of guest crash after snapshot restore** (2-day debugging effort):

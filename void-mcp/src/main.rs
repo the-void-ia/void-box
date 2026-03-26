@@ -1,8 +1,14 @@
-//! void-mcp: MCP stdio server for void-box sidecar messaging.
+//! void-mcp: MCP server for void-box sidecar messaging.
 //!
-//! Speaks JSON-RPC 2.0 over stdin/stdout with Content-Length header framing
-//! (the same wire format as LSP). Claude Code spawns this as a subprocess
-//! and discovers tools automatically via the MCP initialize handshake.
+//! Two transport modes:
+//!
+//! **stdio** (default): Speaks JSON-RPC 2.0 over stdin/stdout with
+//! Content-Length header framing (the same wire format as LSP).
+//!
+//! **Streamable HTTP** (`--sse`): Listens on `127.0.0.1:<port>` and handles
+//! `POST /mcp` with JSON-RPC request bodies, returning JSON responses.
+//! This mode is used when Claude Code cannot spawn MCP servers as child
+//! processes (e.g. inside a minimal guest VM).
 
 mod http;
 mod jsonrpc;
@@ -10,6 +16,7 @@ mod tools;
 
 use std::env;
 use std::io::{self, BufRead, Read, Write};
+use std::net::TcpListener;
 use std::process;
 
 use jsonrpc::{Request, Response, INVALID_PARAMS, METHOD_NOT_FOUND};
@@ -24,6 +31,21 @@ fn main() {
         }
     };
 
+    let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "--sse") {
+        let port = parse_port(&args).unwrap_or(8222);
+        run_http_server(&base_url, port);
+    } else {
+        run_stdio(&base_url);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stdio transport
+// ---------------------------------------------------------------------------
+
+fn run_stdio(base_url: &str) {
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
     let stdout = io::stdout();
@@ -39,22 +61,171 @@ fn main() {
             Ok(req) => req,
             Err(e) => {
                 let resp = Response::error(None, -32700, format!("Parse error: {e}"));
-                write_response(&mut writer, &resp);
+                write_framed(&mut writer, &resp);
                 continue;
             }
         };
 
-        let response = handle_request(&base_url, &request);
+        let response = handle_request(base_url, &request);
 
-        // Notifications (no id) get no response
         if let Some(resp) = response {
-            write_response(&mut writer, &resp);
+            write_framed(&mut writer, &resp);
         }
     }
 }
 
+fn read_content_length(reader: &mut impl BufRead) -> Option<usize> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return content_length;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            if let Ok(len) = value.trim().parse::<usize>() {
+                content_length = Some(len);
+            }
+        }
+    }
+}
+
+fn write_framed(writer: &mut impl Write, response: &Response) {
+    let body = serde_json::to_string(response).expect("failed to serialize response");
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = writer.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Streamable HTTP transport
+// ---------------------------------------------------------------------------
+
+fn run_http_server(base_url: &str, port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: failed to bind {addr}: {e}");
+            process::exit(1);
+        }
+    };
+    eprintln!("void-mcp: listening on http://{addr}/mcp");
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(10))) {
+            eprintln!("void-mcp: set_read_timeout: {e}");
+            continue;
+        }
+
+        let mut buf = vec![0u8; 65536];
+        let n = match stream.read(&mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+        let raw = String::from_utf8_lossy(&buf[..n]);
+
+        // Parse HTTP request line
+        let first_line = raw.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        let method = parts.first().copied().unwrap_or("");
+        let path = parts.get(1).copied().unwrap_or("");
+
+        if path != "/mcp" {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+            );
+            continue;
+        }
+
+        if method == "GET" {
+            // Streamable HTTP spec: server MAY return 405 if it doesn't offer SSE GET
+            let _ = write!(
+                stream,
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+            );
+            continue;
+        }
+
+        if method != "POST" {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+            );
+            continue;
+        }
+
+        // Extract JSON body from HTTP request
+        let body = match raw.split_once("\r\n\r\n") {
+            Some((_, b)) => b.to_string(),
+            None => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+                );
+                continue;
+            }
+        };
+
+        let request: Request = match serde_json::from_str(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                let resp = Response::error(None, -32700, format!("Parse error: {e}"));
+                let json = serde_json::to_string(&resp).unwrap_or_default();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+                continue;
+            }
+        };
+
+        let response = handle_request(base_url, &request);
+
+        match response {
+            Some(resp) => {
+                let json = serde_json::to_string(&resp).unwrap_or_default();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+            }
+            None => {
+                // Notification — no JSON-RPC response, return 202 Accepted
+                let _ = write!(stream, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+            }
+        }
+    }
+}
+
+fn parse_port(args: &[String]) -> Option<u16> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--port" {
+            return args.get(i + 1)?.parse().ok();
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Shared request handling
+// ---------------------------------------------------------------------------
+
 fn handle_request(base_url: &str, req: &Request) -> Option<Response> {
-    // Notifications have no id and expect no response
     req.id.as_ref()?;
 
     let id = req.id.clone();
@@ -113,33 +284,9 @@ fn handle_request(base_url: &str, req: &Request) -> Option<Response> {
     Some(resp)
 }
 
-fn read_content_length(reader: &mut impl BufRead) -> Option<usize> {
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return None, // EOF
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            // End of headers
-            return content_length;
-        }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            if let Ok(len) = value.trim().parse::<usize>() {
-                content_length = Some(len);
-            }
-        }
-    }
-}
-
-fn write_response(writer: &mut impl Write, response: &Response) {
-    let body = serde_json::to_string(response).expect("failed to serialize response");
-    let _ = write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body);
-    let _ = writer.flush();
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -183,7 +330,6 @@ mod tests {
         assert!(names.contains(&"read_peer_messages"));
         assert!(names.contains(&"broadcast_observation"));
         assert!(names.contains(&"recommend_to_leader"));
-        // Old names must NOT exist
         assert!(!names.contains(&"get_context"));
         assert!(!names.contains(&"read_inbox"));
         assert!(!names.contains(&"send_message"));
@@ -207,7 +353,6 @@ mod tests {
 
     #[test]
     fn notification_returns_no_response() {
-        // Notifications have no id
         let req = make_request("notifications/initialized", None, None);
         let resp = handle_request("http://127.0.0.1:9999", &req);
         assert!(resp.is_none());
@@ -228,14 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn write_response_uses_content_length_framing() {
+    fn write_framed_uses_content_length() {
         let resp = Response::success(Some(json!(1)), json!({"ok": true}));
         let mut buf = Vec::new();
-        write_response(&mut buf, &resp);
+        write_framed(&mut buf, &resp);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.starts_with("Content-Length: "));
         assert!(output.contains("\r\n\r\n"));
-        // Verify the body after the separator is valid JSON
         let body = output.split("\r\n\r\n").nth(1).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["jsonrpc"], "2.0");
@@ -264,5 +408,22 @@ mod tests {
         let response = handle_request("http://127.0.0.1:9999", &request).unwrap();
         assert!(response.result.is_some());
         assert_eq!(response.result.unwrap()["serverInfo"]["name"], "void-mcp");
+    }
+
+    #[test]
+    fn parse_port_extracts_value() {
+        let args = vec![
+            "void-mcp".to_string(),
+            "--sse".to_string(),
+            "--port".to_string(),
+            "9090".to_string(),
+        ];
+        assert_eq!(parse_port(&args), Some(9090));
+    }
+
+    #[test]
+    fn parse_port_returns_none_when_missing() {
+        let args = vec!["void-mcp".to_string(), "--sse".to_string()];
+        assert_eq!(parse_port(&args), None);
     }
 }

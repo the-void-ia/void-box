@@ -441,19 +441,53 @@ impl VoidBox {
                     }
                 }
                 SkillKind::Mcp { command, args, env } => {
-                    // Add to MCP config with type: stdio (required by Claude Code)
-                    let mut entry = serde_json::json!({
-                        "type": "stdio",
-                        "command": command,
-                        "args": args,
-                    });
-                    if !env.is_empty() {
-                        entry["env"] = serde_json::json!(env);
+                    // Start the MCP server as a background HTTP process inside the
+                    // guest, then point Claude Code at it via streamable-HTTP URL.
+                    // This avoids Claude Code (Bun) needing to spawn the server as
+                    // a child process, which fails in minimal VM environments.
+                    let mcp_port = 8222 + mcp_servers.len() as u16;
+                    let env_prefix: String =
+                        env.iter().map(|(k, v)| format!("{k}='{v}' ")).collect();
+                    let args_str: String = args.iter().map(|a| format!(" {a}")).collect();
+                    let start_cmd = format!(
+                        "{env_prefix}{command}{args_str} --sse --port {mcp_port} \
+                         >/dev/null 2>/dev/null &"
+                    );
+                    match sandbox.exec("sh", &["-c", &start_cmd]).await {
+                        Ok(output) if output.exit_code == 0 => {
+                            eprintln!(
+                                "[vm:{}] Started MCP server '{}' on port {} (HTTP/SSE)",
+                                tag, skill.name, mcp_port
+                            );
+                        }
+                        Ok(output) => {
+                            eprintln!(
+                                "[vm:{}] WARNING: MCP server '{}' start returned exit {}: {}",
+                                tag,
+                                skill.name,
+                                output.exit_code,
+                                output.stderr_str()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vm:{}] WARNING: Failed to start MCP server '{}': {}",
+                                tag, skill.name, e
+                            );
+                        }
                     }
+
+                    // Brief pause for the server to bind the port
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                    let entry = serde_json::json!({
+                        "type": "http",
+                        "url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+                    });
                     mcp_servers.insert(skill.name.clone(), entry);
                     eprintln!(
-                        "[vm:{}] Registering MCP server '{}' (cmd: {}, args: {:?})",
-                        tag, skill.name, command, args
+                        "[vm:{}] Registering MCP server '{}' (url: http://127.0.0.1:{}/mcp)",
+                        tag, skill.name, mcp_port
                     );
                 }
                 SkillKind::Cli { command } => {
