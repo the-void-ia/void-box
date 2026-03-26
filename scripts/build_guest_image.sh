@@ -45,17 +45,34 @@ else
   source "$SCRIPT_DIR/guest_linux.sh"
 fi
 
-# ── Build guest-agent ─────────────────────────────────────────────────────────
+# ── Build guest binaries ──────────────────────────────────────────────────────
 
 echo "[void-box] Building guest-agent (release, static, target=$GUEST_TARGET, arch=$ARCH)..."
 cargo build --release -p guest-agent --target "$GUEST_TARGET"
 GUEST_AGENT_BIN="target/$GUEST_TARGET/release/guest-agent"
+
+echo "[void-box] Building void-message (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-message --target "$GUEST_TARGET"
+VOID_MESSAGE_BIN="target/$GUEST_TARGET/release/void-message"
+
+echo "[void-box] Building void-mcp (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-mcp --target "$GUEST_TARGET"
+VOID_MCP_BIN="target/$GUEST_TARGET/release/void-mcp"
 
 # ── Assemble rootfs ──────────────────────────────────────────────────────────
 
 prepare_rootfs
 install_dhcp_script
 install_guest_agent "$GUEST_AGENT_BIN"
+
+# Sidecar messaging tools
+echo "[void-box] Installing void-message CLI at /usr/local/bin/void-message..."
+cp "$VOID_MESSAGE_BIN" "$OUT_DIR/usr/local/bin/void-message"
+chmod +x "$OUT_DIR/usr/local/bin/void-message"
+
+echo "[void-box] Installing void-mcp MCP bridge at /usr/local/bin/void-mcp..."
+cp "$VOID_MCP_BIN" "$OUT_DIR/usr/local/bin/void-mcp"
+chmod +x "$OUT_DIR/usr/local/bin/void-mcp"
 
 # Claude-code: install binary, then platform-specific shared libraries
 if install_claude_code_binary; then

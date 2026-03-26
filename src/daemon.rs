@@ -850,12 +850,27 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                             content: crate::sidecar::messaging_skill_content(),
                         });
                     }
-                    // If agent uses claude-code, also register void-mcp as MCP server
-                    let is_claude = spec.agent.as_ref().is_some_and(|a| {
+                    // Register void-mcp for Claude-backed runs. Prefer explicit bridge
+                    // selection, then llm.provider/runtime defaults, then legacy agent skill markers.
+                    let wants_claude_bridge = spec
+                        .agent
+                        .as_ref()
+                        .and_then(|a| a.messaging.as_ref())
+                        .and_then(|m| m.provider_bridge.as_deref())
+                        .is_some_and(|bridge| {
+                            matches!(bridge, "claude" | "claude-code" | "void-mcp")
+                        });
+                    let uses_claude_provider = spec
+                        .llm
+                        .as_ref()
+                        .is_none_or(|llm| llm.provider.eq_ignore_ascii_case("claude"));
+                    let has_claude_agent_skill = spec.agent.as_ref().is_some_and(|a| {
                         a.skills.iter().any(|s| {
                             matches!(s, crate::spec::SkillEntry::Simple(raw) if raw == "agent:claude-code" || raw == "agent:claude")
                         })
                     });
+                    let is_claude =
+                        wants_claude_bridge || uses_claude_provider || has_claude_agent_skill;
                     if is_claude {
                         if let Some(ref mut agent) = spec.agent {
                             let mut mcp_env = std::collections::HashMap::new();
@@ -1955,5 +1970,125 @@ fn kind_name(kind: &RunKind) -> &'static str {
         RunKind::Agent => "agent",
         RunKind::Pipeline => "pipeline",
         RunKind::Workflow => "workflow",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::spec::{
+        AgentSpec, LlmSpec, MessagingSpec, RunKind, RunSpec, SandboxSpec, SkillEntry,
+    };
+
+    fn base_spec() -> RunSpec {
+        RunSpec {
+            api_version: "v1".into(),
+            kind: RunKind::Agent,
+            name: "test".into(),
+            sandbox: SandboxSpec {
+                mode: "auto".into(),
+                kernel: None,
+                initramfs: None,
+                memory_mb: 256,
+                vcpus: 1,
+                network: true,
+                env: Default::default(),
+                mounts: vec![],
+                image: None,
+                guest_image: None,
+                snapshot: None,
+            },
+            llm: Some(LlmSpec {
+                provider: "claude".into(),
+                model: None,
+                base_url: None,
+                api_key_env: None,
+            }),
+            observe: None,
+            agent: Some(AgentSpec {
+                prompt: "hi".into(),
+                skills: vec![],
+                timeout_secs: None,
+                output_file: None,
+                messaging: Some(MessagingSpec {
+                    enabled: true,
+                    provider_bridge: None,
+                }),
+            }),
+            pipeline: None,
+            workflow: None,
+        }
+    }
+
+    fn should_register_void_mcp(spec: &RunSpec) -> bool {
+        let wants_claude_bridge = spec
+            .agent
+            .as_ref()
+            .and_then(|a| a.messaging.as_ref())
+            .and_then(|m| m.provider_bridge.as_deref())
+            .is_some_and(|bridge| matches!(bridge, "claude" | "claude-code" | "void-mcp"));
+        let uses_claude_provider = spec
+            .llm
+            .as_ref()
+            .is_none_or(|llm| llm.provider.eq_ignore_ascii_case("claude"));
+        let has_claude_agent_skill = spec.agent.as_ref().is_some_and(|a| {
+            a.skills.iter().any(|s| {
+                matches!(s, SkillEntry::Simple(raw) if raw == "agent:claude-code" || raw == "agent:claude")
+            })
+        });
+        wants_claude_bridge || uses_claude_provider || has_claude_agent_skill
+    }
+
+    #[test]
+    fn registers_void_mcp_for_claude_provider_without_agent_skill_marker() {
+        let spec = base_spec();
+        assert!(should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn registers_void_mcp_for_explicit_provider_bridge() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        spec.agent
+            .as_mut()
+            .unwrap()
+            .messaging
+            .as_mut()
+            .unwrap()
+            .provider_bridge = Some("void-mcp".into());
+        assert!(should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn does_not_register_void_mcp_for_non_claude_provider_without_bridge_or_skill() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        assert!(!should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn registers_void_mcp_for_legacy_agent_skill_marker() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        spec.agent
+            .as_mut()
+            .unwrap()
+            .skills
+            .push(SkillEntry::Simple("agent:claude-code".into()));
+        assert!(should_register_void_mcp(&spec));
     }
 }
