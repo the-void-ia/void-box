@@ -251,6 +251,7 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "ip",
     "test",
     "void-message",
+    "void-mcp",
 ];
 
 /// Per-process resource limits applied in the guest via `setrlimit`.

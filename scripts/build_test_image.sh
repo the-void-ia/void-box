@@ -64,6 +64,11 @@ echo "[test-image] Building void-message (release, static, target=$GUEST_TARGET)
 cargo build --release -p void-message --target "$GUEST_TARGET"
 VOID_MESSAGE_BIN="target/$GUEST_TARGET/release/void-message"
 
+# ---- Build void-mcp (MCP bridge, static musl) ----
+echo "[test-image] Building void-mcp (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-mcp --target "$GUEST_TARGET"
+VOID_MCP_BIN="target/$GUEST_TARGET/release/void-mcp"
+
 # ---- Assemble rootfs ----
 echo "[test-image] Preparing rootfs at: $OUT_DIR"
 rm -rf "$OUT_DIR"
@@ -84,6 +89,11 @@ chmod +x "$OUT_DIR/usr/local/bin/claude-code"
 echo "[test-image] Installing void-message as /usr/local/bin/void-message..."
 cp "$VOID_MESSAGE_BIN" "$OUT_DIR/usr/local/bin/void-message"
 chmod +x "$OUT_DIR/usr/local/bin/void-message"
+
+# void-mcp MCP bridge for sidecar messaging
+echo "[test-image] Installing void-mcp as /usr/local/bin/void-mcp..."
+cp "$VOID_MCP_BIN" "$OUT_DIR/usr/local/bin/void-mcp"
+chmod +x "$OUT_DIR/usr/local/bin/void-mcp"
 
 # ---- BusyBox for /bin/sh ----
 # Auto-detect a static busybox if BUSYBOX is not explicitly set.

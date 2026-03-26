@@ -850,6 +850,26 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                             content: crate::sidecar::messaging_skill_content(),
                         });
                     }
+                    // If agent uses claude-code, also register void-mcp as MCP server
+                    let is_claude = spec.agent.as_ref().is_some_and(|a| {
+                        a.skills.iter().any(|s| {
+                            matches!(s, crate::spec::SkillEntry::Simple(raw) if raw == "agent:claude-code" || raw == "agent:claude")
+                        })
+                    });
+                    if is_claude {
+                        if let Some(ref mut agent) = spec.agent {
+                            let mut mcp_env = std::collections::HashMap::new();
+                            mcp_env.insert(
+                                "VOID_SIDECAR_URL".to_string(),
+                                format!("http://10.0.2.2:{}", port),
+                            );
+                            agent.skills.push(crate::spec::SkillEntry::Mcp {
+                                command: "void-mcp".to_string(),
+                                args: vec![],
+                                env: mcp_env,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1792,6 +1812,11 @@ fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, 
             "oci".to_string(),
             image.clone(),
             format!("oci:{}:{}", image, mount),
+        )),
+        crate::spec::SkillEntry::Mcp { command, .. } => Some((
+            "mcp".to_string(),
+            command.clone(),
+            format!("mcp:{}", command),
         )),
         crate::spec::SkillEntry::Inline { name, .. } => Some((
             "inline".to_string(),

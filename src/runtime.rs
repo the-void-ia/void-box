@@ -1094,6 +1094,17 @@ fn parse_skill_entry(entry: &SkillEntry) -> Result<Skill> {
             }
             Ok(skill)
         }
+        SkillEntry::Mcp { command, args, env } => {
+            let mut skill = Skill::mcp(command);
+            if !args.is_empty() {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                skill = skill.args(&arg_refs);
+            }
+            for (k, v) in env {
+                skill = skill.env(k, v);
+            }
+            Ok(skill)
+        }
         SkillEntry::Inline { name, content } => Ok(Skill::inline(name, content)),
     }
 }

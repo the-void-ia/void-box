@@ -222,6 +222,14 @@ pub enum SkillEntry {
         #[serde(default = "default_oci_readonly")]
         readonly: bool,
     },
+    /// MCP server skill (programmatic injection, not from YAML).
+    Mcp {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+    },
     /// Inline skill with content provided directly (not from YAML, used programmatically).
     Inline { name: String, content: String },
 }
