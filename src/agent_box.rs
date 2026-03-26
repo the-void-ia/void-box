@@ -47,10 +47,13 @@ use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::Result;
 
-const CLAUDE_HOME: &str = "/home/sandbox/.claude";
-/// Project-scoped config directory. Real Claude Code reads skills and settings
-/// from the project root's .claude/ directory when cwd is set.
-const PROJECT_CLAUDE: &str = "/workspace/.claude";
+/// Project-scoped config directory. Claude Code reads skills, settings, and
+/// MCP config relative to the working directory (set to /workspace).
+const CLAUDE_HOME: &str = "/workspace/.claude";
+
+/// MCP config file path. Claude Code reads project-scoped MCP servers from
+/// .mcp.json at the project root.
+const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
 
 /// An agent Box: Agent(Skills) + Isolation.
 ///
@@ -373,14 +376,10 @@ impl VoidBox {
         Ok(())
     }
 
-    /// Write a skill file to both user-scoped and project-scoped locations.
-    /// Real Claude Code reads from the project root (.claude/skills/), while
-    /// claudio and older versions read from ~/.claude/skills/.
+    /// Write a skill file to the project-scoped .claude/skills/ directory.
     async fn write_skill_file(sandbox: &Sandbox, name: &str, content: &[u8]) -> Result<()> {
-        let home_path = format!("{}/skills/{}.md", CLAUDE_HOME, name);
-        let project_path = format!("{}/skills/{}.md", PROJECT_CLAUDE, name);
-        sandbox.write_file(&home_path, content).await?;
-        sandbox.write_file(&project_path, content).await?;
+        let path = format!("{}/skills/{}.md", CLAUDE_HOME, name);
+        sandbox.write_file(&path, content).await?;
         Ok(())
     }
 
@@ -442,8 +441,9 @@ impl VoidBox {
                     }
                 }
                 SkillKind::Mcp { command, args, env } => {
-                    // Add to MCP config
+                    // Add to MCP config with type: stdio (required by Claude Code)
                     let mut entry = serde_json::json!({
+                        "type": "stdio",
                         "command": command,
                         "args": args,
                     });
@@ -516,20 +516,14 @@ impl VoidBox {
             let config_str = serde_json::to_string_pretty(&mcp_config).map_err(|e| {
                 crate::Error::Config(format!("Failed to serialize MCP config: {}", e))
             })?;
-            // Write to both locations:
-            // - /workspace/.mcp.json — real Claude Code reads project-scoped MCP config here
-            // - ~/.claude/mcp.json — claudio (mock) and older Claude Code versions read from here
             sandbox
-                .write_file("/workspace/.mcp.json", config_str.as_bytes())
-                .await?;
-            sandbox
-                .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
+                .write_file(MCP_CONFIG_PATH, config_str.as_bytes())
                 .await?;
             eprintln!(
-                "[vm:{}] Wrote MCP config ({} servers) to /workspace/.mcp.json and {}/mcp.json",
+                "[vm:{}] Wrote MCP config ({} servers) to {}",
                 tag,
                 mcp_servers.len(),
-                CLAUDE_HOME
+                MCP_CONFIG_PATH,
             );
         }
 
@@ -573,17 +567,10 @@ impl VoidBox {
         let settings = serde_json::json!({
             "skipWebFetchPreflight": true
         });
-        let settings_bytes = settings.to_string();
         sandbox
             .write_file(
                 &format!("{}/settings.json", CLAUDE_HOME),
-                settings_bytes.as_bytes(),
-            )
-            .await?;
-        sandbox
-            .write_file(
-                &format!("{}/settings.json", PROJECT_CLAUDE),
-                settings_bytes.as_bytes(),
+                settings.to_string().as_bytes(),
             )
             .await?;
 
@@ -644,6 +631,15 @@ impl VoidBox {
             "--settings".to_string(),
             r#"{"skipWebFetchPreflight":true}"#.to_string(),
         ]);
+
+        // If MCP servers were provisioned, explicitly point claude-code to the config
+        let has_mcp = self
+            .skills
+            .iter()
+            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
+        if has_mcp {
+            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+        }
 
         let tag_clone = tag.to_string();
         let mut claude_result = sandbox
