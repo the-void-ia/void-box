@@ -172,16 +172,21 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_three_tools() {
+    fn tools_list_returns_four_action_tools() {
         let req = make_request("tools/list", Some(json!(2)), None);
         let resp = handle_request("http://127.0.0.1:9999", &req).unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"get_context"));
-        assert!(names.contains(&"read_inbox"));
-        assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"read_shared_context"));
+        assert!(names.contains(&"read_peer_messages"));
+        assert!(names.contains(&"broadcast_observation"));
+        assert!(names.contains(&"recommend_to_leader"));
+        // Old names must NOT exist
+        assert!(!names.contains(&"get_context"));
+        assert!(!names.contains(&"read_inbox"));
+        assert!(!names.contains(&"send_message"));
     }
 
     #[test]
