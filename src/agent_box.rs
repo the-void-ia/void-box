@@ -508,11 +508,17 @@ impl VoidBox {
             let config_str = serde_json::to_string_pretty(&mcp_config).map_err(|e| {
                 crate::Error::Config(format!("Failed to serialize MCP config: {}", e))
             })?;
+            // Write to both locations:
+            // - /workspace/.mcp.json — real Claude Code reads project-scoped MCP config here
+            // - ~/.claude/mcp.json — claudio (mock) and older Claude Code versions read from here
+            sandbox
+                .write_file("/workspace/.mcp.json", config_str.as_bytes())
+                .await?;
             sandbox
                 .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
                 .await?;
             eprintln!(
-                "[vm:{}] Wrote MCP config ({} servers) to {}/mcp.json",
+                "[vm:{}] Wrote MCP config ({} servers) to /workspace/.mcp.json and {}/mcp.json",
                 tag,
                 mcp_servers.len(),
                 CLAUDE_HOME
