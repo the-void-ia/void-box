@@ -48,6 +48,9 @@ use crate::skill::{Skill, SkillKind};
 use crate::Result;
 
 const CLAUDE_HOME: &str = "/home/sandbox/.claude";
+/// Project-scoped config directory. Real Claude Code reads skills and settings
+/// from the project root's .claude/ directory when cwd is set.
+const PROJECT_CLAUDE: &str = "/workspace/.claude";
 
 /// An agent Box: Agent(Skills) + Isolation.
 ///
@@ -370,6 +373,17 @@ impl VoidBox {
         Ok(())
     }
 
+    /// Write a skill file to both user-scoped and project-scoped locations.
+    /// Real Claude Code reads from the project root (.claude/skills/), while
+    /// claudio and older versions read from ~/.claude/skills/.
+    async fn write_skill_file(sandbox: &Sandbox, name: &str, content: &[u8]) -> Result<()> {
+        let home_path = format!("{}/skills/{}.md", CLAUDE_HOME, name);
+        let project_path = format!("{}/skills/{}.md", PROJECT_CLAUDE, name);
+        sandbox.write_file(&home_path, content).await?;
+        sandbox.write_file(&project_path, content).await?;
+        Ok(())
+    }
+
     /// Provision skills into the sandbox: write SKILL.md files and MCP config.
     async fn provision_skills(&self, sandbox: &Sandbox) -> Result<()> {
         let tag = &self.name;
@@ -388,32 +402,27 @@ impl VoidBox {
                             e
                         ))
                     })?;
-                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
-                    sandbox.write_file(&guest_path, &content).await?;
+                    Self::write_skill_file(sandbox, &skill.name, &content).await?;
                     eprintln!(
-                        "[vm:{}] Installing skill '{}' ({}) -> {}",
+                        "[vm:{}] Installing skill '{}' ({})",
                         tag,
                         skill.name,
                         skill
                             .description_text
                             .as_deref()
                             .unwrap_or("no description"),
-                        guest_path
                     );
                 }
                 SkillKind::Remote { id } => {
-                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
                     eprintln!(
                         "[vm:{}] Fetching remote skill '{}' from skills.sh/{}",
                         tag, skill.name, id
                     );
                     match skill.fetch_remote_content().await {
                         Ok(content) => {
-                            sandbox.write_file(&guest_path, content.as_bytes()).await?;
-                            eprintln!(
-                                "[vm:{}] Installed remote skill '{}' -> {}",
-                                tag, skill.name, guest_path
-                            );
+                            Self::write_skill_file(sandbox, &skill.name, content.as_bytes())
+                                .await?;
+                            eprintln!("[vm:{}] Installed remote skill '{}'", tag, skill.name);
                         }
                         Err(e) => {
                             eprintln!(
@@ -427,7 +436,8 @@ impl VoidBox {
                                  Install manually: `npx skills add {}`\n",
                                 skill.name, id, e, id
                             );
-                            sandbox.write_file(&guest_path, fallback.as_bytes()).await?;
+                            Self::write_skill_file(sandbox, &skill.name, fallback.as_bytes())
+                                .await?;
                         }
                     }
                 }
@@ -487,14 +497,12 @@ impl VoidBox {
                     );
                 }
                 SkillKind::Inline { content } => {
-                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
-                    sandbox.write_file(&guest_path, content.as_bytes()).await?;
+                    Self::write_skill_file(sandbox, &skill.name, content.as_bytes()).await?;
                     eprintln!(
-                        "[vm:{}] Installing inline skill '{}' ({} bytes) -> {}",
+                        "[vm:{}] Installing inline skill '{}' ({} bytes)",
                         tag,
                         skill.name,
                         content.len(),
-                        guest_path
                     );
                 }
             }
@@ -565,10 +573,17 @@ impl VoidBox {
         let settings = serde_json::json!({
             "skipWebFetchPreflight": true
         });
+        let settings_bytes = settings.to_string();
         sandbox
             .write_file(
                 &format!("{}/settings.json", CLAUDE_HOME),
-                settings.to_string().as_bytes(),
+                settings_bytes.as_bytes(),
+            )
+            .await?;
+        sandbox
+            .write_file(
+                &format!("{}/settings.json", PROJECT_CLAUDE),
+                settings_bytes.as_bytes(),
             )
             .await?;
 
