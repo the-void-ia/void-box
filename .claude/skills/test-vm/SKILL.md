@@ -11,7 +11,7 @@ Runs `examples/smoke/smoke.yaml` — the agent replies with `"vm-ok 2+2=4"`. No 
 Usage: `/test-vm [ollama [model] | claude | claude-personal]`
 - `ollama [model]` — local Ollama (default model: `phi4-mini`)
 - `claude` — Anthropic API key (`ANTHROPIC_API_KEY` must be set)
-- `claude-personal` — personal Claude account (Max / claude.ai login)
+- `claude-personal` — personal Claude account (macOS: extracted from Keychain; Linux: staged from `~/.claude/`)
 - no argument — defaults to `ollama phi4-mini`
 
 Recommended Ollama models (2–4 GB RAM, reliable with claude-code): `phi4-mini`, `gemma3:4b`, `llama3.2:3b`. Avoid `*-coder` variants — they don't follow the agentic protocol well.
@@ -127,9 +127,19 @@ claude auth status
 
 If not authenticated, stop and tell the user to run `claude auth login` first, then retry.
 
-**macOS note:** credentials are stored in the macOS Keychain, not in files. The staging step below will not capture them. On macOS, use `claude` (API key) or `ollama` instead for the smoke test.
+Stage credentials so the guest VM can find the OAuth token. The method differs by platform:
 
-If authenticated (Linux), stage the credentials file so the guest can find the OAuth token:
+**macOS** — credentials live in Keychain; extract and write them as a file:
+
+```bash
+mkdir -p target/claude-home
+CREDS_JSON=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null) \
+  || { echo "ERROR: credentials not found in Keychain — run 'claude auth login' first"; exit 1; }
+echo "$CREDS_JSON" > target/claude-home/.credentials.json
+echo "Credentials staged from Keychain"
+```
+
+**Linux** — credentials live in `~/.claude/`; rsync them:
 
 ```bash
 mkdir -p target/claude-home
