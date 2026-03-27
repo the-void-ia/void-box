@@ -4,6 +4,9 @@
 package-lock.json
 package.json
 node_modules
-.claude
+# .claude is tracked so shared config (skills, hooks, settings.json) is available to all contributors.
+# Files matching *.local.* are personal and not shared — keep them out of source control.
+CLAUDE.local.md
+.claude/*.local.*
 .idea
 .local-utils
