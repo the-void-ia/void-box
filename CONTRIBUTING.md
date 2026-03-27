@@ -185,6 +185,19 @@ cargo doc --workspace --no-deps --all-features --exclude guest-agent
 6. **Run relevant ignored suites** when touching VM/OCI/runtime behavior, and mention results in the PR
 7. **Respond to review feedback** promptly
 
+## AI Agent Skills
+
+The repo ships agent skills for common development tasks in `.claude/skills/`. Each skill is a plain markdown file (`SKILL.md`) with self-contained instructions — readable and executable by any AI coding agent.
+
+**Claude Code** loads them automatically; invoke with `/skill-name`. **Other agents** (Codex, Gemini CLI, etc.) can read the `SKILL.md` file directly and follow its instructions.
+
+| Skill | File | Purpose |
+|---|---|---|
+| `/verify` | [`.claude/skills/verify/SKILL.md`](.claude/skills/verify/SKILL.md) | Full quality gate: format check → clippy → tests → audit. Run before marking any task done. |
+| `/test-vm` | [`.claude/skills/test-vm/SKILL.md`](.claude/skills/test-vm/SKILL.md) | Boot a real micro-VM and verify the LLM responds. Supports Ollama, Claude API key, and personal account. |
+
+---
+
 ## Commit Messages
 
 Follow conventional commit format:
