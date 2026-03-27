@@ -278,14 +278,19 @@ impl VmmBackend for KvmBackend {
         });
         let agg_clone = aggregator.clone();
 
+        // subscribe_telemetry uses blocking vsock reads in a loop.
+        // The handshake is async, but once connected the read loop is
+        // purely synchronous. Run it on spawn_blocking so it doesn't
+        // starve the Tokio runtime (which would wedge the daemon HTTP server).
         tokio::spawn(async move {
-            if let Err(e) = cc
-                .subscribe_telemetry(&opts, move |batch| {
+            match cc
+                .subscribe_telemetry_blocking(&opts, move |batch| {
                     agg_clone.ingest(&batch);
                 })
                 .await
             {
-                tracing::warn!("Telemetry subscription ended: {}", e);
+                Ok(()) => {}
+                Err(e) => tracing::warn!("Telemetry subscription ended: {}", e),
             }
         });
 

@@ -844,11 +844,16 @@ impl VmmBackend for VzBackend {
         });
         let agg_clone = aggregator.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(cc.subscribe_telemetry(&opts, move |batch| {
-                agg_clone.ingest(&batch);
-            }));
+        tokio::spawn(async move {
+            match cc
+                .subscribe_telemetry_blocking(&opts, move |batch| {
+                    agg_clone.ingest(&batch);
+                })
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => tracing::warn!("Telemetry subscription ended: {}", e),
+            }
         });
 
         Ok(aggregator)

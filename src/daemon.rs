@@ -28,7 +28,7 @@ struct AppState {
             >,
         >,
     >,
-    sidecar_handles: Arc<Mutex<HashMap<String, crate::sidecar::SidecarHandle>>>,
+    sidecar_handles: Arc<Mutex<HashMap<String, Arc<crate::sidecar::SidecarHandle>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,10 +545,10 @@ async fn push_inbox(run_id: &str, body: &str, state: AppState) -> (String, Strin
             )
         }
     };
-    let handles = state.sidecar_handles.lock().await;
-    match handles.get(run_id) {
-        Some(handle) => {
-            handle.load_inbox(snapshot).await;
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            h.load_inbox(snapshot).await;
             ("200 OK".into(), r#"{"ok":true}"#.into())
         }
         None => (
@@ -559,10 +559,10 @@ async fn push_inbox(run_id: &str, body: &str, state: AppState) -> (String, Strin
 }
 
 async fn drain_intents(run_id: &str, state: AppState) -> (String, String) {
-    let handles = state.sidecar_handles.lock().await;
-    match handles.get(run_id) {
-        Some(handle) => {
-            let intents = handle.drain_intents().await;
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            let intents = h.drain_intents().await;
             ("200 OK".into(), serde_json::to_string(&intents).unwrap())
         }
         None => (
@@ -582,10 +582,10 @@ async fn push_message(run_id: &str, body: &str, state: AppState) -> (String, Str
             )
         }
     };
-    let handles = state.sidecar_handles.lock().await;
-    match handles.get(run_id) {
-        Some(handle) => {
-            handle.push_message(entry).await;
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            h.push_message(entry).await;
             ("200 OK".into(), r#"{"ok":true}"#.into())
         }
         None => (
@@ -759,7 +759,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     .sidecar_handles
                     .lock()
                     .await
-                    .insert(run_id.clone(), handle);
+                    .insert(run_id.clone(), Arc::new(handle));
             }
             Err(e) => {
                 eprintln!("warning: failed to start sidecar for {}: {}", run_id, e);
@@ -1076,9 +1076,14 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         // Drop the runs lock before acquiring sidecar_handles lock
         drop(runs);
 
-        // Clean up sidecar if one was started for this run
-        if let Some(handle) = state_bg.sidecar_handles.lock().await.remove(&run_id_bg) {
-            handle.stop().await;
+        // Clean up sidecar if one was started for this run.
+        // Extract the handle and drop the lock before awaiting stop().
+        let handle = state_bg.sidecar_handles.lock().await.remove(&run_id_bg);
+        if let Some(h) = handle {
+            match Arc::try_unwrap(h) {
+                Ok(owned) => owned.stop().await,
+                Err(arc) => arc.signal_shutdown(),
+            }
         }
     });
 
@@ -1138,18 +1143,17 @@ async fn get_run(id: &str, query: Option<&str>, state: AppState) -> (String, Str
     };
 
     // Append sidecar health if a handle exists for this run.
-    let sidecar_info: Option<serde_json::Value> = {
-        let handles = state.sidecar_handles.lock().await;
-        if let Some(handle) = handles.get(id) {
-            let (buffer_depth, inbox_version) = handle.state_snapshot().await;
-            Some(json!({
-                "status": "ok",
-                "buffer_depth": buffer_depth,
-                "inbox_version": inbox_version
-            }))
-        } else {
-            None
-        }
+    // Clone the handle and drop the lock before awaiting state_snapshot().
+    let sidecar_handle = state.sidecar_handles.lock().await.get(id).cloned();
+    let sidecar_info: Option<serde_json::Value> = if let Some(handle) = sidecar_handle {
+        let (buffer_depth, inbox_version) = handle.state_snapshot().await;
+        Some(json!({
+            "status": "ok",
+            "buffer_depth": buffer_depth,
+            "inbox_version": inbox_version
+        }))
+    } else {
+        None
     };
 
     if let Some(sidecar) = sidecar_info {
@@ -1326,9 +1330,14 @@ async fn cancel_run(id: &str, body: &str, state: AppState) -> (String, String) {
         // Drop the runs lock before acquiring sidecar_handles lock
         drop(runs);
 
-        // Clean up sidecar if one was started for this run
-        if let Some(handle) = state.sidecar_handles.lock().await.remove(id) {
-            handle.stop().await;
+        // Clean up sidecar if one was started for this run.
+        // Extract the handle and drop the lock before awaiting stop().
+        let handle = state.sidecar_handles.lock().await.remove(id);
+        if let Some(h) = handle {
+            match Arc::try_unwrap(h) {
+                Ok(owned) => owned.stop().await,
+                Err(arc) => arc.signal_shutdown(),
+            }
         }
 
         (

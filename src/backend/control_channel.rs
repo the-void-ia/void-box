@@ -334,6 +334,80 @@ impl ControlChannel {
         }
     }
 
+    /// Subscribe to guest telemetry without blocking the async runtime.
+    ///
+    /// Performs the async handshake on the current task, then moves the
+    /// blocking read loop to `spawn_blocking` so it runs on a dedicated
+    /// OS thread instead of a Tokio worker.
+    pub async fn subscribe_telemetry_blocking<F>(
+        &self,
+        opts: &TelemetrySubscribeRequest,
+        on_batch: F,
+    ) -> Result<()>
+    where
+        F: FnMut(TelemetryBatch) + Send + 'static,
+    {
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(5), "telemetry-subscribe")
+            .await?;
+
+        let sub_msg = Message {
+            msg_type: MessageType::SubscribeTelemetry,
+            payload: serde_json::to_vec(opts).unwrap_or_default(),
+        };
+        stream
+            .write_all(&sub_msg.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send SubscribeTelemetry: {}", e)))?;
+
+        info!(
+            "Telemetry subscription active (interval={}ms)",
+            opts.interval_ms
+        );
+
+        let read_timeout_ms = opts.interval_ms.max(1000) * 5;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
+
+        // Move the blocking read loop off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            Self::telemetry_read_loop(&mut *stream, on_batch);
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("Telemetry task panicked: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Blocking read loop for telemetry — runs on a dedicated OS thread.
+    fn telemetry_read_loop<F>(stream: &mut dyn GuestStream, mut on_batch: F)
+    where
+        F: FnMut(TelemetryBatch),
+    {
+        loop {
+            let msg = match Message::read_from_sync(stream) {
+                Ok(m) => m,
+                Err(e) => {
+                    info!("Telemetry subscription ended: {}", e);
+                    return;
+                }
+            };
+
+            if msg.msg_type != MessageType::TelemetryData {
+                warn!(
+                    "Unexpected message type in telemetry stream: {:?}",
+                    msg.msg_type
+                );
+                continue;
+            }
+
+            match serde_json::from_slice::<TelemetryBatch>(&msg.payload) {
+                Ok(batch) => on_batch(batch),
+                Err(e) => {
+                    warn!("Failed to parse TelemetryBatch: {}", e);
+                }
+            }
+        }
+    }
+
     /// Wait for the guest to signal snapshot readiness.
     ///
     /// Connects and sends a `SnapshotReady` message, then waits for the

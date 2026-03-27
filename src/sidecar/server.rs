@@ -58,9 +58,14 @@ impl SidecarHandle {
         (state.buffer_depth(), state.inbox_version())
     }
 
-    /// Gracefully shut down the sidecar HTTP server.
-    pub async fn stop(self) {
+    /// Signal the sidecar to shut down (non-blocking, does not await task completion).
+    pub fn signal_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Gracefully shut down the sidecar HTTP server and await task completion.
+    pub async fn stop(self) {
+        self.signal_shutdown();
         let _ = self.task.await;
     }
 }
