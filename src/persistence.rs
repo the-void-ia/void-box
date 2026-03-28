@@ -990,4 +990,20 @@ mod tests {
         assert_eq!(ap.manifest.len(), 1);
         assert_eq!(ap.manifest[0].name, "result.json");
     }
+
+    #[test]
+    fn output_ready_defaults_to_false() {
+        let json = r#"{"id":"test","status":"running","file":"test.yaml","events":[]}"#;
+        let run: RunState = serde_json::from_str(json).unwrap();
+        assert!(!run.output_ready);
+    }
+
+    #[test]
+    fn output_ready_round_trips() {
+        let json = r#"{"id":"test","status":"running","file":"test.yaml","events":[],"output_ready":true}"#;
+        let run: RunState = serde_json::from_str(json).unwrap();
+        assert!(run.output_ready);
+        let serialized = serde_json::to_string(&run).unwrap();
+        assert!(serialized.contains("\"output_ready\":true"));
+    }
 }
