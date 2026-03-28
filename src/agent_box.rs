@@ -944,11 +944,17 @@ impl VoidBox {
                                 res.is_error,
                             );
 
-                            // The agent wrote output and exited before the monitor
-                            // task could poll it. Try to publish now, before the
-                            // sandbox shuts down, so output_ready fires.
+                            // Try to read output before signaling exit, but with a
+                            // hard timeout. The sandbox may be tearing down, so
+                            // read_file can hang. Never block exit_tx on this.
                             if !res.is_error {
-                                if let Ok(data) = sandbox_agent.read_file(&output_file_agent).await {
+                                let read_result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    sandbox_agent.read_file(&output_file_agent),
+                                )
+                                .await;
+
+                                if let Ok(Ok(data)) = read_result {
                                     if !data.is_empty() {
                                         eprintln!(
                                             "[vm:{}] Service agent: publishing output at exit ({} bytes)",
@@ -972,14 +978,16 @@ impl VoidBox {
                                             });
                                         }
                                     }
+                                } else {
+                                    eprintln!(
+                                        "[vm:{}] Service agent: exit-time output read failed or timed out",
+                                        box_name_agent
+                                    );
                                 }
                             }
 
-                            // Drop the shared output_tx so the monitor task's copy
-                            // is the only remaining ref. When the monitor task ends
-                            // (or we drop it below), output_rx resolves with Err.
+                            // Always drop + signal, even if read failed/timed out.
                             drop(output_tx_agent);
-
                             let _ = exit_tx.send(ServiceExit::Exited {
                                 success: !res.is_error,
                                 error: res.error,
