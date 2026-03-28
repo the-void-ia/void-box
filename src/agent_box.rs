@@ -45,6 +45,7 @@ use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
+use crate::spec::AgentMode;
 use crate::Result;
 
 /// Project-scoped config directory. Claude Code reads skills, settings, and
@@ -134,6 +135,8 @@ struct BoxConfig {
     /// Per-stage timeout in seconds (overrides the default vsock read timeout).
     /// `None` means use the system default (1200s / 20 minutes).
     timeout_secs: Option<u64>,
+    /// Agent mode: Task (run-to-completion) or Service (long-running).
+    mode: AgentMode,
 }
 
 impl Default for BoxConfig {
@@ -154,6 +157,7 @@ impl Default for BoxConfig {
             mock: false,
             llm: LlmProvider::default(),
             timeout_secs: None,
+            mode: AgentMode::default(),
         }
     }
 }
@@ -263,6 +267,12 @@ impl VoidBox {
     /// ```
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.config.timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the agent mode (Task or Service).
+    pub fn mode(mut self, mode: AgentMode) -> Self {
+        self.config.mode = mode;
         self
     }
 
@@ -767,6 +777,254 @@ impl VoidBox {
             box_name: self.name.clone(),
             claude_result,
             file_output,
+        })
+    }
+
+    /// Run this Box as a long-running service.
+    ///
+    /// Provisions skills and launches the agent identically to [`run()`](Self::run),
+    /// but instead of awaiting completion returns a [`ServiceStageHandle`] that
+    /// lets the caller:
+    /// - receive the first output publication via `output_rx`
+    /// - stop the service via `stop_tx`
+    /// - observe the terminal exit reason via `exit_rx`
+    pub async fn run_service(
+        self,
+        input: Option<&[u8]>,
+        telemetry_buffer: Option<TelemetryBuffer>,
+    ) -> Result<ServiceStageHandle> {
+        let sandbox = self.sandbox.as_ref().ok_or_else(|| {
+            crate::Error::Config("VoidBox not built — call .build() first".into())
+        })?;
+
+        // ── Provisioning (identical to run()) ──────────────────────────
+
+        self.provision_security(sandbox).await?;
+
+        let tag = self.name.clone();
+        match sandbox.start_telemetry(telemetry_buffer).await {
+            Ok(agg) => {
+                agg.set_current_stage(&tag);
+                eprintln!("[vm:{}] Guest telemetry started", tag);
+            }
+            Err(e) => {
+                eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
+            }
+        }
+
+        self.provision_skills(sandbox).await?;
+
+        let settings = serde_json::json!({ "skipWebFetchPreflight": true });
+        sandbox
+            .write_file(
+                &format!("{}/settings.json", CLAUDE_HOME),
+                settings.to_string().as_bytes(),
+            )
+            .await?;
+
+        if let Some(data) = input {
+            sandbox.write_file("/workspace/input.json", data).await?;
+            eprintln!(
+                "[vm:{}] Writing input ({} bytes) to /workspace/input.json",
+                tag,
+                data.len()
+            );
+        }
+
+        // Build the full prompt (same logic as run()).
+        let full_prompt = if let Some(data) = input {
+            let input_text = String::from_utf8_lossy(data);
+            let inline = if input_text.len() > 4000 {
+                format!(
+                    "{}...\n(truncated; full data in /workspace/input.json)",
+                    &input_text[..4000]
+                )
+            } else {
+                input_text.to_string()
+            };
+            format!(
+                "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
+                 The above data is also available at /workspace/input.json.\n\
+                 Write your output to {}.",
+                self.prompt, inline, self.config.output_file
+            )
+        } else {
+            format!(
+                "{}\n\nWrite your output to {}.",
+                self.prompt, self.config.output_file
+            )
+        };
+
+        eprintln!(
+            "[vm:{}] Launching service agent | llm={} | prompt_len={} chars",
+            tag,
+            self.config.llm.description(),
+            full_prompt.len()
+        );
+
+        // ── Build CLI args ─────────────────────────────────────────────
+
+        let mut extra_args = self.config.llm.cli_args();
+        extra_args.extend([
+            "--settings".to_string(),
+            r#"{"skipWebFetchPreflight":true}"#.to_string(),
+        ]);
+
+        let has_mcp = self
+            .skills
+            .iter()
+            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
+        if has_mcp {
+            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+        }
+
+        let is_local_llm = self.config.llm.is_local();
+        let output_file = self.config.output_file.clone();
+        let box_name = self.name.clone();
+
+        // ── Channels ───────────────────────────────────────────────────
+
+        let (output_tx, output_rx) = tokio::sync::oneshot::channel::<ServicePublication>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<ServiceExit>();
+
+        // ── Clone sandbox for spawned tasks ────────────────────────────
+
+        let sandbox_agent = Arc::clone(sandbox);
+        let sandbox_monitor = Arc::clone(sandbox);
+
+        // ── Spawn agent process task ───────────────────────────────────
+
+        let tag_agent = tag.clone();
+        let box_name_agent = box_name.clone();
+        tokio::spawn(async move {
+            let tag = tag_agent;
+
+            // timeout_secs = Some(0) means infinite timeout for service mode.
+            let result = sandbox_agent.exec_claude_streaming(
+                &full_prompt,
+                ClaudeExecOpts {
+                    dangerously_skip_permissions: true,
+                    extra_args,
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+                |event| match event {
+                    crate::observe::claude::ClaudeStreamEvent::ToolUse(ref tc) => {
+                        let summary = tc.tool_summary();
+                        if summary.is_empty() {
+                            eprintln!("[vm:{}]   tool: {}", tag, tc.tool_name);
+                        } else {
+                            eprintln!("[vm:{}]   tool: {}  {}", tag, tc.tool_name, summary);
+                        }
+                    }
+                },
+            );
+
+            // Race: agent finishes naturally vs. stop signal.
+            tokio::select! {
+                agent_result = result => {
+                    match agent_result {
+                        Ok(mut res) => {
+                            if is_local_llm {
+                                res.total_cost_usd = 0.0;
+                            }
+                            eprintln!(
+                                "[vm:{}] Service agent exited | tokens={}in/{}out | cost=${:.4} | error={}",
+                                box_name_agent,
+                                res.input_tokens,
+                                res.output_tokens,
+                                res.total_cost_usd,
+                                res.is_error,
+                            );
+                            let _ = exit_tx.send(ServiceExit::Exited {
+                                success: !res.is_error,
+                                error: res.error,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
+                            let _ = exit_tx.send(ServiceExit::Crashed(e.to_string()));
+                        }
+                    }
+                }
+                _ = stop_rx => {
+                    eprintln!("[vm:{}] Service agent stop requested", box_name_agent);
+                    let _ = exit_tx.send(ServiceExit::Canceled);
+                }
+            }
+        });
+
+        // ── Spawn output file monitor task ─────────────────────────────
+
+        let tag_monitor = tag.clone();
+        tokio::spawn(async move {
+            let tag = tag_monitor;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                // Check if the output file exists
+                let exists = match sandbox_monitor.exec("test", &["-f", &output_file]).await {
+                    Ok(out) => out.exit_code == 0,
+                    Err(e) => {
+                        eprintln!(
+                            "[vm:{}] Output monitor: exec error checking file: {}",
+                            tag, e
+                        );
+                        false
+                    }
+                };
+
+                if !exists {
+                    continue;
+                }
+
+                // File exists — read it
+                match sandbox_monitor.read_file(&output_file).await {
+                    Ok(data) if !data.is_empty() => {
+                        eprintln!(
+                            "[vm:{}] Output file ready ({} bytes) at {}",
+                            tag,
+                            data.len(),
+                            output_file,
+                        );
+                        let publication = ServicePublication {
+                            box_name: box_name.clone(),
+                            output: data,
+                            report: crate::runtime::RunReport {
+                                name: box_name.clone(),
+                                kind: "service".to_string(),
+                                success: true,
+                                output: output_file.clone(),
+                                stages: 1,
+                                total_cost_usd: 0.0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                            },
+                        };
+                        let _ = output_tx.send(publication);
+                        return; // one-shot: done after first successful read
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "[vm:{}] Output monitor: file exists but is empty, retrying",
+                            tag
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[vm:{}] Output monitor: failed to read {}: {}, retrying",
+                            tag, output_file, e
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(ServiceStageHandle {
+            output_rx,
+            stop_tx,
+            exit_rx,
         })
     }
 }
