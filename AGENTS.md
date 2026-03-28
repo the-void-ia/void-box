@@ -260,15 +260,26 @@ Static quality:
 
 ```bash
 cargo fmt --all -- --check
+```
+
+Clippy (Linux):
+```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Clippy (macOS — excludes guest-agent, which is Linux-only):
+```bash
 cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
 ```
 
-Core tests:
-
+Core tests (Linux):
 ```bash
 cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
+```
+
+Core tests (macOS — excludes guest-agent):
+```bash
 cargo test --workspace --exclude guest-agent --all-features
 cargo test --doc --workspace --exclude guest-agent --all-features
 ```
@@ -349,10 +360,18 @@ all required gates are explicit.
 
 ### Standard validation sequence
 
+Linux:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+```
+
+macOS (excludes guest-agent, which is Linux-only):
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
+cargo test --workspace --exclude guest-agent --all-features
 ```
 
 ### aarch64 cross-check (required when touching `src/vmm/arch/aarch64/` or arch-neutral VMM code)
