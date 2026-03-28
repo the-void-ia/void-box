@@ -1255,14 +1255,27 @@ async fn spawn_service_run(
                     }
                 }
                 Err(_) => {
-                    // output_rx channel dropped before publishing — treat as crash
-                    terminalize_service(
-                        &state,
-                        &run_id,
-                        ServiceExit::Crashed("output channel dropped before publication".into()),
-                        attempt,
-                    )
-                    .await;
+                    // output_rx channel dropped without sending — agent exited
+                    // without publishing output. Wait for exit_rx to get the
+                    // actual exit status instead of assuming crash.
+                    eprintln!(
+                        "[void-box] Service run {}: output channel closed without publication, awaiting exit",
+                        run_id
+                    );
+                    match (&mut exit_rx).await {
+                        Ok(exit) => {
+                            terminalize_service(&state, &run_id, exit, attempt).await;
+                        }
+                        Err(_) => {
+                            terminalize_service(
+                                &state,
+                                &run_id,
+                                ServiceExit::Crashed("both channels dropped".into()),
+                                attempt,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
         }

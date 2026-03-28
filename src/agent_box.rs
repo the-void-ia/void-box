@@ -975,6 +975,11 @@ impl VoidBox {
                                 }
                             }
 
+                            // Drop the shared output_tx so the monitor task's copy
+                            // is the only remaining ref. When the monitor task ends
+                            // (or we drop it below), output_rx resolves with Err.
+                            drop(output_tx_agent);
+
                             let _ = exit_tx.send(ServiceExit::Exited {
                                 success: !res.is_error,
                                 error: res.error,
@@ -982,12 +987,16 @@ impl VoidBox {
                         }
                         Err(e) => {
                             eprintln!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
+                            // Drop publication channel — no output from a crash.
+                            drop(output_tx_agent);
                             let _ = exit_tx.send(ServiceExit::Crashed(e.to_string()));
                         }
                     }
                 }
                 _ = stop_rx => {
                     eprintln!("[vm:{}] Service agent stop requested", box_name_agent);
+                    // Drop publication channel — canceled before output.
+                    drop(output_tx_agent);
                     let _ = exit_tx.send(ServiceExit::Canceled);
                 }
             }
@@ -1000,6 +1009,13 @@ impl VoidBox {
             let tag = tag_monitor;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                // Check if the sender was already consumed (by the agent exit
+                // fallback) or if the agent dropped its ref. If so, stop polling.
+                if output_tx.lock().await.is_none() {
+                    eprintln!("[vm:{}] Output monitor: channel consumed, exiting", tag);
+                    return;
+                }
 
                 // Check if the output file exists
                 let exists = match sandbox_monitor.exec("test", &["-f", &output_file]).await {
