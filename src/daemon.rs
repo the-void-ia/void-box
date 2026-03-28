@@ -9,12 +9,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use crate::agent_box::ServiceExit;
 use crate::error::ApiError;
 use crate::persistence::{
     generate_event_id, legacy_to_v2_event_type, now_ms, now_rfc3339, provider_from_env,
     PersistenceProvider, RunEvent, RunState, RunStatus, SessionMessage,
 };
-use crate::spec::{RunKind, RunSpec};
+use crate::spec::{AgentMode, RunKind, RunSpec};
 
 #[derive(Clone)]
 struct AppState {
@@ -924,6 +925,32 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         Err(e) => Err(e),
     };
 
+    // Detect service mode and branch to the service lifecycle path.
+    let is_service = prepared_spec
+        .as_ref()
+        .ok()
+        .and_then(|s| s.agent.as_ref())
+        .is_some_and(|a| a.mode == AgentMode::Service);
+
+    if is_service {
+        let state_bg = state.clone();
+        let run_id_bg = run_id.clone();
+        let telemetry_rb = ring_buffer.clone();
+        tokio::spawn(async move {
+            spawn_service_run(state_bg, run_id_bg, prepared_spec, req.input, telemetry_rb).await;
+        });
+
+        return (
+            "200 OK".to_string(),
+            serde_json::to_string(&CreateRunResponse {
+                run_id,
+                attempt_id: 1,
+                state: RunStatus::Running,
+            })
+            .unwrap_or_else(|_| "{}".into()),
+        );
+    }
+
     let state_bg = state.clone();
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
@@ -1127,6 +1154,238 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         })
         .unwrap_or_else(|_| "{}".into()),
     )
+}
+
+/// Background task for service-mode runs.
+///
+/// Unlike the task-mode path, this lifecycle does NOT terminalize when output is
+/// published.  Instead it sets `output_ready = true`, persists the report, and
+/// continues waiting until the service process exits or is cancelled.
+async fn spawn_service_run(
+    state: AppState,
+    run_id: String,
+    prepared_spec: Result<RunSpec, crate::error::Error>,
+    input: Option<String>,
+    telemetry_rb: std::sync::Arc<std::sync::Mutex<crate::observe::telemetry::TelemetryRingBuffer>>,
+) {
+    let attempt: u64 = {
+        let runs = state.runs.lock().await;
+        runs.get(&run_id).map(|r| r.attempt_id).unwrap_or(1)
+    };
+
+    let spec = match prepared_spec {
+        Ok(s) => s,
+        Err(e) => {
+            terminalize_run_simple(
+                &state,
+                &run_id,
+                RunStatus::Failed,
+                Some(e.to_string()),
+                attempt,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let handle = match crate::runtime::run_spec_service(&spec, input, Some(telemetry_rb)).await {
+        Ok(h) => h,
+        Err(e) => {
+            terminalize_run_simple(
+                &state,
+                &run_id,
+                RunStatus::Failed,
+                Some(e.to_string()),
+                attempt,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Destructure the handle so we can race the two receivers independently.
+    let crate::agent_box::ServiceStageHandle {
+        output_rx,
+        stop_tx: _stop_tx,
+        exit_rx,
+    } = handle;
+
+    // Race: output publication vs early exit.
+    // Pin both receivers so select! borrows them rather than moving.
+    tokio::pin!(output_rx);
+    tokio::pin!(exit_rx);
+
+    let mut output_published = false;
+
+    tokio::select! {
+        // Case 1: Output published (happy path for service mode)
+        output_result = &mut output_rx => {
+            match output_result {
+                Ok(publication) => {
+                    output_published = true;
+
+                    // Drain sidecar intents (best-effort)
+                    let _intents = {
+                        let h = state.sidecar_handles.lock().await.get(&run_id).cloned();
+                        if let Some(h) = h {
+                            h.drain_intents().await
+                        } else {
+                            vec![]
+                        }
+                    };
+
+                    // Persist report and set output_ready (one-shot)
+                    {
+                        let mut runs = state.runs.lock().await;
+                        if let Some(r) = runs.get_mut(&run_id) {
+                            r.report = Some(publication.report);
+                            r.output_ready = true;
+                            let seq = r.events.len() as u64;
+                            r.events.push(event_with_seq(
+                                &run_id,
+                                "info",
+                                "run.output_ready",
+                                "service output published".to_string(),
+                                seq,
+                                attempt,
+                            ));
+                            r.updated_at = Some(now_rfc3339());
+                            let _ = state.provider.save_run(r);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // output_rx channel dropped before publishing — treat as crash
+                    terminalize_service(
+                        &state,
+                        &run_id,
+                        ServiceExit::Crashed("output channel dropped before publication".into()),
+                        attempt,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // Case 2: Process died before publishing output
+        exit_result = &mut exit_rx => {
+            match exit_result {
+                Ok(exit) => {
+                    terminalize_service(&state, &run_id, exit, attempt).await;
+                }
+                Err(_) => {
+                    terminalize_service(
+                        &state,
+                        &run_id,
+                        ServiceExit::Crashed("exit channel dropped".into()),
+                        attempt,
+                    )
+                    .await;
+                }
+            }
+            // Never set output_ready — process died before publishing
+        }
+    }
+
+    // If output was published, wait for the service to exit (lifecycle end).
+    if output_published {
+        match exit_rx.await {
+            Ok(exit) => {
+                terminalize_service(&state, &run_id, exit, attempt).await;
+            }
+            Err(_) => {
+                terminalize_service(
+                    &state,
+                    &run_id,
+                    ServiceExit::Crashed("exit channel dropped".into()),
+                    attempt,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Clean up sidecar
+    let sidecar = state.sidecar_handles.lock().await.remove(&run_id);
+    if let Some(h) = sidecar {
+        match Arc::try_unwrap(h) {
+            Ok(owned) => owned.stop().await,
+            Err(arc) => arc.signal_shutdown(),
+        }
+    }
+}
+
+/// Terminalize a service run based on its exit disposition.
+async fn terminalize_service(state: &AppState, run_id: &str, exit: ServiceExit, attempt: u64) {
+    let mut runs = state.runs.lock().await;
+    if let Some(r) = runs.get_mut(run_id) {
+        // Terminal guard: don't overwrite if already terminal (e.g. cancelled)
+        if r.status.is_terminal() {
+            return;
+        }
+
+        let (status, reason) = match &exit {
+            ServiceExit::Exited { success: true, .. } => {
+                (RunStatus::Succeeded, "service exited cleanly")
+            }
+            ServiceExit::Exited {
+                success: false,
+                ref error,
+            } => {
+                r.error = error.clone();
+                (RunStatus::Failed, "service exited with error")
+            }
+            ServiceExit::Canceled => (RunStatus::Cancelled, "service canceled"),
+            ServiceExit::Crashed(ref msg) => {
+                r.error = Some(msg.clone());
+                (RunStatus::Failed, "service crashed")
+            }
+        };
+
+        let seq = r.events.len() as u64;
+        let ev = event_with_seq(
+            run_id,
+            "info",
+            "run.finished",
+            reason.to_string(),
+            seq,
+            attempt,
+        );
+        r.terminal_event_id = ev.event_id.clone();
+        r.status = status;
+        r.terminal_reason = Some(reason.to_string());
+        r.finished_at = Some(now_rfc3339());
+        r.updated_at = Some(now_rfc3339());
+        r.events.push(ev);
+        let _ = state.provider.save_run(r);
+    }
+}
+
+/// Simple terminalize helper for early failures (spec parse, service start).
+async fn terminalize_run_simple(
+    state: &AppState,
+    run_id: &str,
+    status: RunStatus,
+    error: Option<String>,
+    attempt: u64,
+) {
+    let mut runs = state.runs.lock().await;
+    if let Some(r) = runs.get_mut(run_id) {
+        if r.status.is_terminal() {
+            return;
+        }
+        let seq = r.events.len() as u64;
+        let msg = error.clone().unwrap_or_else(|| "run failed".to_string());
+        let ev = event_with_seq(run_id, "error", "run.failed", msg, seq, attempt);
+        r.terminal_event_id = ev.event_id.clone();
+        r.status = status;
+        r.error = error;
+        r.terminal_reason = Some("service failed to start".to_string());
+        r.finished_at = Some(now_rfc3339());
+        r.updated_at = Some(now_rfc3339());
+        r.events.push(ev);
+        let _ = state.provider.save_run(r);
+    }
 }
 
 fn is_api_v2(query: Option<&str>) -> bool {
