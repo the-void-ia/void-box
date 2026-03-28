@@ -116,6 +116,14 @@ pub struct MessagingSpec {
     pub provider_bridge: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    #[default]
+    Task,
+    Service,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub prompt: String,
@@ -127,6 +135,8 @@ pub struct AgentSpec {
     pub output_file: Option<String>,
     #[serde(default)]
     pub messaging: Option<MessagingSpec>,
+    #[serde(default)]
+    pub mode: AgentMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +361,18 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
             if agent.prompt.trim().is_empty() {
                 return Err(Error::Config("agent.prompt cannot be empty".into()));
             }
+            if agent.mode == AgentMode::Service {
+                if agent.timeout_secs.is_some() {
+                    return Err(Error::Config(
+                        "agent: mode: service and timeout_secs are mutually exclusive".into(),
+                    ));
+                }
+                if agent.output_file.is_none() {
+                    return Err(Error::Config(
+                        "agent: mode: service requires output_file".into(),
+                    ));
+                }
+            }
         }
         RunKind::Pipeline => {
             let Some(pipeline) = &spec.pipeline else {
@@ -507,6 +529,78 @@ agent:
         let messaging = agent.messaging.unwrap();
         assert!(!messaging.enabled);
         assert!(messaging.provider_bridge.is_none());
+    }
+
+    #[test]
+    fn agent_mode_service_parses() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+agent:
+  prompt: "run the gateway"
+  output_file: /workspace/output.json
+  mode: service
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let agent = spec.agent.unwrap();
+        assert_eq!(agent.mode, AgentMode::Service);
+    }
+
+    #[test]
+    fn agent_mode_defaults_to_task() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+agent:
+  prompt: "do something"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let agent = spec.agent.unwrap();
+        assert_eq!(agent.mode, AgentMode::Task);
+    }
+
+    #[test]
+    fn agent_mode_service_rejects_timeout() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+agent:
+  prompt: "run"
+  mode: service
+  timeout_secs: 60
+  output_file: /workspace/output.json
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn agent_mode_service_rejects_missing_output_file() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+agent:
+  prompt: "run"
+  mode: service
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("output_file"));
     }
 
     #[test]

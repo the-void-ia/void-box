@@ -97,11 +97,19 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     println!("[void-box] daemon listening on http://{}", addr);
 
     loop {
+        eprintln!("[void-box] daemon awaiting accept");
         let (stream, _) = listener.accept().await?;
+        match stream.peer_addr() {
+            Ok(peer) => eprintln!("[void-box] daemon accepted connection from {peer}"),
+            Err(err) => eprintln!("[void-box] daemon accepted connection (peer unknown: {err})"),
+        }
         let state = state.clone();
+        let peer = stream.peer_addr().ok();
+        eprintln!("[void-box] daemon spawning handler peer={peer:?}");
         tokio::spawn(async move {
+            eprintln!("[void-box] daemon spawned handler starting peer={peer:?}");
             if let Err(e) = handle_stream(stream, state).await {
-                eprintln!("[void-box] daemon connection error: {e}");
+                eprintln!("[void-box] daemon connection error peer={peer:?}: {e}");
             }
         });
     }
@@ -111,9 +119,14 @@ async fn handle_stream(
     mut stream: TcpStream,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let peer = stream.peer_addr().ok();
+    eprintln!("[void-box] handle_stream enter peer={peer:?}");
     let mut buf = vec![0u8; 64 * 1024];
+    eprintln!("[void-box] handle_stream reading first bytes peer={peer:?}");
     let n = stream.read(&mut buf).await?;
+    eprintln!("[void-box] handle_stream first read complete peer={peer:?} bytes={n}");
     if n == 0 {
+        eprintln!("[void-box] handle_stream eof peer={peer:?}");
         return Ok(());
     }
 
@@ -134,15 +147,31 @@ async fn handle_stream(
         ""
     };
 
+    eprintln!("[void-box] handle_stream routing peer={peer:?} method={method} path={path}");
     let (status, content_type, payload) = route_request(method, path, query, body, state).await;
+    eprintln!(
+        "[void-box] handle_stream route complete peer={peer:?} method={method} path={path} status={status}"
+    );
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         payload.len(),
     );
+    eprintln!("[void-box] handle_stream writing header peer={peer:?} method={method} path={path}");
     stream.write_all(header.as_bytes()).await?;
+    eprintln!(
+        "[void-box] handle_stream header write complete peer={peer:?} method={method} path={path}"
+    );
+    eprintln!(
+        "[void-box] handle_stream writing body peer={peer:?} method={method} path={path} bytes={}",
+        payload.len()
+    );
     stream.write_all(&payload).await?;
+    eprintln!(
+        "[void-box] handle_stream body write complete peer={peer:?} method={method} path={path}"
+    );
+    eprintln!("[void-box] handle_stream exit peer={peer:?}");
     Ok(())
 }
 
@@ -169,6 +198,7 @@ async fn route_request(
     body: &str,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
+    eprintln!("[void-box] route_request enter method={method} path={path}");
     match (method, path) {
         ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
@@ -1985,7 +2015,7 @@ fn kind_name(kind: &RunKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::spec::{
-        AgentSpec, LlmSpec, MessagingSpec, RunKind, RunSpec, SandboxSpec, SkillEntry,
+        AgentMode, AgentSpec, LlmSpec, MessagingSpec, RunKind, RunSpec, SandboxSpec, SkillEntry,
     };
 
     fn base_spec() -> RunSpec {
@@ -2022,6 +2052,7 @@ mod tests {
                     enabled: true,
                     provider_bridge: None,
                 }),
+                mode: AgentMode::default(),
             }),
             pipeline: None,
             workflow: None,
