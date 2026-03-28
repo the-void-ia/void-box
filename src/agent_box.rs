@@ -55,6 +55,41 @@ const CLAUDE_HOME: &str = "/workspace/.claude";
 /// .mcp.json at the project root.
 const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
 
+/// Published output from a service agent.
+/// Contains only what agent_box knows: guest execution output.
+/// Artifact publication is built later by the daemon/persistence layer.
+pub struct ServicePublication {
+    pub box_name: String,
+    pub output: Vec<u8>,
+    pub report: crate::runtime::RunReport,
+}
+
+/// Terminal lifecycle result for a service agent. No candidate output.
+pub enum ServiceExit {
+    Exited {
+        success: bool,
+        error: Option<String>,
+    },
+    Canceled,
+    Crashed(String),
+}
+
+/// Handle for a running service agent.
+pub struct ServiceStageHandle {
+    /// Fires exactly once when structured output is ready.
+    pub output_rx: tokio::sync::oneshot::Receiver<ServicePublication>,
+    /// Send to stop the service.
+    pub stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// Fires when the service process exits.
+    pub exit_rx: tokio::sync::oneshot::Receiver<ServiceExit>,
+}
+
+/// Result of running an agent — either a terminal task result or a service handle.
+pub enum AgentRunOutcome {
+    Task(crate::pipeline::StageResult),
+    Service(ServiceStageHandle),
+}
+
 /// An agent Box: Agent(Skills) + Isolation.
 ///
 /// Constructed via the builder pattern with `VoidBox::new("name")`.
