@@ -17,8 +17,8 @@ use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::spec::{
-    load_spec, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec, PipelineStageSpec, RunKind,
-    RunSpec, SkillEntry, StepMode,
+    load_spec, AgentMode, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec,
+    PipelineStageSpec, RunKind, RunSpec, SkillEntry, StepMode,
 };
 
 /// Tracks host directories created for pipeline stage outputs.
@@ -104,6 +104,75 @@ pub async fn run_spec(
     }
 }
 
+/// Run an agent spec in service mode, returning a [`ServiceStageHandle`].
+///
+/// This function only supports agent specs with `mode: service`. If the spec
+/// is not an agent or is not configured for service mode, an error is returned.
+///
+/// The daemon checks `agent.mode` and calls this instead of `run_spec()` for
+/// long-running service agents.
+pub async fn run_spec_service(
+    spec: &RunSpec,
+    input: Option<String>,
+    telemetry_buffer: Option<TelemetryBuffer>,
+) -> Result<crate::agent_box::ServiceStageHandle> {
+    if spec.kind != RunKind::Agent {
+        return Err(Error::Config(
+            "run_spec_service only supports agent specs".into(),
+        ));
+    }
+
+    let agent = spec
+        .agent
+        .as_ref()
+        .ok_or_else(|| Error::Config("missing agent section".into()))?;
+
+    if agent.mode != AgentMode::Service {
+        return Err(Error::Config(
+            "run_spec_service requires agent mode: service".into(),
+        ));
+    }
+
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
+
+    let oci_rootfs_plan = if uses_mock_sandbox(spec) {
+        None
+    } else if let Some(ref image) = spec.sandbox.image {
+        eprintln!("[void-box] Resolving OCI base image: {}", image);
+        let host_rootfs = resolve_oci_base_image(image).await?;
+        Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
+    } else {
+        None
+    };
+
+    let mut builder = VoidBox::new(&spec.name)
+        .prompt(&agent.prompt)
+        .mode(AgentMode::Service);
+
+    builder = apply_box_sandbox(builder, spec, guest.as_ref());
+    builder = apply_box_llm(builder, spec.llm.as_ref());
+
+    if let Some(ref plan) = oci_rootfs_plan {
+        builder = apply_oci_rootfs(builder, plan);
+    }
+
+    for s in &agent.skills {
+        builder = builder.skill(parse_skill_entry(s)?);
+    }
+
+    if let Some(output_file) = &agent.output_file {
+        builder = builder.output_file(output_file);
+    }
+
+    let ab = builder.build()?;
+    ab.run_service(input.as_deref().map(str::as_bytes), telemetry_buffer)
+        .await
+}
+
 fn uses_mock_sandbox(spec: &RunSpec) -> bool {
     spec.sandbox.mode.eq_ignore_ascii_case("mock")
 }
@@ -179,6 +248,10 @@ async fn run_agent(
 
     if let Some(output_file) = &agent.output_file {
         builder = builder.output_file(output_file);
+    }
+
+    if agent.mode == AgentMode::Service {
+        builder = builder.mode(AgentMode::Service);
     }
 
     let ab = builder.build()?;
