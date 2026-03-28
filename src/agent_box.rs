@@ -888,6 +888,10 @@ impl VoidBox {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<ServiceExit>();
 
+        // Wrap output_tx in Arc<Mutex<Option>> so both the agent task (fallback
+        // at exit) and the monitor task can race to publish. First sender wins.
+        let output_tx = Arc::new(tokio::sync::Mutex::new(Some(output_tx)));
+
         // ── Clone sandbox for spawned tasks ────────────────────────────
 
         let sandbox_agent = Arc::clone(sandbox);
@@ -897,6 +901,8 @@ impl VoidBox {
 
         let tag_agent = tag.clone();
         let box_name_agent = box_name.clone();
+        let output_file_agent = output_file.clone();
+        let output_tx_agent = Arc::clone(&output_tx);
         tokio::spawn(async move {
             let tag = tag_agent;
 
@@ -937,6 +943,38 @@ impl VoidBox {
                                 res.total_cost_usd,
                                 res.is_error,
                             );
+
+                            // The agent wrote output and exited before the monitor
+                            // task could poll it. Try to publish now, before the
+                            // sandbox shuts down, so output_ready fires.
+                            if !res.is_error {
+                                if let Ok(data) = sandbox_agent.read_file(&output_file_agent).await {
+                                    if !data.is_empty() {
+                                        eprintln!(
+                                            "[vm:{}] Service agent: publishing output at exit ({} bytes)",
+                                            box_name_agent, data.len()
+                                        );
+                                        let tx = output_tx_agent.lock().await.take();
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(ServicePublication {
+                                                box_name: box_name_agent.clone(),
+                                                output: data,
+                                                report: crate::runtime::RunReport {
+                                                    name: box_name_agent.clone(),
+                                                    kind: "service".to_string(),
+                                                    success: true,
+                                                    output: output_file_agent.clone(),
+                                                    stages: 1,
+                                                    total_cost_usd: res.total_cost_usd,
+                                                    input_tokens: res.input_tokens,
+                                                    output_tokens: res.output_tokens,
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
                             let _ = exit_tx.send(ServiceExit::Exited {
                                 success: !res.is_error,
                                 error: res.error,
@@ -1002,7 +1040,10 @@ impl VoidBox {
                                 output_tokens: 0,
                             },
                         };
-                        let _ = output_tx.send(publication);
+                        let tx = output_tx.lock().await.take();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(publication);
+                        }
                         return; // one-shot: done after first successful read
                     }
                     Ok(_) => {
