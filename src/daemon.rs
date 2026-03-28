@@ -753,6 +753,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             finished_at: None,
             stage_states: None,
             artifact_publication: None,
+            output_ready: false,
         };
 
         let _ = state.provider.save_run(&run);

@@ -145,6 +145,10 @@ pub struct RunState {
     pub stage_states: Option<HashMap<String, StageState>>,
     #[serde(default)]
     pub artifact_publication: Option<ArtifactPublication>,
+    /// True once a service agent has published its structured output.
+    /// One-shot: once set, never reverts. Allows collection while still Running.
+    #[serde(default)]
+    pub output_ready: bool,
 }
 
 fn default_attempt_id() -> u64 {
@@ -969,6 +973,7 @@ mod tests {
                     retrieval_path: "/v1/runs/round-trip-test/stages/main/output-file".to_string(),
                 }],
             }),
+            output_ready: false,
         };
 
         provider.save_run(&run).unwrap();
