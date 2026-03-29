@@ -1040,12 +1040,12 @@ impl VoidBox {
                 {
                     Ok(Ok(found)) => found,
                     Ok(Err(e)) => {
-                        eprintln!("[vm:{}] Output monitor: test failed: {}", tag, e);
+                        eprintln!("[vm:{}] Output monitor: file_exists failed: {}", tag, e);
                         probe_failures += 1;
                         false
                     }
                     Err(_) => {
-                        eprintln!("[vm:{}] Output monitor: test timed out", tag);
+                        eprintln!("[vm:{}] Output monitor: file_exists timed out", tag);
                         probe_failures += 1;
                         false
                     }
