@@ -1203,117 +1203,117 @@ async fn spawn_service_run(
         }
     };
 
-    // Destructure the handle so we can race the two receivers independently.
+    // Destructure the handle.
     let crate::agent_box::ServiceStageHandle {
         output_rx,
         stop_tx: _stop_tx,
         exit_rx,
     } = handle;
 
-    // Race: output publication vs early exit.
-    // Pin both receivers so select! borrows them rather than moving.
+    eprintln!(
+        "[void-box] Service run {}: handle created, awaiting signals",
+        run_id
+    );
+
+    // Watchdog: if neither output nor exit arrives in 120s, terminalize Failed.
+    let watchdog = tokio::time::sleep(std::time::Duration::from_secs(120));
+    tokio::pin!(watchdog);
     tokio::pin!(output_rx);
     tokio::pin!(exit_rx);
 
-    let mut output_published = false;
+    let mut published = false;
+    let mut terminalized = false;
 
+    // Phase 1: Wait for output publication OR exit OR watchdog.
     tokio::select! {
-        // Case 1: Output published (happy path for service mode)
         output_result = &mut output_rx => {
-            match output_result {
-                Ok(publication) => {
-                    output_published = true;
+            if let Ok(publication) = output_result {
+                published = true;
+                eprintln!("[void-box] Service run {}: got output publication", run_id);
 
-                    // Drain sidecar intents (best-effort)
-                    let _intents = {
-                        let h = state.sidecar_handles.lock().await.get(&run_id).cloned();
-                        if let Some(h) = h {
-                            h.drain_intents().await
-                        } else {
-                            vec![]
-                        }
-                    };
+                // Drain sidecar intents (best-effort)
+                let _intents = {
+                    let h = state.sidecar_handles.lock().await.get(&run_id).cloned();
+                    if let Some(h) = h {
+                        h.drain_intents().await
+                    } else {
+                        vec![]
+                    }
+                };
 
-                    // Persist report and set output_ready (one-shot)
-                    {
-                        let mut runs = state.runs.lock().await;
-                        if let Some(r) = runs.get_mut(&run_id) {
-                            r.report = Some(publication.report);
-                            r.output_ready = true;
-                            let seq = r.events.len() as u64;
-                            r.events.push(event_with_seq(
-                                &run_id,
-                                "info",
-                                "run.output_ready",
-                                "service output published".to_string(),
-                                seq,
-                                attempt,
-                            ));
-                            r.updated_at = Some(now_rfc3339());
-                            let _ = state.provider.save_run(r);
-                        }
+                // Persist report and set output_ready (one-shot)
+                {
+                    let mut runs = state.runs.lock().await;
+                    if let Some(r) = runs.get_mut(&run_id) {
+                        r.report = Some(publication.report);
+                        r.output_ready = true;
+                        let seq = r.events.len() as u64;
+                        r.events.push(event_with_seq(
+                            &run_id,
+                            "info",
+                            "run.output_ready",
+                            "service output published".to_string(),
+                            seq,
+                            attempt,
+                        ));
+                        r.updated_at = Some(now_rfc3339());
+                        let _ = state.provider.save_run(r);
                     }
                 }
-                Err(_) => {
-                    // output_rx channel dropped without sending — agent exited
-                    // without publishing output. Wait for exit_rx to get the
-                    // actual exit status instead of assuming crash.
-                    eprintln!(
-                        "[void-box] Service run {}: output channel closed without publication, awaiting exit",
-                        run_id
-                    );
-                    match (&mut exit_rx).await {
-                        Ok(exit) => {
-                            terminalize_service(&state, &run_id, exit, attempt).await;
-                        }
-                        Err(_) => {
-                            terminalize_service(
-                                &state,
-                                &run_id,
-                                ServiceExit::Crashed("both channels dropped".into()),
-                                attempt,
-                            )
-                            .await;
-                        }
-                    }
-                }
+            } else {
+                eprintln!("[void-box] Service run {}: output channel closed without publication", run_id);
+                // Channel closed — agent exited without publishing.
+                // Fall through to phase 2 which will get exit_rx.
             }
         }
 
-        // Case 2: Process died before publishing output
         exit_result = &mut exit_rx => {
+            // exit_rx is authoritative — terminalize immediately.
+            eprintln!("[void-box] Service run {}: got exit before publication", run_id);
+            terminalized = true;
             match exit_result {
-                Ok(exit) => {
-                    terminalize_service(&state, &run_id, exit, attempt).await;
-                }
-                Err(_) => {
-                    terminalize_service(
-                        &state,
-                        &run_id,
-                        ServiceExit::Crashed("exit channel dropped".into()),
-                        attempt,
-                    )
-                    .await;
-                }
+                Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
+                Err(_) => terminalize_service(
+                    &state, &run_id,
+                    ServiceExit::Crashed("exit channel dropped".into()),
+                    attempt,
+                ).await,
             }
-            // Never set output_ready — process died before publishing
+        }
+
+        _ = &mut watchdog => {
+            eprintln!("[void-box] Service run {}: watchdog fired, no progress after 120s", run_id);
+            terminalized = true;
+            terminalize_run_simple(&state, &run_id, RunStatus::Failed,
+                Some("service run made no progress within 120s".into()), attempt).await;
         }
     }
 
-    // If output was published, wait for the service to exit (lifecycle end).
-    if output_published {
-        match exit_rx.await {
-            Ok(exit) => {
-                terminalize_service(&state, &run_id, exit, attempt).await;
+    // Phase 2: If output was published but run hasn't terminalized, wait for exit.
+    if !terminalized {
+        eprintln!(
+            "[void-box] Service run {}: awaiting terminal exit (published={})",
+            run_id, published
+        );
+        let watchdog2 = tokio::time::sleep(std::time::Duration::from_secs(120));
+        tokio::pin!(watchdog2);
+
+        tokio::select! {
+            exit_result = &mut exit_rx => {
+                eprintln!("[void-box] Service run {}: got exit signal", run_id);
+                match exit_result {
+                    Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
+                    Err(_) => terminalize_service(
+                        &state, &run_id,
+                        ServiceExit::Crashed("exit channel dropped in phase 2".into()),
+                        attempt,
+                    ).await,
+                }
             }
-            Err(_) => {
-                terminalize_service(
-                    &state,
-                    &run_id,
-                    ServiceExit::Crashed("exit channel dropped".into()),
-                    attempt,
-                )
-                .await;
+            _ = &mut watchdog2 => {
+                eprintln!("[void-box] Service run {}: watchdog2 fired, published output but never terminated", run_id);
+                terminalize_run_simple(&state, &run_id, RunStatus::Failed,
+                    Some("service run published output but never terminated".into()), attempt).await;
             }
         }
     }

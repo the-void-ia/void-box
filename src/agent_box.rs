@@ -888,9 +888,9 @@ impl VoidBox {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<ServiceExit>();
 
-        // Wrap output_tx in Arc<Mutex<Option>> so both the agent task (fallback
-        // at exit) and the monitor task can race to publish. First sender wins.
+        // Shared state so both tasks can coordinate without blocking each other.
         let output_tx = Arc::new(tokio::sync::Mutex::new(Some(output_tx)));
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // ── Clone sandbox for spawned tasks ────────────────────────────
 
@@ -903,6 +903,7 @@ impl VoidBox {
         let box_name_agent = box_name.clone();
         let output_file_agent = output_file.clone();
         let output_tx_agent = Arc::clone(&output_tx);
+        let exited_agent = Arc::clone(&exited);
         tokio::spawn(async move {
             let tag = tag_agent;
 
@@ -944,15 +945,13 @@ impl VoidBox {
                                 res.is_error,
                             );
 
-                            // Try to read output before signaling exit, but with a
-                            // hard timeout. The sandbox may be tearing down, so
-                            // read_file can hang. Never block exit_tx on this.
+                            // Best-effort exit-time publication. Hard timeout so
+                            // a dying sandbox cannot block exit_tx forever.
                             if !res.is_error {
                                 let read_result = tokio::time::timeout(
                                     std::time::Duration::from_secs(3),
                                     sandbox_agent.read_file(&output_file_agent),
-                                )
-                                .await;
+                                ).await;
 
                                 if let Ok(Ok(data)) = read_result {
                                     if !data.is_empty() {
@@ -960,8 +959,7 @@ impl VoidBox {
                                             "[vm:{}] Service agent: publishing output at exit ({} bytes)",
                                             box_name_agent, data.len()
                                         );
-                                        let tx = output_tx_agent.lock().await.take();
-                                        if let Some(tx) = tx {
+                                        if let Some(tx) = output_tx_agent.lock().await.take() {
                                             let _ = tx.send(ServicePublication {
                                                 box_name: box_name_agent.clone(),
                                                 output: data,
@@ -986,8 +984,9 @@ impl VoidBox {
                                 }
                             }
 
-                            // Always drop + signal, even if read failed/timed out.
-                            drop(output_tx_agent);
+                            // Signal exit — unconditional, never depends on publication.
+                            exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!("[vm:{}] Service agent: sending exit", box_name_agent);
                             let _ = exit_tx.send(ServiceExit::Exited {
                                 success: !res.is_error,
                                 error: res.error,
@@ -995,16 +994,14 @@ impl VoidBox {
                         }
                         Err(e) => {
                             eprintln!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
-                            // Drop publication channel — no output from a crash.
-                            drop(output_tx_agent);
+                            exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = exit_tx.send(ServiceExit::Crashed(e.to_string()));
                         }
                     }
                 }
                 _ = stop_rx => {
                     eprintln!("[vm:{}] Service agent stop requested", box_name_agent);
-                    // Drop publication channel — canceled before output.
-                    drop(output_tx_agent);
+                    exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = exit_tx.send(ServiceExit::Canceled);
                 }
             }
@@ -1013,76 +1010,102 @@ impl VoidBox {
         // ── Spawn output file monitor task ─────────────────────────────
 
         let tag_monitor = tag.clone();
+        let output_tx_monitor = Arc::clone(&output_tx);
+        let exited_monitor = Arc::clone(&exited);
         tokio::spawn(async move {
             let tag = tag_monitor;
+            let mut probe_failures = 0u32;
+
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                // Check if the sender was already consumed (by the agent exit
-                // fallback) or if the agent dropped its ref. If so, stop polling.
-                if output_tx.lock().await.is_none() {
-                    eprintln!("[vm:{}] Output monitor: channel consumed, exiting", tag);
+                // Stop if the agent task already exited.
+                if exited_monitor.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("[vm:{}] Output monitor: agent exited, stopping", tag);
                     return;
                 }
 
-                // Check if the output file exists
-                let exists = match sandbox_monitor.exec("test", &["-f", &output_file]).await {
-                    Ok(out) => out.exit_code == 0,
-                    Err(e) => {
-                        eprintln!(
-                            "[vm:{}] Output monitor: exec error checking file: {}",
-                            tag, e
-                        );
+                // Stop if the sender was already consumed by the exit fallback.
+                if output_tx_monitor.lock().await.is_none() {
+                    eprintln!("[vm:{}] Output monitor: already published, stopping", tag);
+                    return;
+                }
+
+                // Check if the output file exists (with timeout).
+                let exists = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    sandbox_monitor.exec("test", &["-f", &output_file]),
+                )
+                .await
+                {
+                    Ok(Ok(out)) => out.exit_code == 0,
+                    Ok(Err(e)) => {
+                        eprintln!("[vm:{}] Output monitor: test failed: {}", tag, e);
+                        probe_failures += 1;
+                        false
+                    }
+                    Err(_) => {
+                        eprintln!("[vm:{}] Output monitor: test timed out", tag);
+                        probe_failures += 1;
                         false
                     }
                 };
 
                 if !exists {
+                    if probe_failures >= 10 {
+                        eprintln!(
+                            "[vm:{}] Output monitor: too many probe failures, stopping",
+                            tag
+                        );
+                        return;
+                    }
                     continue;
                 }
 
-                // File exists — read it
-                match sandbox_monitor.read_file(&output_file).await {
-                    Ok(data) if !data.is_empty() => {
-                        eprintln!(
-                            "[vm:{}] Output file ready ({} bytes) at {}",
-                            tag,
-                            data.len(),
-                            output_file,
-                        );
-                        let publication = ServicePublication {
-                            box_name: box_name.clone(),
-                            output: data,
-                            report: crate::runtime::RunReport {
-                                name: box_name.clone(),
-                                kind: "service".to_string(),
-                                success: true,
-                                output: output_file.clone(),
-                                stages: 1,
-                                total_cost_usd: 0.0,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                            },
-                        };
-                        let tx = output_tx.lock().await.take();
-                        if let Some(tx) = tx {
-                            let _ = tx.send(publication);
-                        }
-                        return; // one-shot: done after first successful read
+                // File exists — read it (with timeout).
+                let data = match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sandbox_monitor.read_file(&output_file),
+                )
+                .await
+                {
+                    Ok(Ok(data)) if !data.is_empty() => data,
+                    Ok(Ok(_)) => {
+                        eprintln!("[vm:{}] Output monitor: file empty, retrying", tag);
+                        continue;
                     }
-                    Ok(_) => {
-                        eprintln!(
-                            "[vm:{}] Output monitor: file exists but is empty, retrying",
-                            tag
-                        );
+                    Ok(Err(e)) => {
+                        eprintln!("[vm:{}] Output monitor: read failed: {}", tag, e);
+                        continue;
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[vm:{}] Output monitor: failed to read {}: {}, retrying",
-                            tag, output_file, e
-                        );
+                    Err(_) => {
+                        eprintln!("[vm:{}] Output monitor: read timed out", tag);
+                        continue;
                     }
+                };
+
+                eprintln!(
+                    "[vm:{}] Output monitor: publishing output ({} bytes)",
+                    tag,
+                    data.len()
+                );
+                if let Some(tx) = output_tx_monitor.lock().await.take() {
+                    let _ = tx.send(ServicePublication {
+                        box_name: box_name.clone(),
+                        output: data,
+                        report: crate::runtime::RunReport {
+                            name: box_name.clone(),
+                            kind: "service".to_string(),
+                            success: true,
+                            output: output_file.clone(),
+                            stages: 1,
+                            total_cost_usd: 0.0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
+                    });
                 }
+                return; // one-shot
             }
         });
 
