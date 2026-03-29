@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::guest::protocol::{
-    ExecOutputChunk, ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest,
-    MkdirPResponse, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
+    ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, Message,
+    MessageType, MkdirPRequest, MkdirPResponse, ReadFileRequest, ReadFileResponse, TelemetryBatch,
+    TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::{Error, Result};
 
@@ -326,7 +327,77 @@ impl ControlChannel {
         Ok(response)
     }
 
-    /// Open a persistent telemetry subscription to the guest agent.
+    /// Checks if a file exists in the guest filesystem.
+    pub async fn send_file_stat(&self, path: &str) -> Result<FileStatResponse> {
+        let request = FileStatRequest {
+            path: path.to_string(),
+        };
+
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "file-stat")
+            .await?;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+
+        let message = Message {
+            msg_type: MessageType::FileStat,
+            payload: serde_json::to_vec(&request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send FileStat: {}", e)))?;
+
+        tokio::task::spawn_blocking(move || {
+            let response_msg = Message::read_from_sync(&mut *stream)?;
+            if response_msg.msg_type != MessageType::FileStatResponse {
+                return Err(Error::Guest(format!(
+                    "Unexpected response type for FileStat: {:?}",
+                    response_msg.msg_type
+                )));
+            }
+            let response: FileStatResponse = serde_json::from_slice(&response_msg.payload)?;
+            Ok(response)
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("FileStat task panicked: {}", e)))?
+    }
+
+    /// Reads a file from the guest filesystem.
+    pub async fn send_read_file(&self, path: &str) -> Result<ReadFileResponse> {
+        let request = ReadFileRequest {
+            path: path.to_string(),
+        };
+
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "read-file")
+            .await?;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+
+        let message = Message {
+            msg_type: MessageType::ReadFile,
+            payload: serde_json::to_vec(&request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send ReadFile: {}", e)))?;
+
+        tokio::task::spawn_blocking(move || {
+            let response_msg = Message::read_from_sync(&mut *stream)?;
+            if response_msg.msg_type != MessageType::ReadFileResponse {
+                return Err(Error::Guest(format!(
+                    "Unexpected response type for ReadFile: {:?}",
+                    response_msg.msg_type
+                )));
+            }
+            let response: ReadFileResponse = serde_json::from_slice(&response_msg.payload)?;
+            Ok(response)
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("ReadFile task panicked: {}", e)))?
+    }
+
+    /// Opens a persistent telemetry subscription to the guest agent.
     pub async fn subscribe_telemetry<F>(
         &self,
         opts: &TelemetrySubscribeRequest,
