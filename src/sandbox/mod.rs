@@ -209,22 +209,35 @@ impl Sandbox {
         }
     }
 
-    /// Check if a file exists in the sandbox
+    /// Checks if a file exists in the sandbox.
     pub async fn file_exists(&self, path: &str) -> Result<bool> {
-        let output = self.exec("test", &["-e", path]).await?;
-        Ok(output.exit_code == 0)
+        match &self.inner {
+            SandboxInner::Local(local) => {
+                let response = local.file_stat_native(path).await?;
+                Ok(response.exists)
+            }
+            SandboxInner::Mock(mock) => {
+                let output = mock.exec_with_stdin("test", &["-e", path], &[]).await?;
+                Ok(output.exit_code == 0)
+            }
+        }
     }
 
-    /// Read a file from the sandbox
+    /// Reads a file from the sandbox.
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let output = self.exec("cat", &[path]).await?;
-        if output.success() {
-            Ok(output.stdout)
-        } else {
-            Err(Error::Guest(format!(
-                "Failed to read file: {}",
-                output.stderr_str()
-            )))
+        match &self.inner {
+            SandboxInner::Local(local) => local.read_file_native(path).await,
+            SandboxInner::Mock(mock) => {
+                let output = mock.exec_with_stdin("cat", &[path], &[]).await?;
+                if output.exit_code == 0 {
+                    Ok(output.stdout)
+                } else {
+                    Err(crate::Error::Guest(format!(
+                        "Failed to read file: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            }
         }
     }
 

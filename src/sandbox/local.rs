@@ -264,6 +264,25 @@ impl LocalSandbox {
         backend.mkdir_p(path).await
     }
 
+    /// Returns file metadata from the guest filesystem via native RPC.
+    pub(crate) async fn file_stat_native(
+        &self,
+        path: &str,
+    ) -> Result<crate::guest::protocol::FileStatResponse> {
+        self.ensure_started().await?;
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        backend.file_stat(path).await
+    }
+
+    /// Reads a file from the guest filesystem via native RPC.
+    pub(crate) async fn read_file_native(&self, path: &str) -> Result<Vec<u8>> {
+        self.ensure_started().await?;
+        let backend_lock = self.backend.lock().await;
+        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        backend.read_file_native(path).await
+    }
+
     /// Internal helper for `exec_claude` -- runs claude-code with extra env and optional timeout.
     pub(crate) async fn exec_claude_internal(
         &self,

@@ -1034,11 +1034,11 @@ impl VoidBox {
                 // Check if the output file exists (with timeout).
                 let exists = match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    sandbox_monitor.exec("test", &["-f", &output_file]),
+                    sandbox_monitor.file_exists(&output_file),
                 )
                 .await
                 {
-                    Ok(Ok(out)) => out.exit_code == 0,
+                    Ok(Ok(found)) => found,
                     Ok(Err(e)) => {
                         eprintln!("[vm:{}] Output monitor: test failed: {}", tag, e);
                         probe_failures += 1;
