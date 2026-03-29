@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Running on Linux | Void-Box</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-YRRVNN7VM4');
+  </script>
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../docs/">Docs</a>
+        <a href="../">Guides</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Running on Linux</h1>
+      <p>VoidBox runs natively on any Linux host with <code>/dev/kvm</code>. This guide covers zero-setup mode, manual image builds, mock mode for development, and running the test suite.</p>
+
+      <h2>KVM Mode (Zero-Setup)</h2>
+      <p>On a Linux host with <code>/dev/kvm</code>, VoidBox auto-pulls a pre-built guest image (kernel + initramfs) from GHCR on first run. No manual build steps required:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code># Just works — guest image is pulled and cached automatically
+ANTHROPIC_API_KEY=sk-ant-xxx \
+cargo run --bin voidbox -- run --file examples/specs/oci/agent.yaml
+
+# Or with Ollama
+cargo run --bin voidbox -- run --file examples/specs/oci/workflow.yaml</code></pre>
+      </div>
+
+      <p>The guest image (<code>ghcr.io/the-void-ia/voidbox-guest</code>) contains the kernel and initramfs with guest-agent, busybox, and common tools. It is cached at <code>~/.voidbox/oci/guest/</code> after the first pull.</p>
+
+      <h3>Resolution Order</h3>
+      <p>VoidBox resolves the kernel and initramfs using a 5-step chain:</p>
+      <ol>
+        <li><code>sandbox.kernel</code> / <code>sandbox.initramfs</code> in the spec (explicit paths)</li>
+        <li><code>VOID_BOX_KERNEL</code> / <code>VOID_BOX_INITRAMFS</code> env vars</li>
+        <li><code>sandbox.guest_image</code> in the spec (explicit OCI ref)</li>
+        <li>Default: <code>ghcr.io/the-void-ia/voidbox-guest:v{version}</code> (auto-pull)</li>
+        <li>Mock fallback when <code>mode: auto</code></li>
+      </ol>
+
+      <h3>Custom Guest Image</h3>
+      <p>To use a custom guest image or disable auto-pull:</p>
+<pre><code class="language-yaml">sandbox:
+  # Use a specific guest image
+  guest_image: "ghcr.io/the-void-ia/voidbox-guest:latest"
+
+  # Or disable auto-pull (empty string)
+  # guest_image: ""</code></pre>
+
+      <h2>KVM Mode (Manual Build)</h2>
+      <p>If you prefer to build the guest image locally:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code># Build base guest initramfs (guest-agent + tools; no Claude bundle)
+scripts/build_guest_image.sh
+
+# Download a kernel
+scripts/download_kernel.sh
+
+# Run with explicit paths
+ANTHROPIC_API_KEY=sk-ant-xxx \
+VOID_BOX_KERNEL=target/vmlinuz-amd64 \
+VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
+cargo run --example trading_pipeline</code></pre>
+      </div>
+
+      <p>For a production Claude-capable initramfs:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code># Build production rootfs/initramfs with native claude-code + CA certs + sandbox user
+scripts/build_claude_rootfs.sh</code></pre>
+      </div>
+
+      <h3>Script Intent Summary</h3>
+      <div class="card">
+        <table>
+          <thead><tr><th>Script</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>scripts/build_guest_image.sh</code></td><td>Base runtime image for general VM/OCI work</td></tr>
+            <tr><td><code>scripts/build_claude_rootfs.sh</code></td><td>Production image for direct Claude runtime in guest</td></tr>
+            <tr><td><code>scripts/build_test_image.sh</code></td><td>Deterministic test image with <code>claudio</code> mock</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Mock Mode</h2>
+      <p>No KVM required. Mock mode lets you develop and test pipeline logic without hardware virtualization:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo run --example quick_demo
+cargo run --example trading_pipeline
+cargo run --example parallel_pipeline</code></pre>
+      </div>
+
+      <h2>Parallel Pipeline</h2>
+      <p>Run a parallel pipeline with per-box model overrides using environment variables:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>OLLAMA_MODEL=phi4-mini \
+OLLAMA_MODEL_QUANT=qwen3-coder \
+OLLAMA_MODEL_SENTIMENT=phi4-mini \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+cargo run --example parallel_pipeline</code></pre>
+      </div>
+
+      <h2>Running Tests</h2>
+
+      <h3>Unit Tests</h3>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo test --lib</code></pre>
+      </div>
+
+      <h3>Integration Tests (Mock)</h3>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo test --test skill_pipeline</code></pre>
+      </div>
+
+      <h3>Integration Tests</h3>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo test --test integration</code></pre>
+      </div>
+
+      <h3>E2E Tests (KVM + test initramfs)</h3>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>scripts/build_test_image.sh
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">&larr; Guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

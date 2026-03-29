@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Security | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-YRRVNN7VM4');
+</script>
+</head><body>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../../guides/">Guides</a><a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<main class="doc-main wrap">
+<div class="doc-layout">
+<aside class="doc-sidebar">
+  <nav>
+    <strong>Docs</strong>
+    <a href="../architecture/">Architecture</a>
+    <a href="../runtime/">Runtime Model</a>
+    <a href="../cli-tui/">CLI + TUI</a>
+    <a href="../events-observability/">Events + Observability</a>
+    <a href="../oci-containers/">OCI Containers</a>
+    <a href="../snapshots/">Snapshots</a>
+    <a href="../host-mounts/">Host Mounts</a>
+    <a href="../security/">Security</a>
+    <a href="../wire-protocol/">Wire Protocol</a>
+  </nav>
+</aside>
+<div class="doc-content">
+<section>
+<div class="kicker">Security Model</div>
+<h1>Defense in Depth</h1>
+<p>VoidBox uses a layered security model with five distinct isolation boundaries. Each layer provides independent protection &mdash; compromise of one layer does not grant access through subsequent layers.</p>
+</section>
+
+<section>
+<h2>Five Layers of Defense</h2>
+<div class="code-wrap">
+<div class="code-head">Defense in depth</div>
+<pre><code>Layer 1: Hardware isolation (KVM)
+  &mdash; Separate kernel, memory space, devices per VM
+
+Layer 2: Seccomp-BPF (VMM process)
+  &mdash; VMM thread restricted to KVM ioctls + vsock + networking syscalls
+
+Layer 3: Session authentication (vsock)
+  &mdash; 32-byte random secret, per-VM, injected at boot
+
+Layer 4: Guest hardening (guest-agent)
+  &mdash; Command allowlist, rlimits, privilege drop, timeout watchdog
+
+Layer 5: Network isolation (SLIRP)
+  &mdash; Rate limiting, max connections, CIDR deny list</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Layer 1: Hardware Isolation (KVM)</h2>
+<div class="card"><p>Each VoidBox runs in its own micro-VM with a <strong>separate kernel, memory space, and devices</strong>. Hardware virtualization enforces isolation &mdash; not advisory process controls. On macOS, Apple's Virtualization.framework provides equivalent hypervisor-level isolation.</p></div>
+</section>
+
+<section>
+<h2>Layer 2: Seccomp-BPF (VMM Process)</h2>
+<div class="card"><p>The VMM thread is restricted via seccomp-BPF to only the syscalls needed for KVM operation: KVM ioctls, vsock communication, and networking syscalls. All other syscalls are blocked at the kernel level.</p></div>
+</section>
+
+<section>
+<h2>Layer 3: Session Authentication (vsock)</h2>
+<p>Every VM gets a unique 32-byte random session secret, injected via kernel command line. The guest-agent requires this secret on every request.</p>
+<div class="code-wrap">
+<div class="code-head">Session secret flow</div>
+<pre><code>Host                                    Guest
+  |                                       |
+  +-- getrandom(32 bytes)                 |
+  +-- hex-encode -> kernel cmdline        |
+  |   voidbox.secret=abc123...            |
+  |                                       |
+  |              boot                     |
+  | ------------------------------------&gt; |
+  |                                       +-- parse /proc/cmdline
+  |                                       +-- store in OnceLock
+  |                                       |
+  +-- ExecRequest { secret: "abc123..." } |
+  | ------------------------------------&gt; |
+  |                                       +-- verify secret
+  |                                       +-- execute if match
+  | &lt;------------------------------------ |
+  |  ExecResponse { ... }                 |</code></pre>
+</div>
+</section>
+
+<section>
+<h2>Layer 4: Guest Hardening (guest-agent)</h2>
+<p>The guest-agent (PID 1) enforces four independent controls:</p>
+<div class="grid-2">
+  <article class="card">
+    <h3>Command Allowlist</h3>
+    <p>Only approved binaries execute. The allowlist is read from <code>/etc/voidbox/allowed_commands.json</code>, provisioned by the trusted host at boot.</p>
+  </article>
+  <article class="card">
+    <h3>Resource Limits</h3>
+    <p><code>setrlimit</code> enforces memory, file descriptor, and process count limits. Read from <code>/etc/voidbox/resource_limits.json</code>.</p>
+  </article>
+  <article class="card">
+    <h3>Privilege Drop</h3>
+    <p>Child processes run as <code>uid:1000</code>. The guest-agent drops privileges before executing any command, preventing root access inside the VM.</p>
+  </article>
+  <article class="card">
+    <h3>Timeout Watchdog</h3>
+    <p>A watchdog timer sends <code>SIGKILL</code> to child processes that exceed the configured timeout, preventing runaway execution.</p>
+  </article>
+</div>
+</section>
+
+<section>
+<h2>Layer 5: Network Isolation (SLIRP)</h2>
+<p>VoidBox uses smoltcp-based usermode networking (SLIRP) &mdash; no root, no TAP devices, no bridge configuration.</p>
+<ul>
+  <li><strong>Rate limiting</strong> on new connections &mdash; prevents connection floods from guest</li>
+  <li><strong>Maximum concurrent connection limit</strong> &mdash; bounds host resource usage</li>
+  <li><strong>CIDR deny list</strong> &mdash; configurable via <code>ipnet</code>, blocks access to specified network ranges</li>
+</ul>
+</section>
+
+<section>
+<h2>Snapshot Security Considerations</h2>
+<p>Snapshot cloning shares identical VM state across restored instances. Three areas require awareness:</p>
+<div class="grid-2">
+  <article class="card">
+    <h3>RNG Entropy</h3>
+    <p>Restored VMs inherit the same <code>/dev/urandom</code> pool. Mitigated by: fresh CID per restore, hardware <code>RDRAND</code> re-seeding on <code>rdtsc</code>.</p>
+  </article>
+  <article class="card">
+    <h3>ASLR</h3>
+    <p>Clones share guest page table layout. Mitigated by: short-lived tasks, no direct network addressability (SLIRP NAT), command allowlist limiting attack surface.</p>
+  </article>
+</div>
+<div class="card">
+  <h3>Session Isolation</h3>
+  <p>Restored VMs reuse the snapshot's stored session secret for vsock authentication (the secret is baked into the guest's kernel cmdline in snapshot memory). Per-restore secret rotation would require guest-side support.</p>
+</div>
+</section>
+</div>
+</div>
+</main>
+<footer><div class="wrap"><a href="../">← Docs</a></div></footer>
+<script src="../../assets/js/site.js"></script>
+</body></html>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Void-Box | Composable agent runtime with hardware isolation</title>
+  <title>Void-Box | Composable Agent Runtime with Hardware Isolation</title>
   <meta name="description" content="VoidBox is a composable agent runtime with hardware isolation. VoidBox = Agent(Skills) + Isolation." />
   <link rel="stylesheet" href="assets/css/site.css" />
   <!-- Google tag (gtag.js) -->
@@ -24,6 +24,8 @@
         <span>Void-Box</span>
       </a>
       <nav class="top">
+        <a href="docs/">Docs</a>
+        <a href="guides/">Guides</a>
         <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
         <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
       </nav>
@@ -43,10 +45,13 @@
           <span>Agent-native skills</span>
           <span>Claude Code runtime</span>
           <span>Pipeline composition</span>
+          <span>Snapshot / restore</span>
+          <span>OCI containers</span>
+          <span>Host mounts</span>
         </div>
 
         <div class="cta">
-          <a class="btn primary" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">Get Started</a>
+          <a class="btn primary" href="guides/getting-started/">Get Started</a>
           <a class="btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
         </div>
 
@@ -119,7 +124,7 @@ agent:
       </div>
     </section>
 
-    <section>
+    <section class="fade-in">
       <div class="wrap">
         <h2 class="section-title">Why Choose VoidBox?</h2>
         <p class="section-sub">Agent runtime boundaries with the simplicity of declarative skills.</p>
@@ -157,11 +162,97 @@ agent:
         </div>
       </div>
     </section>
+
+    <section class="fade-in">
+      <div class="wrap">
+        <h2 class="section-title">How It Works</h2>
+        <p class="section-sub">Three steps from declaration to isolated execution.</p>
+        <div class="steps">
+          <div class="step">
+            <h3>Declare Skills</h3>
+            <p>Define capabilities as MCP servers, SKILL files, CLI tools, or OCI images. Skills are what your agent can do.</p>
+          </div>
+          <div class="step">
+            <h3>Define Sandbox</h3>
+            <p>Set memory, vCPUs, network access, and mounts. Each sandbox is a hardware-isolated micro-VM boundary.</p>
+          </div>
+          <div class="step">
+            <h3>Run Isolated</h3>
+            <p>VoidBox boots a micro-VM, provisions skills, runs claude-code, and returns results. No shared kernel. No escape surface.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="fade-in">
+      <div class="wrap">
+        <h2 class="section-title">Install</h2>
+        <p class="section-sub">One command. Binary + kernel + initramfs — everything bundled.</p>
+        <div class="install-grid">
+          <div class="install-card">
+            <h3>Shell installer</h3>
+            <div class="install-label">Linux &amp; macOS — recommended</div>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/the-void-ia/void-box/main/scripts/install.sh | sh</code></pre>
+          </div>
+          <div class="install-card">
+            <h3>Homebrew</h3>
+            <div class="install-label">macOS</div>
+<pre><code>brew tap the-void-ia/tap
+brew install voidbox</code></pre>
+          </div>
+          <div class="install-card">
+            <h3>Debian / Ubuntu</h3>
+            <div class="install-label">amd64 &amp; arm64</div>
+<pre><code>curl -fsSLO https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox_0.1.2_amd64.deb
+sudo dpkg -i voidbox_0.1.2_amd64.deb</code></pre>
+          </div>
+          <div class="install-card">
+            <h3>Fedora / RHEL</h3>
+            <div class="install-label">x86_64 &amp; aarch64</div>
+<pre><code>sudo rpm -i https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox-0.1.2-1.x86_64.rpm</code></pre>
+          </div>
+        </div>
+        <div class="install-platforms">
+          <a href="https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox-v0.1.2-linux-x86_64.tar.gz">Linux x86_64</a>
+          <a href="https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox-v0.1.2-linux-aarch64.tar.gz">Linux aarch64</a>
+          <a href="https://github.com/the-void-ia/void-box/releases/download/v0.1.2/voidbox-v0.1.2-darwin-aarch64.tar.gz">macOS aarch64</a>
+        </div>
+        <p class="install-note">v0.1.2 · <a href="https://github.com/the-void-ia/void-box/releases/tag/v0.1.2" target="_blank" rel="noreferrer">All releases &rarr;</a></p>
+      </div>
+    </section>
+
+    <section class="fade-in">
+      <div class="wrap">
+        <h2 class="section-title">See It In Action</h2>
+        <p class="section-sub">Real agent runs inside hardware-isolated micro-VMs.</p>
+        <div class="grid-2">
+          <div>
+            <div class="demo">
+              <video src="assets/img/void-box-openclaw-demo-2x.mp4" autoplay loop muted playsinline></video>
+            </div>
+            <p class="demo-caption">OpenClaw agent — live demo running inside a VoidBox micro-VM</p>
+          </div>
+          <div>
+            <div class="demo">
+              <img src="assets/img/cr_demo.gif" alt="Code review agent demo" />
+            </div>
+            <p class="demo-caption">Code review pipeline — multi-stage analysis with fan-out</p>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <footer>
     <div class="wrap">
-      <div>void-box · Apache-2.0 · <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a></div>
+      <div style="display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:0.8rem">
+        <a href="docs/">Docs</a>
+        <a href="guides/">Guides</a>
+        <a href="docs/architecture/">Architecture</a>
+        <a href="guides/getting-started/">Getting Started</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+      </div>
+      <div>void-box · Apache-2.0 · <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">The Void Platform</a></div>
     </div>
   </footer>
   <script src="assets/js/site.js"></script>

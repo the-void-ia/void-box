@@ -2,7 +2,7 @@
 name = "void-box"
 version = "0.1.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Diego Parra <diegolparra@gmail.com>"]
 description = "Composable workflow sandbox with KVM micro-VMs and native observability"
 repository = "https://github.com/the-void-ia/void-box"
@@ -33,7 +33,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 
 # HTTP client (for fetching remote skills from skills.sh)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 
 # Security (cross-platform)
 getrandom = "0.3"
@@ -41,6 +41,10 @@ getrandom = "0.3"
 # IDs and time formatting
 uuid = { version = "1", features = ["v7"] }
 humantime = "2"
+
+# CLI
+clap = { version = "4", features = ["derive", "cargo", "env"] }
+tracing-appender = "0.2"
 
 # Utilities
 thiserror = "2"
@@ -54,6 +58,7 @@ voidbox-oci = { path = "voidbox-oci" }
 libc = "0.2"
 byteorder = "1"
 sha2 = "0.10"
+tempfile = "3"
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -103,6 +108,7 @@ voidbox-oci = { path = "voidbox-oci" }
 # OTel testing support (in-memory exporters for assertions)
 opentelemetry = { version = "0.31" }
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+httpmock = "0.8.2"
 
 [features]
 default = []
@@ -111,7 +117,7 @@ opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 
 [[bin]]
 name = "voidbox"
-path = "src/bin/voidbox.rs"
+path = "src/bin/voidbox/main.rs"
 
 
 [[example]]

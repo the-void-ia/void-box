@@ -83,6 +83,14 @@ pub enum LlmProvider {
         host: Option<String>,
     },
 
+    /// Claude using personal OAuth credentials (from `claude auth login`).
+    ///
+    /// Unlike [`Claude`](LlmProvider::Claude), this does not require
+    /// `ANTHROPIC_API_KEY`. Instead, the runtime discovers OAuth credentials
+    /// from the host (macOS Keychain or `~/.claude/.credentials.json`) and
+    /// mounts them into the guest at `/home/sandbox/.claude`.
+    ClaudePersonal,
+
     /// Any Anthropic-compatible API endpoint.
     ///
     /// Use this for OpenRouter, Together AI, or self-hosted vLLM/TGI with
@@ -196,7 +204,7 @@ impl LlmProvider {
     /// arbitrary Ollama model names when `ANTHROPIC_API_KEY` is empty.
     pub(crate) fn cli_args(&self) -> Vec<String> {
         match self {
-            LlmProvider::Claude => Vec::new(),
+            LlmProvider::Claude | LlmProvider::ClaudePersonal => Vec::new(),
             LlmProvider::Ollama { model, .. } => {
                 vec!["--model".into(), model.clone()]
             }
@@ -225,6 +233,11 @@ impl LlmProvider {
                     vars.push(("ANTHROPIC_API_KEY".into(), key));
                 }
                 vars
+            }
+            LlmProvider::ClaudePersonal => {
+                // No API key needed — the guest reads OAuth tokens from the
+                // mounted credentials file at $HOME/.claude/.credentials.json.
+                vec![("HOME".into(), "/home/sandbox".into())]
             }
             LlmProvider::Ollama { host, .. } => {
                 let base_url = host
@@ -293,6 +306,7 @@ impl LlmProvider {
     pub fn description(&self) -> String {
         match self {
             LlmProvider::Claude => "Claude (Anthropic API)".into(),
+            LlmProvider::ClaudePersonal => "Claude (personal OAuth)".into(),
             LlmProvider::Ollama { model, host } => {
                 let h = host.as_deref().unwrap_or("localhost:11434");
                 format!("Ollama ({} @ {})", model, h)
@@ -484,6 +498,38 @@ mod tests {
     #[test]
     fn test_lm_studio_is_local() {
         assert!(LlmProvider::lm_studio("x").is_local());
+    }
+
+    #[test]
+    fn test_claude_personal_env_vars() {
+        let provider = LlmProvider::ClaudePersonal;
+        let vars = provider.env_vars();
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(map.get("HOME").unwrap(), "/home/sandbox");
+        assert!(!map.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_claude_personal_cli_args() {
+        assert!(LlmProvider::ClaudePersonal.cli_args().is_empty());
+    }
+
+    #[test]
+    fn test_claude_personal_is_not_local() {
+        assert!(!LlmProvider::ClaudePersonal.is_local());
+    }
+
+    #[test]
+    fn test_claude_personal_description() {
+        assert_eq!(
+            LlmProvider::ClaudePersonal.description(),
+            "Claude (personal OAuth)"
+        );
+    }
+
+    #[test]
+    fn test_claude_personal_requires_network() {
+        assert!(LlmProvider::ClaudePersonal.requires_network());
     }
 
     #[test]

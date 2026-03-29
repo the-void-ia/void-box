@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Running on macOS | Void-Box</title>
+  <link rel="stylesheet" href="../../assets/css/site.css" />
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+
+    gtag('config', 'G-YRRVNN7VM4');
+  </script>
+</head>
+<body>
+  <header class="site">
+    <div class="wrap inner">
+      <a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+      <nav class="top">
+        <a href="../../docs/">Docs</a>
+        <a href="../">Guides</a>
+        <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+        <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="doc-main wrap">
+    <section>
+      <div class="kicker">Guide</div>
+      <h1>Running on macOS</h1>
+      <p>VoidBox runs natively on Apple Silicon Macs using Apple's Virtualization.framework. No Docker or Linux VM required.</p>
+
+      <h2>Overview</h2>
+      <div class="card">
+        <p>VoidBox on macOS uses Virtualization.framework (VZ) directly on Apple Silicon (M1 or later). This gives you the same hardware-isolated micro-VM execution model as Linux/KVM, with no container runtime dependency.</p>
+      </div>
+
+      <h2>One-Time Setup</h2>
+      <p>Install the musl cross-compilation toolchain. This compiles from source and takes approximately 30 minutes the first time:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code># Install the musl cross-compilation toolchain
+brew install filosottile/musl-cross/musl-cross</code></pre>
+      </div>
+
+      <p>Add the Rust target for Linux ARM64:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>rustup target add aarch64-unknown-linux-musl</code></pre>
+      </div>
+
+      <h2>Build and Run</h2>
+      <p>Download the kernel, build the guest initramfs, compile, codesign, and run:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code># Download an ARM64 Linux kernel (cached in target/)
+scripts/download_kernel.sh
+
+# Build the guest initramfs (cross-compiles guest-agent, downloads claude-code + busybox)
+scripts/build_claude_rootfs.sh
+
+# Build the example and sign it with the virtualization entitlement
+cargo build --example ollama_local
+codesign --force --sign - --entitlements voidbox.entitlements target/debug/examples/ollama_local
+
+# Run (Ollama must be listening on 0.0.0.0:11434)
+OLLAMA_MODEL=qwen3-coder \
+VOID_BOX_KERNEL=target/vmlinux-arm64 \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+target/debug/examples/ollama_local</code></pre>
+      </div>
+
+      <h2>Important: Code Signing</h2>
+      <div class="card">
+        <p><strong>Every <code>cargo build</code> invalidates the code signature.</strong> You must re-run <code>codesign</code> after each rebuild, or macOS will refuse to grant the virtualization entitlement and the VM will fail to start.</p>
+      </div>
+
+      <h2>CLI Shortcut</h2>
+      <p>When using the <code>voidbox</code> CLI, <code>cargo run</code> automatically codesigns before executing (via <code>.cargo/config.toml</code> runner). Just run:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>cargo run --bin voidbox -- run --file examples/specs/oci/guest-image-workflow.yaml</code></pre>
+      </div>
+
+      <h2>Direct Binary</h2>
+      <p>If running the binary directly (e.g. <code>./target/debug/voidbox</code>), you must codesign manually first:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>codesign --force --sign - --entitlements voidbox.entitlements target/debug/voidbox</code></pre>
+      </div>
+
+      <p>Then run with the required environment variables:</p>
+      <div class="code-wrap">
+        <div class="code-head">Terminal</div>
+        <pre class="code-run"><code>VOID_BOX_KERNEL=target/vmlinux-arm64 \
+VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+./target/debug/voidbox run --file examples/specs/oci/agent.yaml</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap"><a href="../">&larr; Guides</a></div>
+  </footer>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

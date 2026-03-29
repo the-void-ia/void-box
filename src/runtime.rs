@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent_box::VoidBox;
 use crate::backend::MountConfig;
+use crate::credentials::StagedCredentials;
 use crate::llm::LlmProvider;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::persistence::RunEvent;
@@ -229,9 +230,15 @@ async fn run_agent(
         None
     };
 
+    // Stage credentials for claude-personal provider (if needed).
+    // The StagedCredentials value must outlive the sandbox run so the
+    // mounted temp directory stays on disk until cleanup.
+    let staged_creds = prepare_claude_personal(spec.llm.as_ref())?;
+
     let mut builder = VoidBox::new(&spec.name).prompt(&agent.prompt);
     builder = apply_box_sandbox(builder, spec, guest.as_ref());
     builder = apply_box_llm(builder, spec.llm.as_ref());
+    builder = apply_credential_mount(builder, staged_creds.as_ref());
 
     // Wire OCI rootfs mount if resolved.
     if let Some(ref plan) = oci_rootfs_plan {
@@ -352,6 +359,10 @@ async fn run_pipeline(
         None
     };
 
+    // Stage credentials for claude-personal provider (if needed).
+    // Shared across all pipeline boxes; must outlive the entire pipeline run.
+    let staged_creds = prepare_claude_personal(spec.llm.as_ref())?;
+
     // Build output registry from all declared outputs across all boxes.
     // We create host dirs eagerly so that input wiring can reference them.
     let mut output_registry: OutputRegistry = HashMap::new();
@@ -378,6 +389,7 @@ async fn run_pipeline(
             &output_registry,
             oci_rootfs_plan.as_ref(),
             guest.as_ref(),
+            staged_creds.as_ref(),
         )?;
         boxes_by_name.insert(b.name.clone(), ab);
     }
@@ -705,11 +717,13 @@ fn build_pipeline_box_with_io(
     output_registry: &OutputRegistry,
     oci_rootfs_plan: Option<&OciRootfsPlan>,
     guest: Option<&GuestFiles>,
+    staged_creds: Option<&StagedCredentials>,
 ) -> Result<VoidBox> {
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
     builder = apply_box_sandbox(builder, spec, guest);
     builder = apply_box_overrides(builder, b.sandbox.as_ref(), spec);
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
+    builder = apply_credential_mount(builder, staged_creds);
     for s in &b.skills {
         builder = builder.skill(parse_skill_entry(s)?);
     }
@@ -1013,21 +1027,45 @@ fn resolve_box_snapshot(
 }
 
 fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {
-    spec.sandbox
+    let candidate = spec
+        .sandbox
         .kernel
         .as_ref()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("VOID_BOX_KERNEL").map(PathBuf::from))
-        .filter(|p| p.exists())
+        .or_else(|| std::env::var_os("VOID_BOX_KERNEL").map(PathBuf::from));
+    if let Some(ref path) = candidate {
+        if !path.exists() {
+            eprintln!(
+                "[void-box] WARNING: kernel path '{}' does not exist — \
+                 falling back to installed artifacts or OCI pull. \
+                 Check sandbox.kernel or VOID_BOX_KERNEL.",
+                path.display()
+            );
+            return None;
+        }
+    }
+    candidate
 }
 
 fn resolve_initramfs_local(spec: &RunSpec) -> Option<PathBuf> {
-    spec.sandbox
+    let candidate = spec
+        .sandbox
         .initramfs
         .as_ref()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from))
-        .filter(|p| p.exists())
+        .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from));
+    if let Some(ref path) = candidate {
+        if !path.exists() {
+            eprintln!(
+                "[void-box] WARNING: initramfs path '{}' does not exist — \
+                 falling back to installed artifacts or OCI pull. \
+                 Check sandbox.initramfs or VOID_BOX_INITRAMFS.",
+                path.display()
+            );
+            return None;
+        }
+    }
+    candidate
 }
 
 /// Apply per-box sandbox overrides on top of the base sandbox config.
@@ -1085,6 +1123,7 @@ fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
 
     let provider = match llm.provider.to_ascii_lowercase().as_str() {
         "claude" => LlmProvider::Claude,
+        "claude-personal" => LlmProvider::ClaudePersonal,
         "ollama" => {
             let model = llm.model.clone().unwrap_or_else(|| "qwen3-coder:7b".into());
             if let Some(host) = &llm.base_url {
@@ -1146,6 +1185,35 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
     }
 
     spec.llm = Some(llm);
+}
+
+/// If the LLM provider is `claude-personal`, discover and stage OAuth credentials.
+///
+/// Returns `Some(StagedCredentials)` whose `host_path` should be mounted into
+/// the guest. The temp directory is cleaned up when the value is dropped.
+fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredentials>> {
+    match llm {
+        Some(l) if l.provider.eq_ignore_ascii_case("claude-personal") => {
+            let json = crate::credentials::discover_oauth_credentials()?;
+            Ok(Some(crate::credentials::stage_credentials(&json)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// If credentials were staged, inject a mount into the builder.
+///
+/// RW because Claude Code writes `settings.json` into `~/.claude/` at startup.
+/// Guest writes land in the host `TempDir`, which is ephemeral (cleaned up on drop).
+fn apply_credential_mount(builder: VoidBox, staged: Option<&StagedCredentials>) -> VoidBox {
+    match staged {
+        Some(s) => builder.mount(MountConfig {
+            host_path: s.host_path.clone(),
+            guest_path: "/home/sandbox/.claude".into(),
+            read_only: false,
+        }),
+        None => builder,
+    }
 }
 
 /// Parse a `SkillEntry` (either a simple string or an OCI object) into a `Skill`.

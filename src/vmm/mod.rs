@@ -834,31 +834,39 @@ impl MicroVm {
             handle.kick();
         }
 
-        // 2. Wait for vCPU threads and collect their state
-        let mut vcpu_states = Vec::with_capacity(self.vcpu_handles.len());
-        for handle in self.vcpu_handles.drain(..) {
-            match handle.join_with_state() {
-                Ok(Some(state)) => vcpu_states.push(state),
-                Ok(None) => {
-                    return Err(Error::Snapshot(
-                        "vCPU exited without capturing state".into(),
-                    ))
+        // 2–3. Wait for vCPU + background threads (blocking joins).
+        // Wrapped in block_in_place to avoid stalling the tokio worker thread.
+        let (vcpu_states, event_loop_handle, vsock_irq_handle, net_poll_handle) = (
+            &mut self.vcpu_handles,
+            &mut self.event_loop_handle,
+            &mut self.vsock_irq_handle,
+            &mut self.net_poll_handle,
+        );
+        let vcpu_states = tokio::task::block_in_place(|| {
+            let mut states = Vec::with_capacity(vcpu_states.len());
+            for handle in vcpu_states.drain(..) {
+                match handle.join_with_state() {
+                    Ok(Some(state)) => states.push(state),
+                    Ok(None) => {
+                        return Err(Error::Snapshot(
+                            "vCPU exited without capturing state".into(),
+                        ))
+                    }
+                    Err(e) => return Err(Error::Snapshot(format!("vCPU join failed: {}", e))),
                 }
-                Err(e) => return Err(Error::Snapshot(format!("vCPU join failed: {}", e))),
             }
-        }
+            if let Some(handle) = event_loop_handle.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = vsock_irq_handle.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = net_poll_handle.take() {
+                let _ = handle.join();
+            }
+            Ok(states)
+        })?;
         debug!("Captured {} vCPU states", vcpu_states.len());
-
-        // 3. Wait for background threads
-        if let Some(handle) = self.event_loop_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.vsock_irq_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.net_poll_handle.take() {
-            let _ = handle.join();
-        }
 
         // 4. Capture VM-level state (vm_fd is still valid)
         use crate::vmm::arch::{Arch, CurrentArch};
@@ -1250,31 +1258,29 @@ impl MicroVm {
             handle.kick();
         }
 
-        // Wait for vCPU threads to finish
-        for handle in self.vcpu_handles.drain(..) {
-            handle.join()?;
-        }
-
-        // Wait for event loop to finish
-        if let Some(handle) = self.event_loop_handle.take() {
-            handle
-                .join()
-                .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
-        }
-
-        // Wait for vsock IRQ handler if present
-        if let Some(handle) = self.vsock_irq_handle.take() {
-            handle
-                .join()
-                .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
-        }
-
-        // Wait for net-poll thread if present
-        if let Some(handle) = self.net_poll_handle.take() {
-            handle
-                .join()
-                .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
-        }
+        // Wait for vCPU + background threads (blocking joins).
+        // Wrapped in block_in_place to avoid stalling the tokio worker thread.
+        tokio::task::block_in_place(|| -> Result<()> {
+            for handle in self.vcpu_handles.drain(..) {
+                handle.join()?;
+            }
+            if let Some(handle) = self.event_loop_handle.take() {
+                handle
+                    .join()
+                    .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
+            }
+            if let Some(handle) = self.vsock_irq_handle.take() {
+                handle
+                    .join()
+                    .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
+            }
+            if let Some(handle) = self.net_poll_handle.take() {
+                handle
+                    .join()
+                    .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
+            }
+            Ok(())
+        })?;
 
         info!("MicroVm stopped");
         Ok(())

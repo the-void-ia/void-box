@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>void-box runtime model</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<title>Runtime Model | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
 <script>
@@ -12,28 +12,100 @@
   gtag('config', 'G-YRRVNN7VM4');
 </script>
 </head><body>
-<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../architecture/">Architecture</a><a href="../cli-tui/">CLI/TUI</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+<nav class="top">
+  <a href="../">Docs</a>
+  <a href="../../guides/">Guides</a>
+  <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+  <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+</nav>
+</div></header>
+
 <main class="doc-main wrap">
+  <div class="doc-layout">
+    <aside class="doc-sidebar">
+      <nav>
+        <strong>Docs</strong>
+        <a href="../architecture/">Architecture</a>
+        <a class="active" href="../runtime/">Runtime Model</a>
+        <a href="../cli-tui/">CLI + TUI</a>
+        <a href="../events-observability/">Events + Observability</a>
+        <a href="../oci-containers/">OCI Containers</a>
+        <a href="../snapshots/">Snapshots</a>
+        <a href="../host-mounts/">Host Mounts</a>
+        <a href="../security/">Security</a>
+        <a href="../wire-protocol/">Wire Protocol</a>
+      </nav>
+    </aside>
+    <div class="doc-content">
+
 <section>
 <div class="kicker">Runtime Model</div>
 <h1>Claude Code First-Class Runtime</h1>
-<p>VoidBox uses <code>claude-code</code> as the canonical agent runtime. This is the execution identity in guest environments.</p>
-<div class="card"><h3>Important Clarification</h3><p>When configured for Ollama, VoidBox still runs <code>claude-code</code>; only the provider backend changes via runtime env config.</p></div>
+<p>VoidBox uses <code>claude-code</code> as the canonical agent runtime. This is the execution identity inside every guest environment -- regardless of which LLM provider backend is configured, the guest always runs <code>claude-code</code>.</p>
 </section>
+
+<section>
+<h2>LLM Provider Backends</h2>
+<div class="grid-2">
+  <article class="card">
+    <h3>Claude API (default)</h3>
+    <p>The default path. VoidBox provisions your <code>ANTHROPIC_API_KEY</code> into the guest environment and <code>claude-code</code> calls the Claude API directly over the SLIRP network.</p>
+  </article>
+  <article class="card">
+    <h3>Ollama (Claude-compatible mode)</h3>
+    <p>When configured for Ollama, VoidBox still runs <code>claude-code</code> -- only the provider backend changes. The guest reaches Ollama on the host via the SLIRP gateway (<code>10.0.2.2:11434</code>). Claude-code's provider compatibility layer handles the translation.</p>
+  </article>
+</div>
+</section>
+
 <section>
 <h2>Backend Selection</h2>
-<pre><code># default provider path
+<pre><code># Default provider path (Claude API)
 cargo run --bin voidbox -- run --file examples/specs/hackernews_agent.json
 
-# same spec, ollama backend through claude-code compatibility
+# Same spec, Ollama backend through claude-code compatibility
 VOIDBOX_LLM_PROVIDER=ollama \
 VOIDBOX_LLM_MODEL=qwen2.5-coder:7b \
 cargo run --bin voidbox -- run --file examples/specs/hackernews_agent.json</code></pre>
 </section>
+
+<section>
+<h2>Skill Types</h2>
+<p>Skills are the composable units of capability injected into a VoidBox. Each type is provisioned differently in the guest environment:</p>
+<table>
+  <thead>
+    <tr><th>Type</th><th>Constructor</th><th>Provisioned as</th><th>Example</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Agent</td><td><code>Skill::agent("claude-code")</code></td><td>Reasoning engine designation</td><td>The LLM itself</td></tr>
+    <tr><td>File</td><td><code>Skill::file("path/to/SKILL.md")</code></td><td><code>~/.claude/skills/{name}.md</code></td><td>Domain methodology</td></tr>
+    <tr><td>Remote</td><td><code>Skill::remote("owner/repo/skill")</code></td><td>Fetched from GitHub, written to skills/</td><td><code>obra/superpowers/brainstorming</code></td></tr>
+    <tr><td>MCP</td><td><code>Skill::mcp("server-name")</code></td><td>Entry in <code>~/.claude/mcp.json</code></td><td>Structured tool server</td></tr>
+    <tr><td>CLI</td><td><code>Skill::cli("jq")</code></td><td>Expected in guest initramfs</td><td>Binary tool</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>Guest Execution Model</h2>
+<p>Inside the micro-VM, the <code>guest-agent</code> runs as PID 1 and controls the full execution lifecycle:</p>
+<ol>
+  <li><strong>Authentication</strong> -- Validates the session secret received over vsock against the value injected via kernel cmdline at boot.</li>
+  <li><strong>Policy enforcement</strong> -- Reads <code>/etc/voidbox/allowed_commands.json</code> (command allowlist) and <code>/etc/voidbox/resource_limits.json</code> (rlimits). Applies <code>setrlimit</code> constraints for memory, file descriptors, and process count.</li>
+  <li><strong>Privilege drop</strong> -- Drops from root to <code>uid:1000</code> before executing any user workload.</li>
+  <li><strong>Fork + exec</strong> -- Launches <code>claude-code</code> with <code>--output-format stream-json</code>, streaming structured output back to the host over vsock.</li>
+</ol>
+<p>Skills are pre-provisioned before execution: file skills are written to <code>~/.claude/skills/</code>, MCP entries go to <code>~/.claude/mcp.json</code>, and OCI skill images are mounted read-only at their declared paths.</p>
+</section>
+
 <section>
 <h2>Compatibility Guardrails</h2>
-<p>Runs should fail fast when guest image/runtime is incompatible with required execution mode. Use production guest image builds for runtime examples.</p>
+<p>Runs fail fast when the guest image or runtime is incompatible with the required execution mode. This prevents silent failures where a spec expects capabilities not present in the guest. Use production guest image builds for runtime examples.</p>
 </section>
+
+    </div>
+  </div>
 </main>
 <footer><div class="wrap"><a href="../">← Docs</a></div></footer>
 <script src="../../assets/js/site.js"></script>

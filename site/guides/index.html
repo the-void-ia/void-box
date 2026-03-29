@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>void-box guides</title>
+  <title>Guides | Void-Box</title>
   <link rel="stylesheet" href="../assets/css/site.css" />
   <!-- Google tag (gtag.js) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
@@ -20,7 +20,8 @@
     <div class="wrap inner">
       <a class="brand" href="../"><img src="../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
       <nav class="top">
-        <a href="../">Home</a>
+        <a href="../docs/">Docs</a>
+        <a href="../guides/">Guides</a>
         <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
         <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
       </nav>
@@ -32,6 +33,10 @@
       <h1>Guides</h1>
       <p>Practical implementation walkthroughs.</p>
       <div class="list">
+        <a href="getting-started/"><strong>Getting Started</strong><span>Install void-box, create your first agent, and run it inside a micro-VM.</span></a>
+        <a href="running-on-linux/"><strong>Running on Linux</strong><span>KVM zero-setup with auto-pulled guest images, manual builds, mock mode, and testing.</span></a>
+        <a href="running-on-macos/"><strong>Running on macOS</strong><span>Apple Silicon setup with Virtualization.framework — native micro-VMs, no Docker needed.</span></a>
+        <a href="observability-setup/"><strong>Observability Setup</strong><span>OTLP traces, metrics, and a ready-to-run Grafana + Tempo + Prometheus playground.</span></a>
         <a href="ai-agent-sandboxing/"><strong>AI Agent Sandboxing</strong><span>Execute capability-driven agents inside isolated micro-VM boundaries.</span></a>
         <a href="pipeline-composition/"><strong>Pipeline Composition</strong><span>Build multi-stage pipelines with <code>.pipe()</code> and <code>.fan_out()</code> — fresh VM per stage, no state leaks.</span></a>
         <a href="yaml-specs/"><strong>Declarative YAML Specs</strong><span>Define agents and pipelines as config files and run them with <code>void-box run</code>.</span></a>

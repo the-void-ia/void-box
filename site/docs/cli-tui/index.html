@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>void-box cli and tui</title><link rel="stylesheet" href="../../assets/css/site.css" />
+<title>CLI + TUI | Void-Box</title><link rel="stylesheet" href="../../assets/css/site.css" />
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-YRRVNN7VM4"></script>
 <script>
@@ -12,32 +12,133 @@
   gtag('config', 'G-YRRVNN7VM4');
 </script>
 </head><body>
-<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a><nav class="top"><a href="../">Docs</a><a href="../runtime/">Runtime</a><a href="../events-observability/">Events</a><a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a></nav></div></header>
+<header class="site"><div class="wrap inner"><a class="brand" href="../../"><img src="../../assets/img/void-box.png" alt="void-box logo" /><span>Void-Box</span></a>
+<nav class="top">
+  <a href="../">Docs</a>
+  <a href="../../guides/">Guides</a>
+  <a href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">GitHub</a>
+  <a class="star-btn" href="https://github.com/the-void-ia/void-box" target="_blank" rel="noreferrer">&#9733; Star</a>
+</nav>
+</div></header>
+
 <main class="doc-main wrap">
+  <div class="doc-layout">
+    <aside class="doc-sidebar">
+      <nav>
+        <strong>Docs</strong>
+        <a href="../architecture/">Architecture</a>
+        <a href="../runtime/">Runtime Model</a>
+        <a class="active" href="../cli-tui/">CLI + TUI</a>
+        <a href="../events-observability/">Events + Observability</a>
+        <a href="../oci-containers/">OCI Containers</a>
+        <a href="../snapshots/">Snapshots</a>
+        <a href="../host-mounts/">Host Mounts</a>
+        <a href="../security/">Security</a>
+        <a href="../wire-protocol/">Wire Protocol</a>
+      </nav>
+    </aside>
+    <div class="doc-content">
+
 <section>
 <div class="kicker">CLI / TUI</div>
 <h1>Current Interface Surface</h1>
-<p>The CLI provides run/validate/status/log flows and a TUI command mode layered on daemon HTTP endpoints.</p>
-<div class="grid-2">
-  <article class="card"><h3>CLI Commands</h3><p><code>serve</code>, <code>run</code>, <code>validate</code>, <code>status</code>, <code>logs</code>, <code>tui</code></p></article>
-  <article class="card"><h3>TUI Commands</h3><p><code>/run</code>, <code>/input</code>, <code>/status</code>, <code>/logs</code>, <code>/cancel</code>, <code>/history</code></p></article>
-</div>
+<p><strong>Local (no HTTP daemon):</strong> <code>voidbox run --file …</code> executes a spec <em>in-process</em> on the host. Validation, inspection, snapshot file management, and <code>config</code> also run locally.</p>
+<p><strong>Daemon:</strong> <code>voidbox serve</code> starts the HTTP API (default bind <code>127.0.0.1:43100</code>). Remote-only commands <code>status</code>, <code>logs</code>, and <code>tui</code> talk to that server. Set <code>VOIDBOX_DAEMON_URL</code> or use <code>--daemon</code> to override the default <code>http://127.0.0.1:43100</code>.</p>
+<p>The TUI is an interactive client over the same HTTP API as those remote commands.</p>
 </section>
+
 <section>
-<h2>Daemon APIs used by TUI</h2>
-<ul>
-  <li><code>POST /v1/runs</code></li>
-  <li><code>GET /v1/runs/:id</code></li>
-  <li><code>GET /v1/runs/:id/events</code></li>
-  <li><code>POST /v1/runs/:id/cancel</code></li>
-  <li><code>POST /v1/sessions/:id/messages</code></li>
-  <li><code>GET /v1/sessions/:id/messages</code></li>
-</ul>
+<h2>CLI — local commands</h2>
+<p>These do not require <code>voidbox serve</code>.</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>voidbox run --file &lt;spec&gt;</code></td><td>Run a spec (agent, pipeline, or workflow) in-process. Optional <code>--input</code>. Output respects global <code>--output</code> (human or JSON).</td></tr>
+    <tr><td><code>voidbox validate --file &lt;spec&gt;</code></td><td>Validate a spec without executing it.</td></tr>
+    <tr><td><code>voidbox inspect --file &lt;spec&gt;</code></td><td>Validate and print resolved sandbox-related configuration.</td></tr>
+    <tr><td><code>voidbox skills --file &lt;spec&gt;</code></td><td>List skills declared in the spec.</td></tr>
+    <tr><td><code>voidbox snapshot create --kernel &lt;path&gt;</code></td><td>Create a base snapshot after a cold boot (optional <code>--initramfs</code>, <code>--memory</code>, <code>--vcpus</code>; <code>--diff</code> for a delta on top of an existing base). Configuration hash is derived from kernel/initramfs/memory/vcpus — there is no <code>--config-hash</code> flag.</td></tr>
+    <tr><td><code>voidbox snapshot list</code></td><td>List stored snapshots (hash prefixes and metadata).</td></tr>
+    <tr><td><code>voidbox snapshot delete &lt;hash-prefix&gt;</code></td><td>Delete a snapshot by hash prefix.</td></tr>
+    <tr><td><code>voidbox config init</code></td><td>Write a template config to <code>~/.config/voidbox/config.yaml</code> (XDG paths apply).</td></tr>
+    <tr><td><code>voidbox config validate</code></td><td>Validate and print the merged CLI configuration.</td></tr>
+    <tr><td><code>voidbox version</code></td><td>Print version information.</td></tr>
+    <tr><td><code>voidbox exec …</code></td><td>Legacy sandbox exec (deprecated); prefer <code>voidbox run --file …</code>.</td></tr>
+  </tbody>
+</table>
 </section>
+
+<section>
+<h2>CLI — daemon and remote-only commands</h2>
+<p>Start the server with <code>voidbox serve</code> (optional <code>--listen</code>, default <code>127.0.0.1:43100</code>). Then:</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>voidbox status --run-id &lt;id&gt;</code></td><td>Fetch JSON status for <strong>one</strong> run. Optional <code>--daemon &lt;url&gt;</code>.</td></tr>
+    <tr><td><code>voidbox logs --run-id &lt;id&gt;</code></td><td>Fetch the run&rsquo;s events payload as JSON (single HTTP GET). Optional <code>--daemon</code>. For live updates, poll the API or use a client that reads <code>/v1/runs/:id/events</code> repeatedly.</td></tr>
+    <tr><td><code>voidbox tui</code></td><td>Interactive TUI; optional <code>--file</code> to start a run via the daemon, <code>--session</code>, <code>--daemon</code>, <code>--logo-ascii</code>.</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>Global options and configuration</h2>
+<p>On any subcommand: <code>--output human|json</code>, <code>--no-banner</code>, <code>--log-level</code> (or env <code>VOIDBOX_LOG_LEVEL</code>). Log level and paths also merge from <code>~/.config/voidbox/config.yaml</code>, <code>/etc/voidbox/config.yaml</code>, and <code>VOIDBOX_CONFIG</code>; see <code>voidbox config validate</code>.</p>
+</section>
+
+<section>
+<h2>Daemon API Endpoints</h2>
+<p>The daemon exposes JSON over HTTP. Default base URL <code>http://127.0.0.1:43100</code>. Selected routes:</p>
+<table>
+  <thead>
+    <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>GET</code></td><td><code>/v1/health</code></td><td>Health check and persistence backend name.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/runs</code></td><td>Create a run. JSON body includes <code>file</code>, optional <code>input</code>, <code>snapshot</code>, etc. Returns <code>run_id</code>.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs</code></td><td>List runs. Optional query <code>?state=active</code> or <code>terminal</code>.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id</code></td><td>Get run status and metadata.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/runs/:id/events</code></td><td>Get run events as a JSON array (optional query <code>from_event_id</code>).</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/runs/:id/cancel</code></td><td>Cancel a run.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Append a session message.</td></tr>
+    <tr><td><code>GET</code></td><td><code>/v1/sessions/:id/messages</code></td><td>Get session message history.</td></tr>
+  </tbody>
+</table>
+<p>Additional routes include run stages, telemetry, and stage output files under <code>/v1/runs/…</code> — see the daemon implementation in the repository.</p>
+</section>
+
+<section>
+<h2>TUI Commands</h2>
+<p>The TUI provides an interactive command prompt connected to the daemon. Available commands:</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>/run</code></td><td>Start a new run from a spec file or inline definition.</td></tr>
+    <tr><td><code>/input</code></td><td>Send input to an active interactive session.</td></tr>
+    <tr><td><code>/status</code></td><td>Display the status of all active and recent runs.</td></tr>
+    <tr><td><code>/logs</code></td><td>Stream logs for a specific run ID.</td></tr>
+    <tr><td><code>/cancel</code></td><td>Cancel a running run by its ID.</td></tr>
+    <tr><td><code>/history</code></td><td>Show the history of completed runs with their results.</td></tr>
+  </tbody>
+</table>
+</section>
+
 <section>
 <h2>Known UX Gap</h2>
-<p>Current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX can be layered on top of event streaming APIs.</p>
+<article class="card">
+  <h3>Minimal but Functional</h3>
+  <p>The current TUI is functional but minimal: polling-oriented and plain text. A richer panel-based, live-streaming UX is planned and can be layered on top of the existing <code>/v1/runs/:id/events</code> JSON APIs without changes to the daemon.</p>
+</article>
 </section>
+
+    </div>
+  </div>
 </main>
 <footer><div class="wrap"><a href="../">← Docs</a></div></footer>
 <script src="../../assets/js/site.js"></script>

@@ -20,11 +20,13 @@ vendor: "the-void-ia"
 section: "devel"
 
 contents:
+  # Binary
   - src: dist/voidbox
     dst: /usr/bin/voidbox
     file_info:
       mode: 0755
 
+  # Kernel + initramfs
   - src: dist/vmlinuz
     dst: /usr/lib/voidbox/vmlinuz
     file_info:
@@ -34,6 +36,34 @@ contents:
     dst: /usr/lib/voidbox/initramfs.cpio.gz
     file_info:
       mode: 0644
+
+  # FHS directories (created empty by the package)
+  - dst: /etc/voidbox
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/lib/voidbox
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/log/voidbox
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /usr/share/voidbox
+    type: dir
+    file_info:
+      mode: 0755
+
+  # Optional ASCII logo for TUI (packaged from assets/ if present)
+  # Uncomment when assets/logo/void-box.txt exists:
+  # - src: assets/logo/void-box.txt
+  #   dst: /usr/share/voidbox/logo.txt
+  #   file_info:
+  #     mode: 0644
 
 overrides:
   deb:

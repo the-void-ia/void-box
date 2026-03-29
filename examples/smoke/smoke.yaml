@@ -1,0 +1,34 @@
+api_version: v1
+kind: agent
+name: smoke_test
+
+# Minimal VM smoke test. Verifies: VM boots and LLM responds.
+# No tool use required — any model that can generate text will pass.
+#
+# With Ollama (macOS):
+#   VOIDBOX_LLM_PROVIDER=ollama VOIDBOX_LLM_MODEL=phi4-mini \
+#   VOIDBOX_LLM_BASE_URL=http://192.168.64.1:11434 \
+#   VOID_BOX_KERNEL=target/vmlinux-arm64 \
+#   VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+#     voidbox run --file examples/smoke/smoke.yaml
+#
+# With Claude API key (ANTHROPIC_API_KEY must be set):
+#   VOID_BOX_KERNEL=target/vmlinux-arm64 \
+#   VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
+#     voidbox run --file examples/smoke/smoke.yaml
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 2
+  network: true
+
+llm:
+  provider: claude
+  # Override with VOIDBOX_LLM_PROVIDER / VOIDBOX_LLM_MODEL / VOIDBOX_LLM_BASE_URL
+
+agent:
+  prompt: |
+    Reply with exactly: "vm-ok 2+2=4"
+    Nothing else.
+  timeout_secs: 60

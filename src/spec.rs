@@ -316,7 +316,7 @@ fn default_sandbox_mode() -> String {
 }
 
 fn default_memory() -> usize {
-    512
+    1024
 }
 
 fn default_vcpus() -> usize {

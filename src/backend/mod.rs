@@ -16,6 +16,7 @@ pub mod kvm;
 #[cfg(target_os = "macos")]
 pub mod vz;
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +28,13 @@ use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
 use crate::ExecOutput;
+
+/// Extra bytes needed beyond the initramfs footprint: Linux kernel image in
+/// memory (~80 MB for Ubuntu arm64 6.8) plus slack for page tables, heap,
+/// and the init process (~128 MB).  Both the compressed initramfs (bootloader
+/// places it in guest RAM) and the decompressed tmpfs content coexist during
+/// early-boot extraction, so the caller adds both on top of this constant.
+const INITRAMFS_OVERHEAD_BYTES: u64 = 208 * 1024 * 1024;
 
 /// A single host→guest directory mount.
 #[derive(Debug, Clone)]
@@ -126,6 +134,47 @@ impl BackendConfig {
     pub fn network(mut self, enabled: bool) -> Self {
         self.network = enabled;
         self
+    }
+
+    /// Check whether the configured memory is likely sufficient for the initramfs.
+    ///
+    /// Reads the gzip ISIZE field (last 4 bytes) for the uncompressed size and
+    /// applies the heuristic:
+    ///   minimum = uncompressed + compressed + 300 MB (kernel + runtime headroom)
+    ///
+    /// Returns a warning string if memory looks too low, `None` if it looks fine
+    /// or the check cannot be performed (missing file, not a gz, etc.).
+    pub fn initramfs_memory_warning(&self) -> Option<String> {
+        let initramfs = self.initramfs.as_ref()?;
+        let mut f = std::fs::File::open(initramfs).ok()?;
+        let compressed_bytes = f.metadata().ok()?.len();
+        if compressed_bytes < 4 {
+            return None;
+        }
+        f.seek(SeekFrom::End(-4)).ok()?;
+        let mut buf = [0u8; 4];
+        f.read_exact(&mut buf).ok()?;
+        // gzip ISIZE: uncompressed size mod 2^32 (little-endian)
+        let uncompressed_bytes = u32::from_le_bytes(buf) as u64;
+
+        // Peak physical memory during boot = compressed (in-flight) + uncompressed (tmpfs) + overhead.
+        let min_bytes = uncompressed_bytes + compressed_bytes + INITRAMFS_OVERHEAD_BYTES;
+        let configured_bytes = (self.memory_mb as u64) * 1024 * 1024;
+
+        if configured_bytes < min_bytes {
+            Some(format!(
+                "VM memory ({}MB) is too low for initramfs \
+                 (uncompressed ~{}MB, compressed {}MB). \
+                 The kernel may silently drop initramfs files (e.g. vsock.ko) during boot. \
+                 Recommended minimum: {}MB.",
+                self.memory_mb,
+                uncompressed_bytes / (1024 * 1024),
+                compressed_bytes / (1024 * 1024),
+                min_bytes.div_ceil(1024 * 1024),
+            ))
+        } else {
+            None
+        }
     }
 }
 
