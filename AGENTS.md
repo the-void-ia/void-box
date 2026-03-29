@@ -746,11 +746,11 @@ Quick reference for the production image (`build_claude_rootfs.sh`, ~96 MB compr
 
 | compressed | uncompressed | minimum | recommended |
 |------------|-------------|---------|-------------|
-| ~96 MB | ~278 MB | ~582 MB | 2048 MB |
+| ~96 MB | ~278 MB | ~582 MB | 1024 MB |
 
 The default spec `memory_mb` (`src/spec.rs : default_memory()`) must be set
 high enough to accommodate the largest supported initramfs.  The current default
-is **2048 MB**.
+is **1024 MB**.
 
 **Pre-flight check**: `BackendConfig::initramfs_memory_warning()` reads the
 gzip ISIZE field at VM start and emits a `WARN` log if `memory_mb` is below the
