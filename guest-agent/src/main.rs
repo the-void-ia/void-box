@@ -21,9 +21,10 @@ use serde::Serialize;
 
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
-    ExecOutputChunk, ExecRequest, ExecResponse, MessageType, MkdirPRequest, MkdirPResponse,
-    ProcessMetrics, SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest,
-    WriteFileResponse, MAX_MESSAGE_SIZE,
+    ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, MessageType,
+    MkdirPRequest, MkdirPResponse, ProcessMetrics, ReadFileRequest, ReadFileResponse,
+    SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
+    MAX_MESSAGE_SIZE,
 };
 
 /// vsock port we listen on
@@ -1928,6 +1929,18 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 let response = handle_mkdir_p(&request);
                 send_response(fd, MessageType::MkdirPResponse, &response)?;
             }
+            18 => {
+                let request: ReadFileRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse ReadFileRequest: {}", e))?;
+                let response = handle_read_file(&request);
+                send_response(fd, MessageType::ReadFileResponse, &response)?;
+            }
+            20 => {
+                let request: FileStatRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse FileStatRequest: {}", e))?;
+                let response = handle_file_stat(&request);
+                send_response(fd, MessageType::FileStatResponse, &response)?;
+            }
             17 => {
                 // SnapshotReady - no-op acknowledgement from guest side.
                 // The host sends this to query readiness; the guest simply
@@ -2477,6 +2490,39 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
             success: false,
             error: Some(format!("Failed to write {}: {}", request.path, e)),
         },
+    }
+}
+
+fn handle_read_file(request: &ReadFileRequest) -> ReadFileResponse {
+    match std::fs::read(&request.path) {
+        Ok(content) => ReadFileResponse {
+            success: true,
+            content,
+            error: None,
+        },
+        Err(e) => ReadFileResponse {
+            success: false,
+            content: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+fn handle_file_stat(request: &FileStatRequest) -> FileStatResponse {
+    match std::fs::metadata(&request.path) {
+        Ok(meta) => FileStatResponse {
+            exists: true,
+            size: Some(meta.len()),
+            error: None,
+        },
+        Err(e) => {
+            let not_found = e.kind() == std::io::ErrorKind::NotFound;
+            FileStatResponse {
+                exists: false,
+                size: None,
+                error: if not_found { None } else { Some(e.to_string()) },
+            }
+        }
     }
 }
 
