@@ -135,6 +135,14 @@ pub enum MessageType {
     ExecOutputAck = 16,
     /// Guest signals that it is ready for a snapshot.
     SnapshotReady = 17,
+    /// Reads a file from the guest filesystem.
+    ReadFile = 18,
+    /// Response to ReadFile.
+    ReadFileResponse = 19,
+    /// Checks if a file exists and returns its size.
+    FileStat = 20,
+    /// Response to FileStat.
+    FileStatResponse = 21,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -159,6 +167,10 @@ impl TryFrom<u8> for MessageType {
             15 => Ok(MessageType::ExecOutputChunk),
             16 => Ok(MessageType::ExecOutputAck),
             17 => Ok(MessageType::SnapshotReady),
+            18 => Ok(MessageType::ReadFile),
+            19 => Ok(MessageType::ReadFileResponse),
+            20 => Ok(MessageType::FileStat),
+            21 => Ok(MessageType::FileStatResponse),
             _ => Err(ProtocolError::UnknownMessageType(byte)),
         }
     }
@@ -405,6 +417,34 @@ pub struct MkdirPResponse {
     pub error: Option<String>,
 }
 
+/// Requests reading a file from the guest filesystem.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadFileRequest {
+    pub path: String,
+}
+
+/// Response to a [`ReadFileRequest`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadFileResponse {
+    pub success: bool,
+    pub content: Vec<u8>,
+    pub error: Option<String>,
+}
+
+/// Requests file metadata from the guest filesystem.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileStatRequest {
+    pub path: String,
+}
+
+/// Response to a [`FileStatRequest`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileStatResponse {
+    pub exists: bool,
+    pub size: Option<u64>,
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Data types: Telemetry
 // ---------------------------------------------------------------------------
@@ -539,7 +579,7 @@ mod tests {
     #[test]
     fn message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
-        assert!(MessageType::try_from(18).is_err());
+        assert!(MessageType::try_from(22).is_err());
         assert!(MessageType::try_from(255).is_err());
     }
 
@@ -781,6 +821,91 @@ mod tests {
             decoded.payload[3],
         ]);
         assert_eq!(ver, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn file_stat_request_round_trip() {
+        let req = FileStatRequest {
+            path: "/workspace/output.json".into(),
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: FileStatRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.path, "/workspace/output.json");
+    }
+
+    #[test]
+    fn file_stat_response_exists() {
+        let resp = FileStatResponse {
+            exists: true,
+            size: Some(42),
+            error: None,
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: FileStatResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded.exists);
+        assert_eq!(decoded.size, Some(42));
+    }
+
+    #[test]
+    fn file_stat_response_missing() {
+        let resp = FileStatResponse {
+            exists: false,
+            size: None,
+            error: None,
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: FileStatResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!decoded.exists);
+    }
+
+    #[test]
+    fn read_file_request_round_trip() {
+        let req = ReadFileRequest {
+            path: "/workspace/data.bin".into(),
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let decoded: ReadFileRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.path, "/workspace/data.bin");
+    }
+
+    #[test]
+    fn read_file_response_success() {
+        let resp = ReadFileResponse {
+            success: true,
+            content: b"hello".to_vec(),
+            error: None,
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: ReadFileResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded.success);
+        assert_eq!(decoded.content, b"hello");
+    }
+
+    #[test]
+    fn read_file_response_failure() {
+        let resp = ReadFileResponse {
+            success: false,
+            content: Vec::new(),
+            error: Some("not found".into()),
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let decoded: ReadFileResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!decoded.success);
+        assert_eq!(decoded.error.as_deref(), Some("not found"));
+    }
+
+    #[test]
+    fn message_type_round_trip_new_variants() {
+        assert_eq!(MessageType::try_from(18u8).unwrap(), MessageType::ReadFile);
+        assert_eq!(
+            MessageType::try_from(19u8).unwrap(),
+            MessageType::ReadFileResponse
+        );
+        assert_eq!(MessageType::try_from(20u8).unwrap(), MessageType::FileStat);
+        assert_eq!(
+            MessageType::try_from(21u8).unwrap(),
+            MessageType::FileStatResponse
+        );
     }
 
     #[test]
