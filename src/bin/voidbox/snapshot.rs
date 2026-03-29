@@ -308,7 +308,9 @@ async fn cmd_snapshot_create_macos(
     );
 
     eprintln!("Creating snapshot...");
-    backend.create_snapshot(&snapshot_dir)?;
+    // create_snapshot uses blocking GCD dispatch + recv_timeout internally;
+    // block_in_place tells tokio to compensate so we don't stall the runtime.
+    tokio::task::block_in_place(|| backend.create_snapshot(&snapshot_dir))?;
     let total_ms = start.elapsed().as_millis();
 
     eprintln!("Snapshot created successfully:");

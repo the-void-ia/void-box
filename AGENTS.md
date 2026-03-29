@@ -13,6 +13,47 @@ LSP provides compiler-aware results that understand types, scopes, and cross-fil
 relationships. Fall back to Grep/Glob only for pattern-based searches LSP doesn't
 cover (comments, config files, non-Rust files).
 
+## Rust coding conventions
+
+### Imports and constants
+
+Always declare `use` imports and `const` / `static` items at **module scope**
+(top of the file, after the module-level doc comment), never inline inside
+function bodies.  Inline declarations hide dependencies and make the file harder
+to scan.
+
+```rust
+// ✓ correct
+use std::io::{Read, Seek, SeekFrom};
+const OVERHEAD_BYTES: u64 = 208 * 1024 * 1024;
+
+fn my_fn() { /* uses them */ }
+
+// ✗ avoid
+fn my_fn() {
+    use std::io::{Read, Seek, SeekFrom};
+    const OVERHEAD_BYTES: u64 = 208 * 1024 * 1024;
+    // ...
+}
+```
+
+### VM pre-flight validation
+
+Operations that can fail silently inside the guest (e.g. the kernel dropping
+initramfs files when memory is too low) must surface a clear diagnostic on the
+**host**, before the VM starts.  The pattern:
+
+1. **Check before launch** — validate the config in `VmmBackend::start()` before
+   any irreversible side effect, using helpers on `BackendConfig`
+   (e.g. `initramfs_memory_warning()`).
+2. **Log at `WARN`** — use `warn!()` so the message appears without aborting the
+   run.  Return `Err` only when a successful boot is impossible regardless of
+   retry.
+3. **Name the downstream symptom** — mention the observable failure mode
+   (e.g. *"kernel may silently drop initramfs files (e.g. vsock.ko)"*) so an
+   operator can connect the warning to a later guest error without a separate
+   debugging session.
+
 ## Platform parity
 
 **Contributions must work on both Linux (KVM) and macOS (VZ).** Validate on both
@@ -31,6 +72,60 @@ where applicable. Key platform differences:
 - If `sandbox.image` is set, guest performs OCI root switch with `pivot_root`.
 - On Linux/KVM, OCI base rootfs is attached as cached `virtio-blk` disk.
 - OCI skills are mounted as read-only tool roots.
+
+## Control channel I/O model
+
+The control channel (`src/backend/control_channel.rs`) uses **synchronous I/O**
+(`std::io::Read`/`Write`) for all guest communication, wrapped in
+`tokio::task::spawn_blocking` so that blocking syscalls never stall the tokio
+async runtime.
+
+### Why not fully async (`AsyncRead`/`AsyncWrite`)?
+
+1. **The VZ connector is fundamentally callback-based.**
+   `VZVirtioSocketDevice.connectToPort:completionHandler:` dispatches onto a GCD
+   serial queue and fires an ObjC completion handler.  There is no fd to poll
+   until *after* the callback delivers one.  A bridge channel between GCD and
+   tokio is required regardless.
+
+2. **`AsyncFd` on raw vsock fds is fragile.**
+   The fd comes from `dup(connection.fileDescriptor())` inside a GCD callback,
+   outside tokio's control.  `AsyncFd` requires `O_NONBLOCK`, which changes
+   read/write semantics and demands `WouldBlock` handling.  The current blocking
+   fds with `SO_RCVTIMEO` for timeouts are simpler and correct.
+
+3. **Cancellation safety.**
+   With async reads, `tokio::time::timeout` cancels the future mid-read.  If
+   cancellation happens between a header read and a payload read, the stream is
+   left in an inconsistent state.  Avoiding this requires a cancel-safe framing
+   layer — added complexity for no practical gain.
+
+4. **Concurrency is low.**
+   A single VM has one control channel.  Even with concurrent exec calls, the
+   blocking thread pool (up to 512 threads, dynamic scaling) handles the workload
+   comfortably.  The async advantage (thousands of connections on few threads)
+   doesn't apply.
+
+### Pattern
+
+Every public `async fn` on `ControlChannel` follows the same structure:
+
+1. **Serialize** the outgoing message on the caller's async task (cheap, non-blocking).
+2. **Clone** the `Arc` fields (`connector`, `boot_wait_done`) and copy `session_secret`.
+3. **`spawn_blocking`**: connect → handshake → send → read loop — all synchronous.
+
+The handshake function (`connect_with_handshake_sync`) is a regular `fn` that
+uses `std::thread::sleep` for backoff.  It is never called from an async context
+directly.
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/backend/control_channel.rs` | `ControlChannel`, `GuestStream` trait, `connect_with_handshake_sync` |
+| `src/backend/kvm.rs` | AF_VSOCK connector, `GuestStream` impl for `VsockStream` |
+| `src/backend/vz/backend.rs` | VZ GCD-based connector (`build_connector`) |
+| `src/backend/vz/vsock.rs` | `VzSocketStream` — `GuestStream` impl over dup'd fd |
 
 ## OCI root switch internals
 
@@ -630,3 +725,34 @@ Recommended default:
 
 - Use `build_guest_image.sh` for broad test cycles.
 - Use `build_claude_rootfs.sh` for production gateway/runtime validation.
+
+## VM memory sizing
+
+The VM's `memory_mb` must comfortably exceed the peak physical footprint during
+early-boot initramfs extraction.  During that window the kernel holds **both**
+the compressed initramfs (loaded by the bootloader into guest RAM) **and** the
+decompressed tmpfs contents simultaneously, before releasing the compressed
+copy.  If memory is exhausted mid-extraction the kernel silently stops creating
+files — the symptom surfaces as "file not found: /lib/modules/vsock.ko" inside
+the guest, with no obvious memory-pressure indicator.
+
+**Formula** (`INITRAMFS_OVERHEAD_BYTES = 208 MB` covers kernel + runtime slack):
+
+```
+minimum_memory_mb = compressed_mb + uncompressed_mb + 208
+```
+
+Quick reference for the production image (`build_claude_rootfs.sh`, ~96 MB compressed / ~278 MB uncompressed):
+
+| compressed | uncompressed | minimum | recommended |
+|------------|-------------|---------|-------------|
+| ~96 MB | ~278 MB | ~582 MB | 2048 MB |
+
+The default spec `memory_mb` (`src/spec.rs : default_memory()`) must be set
+high enough to accommodate the largest supported initramfs.  The current default
+is **2048 MB**.
+
+**Pre-flight check**: `BackendConfig::initramfs_memory_warning()` reads the
+gzip ISIZE field at VM start and emits a `WARN` log if `memory_mb` is below the
+computed minimum.  When adding a new backend or changing the default memory,
+verify this check still fires correctly for undersized configs.

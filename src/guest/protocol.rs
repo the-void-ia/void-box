@@ -7,7 +7,36 @@
 // `use crate::guest::protocol::*` paths continue to work.
 pub use void_box_protocol::*;
 
+use crate::observe::tracer::SpanContext;
 use crate::Result;
+
+/// Build an [`ExecRequest`] with optional TRACEPARENT propagation.
+///
+/// Shared by KVM and VZ backends to avoid duplicating the env-injection logic.
+pub fn build_exec_request(
+    program: &str,
+    args: &[&str],
+    stdin: &[u8],
+    env: &[(String, String)],
+    working_dir: Option<&str>,
+    timeout_secs: Option<u64>,
+    span_context: Option<&SpanContext>,
+) -> ExecRequest {
+    let mut exec_env = env.to_vec();
+    if let Some(ctx) = span_context {
+        if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
+            exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
+        }
+    }
+    ExecRequest {
+        program: program.to_string(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin: stdin.to_vec(),
+        env: exec_env,
+        working_dir: working_dir.map(String::from),
+        timeout_secs,
+    }
+}
 
 /// Read a complete [`Message`] from an async tokio stream.
 ///

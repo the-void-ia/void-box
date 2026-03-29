@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::backend::control_channel::{ControlChannel, GuestStream};
+use crate::backend::control_channel::{ControlChannel, GuestStream, GUEST_AGENT_PORT};
 use crate::backend::{BackendConfig, VmmBackend};
 use crate::devices::virtio_vsock::VsockStream;
 use crate::guest::protocol::{
-    ExecOutputChunk, ExecRequest, ExecResponse, TelemetrySubscribeRequest,
+    build_exec_request, ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest,
 };
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
@@ -19,9 +19,6 @@ use crate::observe::Observer;
 use crate::vmm::config::{SecurityConfig, VoidBoxConfig};
 use crate::vmm::MicroVm;
 use crate::{Error, ExecOutput, Result};
-
-/// vsock port used by the guest agent.
-const GUEST_AGENT_PORT: u32 = 1234;
 
 /// Implement `GuestStream` for `VsockStream` so it can be used by `ControlChannel`.
 impl GuestStream for VsockStream {
@@ -66,6 +63,9 @@ impl KvmBackend {
 #[async_trait::async_trait]
 impl VmmBackend for KvmBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
+        if let Some(warning) = config.initramfs_memory_warning() {
+            warn!("KvmBackend: {}", warning);
+        }
         // Snapshot restore path: skip cold boot entirely
         if let Some(ref snapshot_dir) = config.snapshot {
             info!("Restoring VM from snapshot: {}", snapshot_dir.display());
@@ -86,7 +86,7 @@ impl VmmBackend for KvmBackend {
                 .vsock_socket_path()
                 .expect("restored VM must have vsock socket path")
                 .to_path_buf();
-            let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
+            let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
                 let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
@@ -138,7 +138,7 @@ impl VmmBackend for KvmBackend {
         // Build the control channel with AF_VSOCK connector
         let cid = self.cid;
         let session_secret = config.security.session_secret;
-        let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
+        let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
             let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
@@ -159,23 +159,15 @@ impl VmmBackend for KvmBackend {
         timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
         let cc = self.control_channel.as_ref().ok_or(Error::VmNotRunning)?;
-
-        let mut exec_env = env.to_vec();
-        if let Some(ref ctx) = self.span_context {
-            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
-                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
-            }
-        }
-
-        let request = ExecRequest {
-            program: program.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            stdin: stdin.to_vec(),
-            env: exec_env,
-            working_dir: working_dir.map(String::from),
+        let request = build_exec_request(
+            program,
+            args,
+            stdin,
+            env,
+            working_dir,
             timeout_secs,
-        };
-
+            self.span_context.as_ref(),
+        );
         let response = cc.send_exec_request(&request).await?;
         Ok(ExecOutput::new(
             response.stdout,
@@ -200,29 +192,22 @@ impl VmmBackend for KvmBackend {
             .as_ref()
             .ok_or(Error::VmNotRunning)?
             .clone();
-
-        let mut exec_env = env.to_vec();
-        if let Some(ref ctx) = self.span_context {
-            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
-                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
-            }
-        }
-
-        let request = ExecRequest {
-            program: program.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            stdin: Vec::new(),
-            env: exec_env,
-            working_dir: working_dir.map(String::from),
+        let request = build_exec_request(
+            program,
+            args,
+            &[],
+            env,
+            working_dir,
             timeout_secs,
-        };
+            self.span_context.as_ref(),
+        );
 
         let (chunk_tx, chunk_rx) = mpsc::channel(256);
         let (response_tx, response_rx) = oneshot::channel();
 
         tokio::spawn(async move {
             let result = cc
-                .send_exec_request_streaming(&request, |chunk| {
+                .send_exec_request_streaming(&request, move |chunk| {
                     let _ = chunk_tx.try_send(chunk);
                 })
                 .await;

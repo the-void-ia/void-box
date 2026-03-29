@@ -406,6 +406,9 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     .unwrap_or_default()
             };
 
+            // collect() reads /proc/self/{statm,io} on Linux and calls task_info on macOS.
+            // These are memory-backed kernel interfaces that return in microseconds — never
+            // hit disk — so the blocking impact on the tokio worker is negligible.
             let snap = collector.collect();
             if let Ok(mut buf) = host_rb.lock() {
                 buf.push(crate::observe::telemetry::TelemetrySample {

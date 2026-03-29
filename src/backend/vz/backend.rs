@@ -37,12 +37,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use crate::backend::control_channel::{ControlChannel, GuestConnector};
+use crate::backend::control_channel::{ControlChannel, GuestConnector, GUEST_AGENT_PORT};
 use crate::backend::{BackendConfig, VmmBackend};
 use crate::error::Result;
-use crate::guest::protocol::{ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest};
+use crate::guest::protocol::{
+    build_exec_request, ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest,
+};
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
@@ -391,7 +393,7 @@ impl VzBackend {
     ) -> GuestConnector {
         let device = Arc::new(SendSyncDevice(socket_device.0.clone()));
         let queue = vz_queue.clone();
-        Box::new(move || {
+        Arc::new(move || {
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
 
             // Dispatch connectToPort onto the VZ queue (required by Apple).
@@ -430,7 +432,9 @@ impl VzBackend {
                     },
                 );
                 unsafe {
-                    device.0.connectToPort_completionHandler(1234, &handler);
+                    device
+                        .0
+                        .connectToPort_completionHandler(GUEST_AGENT_PORT, &handler);
                 }
             });
 
@@ -570,6 +574,9 @@ impl VzBackend {
 #[async_trait::async_trait]
 impl VmmBackend for VzBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
+        if let Some(warning) = config.initramfs_memory_warning() {
+            warn!("VzBackend: {}", warning);
+        }
         // All ObjC types are !Send, so we run the entire VM setup
         // synchronously via block_in_place to avoid holding them across
         // an .await point.
@@ -740,25 +747,16 @@ impl VmmBackend for VzBackend {
             .control_channel
             .as_ref()
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?;
-
-        let mut exec_env = env.to_vec();
-        if let Some(ref ctx) = self.span_context {
-            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
-                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
-            }
-        }
-
-        let request = crate::guest::protocol::ExecRequest {
-            program: program.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            stdin: stdin.to_vec(),
-            env: exec_env,
-            working_dir: working_dir.map(|s| s.to_string()),
+        let request = build_exec_request(
+            program,
+            args,
+            stdin,
+            env,
+            working_dir,
             timeout_secs,
-        };
-
+            self.span_context.as_ref(),
+        );
         let response = cc.send_exec_request(&request).await?;
-
         Ok(ExecOutput::new(
             response.stdout,
             response.stderr,
@@ -782,22 +780,15 @@ impl VmmBackend for VzBackend {
             .as_ref()
             .ok_or_else(|| crate::Error::Backend("VM not started".into()))?
             .clone();
-
-        let mut exec_env = env.to_vec();
-        if let Some(ref ctx) = self.span_context {
-            if !exec_env.iter().any(|(k, _)| k == "TRACEPARENT") {
-                exec_env.push(("TRACEPARENT".to_string(), ctx.to_traceparent()));
-            }
-        }
-
-        let request = crate::guest::protocol::ExecRequest {
-            program: program.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            stdin: Vec::new(),
-            env: exec_env,
-            working_dir: working_dir.map(|s| s.to_string()),
+        let request = build_exec_request(
+            program,
+            args,
+            &[],
+            env,
+            working_dir,
             timeout_secs,
-        };
+            self.span_context.as_ref(),
+        );
 
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(256);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -862,11 +853,15 @@ impl VmmBackend for VzBackend {
         });
         let agg_clone = aggregator.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(cc.subscribe_telemetry(&opts, move |batch| {
-                agg_clone.ingest(&batch);
-            }));
+        tokio::spawn(async move {
+            if let Err(e) = cc
+                .subscribe_telemetry(&opts, move |batch| {
+                    agg_clone.ingest(&batch);
+                })
+                .await
+            {
+                warn!("Telemetry subscription ended: {}", e);
+            }
         });
 
         Ok(aggregator)

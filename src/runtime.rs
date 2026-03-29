@@ -860,21 +860,45 @@ fn resolve_box_snapshot(
 }
 
 fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {
-    spec.sandbox
+    let candidate = spec
+        .sandbox
         .kernel
         .as_ref()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("VOID_BOX_KERNEL").map(PathBuf::from))
-        .filter(|p| p.exists())
+        .or_else(|| std::env::var_os("VOID_BOX_KERNEL").map(PathBuf::from));
+    if let Some(ref path) = candidate {
+        if !path.exists() {
+            eprintln!(
+                "[void-box] WARNING: kernel path '{}' does not exist — \
+                 falling back to installed artifacts or OCI pull. \
+                 Check sandbox.kernel or VOID_BOX_KERNEL.",
+                path.display()
+            );
+            return None;
+        }
+    }
+    candidate
 }
 
 fn resolve_initramfs_local(spec: &RunSpec) -> Option<PathBuf> {
-    spec.sandbox
+    let candidate = spec
+        .sandbox
         .initramfs
         .as_ref()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from))
-        .filter(|p| p.exists())
+        .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from));
+    if let Some(ref path) = candidate {
+        if !path.exists() {
+            eprintln!(
+                "[void-box] WARNING: initramfs path '{}' does not exist — \
+                 falling back to installed artifacts or OCI pull. \
+                 Check sandbox.initramfs or VOID_BOX_INITRAMFS.",
+                path.display()
+            );
+            return None;
+        }
+    }
+    candidate
 }
 
 /// Apply per-box sandbox overrides on top of the base sandbox config.
