@@ -100,10 +100,8 @@ fn wait_for_terminal(addr: SocketAddr, run_id: &str, timeout: Duration) -> serde
         if status.contains("200") {
             let run: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             let run_status = run["status"].as_str().unwrap_or("unknown");
-            let is_terminal = run_status == "succeeded"
-                || run_status == "failed"
-                || run_status == "canceled"
-                || run_status == "Cancelled";
+            let is_terminal =
+                run_status == "succeeded" || run_status == "failed" || run_status == "cancelled";
             if is_terminal {
                 return run;
             }
@@ -223,8 +221,7 @@ sandbox:
             assert!(
                 final_status == "succeeded"
                     || final_status == "failed"
-                    || final_status == "canceled"
-                    || final_status == "Cancelled",
+                    || final_status == "cancelled",
                 "run should be terminal after cancel, got: {final_status}"
             );
             assert!(
@@ -234,10 +231,8 @@ sandbox:
             break;
         }
 
-        let is_terminal = run_status == "succeeded"
-            || run_status == "failed"
-            || run_status == "canceled"
-            || run_status == "Cancelled";
+        let is_terminal =
+            run_status == "succeeded" || run_status == "failed" || run_status == "cancelled";
         if is_terminal {
             eprintln!("Run terminated without output_ready: {run_status}");
             eprintln!(
