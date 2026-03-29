@@ -176,7 +176,7 @@ async fn try_restored_exec(vm: &MicroVm) -> bool {
 /// Cold-boot a VM, take a cold snapshot (stops the VM), restore from it.
 ///
 /// Compares cold-boot latency against snapshot-restore latency.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cold_boot_vs_restore() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -330,7 +330,7 @@ async fn snapshot_cold_boot_vs_restore() {
 /// - `enable_dirty_tracking()` succeeds on a restored VM
 /// - `snapshot_diff()` produces a smaller memory file than the full dump
 /// - Restoring from a diff snapshot (base + delta) yields a working VM
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_diff_restore() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -541,7 +541,7 @@ async fn snapshot_diff_restore() {
 
 /// Cold-boot a VM with multiple vCPUs, take a snapshot, restore, and verify
 /// that all vCPU states are captured and the restored VM is functional.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_multi_vcpu() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -689,7 +689,7 @@ async fn snapshot_multi_vcpu() {
 /// TCP connections don't survive snapshot/restore (SLIRP state is not
 /// serialized), but the virtio-net device state is restored so the guest
 /// driver can immediately establish new connections.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_net_restore() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -874,7 +874,7 @@ fn snapshot_cli_list_empty() {
 
 /// Boot a VM, take a snapshot into the standard location, then verify
 /// `list_snapshots()` includes it with correct metadata.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_create_and_list() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -950,7 +950,7 @@ async fn snapshot_cli_create_and_list() {
 }
 
 /// Create a snapshot, delete it via `delete_snapshot()`, and verify it is gone.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_delete() {
     let Some((kernel, initramfs)) = preflight() else {
@@ -1030,7 +1030,7 @@ async fn snapshot_cli_delete() {
 /// flow that `voidbox snapshot create --diff` performs). Verify that
 /// `list_snapshots()` returns both entries and that the diff is smaller than
 /// the base.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_create_diff() {
     let Some((kernel, initramfs)) = preflight() else {
