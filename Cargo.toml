@@ -58,6 +58,7 @@ voidbox-oci = { path = "voidbox-oci" }
 libc = "0.2"
 byteorder = "1"
 sha2 = "0.10"
+tempfile = "3"
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]

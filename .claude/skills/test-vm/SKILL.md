@@ -127,37 +127,9 @@ claude auth status
 
 If not authenticated, stop and tell the user to run `claude auth login` first, then retry.
 
-Stage credentials so the guest VM can find the OAuth token. The method differs by platform:
-
-**macOS** — credentials live in Keychain; extract and write them as a file:
-
-```bash
-mkdir -p target/claude-home
-CREDS_JSON=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null) \
-  || { echo "ERROR: credentials not found in Keychain — run 'claude auth login' first"; exit 1; }
-echo "$CREDS_JSON" > target/claude-home/.credentials.json
-echo "Credentials staged from Keychain"
-```
-
-**Linux** — credentials live in `~/.claude/`; rsync them:
-
-```bash
-mkdir -p target/claude-home
-rsync -a --exclude 'settings.json' ~/.claude/ target/claude-home/
-```
-
-Generate a temporary spec by injecting the credentials mount into `smoke.yaml`:
-
-```bash
-python3 << 'EOF'
-mount = '  mounts:\n    - host: "target/claude-home"\n      guest: "/home/sandbox/.claude"\n      mode: "rw"\n'
-content = open('examples/smoke/smoke.yaml').read()
-open('/tmp/voidbox-smoke-personal.yaml', 'w').write(
-    content.replace('  network: true\n', '  network: true\n' + mount)
-)
-print("Generated /tmp/voidbox-smoke-personal.yaml")
-EOF
-```
+No manual credential staging is needed — the `claude-personal` LLM provider discovers
+OAuth credentials automatically (macOS Keychain / Linux `~/.claude/.credentials.json`),
+stages them to a secure temp directory, and mounts them into the guest VM.
 
 ---
 
@@ -184,9 +156,10 @@ VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
 
 **Claude (personal account):**
 ```bash
+VOIDBOX_LLM_PROVIDER=claude-personal \
 VOID_BOX_KERNEL=<kernel-path> \
 VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz \
-./target/release/voidbox run --file /tmp/voidbox-smoke-personal.yaml
+./target/release/voidbox run --file examples/smoke/smoke.yaml
 ```
 
 ---

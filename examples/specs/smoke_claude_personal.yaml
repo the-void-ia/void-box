@@ -1,0 +1,18 @@
+api_version: v1
+kind: agent
+name: claude-personal-test
+
+sandbox:
+  mode: auto
+  memory_mb: 1024
+  vcpus: 2
+  network: true
+
+llm:
+  provider: claude-personal
+
+agent:
+  prompt: "Say hello and confirm you can access the Claude API. Keep it to one sentence."
+  skills:
+    - "agent:claude-code"
+  timeout_secs: 120
