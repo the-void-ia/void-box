@@ -13,6 +13,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -36,7 +37,7 @@ pub trait GuestStream: Read + Write + Send {
 /// A function that creates a new connection to the guest agent.
 ///
 /// Called each time a new request needs a fresh connection.
-pub type GuestConnector = Box<dyn Fn() -> Result<Box<dyn GuestStream>> + Send + Sync>;
+pub type GuestConnector = Arc<dyn Fn() -> Result<Box<dyn GuestStream>> + Send + Sync>;
 
 /// Transport-agnostic control channel for guest communication.
 ///
@@ -305,7 +306,7 @@ impl ControlChannel {
             .connect_with_handshake(Duration::from_secs(3), "mkdir-p")
             .await?;
 
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
 
         let message = Message {
             msg_type: MessageType::MkdirP,
@@ -332,7 +333,6 @@ impl ControlChannel {
         let request = FileStatRequest {
             path: path.to_string(),
         };
-
         let mut stream = self
             .connect_with_handshake(Duration::from_secs(3), "file-stat")
             .await?;
@@ -367,7 +367,6 @@ impl ControlChannel {
         let request = ReadFileRequest {
             path: path.to_string(),
         };
-
         let mut stream = self
             .connect_with_handshake(Duration::from_secs(3), "read-file")
             .await?;
@@ -558,13 +557,59 @@ impl ControlChannel {
         Ok(())
     }
 
-    /// Connect to the guest agent and perform a Ping/Pong handshake.
+    /// Performs one synchronous connect + Ping/Pong handshake attempt.
+    /// Runs on a blocking thread to avoid starving the Tokio runtime.
+    fn try_handshake_sync(
+        connector: &GuestConnector,
+        session_secret: &[u8; 32],
+        handshake_timeout: Duration,
+    ) -> std::result::Result<Box<dyn GuestStream>, String> {
+        let mut s = connector().map_err(|e| format!("connect: {}", e))?;
+
+        s.set_read_timeout(Some(handshake_timeout))
+            .map_err(|e| format!("set_read_timeout: {}", e))?;
+
+        let mut ping_payload = session_secret.to_vec();
+        ping_payload.extend_from_slice(&crate::guest::protocol::PROTOCOL_VERSION.to_le_bytes());
+        let ping_msg = Message {
+            msg_type: MessageType::Ping,
+            payload: ping_payload,
+        };
+        s.write_all(&ping_msg.serialize())
+            .map_err(|e| format!("write ping: {}", e))?;
+
+        let msg = Message::read_from_sync(&mut *s).map_err(|e| format!("read pong: {}", e))?;
+
+        if msg.msg_type != MessageType::Pong {
+            return Err(format!("unexpected handshake message: {:?}", msg.msg_type));
+        }
+
+        let peer_version = if msg.payload.len() >= 4 {
+            u32::from_le_bytes([
+                msg.payload[0],
+                msg.payload[1],
+                msg.payload[2],
+                msg.payload[3],
+            ])
+        } else {
+            0
+        };
+        debug!(
+            "control_channel: handshake OK (peer_version={})",
+            peer_version
+        );
+        Ok(s)
+    }
+
+    /// Connects to the guest agent and performs a Ping/Pong handshake.
+    ///
+    /// Each connect+handshake attempt runs on `spawn_blocking` so
+    /// synchronous vsock I/O never blocks Tokio worker threads.
     async fn connect_with_handshake(
         &self,
         handshake_timeout: Duration,
         context: &str,
     ) -> Result<Box<dyn GuestStream>> {
-        // Wait for guest kernel boot once per ControlChannel lifetime.
         if self
             .boot_wait_done
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -590,80 +635,28 @@ impl ControlChannel {
 
             attempt += 1;
 
-            let mut s = match (self.connector)() {
+            let connector = self.connector.clone();
+            let secret = self.session_secret;
+            let hs_timeout = handshake_timeout;
+
+            let result = tokio::task::spawn_blocking(move || {
+                Self::try_handshake_sync(&connector, &secret, hs_timeout)
+            })
+            .await
+            .map_err(|e| Error::Guest(format!("handshake task panicked: {}", e)))?;
+
+            match result {
                 Ok(stream) => {
-                    debug!("control_channel[{context}]: attempt {} connect OK", attempt);
-                    stream
+                    debug!(
+                        "control_channel[{context}]: attempt {} handshake OK",
+                        attempt
+                    );
+                    return Ok(stream);
                 }
                 Err(e) => {
                     debug!(
-                        "control_channel[{context}]: attempt {} connect failed: {} (retry in {:?})",
+                        "control_channel[{context}]: attempt {} failed: {} (retry in {:?})",
                         attempt, e, delay
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                    continue;
-                }
-            };
-
-            // Handshake: Ping -> Pong
-            if let Err(e) = s.set_read_timeout(Some(handshake_timeout)) {
-                debug!(
-                    "control_channel[{context}]: attempt {} set_read_timeout failed: {}",
-                    attempt, e
-                );
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-
-            // Build Ping payload: [secret: 32 bytes][version: 4 bytes LE]
-            let mut ping_payload = self.session_secret.to_vec();
-            ping_payload.extend_from_slice(&crate::guest::protocol::PROTOCOL_VERSION.to_le_bytes());
-            let ping_msg = Message {
-                msg_type: MessageType::Ping,
-                payload: ping_payload,
-            };
-            if s.write_all(&ping_msg.serialize()).is_err() {
-                debug!(
-                    "control_channel[{context}]: attempt {} failed to send Ping",
-                    attempt
-                );
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-            match Message::read_from_sync(&mut *s) {
-                Ok(msg) if msg.msg_type == MessageType::Pong => {
-                    // Parse optional protocol version from Pong payload.
-                    let peer_version = if msg.payload.len() >= 4 {
-                        u32::from_le_bytes([
-                            msg.payload[0],
-                            msg.payload[1],
-                            msg.payload[2],
-                            msg.payload[3],
-                        ])
-                    } else {
-                        0 // legacy guest, no version in Pong
-                    };
-                    debug!(
-                        "control_channel[{context}]: handshake OK (peer_version={})",
-                        peer_version
-                    );
-                    return Ok(s);
-                }
-                Ok(msg) => {
-                    debug!(
-                        "control_channel[{context}]: attempt {} unexpected handshake message: {:?}",
-                        attempt, msg.msg_type
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                }
-                Err(e) => {
-                    debug!(
-                        "control_channel[{context}]: attempt {} handshake read failed: {}",
-                        attempt, e
                     );
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, Duration::from_secs(2));

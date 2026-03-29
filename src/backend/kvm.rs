@@ -86,10 +86,11 @@ impl VmmBackend for KvmBackend {
                 .vsock_socket_path()
                 .expect("restored VM must have vsock socket path")
                 .to_path_buf();
-            let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
-                let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
-                Ok(Box::new(stream))
-            });
+            let connector: crate::backend::control_channel::GuestConnector =
+                Arc::new(move || -> Result<Box<dyn GuestStream>> {
+                    let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
+                    Ok(Box::new(stream))
+                });
             self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
             self.vm = Some(vm);
 
@@ -138,10 +139,11 @@ impl VmmBackend for KvmBackend {
         // Build the control channel with AF_VSOCK connector
         let cid = self.cid;
         let session_secret = config.security.session_secret;
-        let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
-            let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
-            Ok(Box::new(stream))
-        });
+        let connector: crate::backend::control_channel::GuestConnector =
+            Arc::new(move || -> Result<Box<dyn GuestStream>> {
+                let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
+                Ok(Box::new(stream))
+            });
         self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
         self.vm = Some(vm);
 
