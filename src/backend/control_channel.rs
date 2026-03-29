@@ -108,6 +108,53 @@ impl ControlChannel {
         }
     }
 
+    /// Async-safe non-streaming exec: handshake on the async runtime, then
+    /// move the blocking response loop to `spawn_blocking`.
+    pub async fn send_exec_request_async(&self, request: &ExecRequest) -> Result<ExecResponse> {
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "exec-async")
+            .await?;
+
+        let timeout = request
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(1200));
+        let _ = stream.set_read_timeout(Some(timeout));
+
+        let message = Message {
+            msg_type: MessageType::ExecRequest,
+            payload: serde_json::to_vec(request)?,
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
+
+        debug!("control_channel: sent ExecRequest (async), waiting for ExecResponse");
+
+        tokio::task::spawn_blocking(move || loop {
+            let msg = Message::read_from_sync(&mut *stream)?;
+            match msg.msg_type {
+                MessageType::ExecOutputChunk => continue,
+                MessageType::ExecResponse => {
+                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
+                    debug!(
+                        "control_channel: ExecResponse received (async) exit_code={}",
+                        response.exit_code
+                    );
+                    return Ok(response);
+                }
+                other => {
+                    return Err(Error::Guest(format!(
+                        "Unexpected response type: {:?}",
+                        other
+                    )));
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("Exec task panicked: {}", e)))?
+    }
+
     /// Send an exec request and stream output chunks as they arrive.
     pub async fn send_exec_request_streaming<F>(
         &self,

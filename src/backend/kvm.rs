@@ -176,7 +176,7 @@ impl VmmBackend for KvmBackend {
             timeout_secs,
         };
 
-        let response = cc.send_exec_request(&request).await?;
+        let response = cc.send_exec_request_async(&request).await?;
         Ok(ExecOutput::new(
             response.stdout,
             response.stderr,
@@ -220,11 +220,11 @@ impl VmmBackend for KvmBackend {
         let (chunk_tx, chunk_rx) = mpsc::channel(256);
         let (response_tx, response_rx) = oneshot::channel();
 
+        // Use the async-safe streaming exec that moves blocking reads
+        // to spawn_blocking, preventing Tokio worker starvation.
         tokio::spawn(async move {
             let result = cc
-                .send_exec_request_streaming(&request, |chunk| {
-                    let _ = chunk_tx.try_send(chunk);
-                })
+                .send_exec_request_streaming_async(&request, chunk_tx)
                 .await;
             let _ = response_tx.send(result);
         });
