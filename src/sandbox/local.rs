@@ -16,16 +16,15 @@ use crate::{Error, ExecOutput, Result};
 
 /// Local sandbox backed by a real VM.
 pub struct LocalSandbox {
-    /// Sandbox configuration
     config: SandboxConfig,
-    /// The underlying VM backend (lazily initialized)
-    backend: Mutex<Option<Box<dyn VmmBackend>>>,
-    /// Whether the sandbox is started
+    /// VM backend behind a Mutex for lifecycle (start/stop) and an Arc for
+    /// concurrent operational access. Operational methods clone the Arc and
+    /// drop the lock immediately so long-running execs don't block file RPC.
+    backend: Mutex<Option<Arc<dyn VmmBackend>>>,
     started: std::sync::atomic::AtomicBool,
 }
 
 impl LocalSandbox {
-    /// Create a new local sandbox
     pub fn new(config: SandboxConfig) -> Result<Self> {
         Ok(Self {
             config,
@@ -44,13 +43,11 @@ impl LocalSandbox {
 
         let mut backend_lock = self.backend.lock().await;
 
-        // Double-check after acquiring lock
         if backend_lock.is_some() {
             self.started.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
-        // Build backend config
         let kernel = self
             .config
             .kernel
@@ -91,13 +88,22 @@ impl LocalSandbox {
         let mut backend = crate::backend::create_backend();
         backend.start(backend_config).await?;
 
-        *backend_lock = Some(backend);
+        *backend_lock = Some(Arc::from(backend));
         self.started.store(true, Ordering::SeqCst);
 
         Ok(())
     }
 
-    /// Execute a command in the sandbox
+    /// Returns a cloned Arc to the backend, dropping the mutex immediately.
+    async fn get_backend(&self) -> Result<Arc<dyn VmmBackend>> {
+        self.ensure_started().await?;
+        let lock = self.backend.lock().await;
+        let Some(ref backend) = *lock else {
+            return Err(Error::VmNotRunning);
+        };
+        Ok(Arc::clone(backend))
+    }
+
     pub async fn exec(&self, program: &str, args: &[&str]) -> Result<ExecOutput> {
         self.exec_with_stdin(program, args, &[]).await
     }
@@ -115,10 +121,7 @@ impl LocalSandbox {
             return self.simulate_exec(program, args, stdin);
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
 
         let env: Vec<(String, String)> = self.config.env.clone();
         backend.exec(program, args, stdin, &env, None, None).await
@@ -136,10 +139,7 @@ impl LocalSandbox {
             return self.simulate_exec(program, args, stdin);
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
 
         let env: Vec<(String, String)> = self.config.env.clone();
         backend
@@ -243,10 +243,7 @@ impl LocalSandbox {
             return Ok(());
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
         backend.write_file(path, content).await
     }
 
@@ -257,10 +254,7 @@ impl LocalSandbox {
             return Ok(());
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
         backend.mkdir_p(path).await
     }
 
@@ -269,17 +263,13 @@ impl LocalSandbox {
         &self,
         path: &str,
     ) -> Result<crate::guest::protocol::FileStatResponse> {
-        self.ensure_started().await?;
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
         backend.file_stat(path).await
     }
 
     /// Reads a file from the guest filesystem via native RPC.
     pub(crate) async fn read_file_native(&self, path: &str) -> Result<Vec<u8>> {
-        self.ensure_started().await?;
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
         backend.read_file_native(path).await
     }
 
@@ -294,10 +284,7 @@ impl LocalSandbox {
             return self.simulate_exec("claude-code", args, &[]);
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
@@ -345,10 +332,7 @@ impl LocalSandbox {
             return Ok((chunk_rx, resp_rx));
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
 
         let env: Vec<(String, String)> = self.config.env.clone();
         backend
@@ -396,10 +380,7 @@ impl LocalSandbox {
             return Ok((chunk_rx, resp_rx));
         }
 
-        self.ensure_started().await?;
-
-        let backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_ref().ok_or(Error::VmNotRunning)?;
+        let backend = self.get_backend().await?;
 
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
@@ -418,7 +399,12 @@ impl LocalSandbox {
     ) -> Result<Arc<TelemetryAggregator>> {
         self.ensure_started().await?;
         let mut backend_lock = self.backend.lock().await;
-        let backend = backend_lock.as_mut().ok_or(Error::VmNotRunning)?;
+        let Some(ref mut arc) = *backend_lock else {
+            return Err(Error::VmNotRunning);
+        };
+        let backend = Arc::get_mut(arc).ok_or_else(|| {
+            Error::Config("cannot start telemetry: backend has concurrent users".into())
+        })?;
         let observer = Observer::new(ObserveConfig::default());
         let opts = TelemetrySubscribeRequest {
             interval_ms: 1000,
@@ -427,14 +413,19 @@ impl LocalSandbox {
         backend.start_telemetry(observer, opts, ring_buffer).await
     }
 
-    /// Stop the sandbox
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
 
         let mut backend_lock = self.backend.lock().await;
-        if let Some(mut backend) = backend_lock.take() {
+        if let Some(ref mut arc) = *backend_lock {
+            let Some(backend) = Arc::get_mut(arc) else {
+                return Err(Error::Config(
+                    "cannot stop: backend has concurrent users".into(),
+                ));
+            };
             backend.stop().await?;
         }
+        *backend_lock = None;
         self.started.store(false, Ordering::SeqCst);
 
         Ok(())
