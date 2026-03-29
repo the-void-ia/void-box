@@ -371,7 +371,7 @@ impl VzBackend {
     ) -> GuestConnector {
         let device = Arc::new(SendSyncDevice(socket_device.0.clone()));
         let queue = vz_queue.clone();
-        Arc::new(move || {
+        Box::new(move || {
             let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<i32, String>>();
 
             // Dispatch connectToPort onto the VZ queue (required by Apple).
