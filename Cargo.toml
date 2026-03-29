@@ -153,6 +153,10 @@ name = "conformance"
 path = "tests/conformance.rs"
 
 [[test]]
+name = "e2e_service_mode"
+path = "tests/e2e/service_mode.rs"
+
+[[test]]
 name = "oci_integration"
 path = "tests/oci_integration.rs"
 
