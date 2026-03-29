@@ -1292,14 +1292,28 @@ async fn spawn_service_run(
         }
     }
 
-    // Phase 2: If output was published but run hasn't terminalized, wait for exit.
     if !terminalized {
         eprintln!(
             "[void-box] Service run {}: awaiting terminal exit (published={})",
             run_id, published
         );
+
+        let cancel_poll = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let runs = state.runs.lock().await;
+                let is_cancelled = runs
+                    .get(&run_id)
+                    .is_some_and(|r| r.status == RunStatus::Cancelled);
+                if is_cancelled {
+                    return;
+                }
+            }
+        };
+
         let watchdog2 = tokio::time::sleep(std::time::Duration::from_secs(120));
         tokio::pin!(watchdog2);
+        tokio::pin!(cancel_poll);
 
         tokio::select! {
             exit_result = &mut exit_rx => {
@@ -1313,8 +1327,11 @@ async fn spawn_service_run(
                     ).await,
                 }
             }
+            _ = &mut cancel_poll => {
+                eprintln!("[void-box] Service run {}: cancel detected, terminalizing", run_id);
+            }
             _ = &mut watchdog2 => {
-                eprintln!("[void-box] Service run {}: watchdog2 fired, published output but never terminated", run_id);
+                eprintln!("[void-box] Service run {}: watchdog2 fired", run_id);
                 terminalize_run_simple(&state, &run_id, RunStatus::Failed,
                     Some("service run published output but never terminated".into()), attempt).await;
             }
