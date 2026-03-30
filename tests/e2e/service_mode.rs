@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 /// End-to-end test for `agent.mode: service` lifecycle.
 ///
 /// Exercises the full stack: daemon API -> runtime -> VoidBox -> VM -> guest-agent.
