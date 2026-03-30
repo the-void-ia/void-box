@@ -1244,11 +1244,34 @@ async fn spawn_service_run(
                     }
                 };
 
+                // Persist output bytes as stage artifact so
+                // /v1/runs/{id}/stages/{name}/output-file returns the data.
+                let stage_name = &publication.box_name;
+                if let Err(e) = state.provider.save_stage_artifact(
+                    &run_id,
+                    stage_name,
+                    &publication.output,
+                ) {
+                    eprintln!(
+                        "[void-box] Service run {}: failed to save stage artifact: {}",
+                        run_id, e
+                    );
+                }
+
+                // Build artifact publication manifest
+                let (pub_entry, _) = build_artifact_publication(
+                    &run_id,
+                    &state.provider,
+                    &[], // no events needed for manifest
+                    Some(&publication.report),
+                );
+
                 // Persist report and set output_ready (one-shot)
                 {
                     let mut runs = state.runs.lock().await;
                     if let Some(r) = runs.get_mut(&run_id) {
                         r.report = Some(publication.report);
+                        r.artifact_publication = Some(pub_entry);
                         r.output_ready = true;
                         let seq = r.events.len() as u64;
                         r.events.push(event_with_seq(

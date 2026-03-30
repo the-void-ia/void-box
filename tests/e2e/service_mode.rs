@@ -208,6 +208,28 @@ sandbox:
             );
             assert!(run["report"].is_object(), "report should be present");
             assert!(run["sidecar"].is_object(), "sidecar should be present");
+            assert!(
+                run["artifact_publication"].is_object(),
+                "artifact_publication should be present"
+            );
+
+            // Verify output-file endpoint returns actual data
+            let stage = run["report"]["name"].as_str().unwrap_or("service-mode-e2e");
+            let (of_status, of_body) = http_request(
+                addr,
+                "GET",
+                &format!("/v1/runs/{run_id}/stages/{stage}/output-file"),
+                "",
+            );
+            assert!(
+                of_status.contains("200"),
+                "output-file should return 200, got: {of_status}"
+            );
+            assert!(
+                !of_body.is_empty(),
+                "output-file should return non-empty body"
+            );
+            eprintln!("output-file returned {} bytes", of_body.len());
 
             let (cancel_status, cancel_body) =
                 http_request(addr, "POST", &format!("/v1/runs/{run_id}/cancel"), "{}");
