@@ -6,7 +6,7 @@
 //! Usage:
 //!   void-message context
 //!   void-message inbox [--since N]
-//!   void-message send --kind <kind> --audience <audience> --summary <text> [--priority <pri>]
+//!   void-message send --kind KIND --audience AUDIENCE --summary TEXT [--priority PRI]
 //!   void-message health
 
 use std::env;
