@@ -101,7 +101,6 @@ dispatch2 = "0.3"
 
 [dev-dependencies]
 regex-lite = "0.1.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 tempfile = "3"
 tokio-test = "0.4"
 voidbox-oci = { path = "voidbox-oci" }
