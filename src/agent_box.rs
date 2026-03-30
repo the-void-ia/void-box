@@ -783,7 +783,7 @@ impl VoidBox {
     /// Run this Box as a long-running service.
     ///
     /// Provisions skills and launches the agent identically to [`run()`](Self::run),
-    /// but instead of awaiting completion returns a [`ServiceStageHandle`] that
+    /// but instead of awaiting completion returns a `ServiceStageHandle` that
     /// lets the caller:
     /// - receive the first output publication via `output_rx`
     /// - stop the service via `stop_tx`

@@ -102,3 +102,6 @@ jobs:
 
           # Run mount integration tests
           cargo test --test e2e_mount -- --ignored --test-threads=1
+
+          # Run snapshot integration tests
+          cargo test --test snapshot_integration -- --ignored --test-threads=1 || true

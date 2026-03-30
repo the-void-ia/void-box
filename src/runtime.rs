@@ -105,7 +105,7 @@ pub async fn run_spec(
     }
 }
 
-/// Run an agent spec in service mode, returning a [`ServiceStageHandle`].
+/// Run an agent spec in service mode, returning a `ServiceStageHandle`.
 ///
 /// This function only supports agent specs with `mode: service`. If the spec
 /// is not an agent or is not configured for service mode, an error is returned.
