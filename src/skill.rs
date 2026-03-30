@@ -294,9 +294,10 @@ impl Skill {
             )));
         }
 
-        resp.text().await.map_err(|e| {
+        let body: String = resp.text().await.map_err(|e| {
             crate::Error::Config(format!("Failed to read skill body from {}: {}", url, e))
-        })
+        })?;
+        Ok(body)
     }
 
     /// Build the raw GitHub URL for a remote skill.
