@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use tracing::{debug, warn};
+
 use crate::agent_box::ServiceExit;
 use crate::error::ApiError;
 use crate::persistence::{
@@ -16,6 +18,8 @@ use crate::persistence::{
     PersistenceProvider, RunEvent, RunState, RunStatus, SessionMessage,
 };
 use crate::spec::{AgentMode, RunKind, RunSpec};
+
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -98,22 +102,41 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     println!("[void-box] daemon listening on http://{}", addr);
 
     loop {
-        eprintln!("[void-box] daemon awaiting accept");
+        debug!("daemon awaiting accept");
         let (stream, _) = listener.accept().await?;
         match stream.peer_addr() {
-            Ok(peer) => eprintln!("[void-box] daemon accepted connection from {peer}"),
-            Err(err) => eprintln!("[void-box] daemon accepted connection (peer unknown: {err})"),
+            Ok(peer) => debug!(%peer, "daemon accepted connection"),
+            Err(err) => debug!(%err, "daemon accepted connection (peer unknown)"),
         }
         let state = state.clone();
         let peer = stream.peer_addr().ok();
-        eprintln!("[void-box] daemon spawning handler peer={peer:?}");
+        debug!(?peer, "daemon spawning handler");
         tokio::spawn(async move {
-            eprintln!("[void-box] daemon spawned handler starting peer={peer:?}");
+            debug!(?peer, "daemon spawned handler starting");
             if let Err(e) = handle_stream(stream, state).await {
-                eprintln!("[void-box] daemon connection error peer={peer:?}: {e}");
+                debug!(?peer, %e, "daemon connection error");
             }
         });
     }
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> usize {
+    for line in headers.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("content-length") {
+            let Ok(len) = value.trim().parse::<usize>() else {
+                continue;
+            };
+            return len;
+        }
+    }
+    0
 }
 
 async fn handle_stream(
@@ -121,19 +144,68 @@ async fn handle_stream(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer = stream.peer_addr().ok();
-    eprintln!("[void-box] handle_stream enter peer={peer:?}");
-    let mut buf = vec![0u8; 64 * 1024];
-    eprintln!("[void-box] handle_stream reading first bytes peer={peer:?}");
-    let n = stream.read(&mut buf).await?;
-    eprintln!("[void-box] handle_stream first read complete peer={peer:?} bytes={n}");
-    if n == 0 {
-        eprintln!("[void-box] handle_stream eof peer={peer:?}");
-        return Ok(());
+    debug!(?peer, "handle_stream enter");
+
+    let mut buf = vec![0u8; MAX_REQUEST_BYTES];
+    let mut total = 0usize;
+    debug!(?peer, "handle_stream reading");
+
+    let header_end = loop {
+        if total >= buf.len() {
+            let resp =
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        let n = stream.read(&mut buf[total..]).await?;
+        if n == 0 {
+            if total == 0 {
+                debug!(?peer, "handle_stream eof");
+            }
+            return Ok(());
+        }
+        total += n;
+
+        if let Some(pos) = find_header_end(&buf[..total]) {
+            break pos;
+        }
+    };
+    debug!(?peer, bytes = total, "handle_stream headers complete");
+
+    let headers_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let body_start = header_end + 4;
+
+    let content_length = parse_content_length(&headers_str);
+    if content_length > 0 {
+        let needed = body_start + content_length;
+        if needed > MAX_REQUEST_BYTES {
+            let resp =
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        while total < needed {
+            if total >= buf.len() {
+                let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(resp.as_bytes()).await?;
+                return Ok(());
+            }
+            let n = stream.read(&mut buf[total..]).await?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
     }
 
-    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-    let mut lines = req.lines();
-    let request_line = lines.next().unwrap_or("");
+    let body = if body_start < total {
+        String::from_utf8_lossy(&buf[body_start..total]).to_string()
+    } else {
+        String::new()
+    };
+    let body = body.as_str();
+
+    let request_line = headers_str.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
@@ -142,37 +214,28 @@ async fn handle_stream(
         .split_once('?')
         .map_or((raw_path, None), |(p, q)| (p, Some(q)));
 
-    let body = if let Some(idx) = req.find("\r\n\r\n") {
-        &req[idx + 4..]
-    } else {
-        ""
-    };
-
-    eprintln!("[void-box] handle_stream routing peer={peer:?} method={method} path={path}");
+    debug!(?peer, method, path, "handle_stream routing");
     let (status, content_type, payload) = route_request(method, path, query, body, state).await;
-    eprintln!(
-        "[void-box] handle_stream route complete peer={peer:?} method={method} path={path} status={status}"
-    );
+    debug!(?peer, method, path, %status, "handle_stream route complete");
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         payload.len(),
     );
-    eprintln!("[void-box] handle_stream writing header peer={peer:?} method={method} path={path}");
+    debug!(?peer, method, path, "handle_stream writing header");
     stream.write_all(header.as_bytes()).await?;
-    eprintln!(
-        "[void-box] handle_stream header write complete peer={peer:?} method={method} path={path}"
-    );
-    eprintln!(
-        "[void-box] handle_stream writing body peer={peer:?} method={method} path={path} bytes={}",
-        payload.len()
+    debug!(?peer, method, path, "handle_stream header write complete");
+    debug!(
+        ?peer,
+        method,
+        path,
+        bytes = payload.len(),
+        "handle_stream writing body"
     );
     stream.write_all(&payload).await?;
-    eprintln!(
-        "[void-box] handle_stream body write complete peer={peer:?} method={method} path={path}"
-    );
-    eprintln!("[void-box] handle_stream exit peer={peer:?}");
+    debug!(?peer, method, path, "handle_stream body write complete");
+    debug!(?peer, "handle_stream exit");
     Ok(())
 }
 
@@ -199,7 +262,7 @@ async fn route_request(
     body: &str,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
-    eprintln!("[void-box] route_request enter method={method} path={path}");
+    debug!(method, path, "route_request enter");
     match (method, path) {
         ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
@@ -794,7 +857,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     .insert(run_id.clone(), Arc::new(handle));
             }
             Err(e) => {
-                eprintln!("warning: failed to start sidecar for {}: {}", run_id, e);
+                warn!(%run_id, %e, "failed to start sidecar");
             }
         }
     }
@@ -1213,10 +1276,7 @@ async fn spawn_service_run(
         exit_rx,
     } = handle;
 
-    eprintln!(
-        "[void-box] Service run {}: handle created, awaiting signals",
-        run_id
-    );
+    debug!(%run_id, "service run handle created, awaiting signals");
 
     // Watchdog: if neither output nor exit arrives in 120s, terminalize Failed.
     let watchdog = tokio::time::sleep(std::time::Duration::from_secs(120));
@@ -1232,7 +1292,7 @@ async fn spawn_service_run(
         output_result = &mut output_rx => {
             if let Ok(publication) = output_result {
                 published = true;
-                eprintln!("[void-box] Service run {}: got output publication", run_id);
+                debug!(%run_id, "service run got output publication");
 
                 // Drain sidecar intents (best-effort)
                 let _intents = {
@@ -1252,10 +1312,7 @@ async fn spawn_service_run(
                     stage_name,
                     &publication.output,
                 ) {
-                    eprintln!(
-                        "[void-box] Service run {}: failed to save stage artifact: {}",
-                        run_id, e
-                    );
+                    warn!(%run_id, %e, "service run failed to save stage artifact");
                 }
 
                 // Build artifact publication manifest
@@ -1287,7 +1344,7 @@ async fn spawn_service_run(
                     }
                 }
             } else {
-                eprintln!("[void-box] Service run {}: output channel closed without publication", run_id);
+                debug!(%run_id, "service run output channel closed without publication");
                 // Channel closed — agent exited without publishing.
                 // Fall through to phase 2 which will get exit_rx.
             }
@@ -1295,7 +1352,7 @@ async fn spawn_service_run(
 
         exit_result = &mut exit_rx => {
             // exit_rx is authoritative — terminalize immediately.
-            eprintln!("[void-box] Service run {}: got exit before publication", run_id);
+            debug!(%run_id, "service run got exit before publication");
             terminalized = true;
             match exit_result {
                 Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
@@ -1308,7 +1365,7 @@ async fn spawn_service_run(
         }
 
         _ = &mut watchdog => {
-            eprintln!("[void-box] Service run {}: watchdog fired, no progress after 120s", run_id);
+            warn!(%run_id, "service run watchdog fired, no progress after 120s");
             terminalized = true;
             terminalize_run_simple(&state, &run_id, RunStatus::Failed,
                 Some("service run made no progress within 120s".into()), attempt).await;
@@ -1316,10 +1373,7 @@ async fn spawn_service_run(
     }
 
     if !terminalized {
-        eprintln!(
-            "[void-box] Service run {}: awaiting terminal exit (published={})",
-            run_id, published
-        );
+        debug!(%run_id, published, "service run awaiting terminal exit");
 
         let cancel_poll = async {
             loop {
@@ -1340,7 +1394,7 @@ async fn spawn_service_run(
 
         tokio::select! {
             exit_result = &mut exit_rx => {
-                eprintln!("[void-box] Service run {}: got exit signal", run_id);
+                debug!(%run_id, "service run got exit signal");
                 match exit_result {
                     Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
                     Err(_) => terminalize_service(
@@ -1351,10 +1405,10 @@ async fn spawn_service_run(
                 }
             }
             _ = &mut cancel_poll => {
-                eprintln!("[void-box] Service run {}: cancel detected, terminalizing", run_id);
+                debug!(%run_id, "service run cancel detected, terminalizing");
             }
             _ = &mut watchdog2 => {
-                eprintln!("[void-box] Service run {}: watchdog2 fired", run_id);
+                warn!(%run_id, "service run watchdog2 fired");
                 terminalize_run_simple(&state, &run_id, RunStatus::Failed,
                     Some("service run published output but never terminated".into()), attempt).await;
             }

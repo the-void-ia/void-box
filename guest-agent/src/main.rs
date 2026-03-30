@@ -1835,74 +1835,64 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             read_exact(fd, &mut payload)?;
         }
 
-        // Require authentication for all message types except Ping (which IS the auth).
-        if msg_type != 3 && !AUTHENTICATED.with(|a| a.get()) {
+        if msg_type != MessageType::Ping as u8 && !AUTHENTICATED.with(|a| a.get()) {
             eprintln!("Rejecting unauthenticated message type {}", msg_type);
             return Err(
                 "Connection not authenticated -- send Ping with session secret first".into(),
             );
         }
 
-        // Handle message based on type
-        match msg_type {
-            1 => {
-                // ExecRequest
+        let Ok(message_type) = MessageType::try_from(msg_type) else {
+            eprintln!("Unknown message type: {}", msg_type);
+            continue;
+        };
+
+        match message_type {
+            MessageType::ExecRequest => {
                 let request: ExecRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse request: {}", e))?;
 
                 let response = execute_command(fd, &request);
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
-            3 => {
-                // Ping -- payload carries the 32-byte session secret, optionally
-                // followed by a 4-byte LE protocol version (36 bytes total).
-                // Old hosts send 32 bytes (version 0); new hosts send 36.
-                match SESSION_SECRET.get() {
-                    Some(secret) if payload.len() >= 32 && payload[..32] == secret[..] => {
-                        AUTHENTICATED.with(|a| a.set(true));
+            MessageType::Ping => match SESSION_SECRET.get() {
+                Some(secret) if payload.len() >= 32 && payload[..32] == secret[..] => {
+                    AUTHENTICATED.with(|a| a.set(true));
 
-                        // Parse optional protocol version from bytes 32..36.
-                        let peer_version = if payload.len() >= 36 {
-                            u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
-                        } else {
-                            0 // legacy host, no version field
-                        };
+                    let peer_version = if payload.len() >= 36 {
+                        u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
+                    } else {
+                        0
+                    };
 
-                        // Reply with our protocol version in the Pong payload.
-                        let version_bytes = void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
-                        send_raw_message(fd, MessageType::Pong, &version_bytes)?;
+                    let version_bytes = void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
+                    send_raw_message(fd, MessageType::Pong, &version_bytes)?;
 
-                        kmsg(&format!(
-                            "Authenticated (peer_version={}, our_version={})",
-                            peer_version,
-                            void_box_protocol::PROTOCOL_VERSION
-                        ));
+                    kmsg(&format!(
+                        "Authenticated (peer_version={}, our_version={})",
+                        peer_version,
+                        void_box_protocol::PROTOCOL_VERSION
+                    ));
 
-                        // Kick OCI setup asynchronously after auth so we never block
-                        // Ping/Pong handling on expensive rootfs preparation.
-                        trigger_oci_rootfs_setup_async();
-                    }
-                    Some(_) => {
-                        eprintln!("Authentication failed: invalid secret");
-                        return Err("Authentication failed: invalid session secret".into());
-                    }
-                    None => {
-                        eprintln!("Authentication failed: no secret configured");
-                        return Err("Authentication failed: no session secret configured".into());
-                    }
+                    trigger_oci_rootfs_setup_async();
                 }
-                // Continue loop - host will send ExecRequest on same connection
-            }
-            5 => {
-                // Shutdown
+                Some(_) => {
+                    eprintln!("Authentication failed: invalid secret");
+                    return Err("Authentication failed: invalid session secret".into());
+                }
+                None => {
+                    eprintln!("Authentication failed: no secret configured");
+                    return Err("Authentication failed: no session secret configured".into());
+                }
+            },
+            MessageType::Shutdown => {
                 eprintln!("Shutdown requested");
                 unsafe {
                     libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
                 }
                 return Ok(());
             }
-            10 => {
-                // SubscribeTelemetry - enter streaming mode
+            MessageType::SubscribeTelemetry => {
                 let opts: TelemetrySubscribeRequest = if payload.is_empty() {
                     TelemetrySubscribeRequest::default()
                 } else {
@@ -1915,40 +1905,46 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 telemetry_stream_loop(fd, &opts);
                 return Ok(());
             }
-            11 => {
-                // WriteFile - native file write (no shell/base64 needed)
+            MessageType::WriteFile => {
                 let request: WriteFileRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse WriteFileRequest: {}", e))?;
                 let response = handle_write_file(&request);
                 send_response(fd, MessageType::WriteFileResponse, &response)?;
             }
-            13 => {
-                // MkdirP - create directories
+            MessageType::MkdirP => {
                 let request: MkdirPRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse MkdirPRequest: {}", e))?;
                 let response = handle_mkdir_p(&request);
                 send_response(fd, MessageType::MkdirPResponse, &response)?;
             }
-            18 => {
+            MessageType::ReadFile => {
                 let request: ReadFileRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse ReadFileRequest: {}", e))?;
                 let response = handle_read_file(&request);
                 send_response(fd, MessageType::ReadFileResponse, &response)?;
             }
-            20 => {
+            MessageType::FileStat => {
                 let request: FileStatRequest = serde_json::from_slice(&payload)
                     .map_err(|e| format!("Failed to parse FileStatRequest: {}", e))?;
                 let response = handle_file_stat(&request);
                 send_response(fd, MessageType::FileStatResponse, &response)?;
             }
-            17 => {
-                // SnapshotReady - no-op acknowledgement from guest side.
-                // The host sends this to query readiness; the guest simply
-                // replies with SnapshotReady to confirm it is ready.
+            MessageType::SnapshotReady => {
                 send_raw_message(fd, MessageType::SnapshotReady, &[])?;
             }
-            _ => {
-                eprintln!("Unknown message type: {}", msg_type);
+            MessageType::ExecResponse
+            | MessageType::Pong
+            | MessageType::FileTransfer
+            | MessageType::FileTransferResponse
+            | MessageType::TelemetryData
+            | MessageType::TelemetryAck
+            | MessageType::WriteFileResponse
+            | MessageType::MkdirPResponse
+            | MessageType::ExecOutputChunk
+            | MessageType::ExecOutputAck
+            | MessageType::ReadFileResponse
+            | MessageType::FileStatResponse => {
+                eprintln!("Unexpected response-type message: {:?}", message_type);
             }
         }
     }

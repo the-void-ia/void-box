@@ -609,6 +609,30 @@ impl VoidBox {
         Ok(())
     }
 
+    fn build_full_prompt(&self, input: Option<&[u8]>) -> String {
+        let Some(data) = input else {
+            return format!(
+                "{}\n\nWrite your output to {}.",
+                self.prompt, self.config.output_file
+            );
+        };
+        let input_text = String::from_utf8_lossy(data);
+        let inline = if input_text.len() > 4000 {
+            format!(
+                "{}...\n(truncated; full data in /workspace/input.json)",
+                &input_text[..4000]
+            )
+        } else {
+            input_text.to_string()
+        };
+        format!(
+            "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
+             The above data is also available at /workspace/input.json.\n\
+             Write your output to {}.",
+            self.prompt, inline, self.config.output_file
+        )
+    }
+
     /// Run this Box: provision skills, execute the agent, return the result.
     ///
     /// If `input` is provided, it's written to `/workspace/input.json` before
@@ -665,34 +689,7 @@ impl VoidBox {
             );
         }
 
-        // Build the full prompt.
-        // We embed the previous stage's output directly in the prompt so models
-        // don't need to use file-reading tools (small local models often can't).
-        // The data is still written to /workspace/input.json for models that
-        // prefer tool-based file access.
-        let full_prompt = if let Some(data) = input {
-            let input_text = String::from_utf8_lossy(data);
-            // Truncate if very large to avoid blowing context window
-            let inline = if input_text.len() > 4000 {
-                format!(
-                    "{}...\n(truncated; full data in /workspace/input.json)",
-                    &input_text[..4000]
-                )
-            } else {
-                input_text.to_string()
-            };
-            format!(
-                "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
-                 The above data is also available at /workspace/input.json.\n\
-                 Write your output to {}.",
-                self.prompt, inline, self.config.output_file
-            )
-        } else {
-            format!(
-                "{}\n\nWrite your output to {}.",
-                self.prompt, self.config.output_file
-            )
-        };
+        let full_prompt = self.build_full_prompt(input);
 
         eprintln!(
             "[vm:{}] Executing agent | llm={} | prompt_len={} chars",
@@ -831,29 +828,7 @@ impl VoidBox {
             );
         }
 
-        // Build the full prompt (same logic as run()).
-        let full_prompt = if let Some(data) = input {
-            let input_text = String::from_utf8_lossy(data);
-            let inline = if input_text.len() > 4000 {
-                format!(
-                    "{}...\n(truncated; full data in /workspace/input.json)",
-                    &input_text[..4000]
-                )
-            } else {
-                input_text.to_string()
-            };
-            format!(
-                "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
-                 The above data is also available at /workspace/input.json.\n\
-                 Write your output to {}.",
-                self.prompt, inline, self.config.output_file
-            )
-        } else {
-            format!(
-                "{}\n\nWrite your output to {}.",
-                self.prompt, self.config.output_file
-            )
-        };
+        let full_prompt = self.build_full_prompt(input);
 
         eprintln!(
             "[vm:{}] Launching service agent | llm={} | prompt_len={} chars",

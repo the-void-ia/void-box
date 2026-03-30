@@ -103,5 +103,14 @@ jobs:
           # Run mount integration tests
           cargo test --test e2e_mount -- --ignored --test-threads=1
 
-          # Run snapshot integration tests
-          cargo test --test snapshot_integration -- --ignored --test-threads=1 || true
+      - name: Run snapshot integration tests
+        continue-on-error: true
+        env:
+          VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
+          if [ -f "$KERNEL_COPY" ]; then
+            export VOID_BOX_KERNEL="$KERNEL_COPY"
+          fi
+          cargo test --test snapshot_integration -- --ignored --test-threads=1

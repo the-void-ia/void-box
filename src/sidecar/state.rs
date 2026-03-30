@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -178,7 +179,7 @@ impl SidecarState {
             return Err(IntentRejection::MaxPerIteration);
         }
 
-        let intent_id = format!("int-{}", uuid_v4());
+        let intent_id = format!("int-{}", unique_id());
         let stamped = StampedIntent {
             intent_id,
             from_candidate_id: self.candidate_id.clone(),
@@ -242,15 +243,13 @@ fn compute_content_hash(payload: &serde_json::Value, audience: &str, iteration: 
     hasher.finish()
 }
 
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn unique_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    format!(
-        "{:016x}{:016x}",
-        nanos,
-        nanos.wrapping_mul(6364136223846793005)
-    )
+        .as_nanos() as u64;
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}{:016x}", nanos, seq)
 }

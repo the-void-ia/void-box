@@ -253,16 +253,14 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 
 fn parse_content_length(headers: &str) -> usize {
     for line in headers.lines() {
-        if let Some(val) = line.strip_prefix("Content-Length:") {
-            if let Ok(len) = val.trim().parse::<usize>() {
-                return len;
-            }
-        }
-        // Also handle lowercase
-        if let Some(val) = line.strip_prefix("content-length:") {
-            if let Ok(len) = val.trim().parse::<usize>() {
-                return len;
-            }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("content-length") {
+            let Ok(len) = value.trim().parse::<usize>() else {
+                continue;
+            };
+            return len;
         }
     }
     0
