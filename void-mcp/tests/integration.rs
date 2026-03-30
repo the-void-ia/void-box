@@ -21,6 +21,10 @@ fn void_mcp_bin() -> String {
 }
 
 fn build_binary() {
+    let bin = void_mcp_bin();
+    if std::path::Path::new(&bin).exists() {
+        return;
+    }
     let status = Command::new("cargo")
         .args(["build", "-p", "void-mcp"])
         .status()
