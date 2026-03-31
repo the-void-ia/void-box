@@ -5,8 +5,9 @@
 //! ## Skill & MCP awareness
 //!
 //! On startup, claudio scans the guest filesystem for provisioned skills and MCP config:
-//! - `/home/sandbox/.claude/skills/*.md` -- SKILL.md files provisioned by VoidBox
-//! - `/home/sandbox/.claude/mcp.json` -- MCP server configuration
+//! - `/workspace/.claude/skills/*.md` -- SKILL.md files provisioned by VoidBox
+//! - `/workspace/.mcp.json` -- MCP server configuration (project-scoped)
+//! - `/workspace/.claude/mcp.json` -- MCP server configuration (fallback)
 //!
 //! Discovered skills and MCP servers are:
 //! 1. Reported in the system event (`"skills":[...],"mcp_servers":[...]`)
@@ -35,7 +36,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-const CLAUDE_HOME: &str = "/home/sandbox/.claude";
+const CLAUDE_HOME: &str = "/workspace/.claude";
 
 fn main() {
     // Parse command line args to extract the prompt (mimic claude-code CLI)
@@ -128,9 +129,16 @@ impl DiscoveredSkills {
             }
         }
 
-        // Read /home/sandbox/.claude/mcp.json
-        let mcp_path_path = format!("{}/mcp.json", CLAUDE_HOME);
-        let mcp_path = Path::new(&mcp_path_path);
+        // Read MCP config: check project-scoped .mcp.json first (like real Claude Code),
+        // then fall back to CLAUDE_HOME/mcp.json.
+        let home_mcp_path = format!("{}/mcp.json", CLAUDE_HOME);
+        let mcp_candidates = ["/workspace/.mcp.json", home_mcp_path.as_str()];
+        let mcp_path_str = mcp_candidates
+            .iter()
+            .find(|p| Path::new(p).is_file())
+            .copied()
+            .unwrap_or("");
+        let mcp_path = Path::new(mcp_path_str);
         if mcp_path.is_file() {
             if let Ok(content) = fs::read_to_string(mcp_path) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {

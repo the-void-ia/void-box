@@ -325,3 +325,105 @@ async fn conformance_lifecycle() {
         "backend should not be running after stop"
     );
 }
+
+// ===========================================================================
+// Conformance: native file RPC
+// ===========================================================================
+
+/// Backend can stat a file that exists and a file that does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
+async fn conformance_file_stat() {
+    let backend = match create_started_backend().await {
+        Some(b) => b,
+        None => return,
+    };
+
+    backend
+        .write_file("/workspace/stat_test.txt", b"hello")
+        .await
+        .expect("write_file failed");
+
+    let stat = backend
+        .file_stat("/workspace/stat_test.txt")
+        .await
+        .expect("file_stat failed");
+    assert!(stat.exists);
+    assert_eq!(stat.size, Some(5));
+    assert!(stat.error.is_none());
+
+    let stat = backend
+        .file_stat("/workspace/no_such_file.txt")
+        .await
+        .expect("file_stat on missing file failed");
+    assert!(!stat.exists);
+    assert!(stat.error.is_none());
+}
+
+/// Backend can read a file via the native file RPC channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
+async fn conformance_read_file_native() {
+    let backend = match create_started_backend().await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let content = b"native read file test content";
+    backend
+        .write_file("/workspace/read_test.txt", content)
+        .await
+        .expect("write_file failed");
+
+    let data = backend
+        .read_file_native("/workspace/read_test.txt")
+        .await
+        .expect("read_file_native failed");
+    assert_eq!(data, content);
+
+    let result = backend
+        .read_file_native("/workspace/no_such_file_read.txt")
+        .await;
+    assert!(result.is_err());
+}
+
+/// Native file RPC works while a long-running exec holds the exec channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires VM backend + kernel/initramfs artifacts"]
+async fn conformance_file_rpc_while_exec_running() {
+    let backend = match create_started_backend().await {
+        Some(b) => b,
+        None => return,
+    };
+
+    backend
+        .write_file("/workspace/concurrent_test.txt", b"concurrent")
+        .await
+        .expect("write_file failed");
+
+    let (_chunk_rx, _response_rx) = backend
+        .exec_streaming("sh", &["-c", "sleep 10"], &[], None, Some(15))
+        .await
+        .expect("exec_streaming failed");
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let stat = backend
+        .file_stat("/workspace/concurrent_test.txt")
+        .await
+        .expect("file_stat must work during active exec");
+    assert!(stat.exists);
+    assert_eq!(stat.size, Some(10));
+
+    let data = backend
+        .read_file_native("/workspace/concurrent_test.txt")
+        .await
+        .expect("read_file_native must work during active exec");
+    assert_eq!(data, b"concurrent");
+
+    let stat = backend
+        .file_stat("/workspace/no_such_concurrent.txt")
+        .await
+        .expect("file_stat on missing file must work during exec");
+    assert!(!stat.exists);
+}

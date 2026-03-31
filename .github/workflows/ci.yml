@@ -54,6 +54,14 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Build workspace binaries
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo build --workspace --exclude guest-agent --all-features
+          else
+            cargo build --workspace --all-features
+          fi
+
       - name: Run tests
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then

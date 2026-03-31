@@ -9,13 +9,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use tracing::{debug, warn};
+
+use crate::agent_box::ServiceExit;
 use crate::error::ApiError;
 use crate::persistence::{
     generate_event_id, legacy_to_v2_event_type, now_ms, now_rfc3339, provider_from_env,
     PersistenceProvider, RunEvent, RunState, RunStatus, SessionMessage,
 };
-use crate::runtime::run_file;
-use crate::spec::{RunKind, RunSpec};
+use crate::spec::{AgentMode, RunKind, RunSpec};
+
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -29,6 +33,7 @@ struct AppState {
             >,
         >,
     >,
+    sidecar_handles: Arc<Mutex<HashMap<String, Arc<crate::sidecar::SidecarHandle>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,35 +95,117 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         runs: Arc::new(Mutex::new(initial_runs)),
         provider,
         telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
+        sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let listener = TcpListener::bind(addr).await?;
     println!("[void-box] daemon listening on http://{}", addr);
 
     loop {
+        debug!("daemon awaiting accept");
         let (stream, _) = listener.accept().await?;
+        match stream.peer_addr() {
+            Ok(peer) => debug!(%peer, "daemon accepted connection"),
+            Err(err) => debug!(%err, "daemon accepted connection (peer unknown)"),
+        }
         let state = state.clone();
+        let peer = stream.peer_addr().ok();
+        debug!(?peer, "daemon spawning handler");
         tokio::spawn(async move {
+            debug!(?peer, "daemon spawned handler starting");
             if let Err(e) = handle_stream(stream, state).await {
-                eprintln!("[void-box] daemon connection error: {e}");
+                debug!(?peer, %e, "daemon connection error");
             }
         });
     }
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> usize {
+    for line in headers.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("content-length") {
+            let Ok(len) = value.trim().parse::<usize>() else {
+                continue;
+            };
+            return len;
+        }
+    }
+    0
 }
 
 async fn handle_stream(
     mut stream: TcpStream,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
+    let peer = stream.peer_addr().ok();
+    debug!(?peer, "handle_stream enter");
+
+    let mut buf = vec![0u8; MAX_REQUEST_BYTES];
+    let mut total = 0usize;
+    debug!(?peer, "handle_stream reading");
+
+    let header_end = loop {
+        if total >= buf.len() {
+            let resp =
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        let n = stream.read(&mut buf[total..]).await?;
+        if n == 0 {
+            if total == 0 {
+                debug!(?peer, "handle_stream eof");
+            }
+            return Ok(());
+        }
+        total += n;
+
+        if let Some(pos) = find_header_end(&buf[..total]) {
+            break pos;
+        }
+    };
+    debug!(?peer, bytes = total, "handle_stream headers complete");
+
+    let headers_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let body_start = header_end + 4;
+
+    let content_length = parse_content_length(&headers_str);
+    if content_length > 0 {
+        let needed = body_start + content_length;
+        if needed > MAX_REQUEST_BYTES {
+            let resp =
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        while total < needed {
+            if total >= buf.len() {
+                let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(resp.as_bytes()).await?;
+                return Ok(());
+            }
+            let n = stream.read(&mut buf[total..]).await?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
     }
 
-    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-    let mut lines = req.lines();
-    let request_line = lines.next().unwrap_or("");
+    let body = if body_start < total {
+        String::from_utf8_lossy(&buf[body_start..total]).to_string()
+    } else {
+        String::new()
+    };
+    let body = body.as_str();
+
+    let request_line = headers_str.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
@@ -127,21 +214,28 @@ async fn handle_stream(
         .split_once('?')
         .map_or((raw_path, None), |(p, q)| (p, Some(q)));
 
-    let body = if let Some(idx) = req.find("\r\n\r\n") {
-        &req[idx + 4..]
-    } else {
-        ""
-    };
-
+    debug!(?peer, method, path, "handle_stream routing");
     let (status, content_type, payload) = route_request(method, path, query, body, state).await;
+    debug!(?peer, method, path, %status, "handle_stream route complete");
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         payload.len(),
     );
+    debug!(?peer, method, path, "handle_stream writing header");
     stream.write_all(header.as_bytes()).await?;
+    debug!(?peer, method, path, "handle_stream header write complete");
+    debug!(
+        ?peer,
+        method,
+        path,
+        bytes = payload.len(),
+        "handle_stream writing body"
+    );
     stream.write_all(&payload).await?;
+    debug!(?peer, method, path, "handle_stream body write complete");
+    debug!(?peer, "handle_stream exit");
     Ok(())
 }
 
@@ -168,6 +262,7 @@ async fn route_request(
     body: &str,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
+    debug!(method, path, "route_request enter");
     match (method, path) {
         ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
@@ -181,11 +276,20 @@ async fn route_request(
         ("GET", "/v1/runs") => as_json(list_runs(query, state).await),
         _ => {
             if let Some(id) = path.strip_prefix("/v1/runs/") {
+                // /v1/runs/{run_id}/stages/{stage_name}/artifacts/{artifact_name}
+                if let Some((rest, artifact_name)) = id.rsplit_once("/artifacts/") {
+                    if let Some((run_id, stage_name)) = rest.rsplit_once("/stages/") {
+                        if method == "GET" {
+                            return get_named_artifact(run_id, stage_name, artifact_name, state)
+                                .await;
+                        }
+                    }
+                }
                 // /v1/runs/{run_id}/stages/{stage_name}/output-file
                 if let Some(rest) = id.strip_suffix("/output-file") {
                     if let Some((run_id, stage_name)) = rest.rsplit_once("/stages/") {
                         if method == "GET" {
-                            return get_stage_output_file(run_id, stage_name, state).await;
+                            return get_stage_output_file(run_id, stage_name, query, state).await;
                         }
                     }
                 }
@@ -205,6 +309,24 @@ async fn route_request(
                 if let Some(id) = id.strip_suffix("/cancel") {
                     if method == "POST" {
                         return as_json(cancel_run(id, body, state).await);
+                    }
+                }
+                // PUT /v1/runs/{id}/inbox
+                if let Some(run_id) = id.strip_suffix("/inbox") {
+                    if method == "PUT" {
+                        return as_json(push_inbox(run_id, body, state).await);
+                    }
+                }
+                // GET /v1/runs/{id}/intents
+                if let Some(run_id) = id.strip_suffix("/intents") {
+                    if method == "GET" {
+                        return as_json(drain_intents(run_id, state).await);
+                    }
+                }
+                // POST /v1/runs/{id}/messages
+                if let Some(run_id) = id.strip_suffix("/messages") {
+                    if method == "POST" {
+                        return as_json(push_message(run_id, body, state).await);
                     }
                 }
                 if method == "GET" {
@@ -228,6 +350,342 @@ async fn route_request(
                 ApiError::not_found("route not found").to_json(),
             ))
         }
+    }
+}
+
+/// Reason for publication failure, used to wire into run failure.
+#[derive(Debug)]
+enum PublicationFailureReason {
+    StructuredOutputMissing(String),
+    StructuredOutputMalformed(String),
+}
+
+fn build_artifact_publication(
+    run_id: &str,
+    provider: &Arc<dyn PersistenceProvider>,
+    events: &[RunEvent],
+    report: Option<&crate::runtime::RunReport>,
+) -> (
+    crate::persistence::ArtifactPublication,
+    Option<PublicationFailureReason>,
+) {
+    use crate::persistence::{
+        ArtifactManifestEntry, ArtifactPublication, ArtifactPublicationStatus,
+    };
+
+    // Collect stages that reached a terminal state (completed, failed, skipped)
+    // and separately track which ones completed successfully.
+    let mut completed_stages: Vec<String> = Vec::new();
+    let mut any_stage_ran = false;
+    for ev in events {
+        if let Some(ref sn) = ev.stage_name {
+            match ev.event_type.as_str() {
+                "stage.completed" => {
+                    if !completed_stages.contains(sn) {
+                        completed_stages.push(sn.clone());
+                    }
+                    any_stage_ran = true;
+                }
+                "stage.started" | "stage.failed" | "stage.skipped" => {
+                    any_stage_ran = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // No stages ran at all (e.g. spec load failure) — nothing to publish
+    if !any_stage_ran {
+        return (
+            ArtifactPublication {
+                status: ArtifactPublicationStatus::NotStarted,
+                published_at: None,
+                manifest: Vec::new(),
+            },
+            None,
+        );
+    }
+
+    // If stages ran but none completed, output is missing only for runs that
+    // are expected to publish structured output.
+    if completed_stages.is_empty() {
+        if !requires_structured_output(report) {
+            return (
+                ArtifactPublication {
+                    status: ArtifactPublicationStatus::NotStarted,
+                    published_at: None,
+                    manifest: Vec::new(),
+                },
+                None,
+            );
+        }
+        return (
+            ArtifactPublication {
+                status: ArtifactPublicationStatus::Failed,
+                published_at: None,
+                manifest: Vec::new(),
+            },
+            Some(PublicationFailureReason::StructuredOutputMissing(
+                "no stages completed successfully".to_string(),
+            )),
+        );
+    }
+
+    let mut manifest = Vec::new();
+
+    for stage in &completed_stages {
+        let data = match provider.load_stage_artifact(run_id, stage) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                if !requires_structured_output(report) {
+                    continue;
+                }
+                // Stage completed but no artifact — structured output missing
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMissing(format!(
+                        "stage '{}' completed without result.json",
+                        stage
+                    ))),
+                );
+            }
+            Err(_) => {
+                if !requires_structured_output(report) {
+                    continue;
+                }
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMissing(format!(
+                        "failed to load artifact for stage '{}'",
+                        stage
+                    ))),
+                );
+            }
+        };
+
+        let parsed = match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(v) => v,
+            Err(_) => {
+                if !requires_structured_output(report) {
+                    // Non-orchestration run with non-JSON output — skip validation
+                    continue;
+                }
+                return (
+                    ArtifactPublication {
+                        status: ArtifactPublicationStatus::Failed,
+                        published_at: None,
+                        manifest: Vec::new(),
+                    },
+                    Some(PublicationFailureReason::StructuredOutputMalformed(
+                        format!("result.json for stage '{}' is not valid JSON", stage),
+                    )),
+                );
+            }
+        };
+
+        if parsed.get("status").is_none() {
+            if !requires_structured_output(report) {
+                // Non-orchestration run with JSON missing status — skip validation
+                continue;
+            }
+            return (
+                ArtifactPublication {
+                    status: ArtifactPublicationStatus::Failed,
+                    published_at: None,
+                    manifest: Vec::new(),
+                },
+                Some(PublicationFailureReason::StructuredOutputMalformed(
+                    format!(
+                        "result.json for stage '{}' is missing required 'status' field",
+                        stage
+                    ),
+                )),
+            );
+        }
+
+        manifest.push(ArtifactManifestEntry {
+            name: "result.json".to_string(),
+            stage: stage.clone(),
+            media_type: "application/json".to_string(),
+            size_bytes: Some(data.len() as u64),
+            retrieval_path: format!("/v1/runs/{}/stages/{}/output-file", run_id, stage),
+        });
+
+        if let Some(artifacts) = parsed.get("artifacts").and_then(|a| a.as_array()) {
+            for art in artifacts {
+                let name = art.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                let media_type = art
+                    .get("media_type")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                if !name.is_empty() {
+                    let size = provider
+                        .load_named_artifact(run_id, stage, name)
+                        .ok()
+                        .flatten()
+                        .map(|d| d.len() as u64);
+                    manifest.push(ArtifactManifestEntry {
+                        name: name.to_string(),
+                        stage: stage.clone(),
+                        media_type: media_type.to_string(),
+                        size_bytes: size,
+                        retrieval_path: format!(
+                            "/v1/runs/{}/stages/{}/artifacts/{}",
+                            run_id, stage, name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    (
+        ArtifactPublication {
+            status: if manifest.is_empty() {
+                ArtifactPublicationStatus::NotStarted
+            } else {
+                ArtifactPublicationStatus::Published
+            },
+            published_at: if manifest.is_empty() {
+                None
+            } else {
+                Some(now_rfc3339())
+            },
+            manifest,
+        },
+        None,
+    )
+}
+
+fn requires_structured_output(report: Option<&crate::runtime::RunReport>) -> bool {
+    match report {
+        Some(report) if report.kind == "workflow" => report.stages <= 1,
+        Some(report) if report.kind == "agent" || report.kind == "pipeline" => true,
+        _ => false,
+    }
+}
+
+fn build_stage_states(events: &[RunEvent]) -> HashMap<String, crate::persistence::StageState> {
+    let mut states: HashMap<String, crate::persistence::StageState> = HashMap::new();
+    for ev in events {
+        let Some(ref sn) = ev.stage_name else {
+            continue;
+        };
+        match ev.event_type.as_str() {
+            "stage.started" => {
+                states.insert(
+                    sn.clone(),
+                    crate::persistence::StageState {
+                        status: "running".to_string(),
+                        started_at: ev.timestamp.clone(),
+                        completed_at: None,
+                    },
+                );
+            }
+            "stage.completed" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "succeeded".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "succeeded".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            "stage.failed" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "failed".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "failed".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            "stage.skipped" => {
+                let entry = states
+                    .entry(sn.clone())
+                    .or_insert(crate::persistence::StageState {
+                        status: "skipped".to_string(),
+                        started_at: None,
+                        completed_at: ev.timestamp.clone(),
+                    });
+                entry.status = "skipped".to_string();
+                entry.completed_at = ev.timestamp.clone();
+            }
+            _ => {}
+        }
+    }
+    states
+}
+
+async fn push_inbox(run_id: &str, body: &str, state: AppState) -> (String, String) {
+    let snapshot: crate::sidecar::InboxSnapshot = match serde_json::from_str(body) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "400 Bad Request".into(),
+                ApiError::invalid_params(e.to_string()).to_json(),
+            )
+        }
+    };
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            h.load_inbox(snapshot).await;
+            ("200 OK".into(), r#"{"ok":true}"#.into())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
+    }
+}
+
+async fn drain_intents(run_id: &str, state: AppState) -> (String, String) {
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            let intents = h.drain_intents().await;
+            ("200 OK".into(), serde_json::to_string(&intents).unwrap())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
+    }
+}
+
+async fn push_message(run_id: &str, body: &str, state: AppState) -> (String, String) {
+    let entry: crate::sidecar::InboxEntry = match serde_json::from_str(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                "400 Bad Request".into(),
+                ApiError::invalid_params(e.to_string()).to_json(),
+            )
+        }
+    };
+    let handle = state.sidecar_handles.lock().await.get(run_id).cloned();
+    match handle {
+        Some(h) => {
+            h.push_message(entry).await;
+            ("200 OK".into(), r#"{"ok":true}"#.into())
+        }
+        None => (
+            "404 Not Found".into(),
+            ApiError::not_found("no sidecar for run").to_json(),
+        ),
     }
 }
 
@@ -264,9 +722,20 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         .unwrap_or_else(|| format!("run-{}", now_ms()));
     let environment_id = format!("env-{}", run_id);
 
+    // Load and prepare the spec once. The loaded spec (if successful) is passed
+    // into the background task — no double-loading, no leaked channels.
+    let loaded_spec = crate::spec::load_spec(PathBuf::from(&req.file).as_path());
     let mut planned_events = Vec::new();
-    match crate::spec::load_spec(PathBuf::from(&req.file).as_path()) {
-        Ok(spec) => planned_events = plan_events_from_spec(&run_id, &environment_id, &spec),
+    let mut messaging_enabled = false;
+    match &loaded_spec {
+        Ok(spec) => {
+            messaging_enabled = spec
+                .agent
+                .as_ref()
+                .and_then(|a| a.messaging.as_ref())
+                .is_some_and(|m| m.enabled);
+            planned_events = plan_events_from_spec(&run_id, &environment_id, spec);
+        }
         Err(e) => planned_events.push(event(
             &run_id,
             "warn",
@@ -345,6 +814,10 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             active_microvm_count: 0,
             policy: req.policy.clone(),
             terminal_event_id: None,
+            finished_at: None,
+            stage_states: None,
+            artifact_publication: None,
+            output_ready: false,
         };
 
         let _ = state.provider.save_run(&run);
@@ -370,6 +843,23 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
     {
         let mut bufs = state.telemetry_buffers.lock().await;
         bufs.insert(run_id.clone(), ring_buffer.clone());
+    }
+
+    // Start sidecar if messaging is enabled
+    if messaging_enabled {
+        let sidecar_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        match crate::sidecar::start_sidecar(&run_id, &run_id, &run_id, vec![], sidecar_addr).await {
+            Ok(handle) => {
+                state
+                    .sidecar_handles
+                    .lock()
+                    .await
+                    .insert(run_id.clone(), Arc::new(handle));
+            }
+            Err(e) => {
+                warn!(%run_id, %e, "failed to start sidecar");
+            }
+        }
     }
 
     // Spawn host metrics collection task (1s interval)
@@ -428,6 +918,105 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         }
     });
 
+    // Prepare the spec before spawning the background task: apply overrides,
+    // inject snapshot config, and add messaging skill if sidecar is active.
+    // This keeps the background task simple — it just calls run_spec.
+    let prepared_spec = match loaded_spec {
+        Ok(mut spec) => {
+            if req.snapshot.is_some() {
+                spec.sandbox.snapshot = req.snapshot.clone();
+            }
+            crate::runtime::apply_llm_overrides_from_env(&mut spec);
+
+            if messaging_enabled {
+                let sidecar_port = state
+                    .sidecar_handles
+                    .lock()
+                    .await
+                    .get(&run_id)
+                    .map(|h| h.addr().port());
+                if let Some(port) = sidecar_port {
+                    // Inject sidecar URL as env var for void-message CLI
+                    spec.sandbox.env.insert(
+                        "VOID_SIDECAR_URL".to_string(),
+                        format!("http://10.0.2.2:{}", port),
+                    );
+                    // Inject messaging skill (documents the CLI, not raw HTTP)
+                    if let Some(ref mut agent) = spec.agent {
+                        agent.skills.push(crate::spec::SkillEntry::Inline {
+                            name: "void-messaging".into(),
+                            content: crate::sidecar::messaging_skill_content(),
+                        });
+                    }
+                    // Register void-mcp for Claude-backed runs. Prefer explicit bridge
+                    // selection, then llm.provider/runtime defaults, then legacy agent skill markers.
+                    let wants_claude_bridge = spec
+                        .agent
+                        .as_ref()
+                        .and_then(|a| a.messaging.as_ref())
+                        .and_then(|m| m.provider_bridge.as_deref())
+                        .is_some_and(|bridge| {
+                            matches!(bridge, "claude" | "claude-code" | "void-mcp")
+                        });
+                    let uses_claude_provider = spec
+                        .llm
+                        .as_ref()
+                        .is_none_or(|llm| llm.provider.eq_ignore_ascii_case("claude"));
+                    let has_claude_agent_skill = spec.agent.as_ref().is_some_and(|a| {
+                        a.skills.iter().any(|s| {
+                            matches!(s, crate::spec::SkillEntry::Simple(raw) if raw == "agent:claude-code" || raw == "agent:claude")
+                        })
+                    });
+                    let is_claude =
+                        wants_claude_bridge || uses_claude_provider || has_claude_agent_skill;
+                    if is_claude {
+                        if let Some(ref mut agent) = spec.agent {
+                            let mut mcp_env = std::collections::HashMap::new();
+                            mcp_env.insert(
+                                "VOID_SIDECAR_URL".to_string(),
+                                format!("http://10.0.2.2:{}", port),
+                            );
+                            agent.skills.push(crate::spec::SkillEntry::Mcp {
+                                command: "void-mcp".to_string(),
+                                args: vec![],
+                                env: mcp_env,
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(spec)
+        }
+        Err(e) => Err(e),
+    };
+
+    // Detect service mode and branch to the service lifecycle path.
+    let is_service = prepared_spec
+        .as_ref()
+        .ok()
+        .and_then(|s| s.agent.as_ref())
+        .is_some_and(|a| a.mode == AgentMode::Service);
+
+    if is_service {
+        let state_bg = state.clone();
+        let run_id_bg = run_id.clone();
+        let telemetry_rb = ring_buffer.clone();
+        tokio::spawn(async move {
+            spawn_service_run(state_bg, run_id_bg, prepared_spec, req.input, telemetry_rb).await;
+        });
+
+        return (
+            "200 OK".to_string(),
+            serde_json::to_string(&CreateRunResponse {
+                run_id,
+                attempt_id: 1,
+                state: RunStatus::Running,
+            })
+            .unwrap_or_else(|_| "{}".into()),
+        );
+    }
+
     let state_bg = state.clone();
     let run_id_bg = run_id.clone();
     let policy_bg = req.policy.clone();
@@ -460,37 +1049,27 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
             }
         });
 
-        let path = PathBuf::from(&req.file);
-        // If the request specifies a snapshot, override the spec before running.
-        let result = if req.snapshot.is_some() {
-            match crate::spec::load_spec(&path) {
-                Ok(mut spec) => {
-                    spec.sandbox.snapshot = req.snapshot;
-                    crate::runtime::apply_llm_overrides_from_env(&mut spec);
-                    crate::runtime::run_spec(
-                        &spec,
-                        req.input,
-                        policy_bg,
-                        Some(stage_tx),
-                        Some(telemetry_rb),
-                        Some(provider_bg.clone()),
-                        Some(&run_id_bg),
-                    )
-                    .await
-                }
-                Err(e) => Err(e),
+        // run_spec always consumes stage_tx (even on failure), so the
+        // collector task will exit cleanly when the channel closes.
+        let result = match prepared_spec {
+            Ok(spec) => {
+                crate::runtime::run_spec(
+                    &spec,
+                    req.input,
+                    policy_bg,
+                    Some(stage_tx),
+                    Some(telemetry_rb),
+                    Some(provider_bg),
+                    Some(&run_id_bg),
+                )
+                .await
             }
-        } else {
-            run_file(
-                &path,
-                req.input,
-                policy_bg,
-                Some(stage_tx),
-                Some(telemetry_rb),
-                Some(provider_bg),
-                Some(&run_id_bg),
-            )
-            .await
+            Err(e) => {
+                // Spec failed to load — run_spec is not called, so we must
+                // drop stage_tx explicitly to close the channel.
+                drop(stage_tx);
+                Err(e)
+            }
         };
 
         // Wait for collector to drain remaining events
@@ -576,8 +1155,59 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     r.events.push(failed_event);
                 }
             }
-            r.updated_at = Some(now_rfc3339());
+            let now_ts = now_rfc3339();
+            r.finished_at = Some(now_ts.clone());
+            r.stage_states = Some(build_stage_states(&r.events));
+            let (publication, pub_failure) = build_artifact_publication(
+                &run_id_bg,
+                &state_bg.provider,
+                &r.events,
+                r.report.as_ref(),
+            );
+            r.artifact_publication = Some(publication);
+
+            // Publication failure flips a successful run to failed
+            if let Some(reason) = pub_failure {
+                if r.status == RunStatus::Succeeded {
+                    let (error_msg, event_msg) = match reason {
+                        PublicationFailureReason::StructuredOutputMissing(ref msg) => (
+                            msg.clone(),
+                            format!("run failed: structured output missing: {msg}"),
+                        ),
+                        PublicationFailureReason::StructuredOutputMalformed(ref msg) => (
+                            msg.clone(),
+                            format!("run failed: structured output malformed: {msg}"),
+                        ),
+                    };
+                    let failed_event = event_with_seq(
+                        &run_id_bg,
+                        "error",
+                        "run.failed",
+                        event_msg,
+                        r.events.len() as u64,
+                        attempt,
+                    );
+                    r.terminal_event_id = failed_event.event_id.clone();
+                    r.status = RunStatus::Failed;
+                    r.error = Some(error_msg);
+                    r.events.push(failed_event);
+                }
+            }
+
+            r.updated_at = Some(now_ts);
             let _ = state_bg.provider.save_run(r);
+        }
+        // Drop the runs lock before acquiring sidecar_handles lock
+        drop(runs);
+
+        // Clean up sidecar if one was started for this run.
+        // Extract the handle and drop the lock before awaiting stop().
+        let handle = state_bg.sidecar_handles.lock().await.remove(&run_id_bg);
+        if let Some(h) = handle {
+            match Arc::try_unwrap(h) {
+                Ok(owned) => owned.stop().await,
+                Err(arc) => arc.signal_shutdown(),
+            }
         }
     });
 
@@ -590,6 +1220,282 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         })
         .unwrap_or_else(|_| "{}".into()),
     )
+}
+
+/// Background task for service-mode runs.
+///
+/// Unlike the task-mode path, this lifecycle does NOT terminalize when output is
+/// published.  Instead it sets `output_ready = true`, persists the report, and
+/// continues waiting until the service process exits or is cancelled.
+async fn spawn_service_run(
+    state: AppState,
+    run_id: String,
+    prepared_spec: Result<RunSpec, crate::error::Error>,
+    input: Option<String>,
+    telemetry_rb: std::sync::Arc<std::sync::Mutex<crate::observe::telemetry::TelemetryRingBuffer>>,
+) {
+    let attempt: u64 = {
+        let runs = state.runs.lock().await;
+        runs.get(&run_id).map(|r| r.attempt_id).unwrap_or(1)
+    };
+
+    let spec = match prepared_spec {
+        Ok(s) => s,
+        Err(e) => {
+            terminalize_run_simple(
+                &state,
+                &run_id,
+                RunStatus::Failed,
+                Some(e.to_string()),
+                attempt,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let handle = match crate::runtime::run_spec_service(&spec, input, Some(telemetry_rb)).await {
+        Ok(h) => h,
+        Err(e) => {
+            terminalize_run_simple(
+                &state,
+                &run_id,
+                RunStatus::Failed,
+                Some(e.to_string()),
+                attempt,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Destructure the handle.
+    let crate::agent_box::ServiceStageHandle {
+        output_rx,
+        stop_tx: _stop_tx,
+        exit_rx,
+    } = handle;
+
+    debug!(%run_id, "service run handle created, awaiting signals");
+
+    // Watchdog: if neither output nor exit arrives in 120s, terminalize Failed.
+    let watchdog = tokio::time::sleep(std::time::Duration::from_secs(120));
+    tokio::pin!(watchdog);
+    tokio::pin!(output_rx);
+    tokio::pin!(exit_rx);
+
+    let mut published = false;
+    let mut terminalized = false;
+
+    // Phase 1: Wait for output publication OR exit OR watchdog.
+    tokio::select! {
+        output_result = &mut output_rx => {
+            if let Ok(publication) = output_result {
+                published = true;
+                debug!(%run_id, "service run got output publication");
+
+                // Drain sidecar intents (best-effort)
+                let _intents = {
+                    let h = state.sidecar_handles.lock().await.get(&run_id).cloned();
+                    if let Some(h) = h {
+                        h.drain_intents().await
+                    } else {
+                        vec![]
+                    }
+                };
+
+                // Persist output bytes as stage artifact so
+                // /v1/runs/{id}/stages/{name}/output-file returns the data.
+                let stage_name = &publication.box_name;
+                if let Err(e) = state.provider.save_stage_artifact(
+                    &run_id,
+                    stage_name,
+                    &publication.output,
+                ) {
+                    warn!(%run_id, %e, "service run failed to save stage artifact");
+                }
+
+                // Build artifact publication manifest
+                let (pub_entry, _) = build_artifact_publication(
+                    &run_id,
+                    &state.provider,
+                    &[], // no events needed for manifest
+                    Some(&publication.report),
+                );
+
+                // Persist report and set output_ready (one-shot)
+                {
+                    let mut runs = state.runs.lock().await;
+                    if let Some(r) = runs.get_mut(&run_id) {
+                        r.report = Some(publication.report);
+                        r.artifact_publication = Some(pub_entry);
+                        r.output_ready = true;
+                        let seq = r.events.len() as u64;
+                        r.events.push(event_with_seq(
+                            &run_id,
+                            "info",
+                            "run.output_ready",
+                            "service output published".to_string(),
+                            seq,
+                            attempt,
+                        ));
+                        r.updated_at = Some(now_rfc3339());
+                        let _ = state.provider.save_run(r);
+                    }
+                }
+            } else {
+                debug!(%run_id, "service run output channel closed without publication");
+                // Channel closed — agent exited without publishing.
+                // Fall through to phase 2 which will get exit_rx.
+            }
+        }
+
+        exit_result = &mut exit_rx => {
+            // exit_rx is authoritative — terminalize immediately.
+            debug!(%run_id, "service run got exit before publication");
+            terminalized = true;
+            match exit_result {
+                Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
+                Err(_) => terminalize_service(
+                    &state, &run_id,
+                    ServiceExit::Crashed("exit channel dropped".into()),
+                    attempt,
+                ).await,
+            }
+        }
+
+        _ = &mut watchdog => {
+            warn!(%run_id, "service run watchdog fired, no progress after 120s");
+            terminalized = true;
+            terminalize_run_simple(&state, &run_id, RunStatus::Failed,
+                Some("service run made no progress within 120s".into()), attempt).await;
+        }
+    }
+
+    if !terminalized {
+        debug!(%run_id, published, "service run awaiting terminal exit");
+
+        let cancel_poll = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let runs = state.runs.lock().await;
+                let is_cancelled = runs
+                    .get(&run_id)
+                    .is_some_and(|r| r.status == RunStatus::Cancelled);
+                if is_cancelled {
+                    return;
+                }
+            }
+        };
+
+        let watchdog2 = tokio::time::sleep(std::time::Duration::from_secs(120));
+        tokio::pin!(watchdog2);
+        tokio::pin!(cancel_poll);
+
+        tokio::select! {
+            exit_result = &mut exit_rx => {
+                debug!(%run_id, "service run got exit signal");
+                match exit_result {
+                    Ok(exit) => terminalize_service(&state, &run_id, exit, attempt).await,
+                    Err(_) => terminalize_service(
+                        &state, &run_id,
+                        ServiceExit::Crashed("exit channel dropped in phase 2".into()),
+                        attempt,
+                    ).await,
+                }
+            }
+            _ = &mut cancel_poll => {
+                debug!(%run_id, "service run cancel detected, terminalizing");
+            }
+            _ = &mut watchdog2 => {
+                warn!(%run_id, "service run watchdog2 fired");
+                terminalize_run_simple(&state, &run_id, RunStatus::Failed,
+                    Some("service run published output but never terminated".into()), attempt).await;
+            }
+        }
+    }
+
+    // Clean up sidecar
+    let sidecar = state.sidecar_handles.lock().await.remove(&run_id);
+    if let Some(h) = sidecar {
+        match Arc::try_unwrap(h) {
+            Ok(owned) => owned.stop().await,
+            Err(arc) => arc.signal_shutdown(),
+        }
+    }
+}
+
+/// Terminalize a service run based on its exit disposition.
+async fn terminalize_service(state: &AppState, run_id: &str, exit: ServiceExit, attempt: u64) {
+    let mut runs = state.runs.lock().await;
+    if let Some(r) = runs.get_mut(run_id) {
+        // Terminal guard: don't overwrite if already terminal (e.g. cancelled)
+        if r.status.is_terminal() {
+            return;
+        }
+
+        let (status, reason) = match &exit {
+            ServiceExit::Exited { success: true, .. } => {
+                (RunStatus::Succeeded, "service exited cleanly")
+            }
+            ServiceExit::Exited {
+                success: false,
+                ref error,
+            } => {
+                r.error = error.clone();
+                (RunStatus::Failed, "service exited with error")
+            }
+            ServiceExit::Canceled => (RunStatus::Cancelled, "service canceled"),
+            ServiceExit::Crashed(ref msg) => {
+                r.error = Some(msg.clone());
+                (RunStatus::Failed, "service crashed")
+            }
+        };
+
+        let seq = r.events.len() as u64;
+        let ev = event_with_seq(
+            run_id,
+            "info",
+            "run.finished",
+            reason.to_string(),
+            seq,
+            attempt,
+        );
+        r.terminal_event_id = ev.event_id.clone();
+        r.status = status;
+        r.terminal_reason = Some(reason.to_string());
+        r.finished_at = Some(now_rfc3339());
+        r.updated_at = Some(now_rfc3339());
+        r.events.push(ev);
+        let _ = state.provider.save_run(r);
+    }
+}
+
+/// Simple terminalize helper for early failures (spec parse, service start).
+async fn terminalize_run_simple(
+    state: &AppState,
+    run_id: &str,
+    status: RunStatus,
+    error: Option<String>,
+    attempt: u64,
+) {
+    let mut runs = state.runs.lock().await;
+    if let Some(r) = runs.get_mut(run_id) {
+        if r.status.is_terminal() {
+            return;
+        }
+        let seq = r.events.len() as u64;
+        let msg = error.clone().unwrap_or_else(|| "run failed".to_string());
+        let ev = event_with_seq(run_id, "error", "run.failed", msg, seq, attempt);
+        r.terminal_event_id = ev.event_id.clone();
+        r.status = status;
+        r.error = error;
+        r.terminal_reason = Some("service failed to start".to_string());
+        r.finished_at = Some(now_rfc3339());
+        r.updated_at = Some(now_rfc3339());
+        r.events.push(ev);
+        let _ = state.provider.save_run(r);
+    }
 }
 
 fn is_api_v2(query: Option<&str>) -> bool {
@@ -611,27 +1517,55 @@ fn apply_v2_event_names(events: &[RunEvent]) -> Vec<RunEvent> {
 }
 
 async fn get_run(id: &str, query: Option<&str>, state: AppState) -> (String, String) {
-    let runs = state.runs.lock().await;
-    if let Some(r) = runs.get(id) {
-        if is_api_v2(query) {
-            let mut run = r.clone();
-            run.events = apply_v2_event_names(&run.events);
-            (
-                "200 OK".to_string(),
-                serde_json::to_string(&run).unwrap_or_else(|_| "{}".into()),
-            )
+    // Serialize the run while holding the runs lock, then drop it before
+    // acquiring the sidecar_handles lock to avoid lock-order issues.
+    let run_json: Option<serde_json::Value> = {
+        let runs = state.runs.lock().await;
+        if let Some(r) = runs.get(id) {
+            let value = if is_api_v2(query) {
+                let mut run = r.clone();
+                run.events = apply_v2_event_names(&run.events);
+                serde_json::to_value(&run).unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            };
+            Some(value)
         } else {
-            (
-                "200 OK".to_string(),
-                serde_json::to_string(r).unwrap_or_else(|_| "{}".into()),
-            )
+            None
         }
-    } else {
-        (
+    };
+
+    let Some(mut run_value) = run_json else {
+        return (
             "404 Not Found".to_string(),
             ApiError::not_found(format!("run '{id}' not found")).to_json(),
-        )
+        );
+    };
+
+    // Append sidecar health if a handle exists for this run.
+    // Clone the handle and drop the lock before awaiting state_snapshot().
+    let sidecar_handle = state.sidecar_handles.lock().await.get(id).cloned();
+    let sidecar_info: Option<serde_json::Value> = if let Some(handle) = sidecar_handle {
+        let (buffer_depth, inbox_version) = handle.state_snapshot().await;
+        Some(json!({
+            "status": "ok",
+            "buffer_depth": buffer_depth,
+            "inbox_version": inbox_version
+        }))
+    } else {
+        None
+    };
+
+    if let Some(sidecar) = sidecar_info {
+        if let serde_json::Value::Object(ref mut map) = run_value {
+            map.insert("sidecar".to_string(), sidecar);
+        }
     }
+
+    (
+        "200 OK".to_string(),
+        serde_json::to_string(&run_value).unwrap_or_else(|_| "{}".into()),
+    )
 }
 
 async fn get_events(id: &str, query: Option<&str>, state: AppState) -> (String, String) {
@@ -784,14 +1718,33 @@ async fn cancel_run(id: &str, body: &str, state: AppState) -> (String, String) {
         let terminal_event_id = cancel_event.event_id.clone();
         r.terminal_event_id = terminal_event_id.clone();
         r.events.push(cancel_event);
-        r.updated_at = Some(now_rfc3339());
+        let now_ts = now_rfc3339();
+        r.finished_at = Some(now_ts.clone());
+        r.stage_states = Some(build_stage_states(&r.events));
+        let (publication, _) =
+            build_artifact_publication(id, &state.provider, &r.events, r.report.as_ref());
+        r.artifact_publication = Some(publication);
+        r.updated_at = Some(now_ts);
         let _ = state.provider.save_run(r);
+        let response_status = r.status.clone();
+        // Drop the runs lock before acquiring sidecar_handles lock
+        drop(runs);
+
+        // Clean up sidecar if one was started for this run.
+        // Extract the handle and drop the lock before awaiting stop().
+        let handle = state.sidecar_handles.lock().await.remove(id);
+        if let Some(h) = handle {
+            match Arc::try_unwrap(h) {
+                Ok(owned) => owned.stop().await,
+                Err(arc) => arc.signal_shutdown(),
+            }
+        }
 
         (
             "200 OK".to_string(),
             serde_json::to_string(&CancelRunResponse {
                 run_id: id.to_string(),
-                state: r.status.clone(),
+                state: response_status,
                 terminal_event_id,
             })
             .unwrap_or_else(|_| "{}".into()),
@@ -1284,17 +2237,100 @@ fn skill_entry_info(entry: &crate::spec::SkillEntry) -> Option<(String, String, 
             image.clone(),
             format!("oci:{}:{}", image, mount),
         )),
+        crate::spec::SkillEntry::Mcp { command, .. } => Some((
+            "mcp".to_string(),
+            command.clone(),
+            format!("mcp:{}", command),
+        )),
+        crate::spec::SkillEntry::Inline { name, .. } => Some((
+            "inline".to_string(),
+            name.clone(),
+            format!("inline:{}", name),
+        )),
+    }
+}
+
+async fn get_named_artifact(
+    run_id: &str,
+    stage_name: &str,
+    artifact_name: &str,
+    state: AppState,
+) -> (String, String, Vec<u8>) {
+    // Check run exists
+    {
+        let runs = state.runs.lock().await;
+        if !runs.contains_key(run_id) {
+            return as_json((
+                "404 Not Found".to_string(),
+                ApiError::not_found(format!("run '{run_id}' not found")).to_json(),
+            ));
+        }
+
+        // Check if artifact publication is still in progress
+        if let Some(r) = runs.get(run_id) {
+            if let Some(ref pub_state) = r.artifact_publication {
+                if pub_state.status == crate::persistence::ArtifactPublicationStatus::Publishing {
+                    return as_json((
+                        "409 Conflict".to_string(),
+                        ApiError::artifact_publication_incomplete(format!(
+                            "artifact publication in progress for run '{run_id}'"
+                        ))
+                        .to_json(),
+                    ));
+                }
+            }
+        }
+    }
+
+    match state
+        .provider
+        .load_named_artifact(run_id, stage_name, artifact_name)
+    {
+        Ok(Some(data)) => {
+            let content_type = if serde_json::from_slice::<serde_json::Value>(&data).is_ok() {
+                "application/json"
+            } else if std::str::from_utf8(&data).is_ok() {
+                "text/plain"
+            } else {
+                "application/octet-stream"
+            };
+            ("200 OK".to_string(), content_type.to_string(), data)
+        }
+        Ok(None) => as_json((
+            "404 Not Found".to_string(),
+            ApiError::artifact_not_found(format!(
+                "artifact '{artifact_name}' not found for run '{run_id}' stage '{stage_name}'"
+            ))
+            .to_json(),
+        )),
+        Err(e) => as_json((
+            "500 Internal Server Error".to_string(),
+            ApiError::internal(format!("failed to load artifact: {e}")).to_json(),
+        )),
     }
 }
 
 async fn get_stage_output_file(
     run_id: &str,
     stage_name: &str,
+    _query: Option<&str>,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
     let data = match state.provider.load_stage_artifact(run_id, stage_name) {
         Ok(Some(data)) => data,
         Ok(None) => {
+            // Check if the run exists to differentiate error codes
+            let runs = state.runs.lock().await;
+            if runs.contains_key(run_id) {
+                return as_json((
+                    "404 Not Found".to_string(),
+                    ApiError::structured_output_missing(format!(
+                        "stage '{}' completed without result.json for run '{}'",
+                        stage_name, run_id
+                    ))
+                    .to_json(),
+                ));
+            }
             return as_json((
                 "404 Not Found".to_string(),
                 ApiError::not_found(format!(
@@ -1312,15 +2348,30 @@ async fn get_stage_output_file(
         }
     };
 
-    let content_type = if serde_json::from_slice::<serde_json::Value>(&data).is_ok() {
-        "application/json"
-    } else if std::str::from_utf8(&data).is_ok() {
-        "text/plain"
-    } else {
-        "application/octet-stream"
-    };
-
-    ("200 OK".to_string(), content_type.to_string(), data)
+    // Validate structured output: must be valid JSON with a "status" field
+    match serde_json::from_slice::<serde_json::Value>(&data) {
+        Ok(val) => {
+            if val.get("status").is_none() {
+                return as_json((
+                    "422 Unprocessable Entity".to_string(),
+                    ApiError::structured_output_malformed(format!(
+                        "result.json for run '{}' stage '{}' is missing required 'status' field",
+                        run_id, stage_name
+                    ))
+                    .to_json(),
+                ));
+            }
+            ("200 OK".to_string(), "application/json".to_string(), data)
+        }
+        Err(_) => as_json((
+            "422 Unprocessable Entity".to_string(),
+            ApiError::structured_output_malformed(format!(
+                "result.json for run '{}' stage '{}' is not valid JSON",
+                run_id, stage_name
+            ))
+            .to_json(),
+        )),
+    }
 }
 
 fn kind_name(kind: &RunKind) -> &'static str {
@@ -1328,5 +2379,126 @@ fn kind_name(kind: &RunKind) -> &'static str {
         RunKind::Agent => "agent",
         RunKind::Pipeline => "pipeline",
         RunKind::Workflow => "workflow",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::spec::{
+        AgentMode, AgentSpec, LlmSpec, MessagingSpec, RunKind, RunSpec, SandboxSpec, SkillEntry,
+    };
+
+    fn base_spec() -> RunSpec {
+        RunSpec {
+            api_version: "v1".into(),
+            kind: RunKind::Agent,
+            name: "test".into(),
+            sandbox: SandboxSpec {
+                mode: "auto".into(),
+                kernel: None,
+                initramfs: None,
+                memory_mb: 256,
+                vcpus: 1,
+                network: true,
+                env: Default::default(),
+                mounts: vec![],
+                image: None,
+                guest_image: None,
+                snapshot: None,
+            },
+            llm: Some(LlmSpec {
+                provider: "claude".into(),
+                model: None,
+                base_url: None,
+                api_key_env: None,
+            }),
+            observe: None,
+            agent: Some(AgentSpec {
+                prompt: "hi".into(),
+                skills: vec![],
+                timeout_secs: None,
+                output_file: None,
+                messaging: Some(MessagingSpec {
+                    enabled: true,
+                    provider_bridge: None,
+                }),
+                mode: AgentMode::default(),
+            }),
+            pipeline: None,
+            workflow: None,
+        }
+    }
+
+    fn should_register_void_mcp(spec: &RunSpec) -> bool {
+        let wants_claude_bridge = spec
+            .agent
+            .as_ref()
+            .and_then(|a| a.messaging.as_ref())
+            .and_then(|m| m.provider_bridge.as_deref())
+            .is_some_and(|bridge| matches!(bridge, "claude" | "claude-code" | "void-mcp"));
+        let uses_claude_provider = spec
+            .llm
+            .as_ref()
+            .is_none_or(|llm| llm.provider.eq_ignore_ascii_case("claude"));
+        let has_claude_agent_skill = spec.agent.as_ref().is_some_and(|a| {
+            a.skills.iter().any(|s| {
+                matches!(s, SkillEntry::Simple(raw) if raw == "agent:claude-code" || raw == "agent:claude")
+            })
+        });
+        wants_claude_bridge || uses_claude_provider || has_claude_agent_skill
+    }
+
+    #[test]
+    fn registers_void_mcp_for_claude_provider_without_agent_skill_marker() {
+        let spec = base_spec();
+        assert!(should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn registers_void_mcp_for_explicit_provider_bridge() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        spec.agent
+            .as_mut()
+            .unwrap()
+            .messaging
+            .as_mut()
+            .unwrap()
+            .provider_bridge = Some("void-mcp".into());
+        assert!(should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn does_not_register_void_mcp_for_non_claude_provider_without_bridge_or_skill() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        assert!(!should_register_void_mcp(&spec));
+    }
+
+    #[test]
+    fn registers_void_mcp_for_legacy_agent_skill_marker() {
+        let mut spec = base_spec();
+        spec.llm = Some(LlmSpec {
+            provider: "ollama".into(),
+            model: Some("qwen3-coder".into()),
+            base_url: None,
+            api_key_env: None,
+        });
+        spec.agent
+            .as_mut()
+            .unwrap()
+            .skills
+            .push(SkillEntry::Simple("agent:claude-code".into()));
+        assert!(should_register_void_mcp(&spec));
     }
 }

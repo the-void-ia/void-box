@@ -33,7 +33,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 
 # HTTP client (for fetching remote skills from skills.sh)
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 
 # Security (cross-platform)
 getrandom = "0.3"
@@ -136,6 +136,14 @@ name = "e2e_mount"
 path = "tests/e2e/mount.rs"
 
 [[test]]
+name = "e2e_sidecar"
+path = "tests/e2e/sidecar.rs"
+
+[[test]]
+name = "e2e_claude_mcp"
+path = "tests/e2e/claude_mcp.rs"
+
+[[test]]
 name = "orchestration_contract"
 path = "tests/orchestration_contract.rs"
 
@@ -144,11 +152,15 @@ name = "conformance"
 path = "tests/conformance.rs"
 
 [[test]]
+name = "e2e_service_mode"
+path = "tests/e2e/service_mode.rs"
+
+[[test]]
 name = "oci_integration"
 path = "tests/oci_integration.rs"
 
 [workspace]
-members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci"]
+members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]
 
 # guest-agent builds as a tiny static init binary for the guest initramfs.
 # Use `cargo build -p guest-agent --release` with these workspace-level settings.
@@ -158,4 +170,10 @@ members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci"]
 opt-level = "z"
 
 [profile.release.package.claudio]
+opt-level = "z"
+
+[profile.release.package.void-message]
+opt-level = "z"
+
+[profile.release.package.void-mcp]
 opt-level = "z"

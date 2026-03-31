@@ -421,6 +421,18 @@ fn cmd_skills(format: OutputFormat, file: &Path) -> Result<(), Box<dyn std::erro
                 source: source.into(),
                 value: format!("oci:{image} → {mount} (ro={readonly})"),
             },
+            SkillEntry::Mcp {
+                command,
+                args,
+                env: _,
+            } => SkillRow {
+                source: source.into(),
+                value: format!("mcp:{command} {}", args.join(" ")),
+            },
+            SkillEntry::Inline { name, .. } => SkillRow {
+                source: source.into(),
+                value: format!("inline:{name}"),
+            },
         }
     }
 

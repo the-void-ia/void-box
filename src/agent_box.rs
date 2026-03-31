@@ -45,9 +45,51 @@ use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
+use crate::spec::AgentMode;
 use crate::Result;
 
-const CLAUDE_HOME: &str = "/home/sandbox/.claude";
+/// Project-scoped config directory. Claude Code reads skills, settings, and
+/// MCP config relative to the working directory (set to /workspace).
+const CLAUDE_HOME: &str = "/workspace/.claude";
+
+/// MCP config file path. Claude Code reads project-scoped MCP servers from
+/// .mcp.json at the project root.
+const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
+
+/// Published output from a service agent.
+/// Contains only what agent_box knows: guest execution output.
+/// Artifact publication is built later by the daemon/persistence layer.
+pub struct ServicePublication {
+    pub box_name: String,
+    pub output: Vec<u8>,
+    pub report: crate::runtime::RunReport,
+}
+
+/// Terminal lifecycle result for a service agent. No candidate output.
+pub enum ServiceExit {
+    Exited {
+        success: bool,
+        error: Option<String>,
+    },
+    Canceled,
+    Crashed(String),
+}
+
+/// Handle for a running service agent.
+pub struct ServiceStageHandle {
+    /// Fires exactly once when structured output is ready.
+    pub output_rx: tokio::sync::oneshot::Receiver<ServicePublication>,
+    /// Send to stop the service.
+    pub stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// Fires when the service process exits.
+    pub exit_rx: tokio::sync::oneshot::Receiver<ServiceExit>,
+}
+
+/// Result of running an agent — either a terminal task result or a service handle.
+pub enum AgentRunOutcome {
+    Task(crate::pipeline::StageResult),
+    Service(ServiceStageHandle),
+}
 
 /// An agent Box: Agent(Skills) + Isolation.
 ///
@@ -93,6 +135,8 @@ struct BoxConfig {
     /// Per-stage timeout in seconds (overrides the default vsock read timeout).
     /// `None` means use the system default (1200s / 20 minutes).
     timeout_secs: Option<u64>,
+    /// Agent mode: Task (run-to-completion) or Service (long-running).
+    mode: AgentMode,
 }
 
 impl Default for BoxConfig {
@@ -113,6 +157,7 @@ impl Default for BoxConfig {
             mock: false,
             llm: LlmProvider::default(),
             timeout_secs: None,
+            mode: AgentMode::default(),
         }
     }
 }
@@ -222,6 +267,12 @@ impl VoidBox {
     /// ```
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.config.timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the agent mode (Task or Service).
+    pub fn mode(mut self, mode: AgentMode) -> Self {
+        self.config.mode = mode;
         self
     }
 
@@ -370,6 +421,13 @@ impl VoidBox {
         Ok(())
     }
 
+    /// Write a skill file to the project-scoped .claude/skills/ directory.
+    async fn write_skill_file(sandbox: &Sandbox, name: &str, content: &[u8]) -> Result<()> {
+        let path = format!("{}/skills/{}.md", CLAUDE_HOME, name);
+        sandbox.write_file(&path, content).await?;
+        Ok(())
+    }
+
     /// Provision skills into the sandbox: write SKILL.md files and MCP config.
     async fn provision_skills(&self, sandbox: &Sandbox) -> Result<()> {
         let tag = &self.name;
@@ -388,32 +446,27 @@ impl VoidBox {
                             e
                         ))
                     })?;
-                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
-                    sandbox.write_file(&guest_path, &content).await?;
+                    Self::write_skill_file(sandbox, &skill.name, &content).await?;
                     eprintln!(
-                        "[vm:{}] Installing skill '{}' ({}) -> {}",
+                        "[vm:{}] Installing skill '{}' ({})",
                         tag,
                         skill.name,
                         skill
                             .description_text
                             .as_deref()
                             .unwrap_or("no description"),
-                        guest_path
                     );
                 }
                 SkillKind::Remote { id } => {
-                    let guest_path = format!("{}/skills/{}.md", CLAUDE_HOME, skill.name);
                     eprintln!(
                         "[vm:{}] Fetching remote skill '{}' from skills.sh/{}",
                         tag, skill.name, id
                     );
                     match skill.fetch_remote_content().await {
                         Ok(content) => {
-                            sandbox.write_file(&guest_path, content.as_bytes()).await?;
-                            eprintln!(
-                                "[vm:{}] Installed remote skill '{}' -> {}",
-                                tag, skill.name, guest_path
-                            );
+                            Self::write_skill_file(sandbox, &skill.name, content.as_bytes())
+                                .await?;
+                            eprintln!("[vm:{}] Installed remote skill '{}'", tag, skill.name);
                         }
                         Err(e) => {
                             eprintln!(
@@ -427,23 +480,59 @@ impl VoidBox {
                                  Install manually: `npx skills add {}`\n",
                                 skill.name, id, e, id
                             );
-                            sandbox.write_file(&guest_path, fallback.as_bytes()).await?;
+                            Self::write_skill_file(sandbox, &skill.name, fallback.as_bytes())
+                                .await?;
                         }
                     }
                 }
                 SkillKind::Mcp { command, args, env } => {
-                    // Add to MCP config
-                    let mut entry = serde_json::json!({
-                        "command": command,
-                        "args": args,
-                    });
-                    if !env.is_empty() {
-                        entry["env"] = serde_json::json!(env);
+                    // Start the MCP server as a background HTTP process inside the
+                    // guest, then point Claude Code at it via streamable-HTTP URL.
+                    // This avoids Claude Code (Bun) needing to spawn the server as
+                    // a child process, which fails in minimal VM environments.
+                    let mcp_port = 8222 + mcp_servers.len() as u16;
+                    let env_prefix: String =
+                        env.iter().map(|(k, v)| format!("{k}='{v}' ")).collect();
+                    let args_str: String = args.iter().map(|a| format!(" {a}")).collect();
+                    let start_cmd = format!(
+                        "{env_prefix}{command}{args_str} --sse --port {mcp_port} \
+                         >/dev/null 2>/dev/null &"
+                    );
+                    match sandbox.exec("sh", &["-c", &start_cmd]).await {
+                        Ok(output) if output.exit_code == 0 => {
+                            eprintln!(
+                                "[vm:{}] Started MCP server '{}' on port {} (HTTP/SSE)",
+                                tag, skill.name, mcp_port
+                            );
+                        }
+                        Ok(output) => {
+                            eprintln!(
+                                "[vm:{}] WARNING: MCP server '{}' start returned exit {}: {}",
+                                tag,
+                                skill.name,
+                                output.exit_code,
+                                output.stderr_str()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vm:{}] WARNING: Failed to start MCP server '{}': {}",
+                                tag, skill.name, e
+                            );
+                        }
                     }
+
+                    // Brief pause for the server to bind the port
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                    let entry = serde_json::json!({
+                        "type": "http",
+                        "url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+                    });
                     mcp_servers.insert(skill.name.clone(), entry);
                     eprintln!(
-                        "[vm:{}] Registering MCP server '{}' (cmd: {}, args: {:?})",
-                        tag, skill.name, command, args
+                        "[vm:{}] Registering MCP server '{}' (url: http://127.0.0.1:{}/mcp)",
+                        tag, skill.name, mcp_port
                     );
                 }
                 SkillKind::Cli { command } => {
@@ -486,6 +575,15 @@ impl VoidBox {
                         tag, skill.name, profile_path
                     );
                 }
+                SkillKind::Inline { content } => {
+                    Self::write_skill_file(sandbox, &skill.name, content.as_bytes()).await?;
+                    eprintln!(
+                        "[vm:{}] Installing inline skill '{}' ({} bytes)",
+                        tag,
+                        skill.name,
+                        content.len(),
+                    );
+                }
             }
         }
 
@@ -498,17 +596,41 @@ impl VoidBox {
                 crate::Error::Config(format!("Failed to serialize MCP config: {}", e))
             })?;
             sandbox
-                .write_file(&format!("{}/mcp.json", CLAUDE_HOME), config_str.as_bytes())
+                .write_file(MCP_CONFIG_PATH, config_str.as_bytes())
                 .await?;
             eprintln!(
-                "[vm:{}] Wrote MCP config ({} servers) to {}/mcp.json",
+                "[vm:{}] Wrote MCP config ({} servers) to {}",
                 tag,
                 mcp_servers.len(),
-                CLAUDE_HOME
+                MCP_CONFIG_PATH,
             );
         }
 
         Ok(())
+    }
+
+    fn build_full_prompt(&self, input: Option<&[u8]>) -> String {
+        let Some(data) = input else {
+            return format!(
+                "{}\n\nWrite your output to {}.",
+                self.prompt, self.config.output_file
+            );
+        };
+        let input_text = String::from_utf8_lossy(data);
+        let inline = if input_text.len() > 4000 {
+            format!(
+                "{}...\n(truncated; full data in /workspace/input.json)",
+                &input_text[..4000]
+            )
+        } else {
+            input_text.to_string()
+        };
+        format!(
+            "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
+             The above data is also available at /workspace/input.json.\n\
+             Write your output to {}.",
+            self.prompt, inline, self.config.output_file
+        )
     }
 
     /// Run this Box: provision skills, execute the agent, return the result.
@@ -567,34 +689,7 @@ impl VoidBox {
             );
         }
 
-        // Build the full prompt.
-        // We embed the previous stage's output directly in the prompt so models
-        // don't need to use file-reading tools (small local models often can't).
-        // The data is still written to /workspace/input.json for models that
-        // prefer tool-based file access.
-        let full_prompt = if let Some(data) = input {
-            let input_text = String::from_utf8_lossy(data);
-            // Truncate if very large to avoid blowing context window
-            let inline = if input_text.len() > 4000 {
-                format!(
-                    "{}...\n(truncated; full data in /workspace/input.json)",
-                    &input_text[..4000]
-                )
-            } else {
-                input_text.to_string()
-            };
-            format!(
-                "{}\n\n--- Previous stage output ---\n{}\n--- End previous stage output ---\n\n\
-                 The above data is also available at /workspace/input.json.\n\
-                 Write your output to {}.",
-                self.prompt, inline, self.config.output_file
-            )
-        } else {
-            format!(
-                "{}\n\nWrite your output to {}.",
-                self.prompt, self.config.output_file
-            )
-        };
+        let full_prompt = self.build_full_prompt(input);
 
         eprintln!(
             "[vm:{}] Executing agent | llm={} | prompt_len={} chars",
@@ -612,6 +707,15 @@ impl VoidBox {
             "--settings".to_string(),
             r#"{"skipWebFetchPreflight":true}"#.to_string(),
         ]);
+
+        // If MCP servers were provisioned, explicitly point claude-code to the config
+        let has_mcp = self
+            .skills
+            .iter()
+            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
+        if has_mcp {
+            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+        }
 
         let tag_clone = tag.to_string();
         let mut claude_result = sandbox
@@ -670,6 +774,320 @@ impl VoidBox {
             box_name: self.name.clone(),
             claude_result,
             file_output,
+        })
+    }
+
+    /// Run this Box as a long-running service.
+    ///
+    /// Provisions skills and launches the agent identically to [`run()`](Self::run),
+    /// but instead of awaiting completion returns a `ServiceStageHandle` that
+    /// lets the caller:
+    /// - receive the first output publication via `output_rx`
+    /// - stop the service via `stop_tx`
+    /// - observe the terminal exit reason via `exit_rx`
+    pub async fn run_service(
+        self,
+        input: Option<&[u8]>,
+        telemetry_buffer: Option<TelemetryBuffer>,
+    ) -> Result<ServiceStageHandle> {
+        let sandbox = self.sandbox.as_ref().ok_or_else(|| {
+            crate::Error::Config("VoidBox not built — call .build() first".into())
+        })?;
+
+        // ── Provisioning (identical to run()) ──────────────────────────
+
+        self.provision_security(sandbox).await?;
+
+        let tag = self.name.clone();
+        match sandbox.start_telemetry(telemetry_buffer).await {
+            Ok(agg) => {
+                agg.set_current_stage(&tag);
+                eprintln!("[vm:{}] Guest telemetry started", tag);
+            }
+            Err(e) => {
+                eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
+            }
+        }
+
+        self.provision_skills(sandbox).await?;
+
+        let settings = serde_json::json!({ "skipWebFetchPreflight": true });
+        sandbox
+            .write_file(
+                &format!("{}/settings.json", CLAUDE_HOME),
+                settings.to_string().as_bytes(),
+            )
+            .await?;
+
+        if let Some(data) = input {
+            sandbox.write_file("/workspace/input.json", data).await?;
+            eprintln!(
+                "[vm:{}] Writing input ({} bytes) to /workspace/input.json",
+                tag,
+                data.len()
+            );
+        }
+
+        let full_prompt = self.build_full_prompt(input);
+
+        eprintln!(
+            "[vm:{}] Launching service agent | llm={} | prompt_len={} chars",
+            tag,
+            self.config.llm.description(),
+            full_prompt.len()
+        );
+
+        // ── Build CLI args ─────────────────────────────────────────────
+
+        let mut extra_args = self.config.llm.cli_args();
+        extra_args.extend([
+            "--settings".to_string(),
+            r#"{"skipWebFetchPreflight":true}"#.to_string(),
+        ]);
+
+        let has_mcp = self
+            .skills
+            .iter()
+            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
+        if has_mcp {
+            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+        }
+
+        let is_local_llm = self.config.llm.is_local();
+        let output_file = self.config.output_file.clone();
+        let box_name = self.name.clone();
+
+        // ── Channels ───────────────────────────────────────────────────
+
+        let (output_tx, output_rx) = tokio::sync::oneshot::channel::<ServicePublication>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<ServiceExit>();
+
+        // Shared state so both tasks can coordinate without blocking each other.
+        let output_tx = Arc::new(tokio::sync::Mutex::new(Some(output_tx)));
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // ── Clone sandbox for spawned tasks ────────────────────────────
+
+        let sandbox_agent = Arc::clone(sandbox);
+        let sandbox_monitor = Arc::clone(sandbox);
+
+        // ── Spawn agent process task ───────────────────────────────────
+
+        let tag_agent = tag.clone();
+        let box_name_agent = box_name.clone();
+        let output_file_agent = output_file.clone();
+        let output_tx_agent = Arc::clone(&output_tx);
+        let exited_agent = Arc::clone(&exited);
+        tokio::spawn(async move {
+            let tag = tag_agent;
+
+            // timeout_secs = Some(0) means infinite timeout for service mode.
+            let result = sandbox_agent.exec_claude_streaming(
+                &full_prompt,
+                ClaudeExecOpts {
+                    dangerously_skip_permissions: true,
+                    extra_args,
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+                |event| match event {
+                    crate::observe::claude::ClaudeStreamEvent::ToolUse(ref tc) => {
+                        let summary = tc.tool_summary();
+                        if summary.is_empty() {
+                            eprintln!("[vm:{}]   tool: {}", tag, tc.tool_name);
+                        } else {
+                            eprintln!("[vm:{}]   tool: {}  {}", tag, tc.tool_name, summary);
+                        }
+                    }
+                },
+            );
+
+            // Race: agent finishes naturally vs. stop signal.
+            tokio::select! {
+                agent_result = result => {
+                    match agent_result {
+                        Ok(mut res) => {
+                            if is_local_llm {
+                                res.total_cost_usd = 0.0;
+                            }
+                            eprintln!(
+                                "[vm:{}] Service agent exited | tokens={}in/{}out | cost=${:.4} | error={}",
+                                box_name_agent,
+                                res.input_tokens,
+                                res.output_tokens,
+                                res.total_cost_usd,
+                                res.is_error,
+                            );
+
+                            // Best-effort exit-time publication. Hard timeout so
+                            // a dying sandbox cannot block exit_tx forever.
+                            if !res.is_error {
+                                let read_result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    sandbox_agent.read_file(&output_file_agent),
+                                ).await;
+
+                                if let Ok(Ok(data)) = read_result {
+                                    if !data.is_empty() {
+                                        eprintln!(
+                                            "[vm:{}] Service agent: publishing output at exit ({} bytes)",
+                                            box_name_agent, data.len()
+                                        );
+                                        if let Some(tx) = output_tx_agent.lock().await.take() {
+                                            let _ = tx.send(ServicePublication {
+                                                box_name: box_name_agent.clone(),
+                                                output: data,
+                                                report: crate::runtime::RunReport {
+                                                    name: box_name_agent.clone(),
+                                                    kind: "service".to_string(),
+                                                    success: true,
+                                                    output: output_file_agent.clone(),
+                                                    stages: 1,
+                                                    total_cost_usd: res.total_cost_usd,
+                                                    input_tokens: res.input_tokens,
+                                                    output_tokens: res.output_tokens,
+                                                },
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "[vm:{}] Service agent: exit-time output read failed or timed out",
+                                        box_name_agent
+                                    );
+                                }
+                            }
+
+                            // Signal exit — unconditional, never depends on publication.
+                            exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!("[vm:{}] Service agent: sending exit", box_name_agent);
+                            let _ = exit_tx.send(ServiceExit::Exited {
+                                success: !res.is_error,
+                                error: res.error,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
+                            exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _ = exit_tx.send(ServiceExit::Crashed(e.to_string()));
+                        }
+                    }
+                }
+                _ = stop_rx => {
+                    eprintln!("[vm:{}] Service agent stop requested", box_name_agent);
+                    exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = exit_tx.send(ServiceExit::Canceled);
+                }
+            }
+        });
+
+        // ── Spawn output file monitor task ─────────────────────────────
+
+        let tag_monitor = tag.clone();
+        let output_tx_monitor = Arc::clone(&output_tx);
+        let exited_monitor = Arc::clone(&exited);
+        tokio::spawn(async move {
+            let tag = tag_monitor;
+            let mut probe_failures = 0u32;
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                // Stop if the agent task already exited.
+                if exited_monitor.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("[vm:{}] Output monitor: agent exited, stopping", tag);
+                    return;
+                }
+
+                // Stop if the sender was already consumed by the exit fallback.
+                if output_tx_monitor.lock().await.is_none() {
+                    eprintln!("[vm:{}] Output monitor: already published, stopping", tag);
+                    return;
+                }
+
+                // Check if the output file exists (with timeout).
+                let exists = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    sandbox_monitor.file_exists(&output_file),
+                )
+                .await
+                {
+                    Ok(Ok(found)) => found,
+                    Ok(Err(e)) => {
+                        eprintln!("[vm:{}] Output monitor: file_exists failed: {}", tag, e);
+                        probe_failures += 1;
+                        false
+                    }
+                    Err(_) => {
+                        eprintln!("[vm:{}] Output monitor: file_exists timed out", tag);
+                        probe_failures += 1;
+                        false
+                    }
+                };
+
+                if !exists {
+                    if probe_failures >= 10 {
+                        eprintln!(
+                            "[vm:{}] Output monitor: too many probe failures, stopping",
+                            tag
+                        );
+                        return;
+                    }
+                    continue;
+                }
+
+                // File exists — read it (with timeout).
+                let data = match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sandbox_monitor.read_file(&output_file),
+                )
+                .await
+                {
+                    Ok(Ok(data)) if !data.is_empty() => data,
+                    Ok(Ok(_)) => {
+                        eprintln!("[vm:{}] Output monitor: file empty, retrying", tag);
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[vm:{}] Output monitor: read failed: {}", tag, e);
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("[vm:{}] Output monitor: read timed out", tag);
+                        continue;
+                    }
+                };
+
+                eprintln!(
+                    "[vm:{}] Output monitor: publishing output ({} bytes)",
+                    tag,
+                    data.len()
+                );
+                if let Some(tx) = output_tx_monitor.lock().await.take() {
+                    let _ = tx.send(ServicePublication {
+                        box_name: box_name.clone(),
+                        output: data,
+                        report: crate::runtime::RunReport {
+                            name: box_name.clone(),
+                            kind: "service".to_string(),
+                            success: true,
+                            output: output_file.clone(),
+                            stages: 1,
+                            total_cost_usd: 0.0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
+                    });
+                }
+                return; // one-shot
+            }
+        });
+
+        Ok(ServiceStageHandle {
+            output_rx,
+            stop_tx,
+            exit_rx,
         })
     }
 }

@@ -59,6 +59,16 @@ echo "[test-image] Building claudio (release, static, target=$GUEST_TARGET)..."
 cargo build --release -p claudio --target "$GUEST_TARGET"
 CLAUDIO_BIN="target/$GUEST_TARGET/release/claudio"
 
+# ---- Build void-message (sidecar CLI, static musl) ----
+echo "[test-image] Building void-message (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-message --target "$GUEST_TARGET"
+VOID_MESSAGE_BIN="target/$GUEST_TARGET/release/void-message"
+
+# ---- Build void-mcp (MCP bridge, static musl) ----
+echo "[test-image] Building void-mcp (release, static, target=$GUEST_TARGET)..."
+cargo build --release -p void-mcp --target "$GUEST_TARGET"
+VOID_MCP_BIN="target/$GUEST_TARGET/release/void-mcp"
+
 # ---- Assemble rootfs ----
 echo "[test-image] Preparing rootfs at: $OUT_DIR"
 rm -rf "$OUT_DIR"
@@ -74,6 +84,16 @@ cp "$GUEST_AGENT_BIN" "$OUT_DIR/sbin/guest-agent"
 echo "[test-image] Installing claudio as /usr/local/bin/claude-code..."
 cp "$CLAUDIO_BIN" "$OUT_DIR/usr/local/bin/claude-code"
 chmod +x "$OUT_DIR/usr/local/bin/claude-code"
+
+# void-message CLI for sidecar messaging
+echo "[test-image] Installing void-message as /usr/local/bin/void-message..."
+cp "$VOID_MESSAGE_BIN" "$OUT_DIR/usr/local/bin/void-message"
+chmod +x "$OUT_DIR/usr/local/bin/void-message"
+
+# void-mcp MCP bridge for sidecar messaging
+echo "[test-image] Installing void-mcp as /usr/local/bin/void-mcp..."
+cp "$VOID_MCP_BIN" "$OUT_DIR/usr/local/bin/void-mcp"
+chmod +x "$OUT_DIR/usr/local/bin/void-mcp"
 
 # ---- BusyBox for /bin/sh ----
 # Auto-detect a static busybox if BUSYBOX is not explicitly set.
@@ -93,7 +113,8 @@ if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
     ln -sf busybox "$OUT_DIR/bin/sh"
     for cmd in echo cat env tr test ls mkdir rm cp mv pwd id hostname \
                dd stat chmod wc touch head tail grep sed awk sort uniq \
-               uname date df du find xargs; do
+               uname date df du find xargs ip ifconfig route which \
+               basename dirname readlink realpath sleep wget nc; do
         ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
 else

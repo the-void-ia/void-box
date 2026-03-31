@@ -835,6 +835,30 @@ impl VmmBackend for VzBackend {
         Ok(())
     }
 
+    async fn file_stat(&self, path: &str) -> Result<crate::guest::protocol::FileStatResponse> {
+        let cc = self
+            .control_channel
+            .as_ref()
+            .ok_or(crate::Error::VmNotRunning)?;
+        cc.send_file_stat(path).await
+    }
+
+    async fn read_file_native(&self, path: &str) -> Result<Vec<u8>> {
+        let cc = self
+            .control_channel
+            .as_ref()
+            .ok_or(crate::Error::VmNotRunning)?;
+        let response = cc.send_read_file(path).await?;
+        if response.success {
+            Ok(response.content)
+        } else {
+            Err(crate::Error::Backend(format!(
+                "Failed to read file: {}",
+                response.error.unwrap_or_default()
+            )))
+        }
+    }
+
     async fn start_telemetry(
         &mut self,
         observer: Observer,

@@ -237,6 +237,12 @@ pub trait VmmBackend: Send + Sync {
     /// Create directories in the guest filesystem (mkdir -p).
     async fn mkdir_p(&self, path: &str) -> Result<()>;
 
+    /// Checks if a file exists in the guest filesystem.
+    async fn file_stat(&self, path: &str) -> Result<crate::guest::protocol::FileStatResponse>;
+
+    /// Reads a file from the guest filesystem.
+    async fn read_file_native(&self, path: &str) -> Result<Vec<u8>>;
+
     /// Start a telemetry subscription from the guest.
     async fn start_telemetry(
         &mut self,
@@ -299,6 +305,8 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "gzip",
     "ip",
     "test",
+    "void-message",
+    "void-mcp",
 ];
 
 /// Per-process resource limits applied in the guest via `setrlimit`.

@@ -18,8 +18,8 @@ use crate::pipeline::Pipeline;
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::spec::{
-    load_spec, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec, PipelineStageSpec, RunKind,
-    RunSpec, SkillEntry, StepMode,
+    load_spec, AgentMode, BoxSandboxOverride, LlmSpec, MountSpec, PipelineBoxSpec,
+    PipelineStageSpec, RunKind, RunSpec, SkillEntry, StepMode,
 };
 
 /// Tracks host directories created for pipeline stage outputs.
@@ -101,8 +101,81 @@ pub async fn run_spec(
             )
             .await
         }
-        RunKind::Workflow => run_workflow(spec, input, policy, stage_tx).await,
+        RunKind::Workflow => run_workflow(spec, input, policy, stage_tx, provider, run_id).await,
     }
+}
+
+/// Run an agent spec in service mode, returning a `ServiceStageHandle`.
+///
+/// This function only supports agent specs with `mode: service`. If the spec
+/// is not an agent or is not configured for service mode, an error is returned.
+///
+/// The daemon checks `agent.mode` and calls this instead of `run_spec()` for
+/// long-running service agents.
+pub async fn run_spec_service(
+    spec: &RunSpec,
+    input: Option<String>,
+    telemetry_buffer: Option<TelemetryBuffer>,
+) -> Result<crate::agent_box::ServiceStageHandle> {
+    if spec.kind != RunKind::Agent {
+        return Err(Error::Config(
+            "run_spec_service only supports agent specs".into(),
+        ));
+    }
+
+    let agent = spec
+        .agent
+        .as_ref()
+        .ok_or_else(|| Error::Config("missing agent section".into()))?;
+
+    if agent.mode != AgentMode::Service {
+        return Err(Error::Config(
+            "run_spec_service requires agent mode: service".into(),
+        ));
+    }
+
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
+
+    let oci_rootfs_plan = if uses_mock_sandbox(spec) {
+        None
+    } else if let Some(ref image) = spec.sandbox.image {
+        eprintln!("[void-box] Resolving OCI base image: {}", image);
+        let host_rootfs = resolve_oci_base_image(image).await?;
+        Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
+    } else {
+        None
+    };
+
+    let mut builder = VoidBox::new(&spec.name)
+        .prompt(&agent.prompt)
+        .mode(AgentMode::Service);
+
+    builder = apply_box_sandbox(builder, spec, guest.as_ref());
+    builder = apply_box_llm(builder, spec.llm.as_ref());
+
+    if let Some(ref plan) = oci_rootfs_plan {
+        builder = apply_oci_rootfs(builder, plan);
+    }
+
+    for s in &agent.skills {
+        builder = builder.skill(parse_skill_entry(s)?);
+    }
+
+    if let Some(output_file) = &agent.output_file {
+        builder = builder.output_file(output_file);
+    }
+
+    let ab = builder.build()?;
+    ab.run_service(input.as_deref().map(str::as_bytes), telemetry_buffer)
+        .await
+}
+
+fn uses_mock_sandbox(spec: &RunSpec) -> bool {
+    spec.sandbox.mode.eq_ignore_ascii_case("mock")
 }
 
 /// Helper to send a stage event through the channel (fire-and-forget).
@@ -141,11 +214,15 @@ async fn run_agent(
 
     let stage_start = std::time::Instant::now();
 
-    // Resolve guest image (kernel + initramfs) via the 5-step chain.
-    let guest = resolve_guest_image(spec).await;
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
 
-    // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if uses_mock_sandbox(spec) {
+        None
+    } else if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
         let host_rootfs = resolve_oci_base_image(image).await?;
         Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
@@ -178,6 +255,10 @@ async fn run_agent(
 
     if let Some(output_file) = &agent.output_file {
         builder = builder.output_file(output_file);
+    }
+
+    if agent.mode == AgentMode::Service {
+        builder = builder.mode(AgentMode::Service);
     }
 
     let ab = builder.build()?;
@@ -262,11 +343,15 @@ async fn run_pipeline(
         .as_ref()
         .ok_or_else(|| Error::Config("missing pipeline section".into()))?;
 
-    // Resolve guest image (kernel + initramfs) via the 5-step chain.
-    let guest = resolve_guest_image(spec).await;
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
 
-    // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if uses_mock_sandbox(spec) {
+        None
+    } else if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
         let host_rootfs = resolve_oci_base_image(image).await?;
         Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
@@ -423,17 +508,23 @@ async fn run_workflow(
     input: Option<String>,
     policy: Option<crate::persistence::RunPolicy>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
+    provider: Option<Arc<dyn crate::persistence::PersistenceProvider>>,
+    run_id: Option<&str>,
 ) -> Result<RunReport> {
     let w = spec
         .workflow
         .as_ref()
         .ok_or_else(|| Error::Config("missing workflow section".into()))?;
 
-    // Resolve guest image (kernel + initramfs) via the 5-step chain.
-    let guest = resolve_guest_image(spec).await;
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
 
-    // Resolve OCI base image before building the sandbox (async).
-    let oci_rootfs_plan = if let Some(ref image) = spec.sandbox.image {
+    let oci_rootfs_plan = if uses_mock_sandbox(spec) {
+        None
+    } else if let Some(ref image) = spec.sandbox.image {
         eprintln!("[void-box] Resolving OCI base image: {}", image);
         let host_rootfs = resolve_oci_base_image(image).await?;
         Some(resolve_oci_rootfs_plan(image, host_rootfs).await?)
@@ -528,8 +619,13 @@ async fn run_workflow(
 
     let observed = workflow
         .observe_with_stage_tx(crate::observe::ObserveConfig::from_env(), stage_tx)
-        .run_in(sandbox)
+        .run_in(sandbox.clone())
         .await?;
+
+    if let (Some(output_step), Some(prov), Some(rid)) = (&w.output_step, provider.as_ref(), run_id)
+    {
+        persist_workflow_artifacts(sandbox.as_ref(), prov.as_ref(), rid, output_step).await?;
+    }
 
     let output = if let Some(i) = input {
         format!("{}\n{}", i, observed.result.output_str())
@@ -547,6 +643,63 @@ async fn run_workflow(
         input_tokens: 0,
         output_tokens: 0,
     })
+}
+
+async fn persist_workflow_artifacts(
+    sandbox: &Sandbox,
+    provider: &dyn crate::persistence::PersistenceProvider,
+    run_id: &str,
+    output_step: &str,
+) -> Result<()> {
+    let result_path = "/workspace/result.json";
+    if !sandbox.file_exists(result_path).await.unwrap_or(false) {
+        return Ok(());
+    }
+
+    let data = sandbox.read_file(result_path).await?;
+    provider.save_stage_artifact(run_id, output_step, &data)?;
+    if output_step != "main" {
+        provider.save_stage_artifact(run_id, "main", &data)?;
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                "result.json for run '{}' step '{}' is not valid JSON: {e}",
+                run_id,
+                output_step
+            );
+            return Ok(());
+        }
+    };
+
+    if let Some(artifacts) = parsed.get("artifacts").and_then(|value| value.as_array()) {
+        for artifact in artifacts {
+            let Some(name) = artifact.get("name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let artifact_path = artifact
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(name);
+            let guest_path = if artifact_path.starts_with('/') {
+                artifact_path.to_string()
+            } else {
+                format!("/workspace/{artifact_path}")
+            };
+            if !sandbox.file_exists(&guest_path).await.unwrap_or(false) {
+                continue;
+            }
+            let bytes = sandbox.read_file(&guest_path).await?;
+            provider.save_named_artifact(run_id, output_step, name, &bytes)?;
+            if output_step != "main" {
+                provider.save_named_artifact(run_id, "main", name, &bytes)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a pipeline box with mount-based I/O wiring.
@@ -1082,6 +1235,18 @@ fn parse_skill_entry(entry: &SkillEntry) -> Result<Skill> {
             }
             Ok(skill)
         }
+        SkillEntry::Mcp { command, args, env } => {
+            let mut skill = Skill::mcp(command);
+            if !args.is_empty() {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                skill = skill.args(&arg_refs);
+            }
+            for (k, v) in env {
+                skill = skill.env(k, v);
+            }
+            Ok(skill)
+        }
+        SkillEntry::Inline { name, content } => Ok(Skill::inline(name, content)),
     }
 }
 

@@ -1,0 +1,13 @@
+[package]
+name = "void-message"
+version = "0.1.0"
+edition = "2021"
+description = "In-guest CLI for void-box sidecar messaging"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+void-box = { path = ".." }
+tokio = { version = "1", features = ["full"] }

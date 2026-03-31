@@ -72,6 +72,8 @@ where applicable. Key platform differences:
 - If `sandbox.image` is set, guest performs OCI root switch with `pivot_root`.
 - On Linux/KVM, OCI base rootfs is attached as cached `virtio-blk` disk.
 - OCI skills are mounted as read-only tool roots.
+- If `agent.mode` is `service`, the agent runs indefinitely; output is published while the process continues.
+- If `agent.messaging.enabled` is `true`, a host-side sidecar coordinates inter-agent communication over HTTP; `void-mcp` bridges Claude Code to the sidecar via MCP tools.
 
 ## Control channel I/O model
 
@@ -349,6 +351,232 @@ connects and round-trips the message.
 - **Session secret**: Each restored VM gets a unique secret via kernel cmdline;
   the snapshot's stored secret is for state continuity, not auth reuse.
 
+## Service mode
+
+VoidBox agents run in one of two modes: **task** (default) or **service**.  Task
+mode runs to completion and returns output.  Service mode runs indefinitely —
+publishing structured output while the process continues — and is designed for
+long-running daemons like API gateways.
+
+### YAML configuration
+
+Agent-level:
+
+```yaml
+agent:
+  prompt: "Run the gateway"
+  mode: service
+  output_file: /workspace/output.json
+```
+
+Workflow step-level:
+
+```yaml
+steps:
+  - name: gateway
+    mode: service
+    run:
+      program: sh
+      args: [-lc, "exec node /app/server.mjs"]
+
+output_step: gateway
+```
+
+### Validation rules
+
+| Field | Task mode | Service mode |
+|-------|-----------|--------------|
+| `timeout_secs` | Optional | **Not allowed** (rejected at parse time) |
+| `output_file` | Optional | **Required** |
+
+Service workflow steps set effective timeout to `0` (infinite).
+
+### Lifecycle differences
+
+| Phase | Task mode | Service mode |
+|-------|-----------|--------------|
+| Output | Returned on completion | Published via `output_rx` while process runs |
+| Daemon status | Terminal on exit | `output_ready=true` on publication, `status=running` until exit |
+| Termination | Process exits | Explicit cancel, natural exit, or crash |
+
+The daemon (`spawn_service_run()`) manages three oneshot channels:
+
+- `output_rx` — fires when the output file is ready
+- `exit_rx` — fires when the service process terminates
+- `stop_tx` — signal to gracefully stop the service
+
+`ServiceExit` maps to `RunStatus`: `Exited { success: true }` → `Succeeded`,
+`Exited { success: false }` → `Failed`, `Canceled` → `Cancelled`,
+`Crashed(msg)` → `Failed`.
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/spec.rs` | `AgentMode`, `StepMode`, `MessagingSpec`, validation rules |
+| `src/agent_box.rs` | `ServiceStageHandle`, `ServiceExit`, `run_service()` |
+| `src/daemon.rs` | `spawn_service_run()`, `terminalize_service()` |
+| `src/runtime.rs` | `run_spec_service()`, timeout override for service steps |
+
+## Messaging and sidecar
+
+VoidBox includes a **sidecar** — a host-side HTTP server that coordinates
+inter-agent communication.  Agents exchange **intents** (typed messages with
+audience and priority) through the sidecar, enabling multi-agent collaboration
+within isolated VM sandboxes.
+
+### Enabling messaging
+
+```yaml
+agent:
+  prompt: "..."
+  messaging:
+    enabled: true
+    provider_bridge: claude_channels  # optional
+```
+
+When `messaging.enabled` is `true`, the daemon starts a sidecar server and
+injects `VOID_SIDECAR_URL=http://10.0.2.2:<port>` into the guest environment.
+
+### Architecture
+
+```
+Guest VM                              Host
+┌──────────────────────┐    HTTP    ┌─────────────┐
+│  void-message CLI    │──────────→│  Sidecar     │
+│  void-mcp server     │           │  /v1/inbox   │
+│  (agent process)     │           │  /v1/intents │
+└──────────────────────┘           │  /v1/context │
+                                   └─────────────┘
+```
+
+The sidecar runs on the host network.  Guest tools reach it via the SLIRP
+gateway address (`10.0.2.2`).
+
+### Intent model
+
+Agents communicate through **intents** — structured messages with:
+
+- **kind**: `proposal`, `signal`, or `evaluation`
+- **audience**: `broadcast` (all agents) or `leader` (coordinator only)
+- **priority**: `high`, `normal`, or `low`
+- **payload**: JSON, max 4096 bytes
+
+Constraints: max 3 intents per iteration, default TTL of 2 iterations.
+Idempotency keys prevent duplicate submissions.
+
+### Sidecar API endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/context` | GET | Execution identity (candidate_id, execution_id, iteration, role, peers) |
+| `/v1/inbox?since=<version>` | GET | Read peer messages (incremental polling) |
+| `/v1/intents` | POST | Submit intent (with idempotency key) |
+| `/v1/health` | GET | Health check |
+
+### void-message CLI
+
+A guest-side CLI for direct sidecar interaction:
+
+```bash
+void-message context              # read execution identity
+void-message inbox [--since N]    # read peer messages
+void-message send --kind signal --audience broadcast --summary "ready"
+void-message health               # check sidecar
+```
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/spec.rs` | `MessagingSpec` (`enabled`, `provider_bridge`) |
+| `src/sidecar/mod.rs` | Module exports, `messaging_skill_content()` |
+| `src/sidecar/server.rs` | HTTP server, request handlers |
+| `src/sidecar/state.rs` | Intent acceptance, dedup, limits |
+| `src/sidecar/types.rs` | `SubmittedIntent`, `StampedIntent`, `InboxSnapshot`, `SidecarContext` |
+| `src/daemon.rs` | Sidecar startup, env injection |
+| `void-message/src/main.rs` | Guest-side CLI |
+
+## MCP integration
+
+The `void-mcp` crate implements an MCP (Model Context Protocol) server that
+bridges Claude Code to the sidecar messaging system.  It exposes four
+collaboration tools and handles the MCP JSON-RPC wire protocol.
+
+### Tools
+
+| Tool | Purpose | Sidecar endpoint |
+|------|---------|-----------------|
+| `read_shared_context` | Execution identity (candidate_id, role, peers) | `GET /v1/context` |
+| `read_peer_messages` | Observations from sibling agents (incremental `since`) | `GET /v1/inbox` |
+| `broadcast_observation` | Share finding with all agents | `POST /v1/intents` (kind=signal, audience=broadcast) |
+| `recommend_to_leader` | Send recommendation to coordinator (promote/refine/reject) | `POST /v1/intents` (kind=proposal/evaluation, audience=leader) |
+
+### Transport modes
+
+- **Stdio** (default): Content-Length framed JSON-RPC 2.0 (same as LSP)
+- **Streamable HTTP** (`--sse`): Listens on `127.0.0.1:<port>`, handles
+  `POST /mcp` — used inside minimal VMs where Claude Code can't spawn child
+  processes
+
+### Provisioning flow
+
+When a spec includes an MCP skill, `VoidBox::provision_skills()`:
+
+1. Starts `void-mcp` as a background HTTP server inside the guest (SSE mode,
+   port `8222 + index`)
+2. Writes `/workspace/.mcp.json`:
+   ```json
+   {
+     "mcpServers": {
+       "void-mcp": {
+         "type": "http",
+         "url": "http://127.0.0.1:8222/mcp"
+       }
+     }
+   }
+   ```
+3. Passes `--mcp-config /workspace/.mcp.json` to Claude Code
+
+The `void-mcp` binary is in the guest execution allowlist
+(`DEFAULT_COMMAND_ALLOWLIST` in `src/backend/mod.rs`).
+
+### Data flow
+
+```
+Claude Code → JSON-RPC → void-mcp (:8222) → HTTP → Sidecar (host :N) → Swarm state
+```
+
+### Skill configuration
+
+Skills can be declared in YAML specs or via the builder API:
+
+```yaml
+agent:
+  skills:
+    - mcp:void-mcp
+```
+
+Or programmatically:
+
+```rust
+Skill::mcp("void-mcp")
+    .args(vec!["--sse".into()])
+    .env("VOID_SIDECAR_URL", url)
+```
+
+### Key files
+
+| File | Role |
+|------|------|
+| `void-mcp/src/main.rs` | MCP server (stdio + HTTP transport) |
+| `void-mcp/src/tools.rs` | Tool definitions, sidecar HTTP client |
+| `void-mcp/src/jsonrpc.rs` | JSON-RPC 2.0 protocol types |
+| `void-mcp/src/http.rs` | HTTP client utilities |
+| `src/skill.rs` | `Skill::mcp()` factory, `SkillKind::Mcp` |
+| `src/agent_box.rs` | `provision_skills()` — MCP server startup, `.mcp.json` generation |
+| `src/backend/mod.rs` | `DEFAULT_COMMAND_ALLOWLIST` (includes `void-mcp`) |
+
 ## Testing
 
 Static quality:
@@ -399,6 +627,11 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+
+# Service mode + sidecar + MCP e2e suites:
+cargo test --test e2e_service_mode -- --ignored --test-threads=1
+cargo test --test e2e_sidecar -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
 ```
 
 ### Test initramfs and BusyBox
@@ -512,6 +745,11 @@ cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+
+# Service mode + sidecar + MCP e2e suites (Linux-only):
+cargo test --test e2e_service_mode -- --ignored --test-threads=1
+cargo test --test e2e_sidecar -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -530,8 +768,9 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
 ```
 
-`e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`)
-and are not expected to run on macOS.
+`e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
+`e2e_claude_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
+to run on macOS.
 
 ### OpenClaw production validation
 
@@ -641,6 +880,35 @@ That production image is for real Claude/OpenClaw runtime paths.
 
 ## Known issues
 
+### Vsock control channel timeout with large initramfs or missing `ip`
+
+**Symptom:** `control_channel: deadline reached (connect or handshake)` — the
+host connects via AF_VSOCK but gets `ECONNRESET` on every attempt.
+
+**Root causes (two independent issues):**
+
+1. **Missing `ip` binary → `Command::new("ip").output()` hangs PID 1.**
+   The guest-agent's `setup_network()` calls `run_cmd("ip", ...)` which
+   internally does `fork+execvp`. When `ip` is not in PATH (e.g. no busybox
+   symlink), `execvp` fails — but in the minimal initramfs PID 1 environment,
+   the Rust `Command::output()` call can hang indefinitely instead of returning
+   `Err(ENOENT)`. The guest-agent never reaches `create_vsock_listener()`.
+   **Fix:** Ensure `ip` (and `which`) are included as busybox symlinks in the
+   initramfs (`scripts/build_test_image.sh`).
+
+2. **Large production initramfs (100+ MB) exceeds boot timeout.**
+   The control channel allows 4 s boot wait + 30 s connect deadline (34 s total).
+   A 100 MB+ initramfs (with real `claude-code`, glibc, git, etc.) takes longer
+   to decompress, load modules, and complete network setup — especially with only
+   256 MB of guest RAM. **Fix:** Use at least **3 GB** of guest memory for
+   production initramfs (`memory_mb(3072)`) so the kernel can decompress and
+   boot within the timeout window.
+
+**Debugging tip:** Boot a `MicroVm` directly with `loglevel=7` in the kernel
+cmdline and read `vm.read_serial_output()` to see guest-agent progress messages.
+With `loglevel=0`, `/dev/kmsg` writes don't reach the serial console. Increase
+the serial channel buffer from 4096 to 65536 if kernel messages overflow it.
+
 ### Snapshot restore: XCR0 and LAPIC timer
 
 **Root causes of guest crash after snapshot restore** (2-day debugging effort):
@@ -703,6 +971,14 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 - `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs
   (macOS) — RW/RO, write, read, mkdir, rename, delete, chmod, large files,
   pre-existing content, empty dirs.
+- `e2e_service_mode`: service lifecycle — output publication while running,
+  graceful stop, exit status mapping. **Must pass** for changes to service mode,
+  daemon service lifecycle, or `ServiceStageHandle`.
+- `e2e_sidecar`: sidecar intent flow — submit, inbox polling, context identity,
+  idempotency. **Must pass** for changes to sidecar state, types, or server.
+- `e2e_claude_mcp`: end-to-end Claude Code with void-mcp tools inside a real VM.
+  Requires `ANTHROPIC_API_KEY`. **Must pass** for changes to void-mcp tools or
+  MCP provisioning.
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 
