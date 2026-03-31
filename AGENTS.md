@@ -72,6 +72,8 @@ where applicable. Key platform differences:
 - If `sandbox.image` is set, guest performs OCI root switch with `pivot_root`.
 - On Linux/KVM, OCI base rootfs is attached as cached `virtio-blk` disk.
 - OCI skills are mounted as read-only tool roots.
+- If `agent.mode` is `service`, the agent runs indefinitely; output is published while the process continues.
+- If `agent.messaging.enabled` is `true`, a host-side sidecar coordinates inter-agent communication over HTTP; `void-mcp` bridges Claude Code to the sidecar via MCP tools.
 
 ## Control channel I/O model
 
@@ -625,6 +627,11 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+
+# Service mode + sidecar + MCP e2e suites:
+cargo test --test e2e_service_mode -- --ignored --test-threads=1
+cargo test --test e2e_sidecar -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
 ```
 
 ### Test initramfs and BusyBox
@@ -958,6 +965,14 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 - `e2e_mount`: host↔guest directory sharing via virtio-9p (Linux) / virtiofs
   (macOS) — RW/RO, write, read, mkdir, rename, delete, chmod, large files,
   pre-existing content, empty dirs.
+- `e2e_service_mode`: service lifecycle — output publication while running,
+  graceful stop, exit status mapping. **Must pass** for changes to service mode,
+  daemon service lifecycle, or `ServiceStageHandle`.
+- `e2e_sidecar`: sidecar intent flow — submit, inbox polling, context identity,
+  idempotency. **Must pass** for changes to sidecar state, types, or server.
+- `e2e_claude_mcp`: end-to-end Claude Code with void-mcp tools inside a real VM.
+  Requires `ANTHROPIC_API_KEY`. **Must pass** for changes to void-mcp tools or
+  MCP provisioning.
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 
