@@ -539,7 +539,7 @@ When a spec includes an MCP skill, `VoidBox::provision_skills()`:
 3. Passes `--mcp-config /workspace/.mcp.json` to Claude Code
 
 The `void-mcp` binary is in the guest execution allowlist
-(`HOST_BINARIES` in `src/backend/mod.rs`).
+(`DEFAULT_COMMAND_ALLOWLIST` in `src/backend/mod.rs`).
 
 ### Data flow
 
@@ -575,7 +575,7 @@ Skill::mcp("void-mcp")
 | `void-mcp/src/http.rs` | HTTP client utilities |
 | `src/skill.rs` | `Skill::mcp()` factory, `SkillKind::Mcp` |
 | `src/agent_box.rs` | `provision_skills()` — MCP server startup, `.mcp.json` generation |
-| `src/backend/mod.rs` | `HOST_BINARIES` allowlist |
+| `src/backend/mod.rs` | `DEFAULT_COMMAND_ALLOWLIST` (includes `void-mcp`) |
 
 ## Testing
 
@@ -745,6 +745,11 @@ cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+
+# Service mode + sidecar + MCP e2e suites (Linux-only):
+cargo test --test e2e_service_mode -- --ignored --test-threads=1
+cargo test --test e2e_sidecar -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -763,8 +768,9 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
 ```
 
-`e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`)
-and are not expected to run on macOS.
+`e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
+`e2e_claude_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
+to run on macOS.
 
 ### OpenClaw production validation
 
