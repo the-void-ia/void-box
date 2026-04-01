@@ -166,7 +166,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         program: String,
         /// Arguments to the program.
-        #[arg(trailing_var_arg = true)]
+        #[arg(long)]
         args: Vec<String>,
         /// Working directory inside the guest.
         #[arg(long)]
