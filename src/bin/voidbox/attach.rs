@@ -133,6 +133,17 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
 
     let sandbox = builder.build()?;
 
+    let program_base = match Path::new(opts.program).file_name() {
+        Some(name) => name.to_str().unwrap_or(opts.program),
+        None => opts.program,
+    };
+    if program_base == "claude" || program_base == "claude-code" {
+        let onboarding = r#"{"hasCompletedOnboarding":true}"#;
+        let _ = sandbox
+            .write_file("/home/sandbox/.claude.json", onboarding.as_bytes())
+            .await;
+    }
+
     let mut pty_env: Vec<(String, String)> = provider.env_vars();
     for raw in opts.env_vars {
         let (k, v) = parse_env_flag(raw)?;
