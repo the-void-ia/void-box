@@ -14,11 +14,11 @@ use std::fs;
 /// Staged credentials ready to be mounted into the guest VM.
 ///
 /// The underlying temp directory is removed when this value is dropped.
-pub(crate) struct StagedCredentials {
+pub struct StagedCredentials {
     /// Kept alive for its `Drop` impl (auto-cleanup).
     _dir: tempfile::TempDir,
     /// Absolute host path to the staged directory.
-    pub(crate) host_path: String,
+    pub host_path: String,
 }
 
 /// Discover OAuth credentials from the host system.
@@ -28,7 +28,7 @@ pub(crate) struct StagedCredentials {
 ///
 /// Returns the raw JSON string on success, or a user-friendly error directing
 /// the user to run `claude auth login`.
-pub(crate) fn discover_oauth_credentials() -> Result<String> {
+pub fn discover_oauth_credentials() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         discover_macos()
@@ -112,7 +112,7 @@ fn validate_credentials_json(json: &str) -> Result<()> {
 /// Creates a temp directory with a `.credentials.json` file (0600 permissions).
 /// The returned [`StagedCredentials`] holds the directory alive; dropping it
 /// removes the staged files.
-pub(crate) fn stage_credentials(creds_json: &str) -> Result<StagedCredentials> {
+pub fn stage_credentials(creds_json: &str) -> Result<StagedCredentials> {
     let dir = tempfile::Builder::new()
         .prefix("voidbox-claude-creds-")
         .tempdir()

@@ -218,8 +218,8 @@ impl LlmProvider {
         }
     }
 
-    /// Generate the environment variables to inject into the guest VM.
-    pub(crate) fn env_vars(&self) -> Vec<(String, String)> {
+    /// Generates the environment variables to inject into the guest VM.
+    pub fn env_vars(&self) -> Vec<(String, String)> {
         match self {
             LlmProvider::Claude => {
                 // Pass through host ANTHROPIC_API_KEY if available

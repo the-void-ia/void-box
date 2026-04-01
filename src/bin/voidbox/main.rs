@@ -159,8 +159,11 @@ enum Command {
 
     /// Boot an ephemeral VM and open an interactive shell.
     Shell {
-        /// Program to run (default: sh).
-        #[arg(long, default_value = "sh")]
+        /// Spec file (optional; generates ephemeral spec if omitted).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Program to run in the PTY.
+        #[arg(long, default_value = "claude")]
         program: String,
         /// Arguments to the program.
         #[arg(trailing_var_arg = true)]
@@ -169,11 +172,23 @@ enum Command {
         #[arg(long)]
         working_dir: Option<String>,
         /// Guest memory in MB.
-        #[arg(long, default_value = "512")]
+        #[arg(long, default_value = "1024")]
         memory_mb: usize,
         /// Enable guest networking.
-        #[arg(long)]
+        #[arg(long, default_value = "true")]
         network: bool,
+        /// LLM provider override.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restore from snapshot.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Mount host directory (HOST:GUEST[:ro|rw], repeatable).
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
+        /// Set guest env var (KEY=VALUE, repeatable).
+        #[arg(long = "env")]
+        env_vars: Vec<String>,
     },
 }
 
@@ -278,12 +293,31 @@ async fn run(
             attach::cmd_attach(&run_id, Some(&program), &args, working_dir.as_deref(), &url).await
         }
         Command::Shell {
+            file,
             program,
             args,
             working_dir,
             memory_mb,
             network,
-        } => attach::cmd_shell(&program, &args, working_dir.as_deref(), memory_mb, network).await,
+            provider,
+            snapshot,
+            mounts,
+            env_vars,
+        } => {
+            attach::cmd_shell(attach::ShellOpts {
+                file: file.as_deref(),
+                program: &program,
+                args: &args,
+                working_dir: working_dir.as_deref(),
+                memory_mb,
+                network,
+                provider: provider.as_deref(),
+                snapshot: snapshot.as_deref(),
+                mounts: &mounts,
+                env_vars: &env_vars,
+            })
+            .await
+        }
     }
 }
 
