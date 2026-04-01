@@ -179,11 +179,11 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
         argv_c.push(arg_c);
     }
 
-    let argv_ptrs: Vec<*const libc::c_char> = argv_c
-        .iter()
-        .map(|c| c.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
+    let mut argv_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(argv_c.len() + 1);
+    for c in &argv_c {
+        argv_ptrs.push(c.as_ptr());
+    }
+    argv_ptrs.push(std::ptr::null());
 
     unsafe {
         libc::execvp(program_c.as_ptr(), argv_ptrs.as_ptr());
@@ -197,11 +197,8 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
 /// PtyClose). The current thread handles master-to-vsock forwarding and
 /// child reaping.
 fn pty_io_loop(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) {
-    let reader_master_fd = master_fd;
-    let reader_child_pid = child_pid;
-
     let reader_handle = std::thread::spawn(move || {
-        pty_reader_thread(vsock_fd, reader_master_fd, reader_child_pid);
+        pty_reader_thread(vsock_fd, master_fd, child_pid);
     });
 
     let exit_code = pty_writer_loop(vsock_fd, master_fd, child_pid);

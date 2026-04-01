@@ -22,7 +22,6 @@ pub async fn cmd_shell(
     args: &[String],
     working_dir: Option<&str>,
     memory_mb: usize,
-    image: Option<&str>,
     network: bool,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let kernel = std::env::var("VOID_BOX_KERNEL").map_err(|_| "VOID_BOX_KERNEL not set")?;
@@ -36,8 +35,6 @@ pub async fn cmd_shell(
     if let Some(path) = &initramfs {
         builder = builder.initramfs(path);
     }
-
-    let _ = image;
 
     let sandbox = builder.build()?;
 
@@ -54,13 +51,13 @@ pub async fn cmd_shell(
 
     let session = sandbox.attach_pty(request).await?;
 
-    let _guard = RawModeGuard::engage(0).map_err(|e| format!("failed to enter raw mode: {e}"))?;
+    let guard = RawModeGuard::engage(0).map_err(|e| format!("failed to enter raw mode: {e}"))?;
 
     let exit_code = tokio::task::spawn_blocking(move || session.run())
         .await
         .map_err(|e| format!("pty task panicked: {e}"))??;
 
-    drop(_guard);
+    drop(guard);
     stop_sandbox(sandbox).await;
 
     Ok(exit_code)

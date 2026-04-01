@@ -171,9 +171,6 @@ enum Command {
         /// Guest memory in MB.
         #[arg(long, default_value = "512")]
         memory_mb: usize,
-        /// OCI image to use for the rootfs.
-        #[arg(long)]
-        image: Option<String>,
         /// Enable guest networking.
         #[arg(long)]
         network: bool,
@@ -285,19 +282,8 @@ async fn run(
             args,
             working_dir,
             memory_mb,
-            image,
             network,
-        } => {
-            attach::cmd_shell(
-                &program,
-                &args,
-                working_dir.as_deref(),
-                memory_mb,
-                image.as_deref(),
-                network,
-            )
-            .await
-        }
+        } => attach::cmd_shell(&program, &args, working_dir.as_deref(), memory_mb, network).await,
     }
 }
 
