@@ -30,6 +30,10 @@ pub struct RawModeGuard {
 impl RawModeGuard {
     /// Puts file descriptor `fd` into raw mode and returns a guard that
     /// restores the original terminal settings on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if `tcgetattr` or `tcsetattr` fails.
     pub fn engage(fd: RawFd) -> io::Result<Self> {
         let mut original: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut original) } < 0 {
@@ -64,6 +68,11 @@ pub struct PtySession {
 impl PtySession {
     /// Connects to the guest agent, handshakes, sends a `PtyOpen` request,
     /// and waits for the `PtyOpened` response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Guest`] if the connection, handshake, or `PtyOpen`
+    /// exchange fails, or if the guest rejects the request.
     pub fn open(
         connector: &GuestConnector,
         session_secret: &[u8; 32],
@@ -119,6 +128,11 @@ impl PtySession {
     /// frames to the guest. The calling thread reads frames from the guest:
     /// `PtyData` bytes are written to stdout, `PtyClosed` terminates the
     /// loop and returns the exit code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Guest`] if the vsock fd cannot be duplicated or
+    /// a protocol read error occurs during the session.
     pub fn run(self) -> Result<i32> {
         let fd = self.stream.as_raw_fd();
         let write_fd = unsafe { libc::dup(fd) };
@@ -130,50 +144,52 @@ impl PtySession {
         }
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_writer = Arc::clone(&done);
 
-        let writer_handle = std::thread::spawn(move || {
-            let mut stdin = io::stdin().lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                if done_writer.load(Ordering::Relaxed) {
-                    break;
+        let writer_handle = std::thread::spawn({
+            let done = Arc::clone(&done);
+            move || {
+                let mut stdin = io::stdin().lock();
+                let mut buf = [0u8; 4096];
+                loop {
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let n = match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    let msg = Message {
+                        msg_type: MessageType::PtyData,
+                        payload: buf[..n].to_vec(),
+                    };
+                    let serialized = msg.serialize();
+                    let ret = unsafe {
+                        libc::write(
+                            write_fd,
+                            serialized.as_ptr() as *const libc::c_void,
+                            serialized.len(),
+                        )
+                    };
+                    if ret < 0 {
+                        break;
+                    }
                 }
-                let n = match stdin.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+
+                let close_msg = Message {
+                    msg_type: MessageType::PtyClose,
+                    payload: Vec::new(),
                 };
-                let msg = Message {
-                    msg_type: MessageType::PtyData,
-                    payload: buf[..n].to_vec(),
-                };
-                let serialized = msg.serialize();
-                let ret = unsafe {
+                let serialized = close_msg.serialize();
+                unsafe {
                     libc::write(
                         write_fd,
                         serialized.as_ptr() as *const libc::c_void,
                         serialized.len(),
-                    )
-                };
-                if ret < 0 {
-                    break;
+                    );
+                    libc::close(write_fd);
                 }
-            }
-
-            let close_msg = Message {
-                msg_type: MessageType::PtyClose,
-                payload: Vec::new(),
-            };
-            let serialized = close_msg.serialize();
-            unsafe {
-                libc::write(
-                    write_fd,
-                    serialized.as_ptr() as *const libc::c_void,
-                    serialized.len(),
-                );
-                libc::close(write_fd);
             }
         });
 

@@ -31,6 +31,10 @@ const SANDBOX_GID: libc::gid_t = 1000;
 ///
 /// Validates the command against the allowlist, acquires the single-session
 /// guard, and delegates to `run_pty_session` on success.
+///
+/// # Errors
+///
+/// Returns `Err` if sending a response message over the vsock fd fails.
 pub fn handle_pty_open(
     fd: RawFd,
     request: &PtyOpenRequest,
