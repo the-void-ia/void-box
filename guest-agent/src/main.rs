@@ -478,6 +478,27 @@ fn init_system() {
         );
     }
 
+    let _ = std::fs::create_dir_all("/dev/pts");
+    let devpts = std::ffi::CString::new("devpts").unwrap();
+    let pts_path = std::ffi::CString::new("/dev/pts").unwrap();
+    let pts_opts = std::ffi::CString::new("newinstance,ptmxmode=0666").unwrap();
+    unsafe {
+        libc::mount(
+            devpts.as_ptr(),
+            pts_path.as_ptr(),
+            devpts.as_ptr(),
+            0,
+            pts_opts.as_ptr() as *const _,
+        );
+    }
+
+    let ptmx_src = std::ffi::CString::new("/dev/pts/ptmx").unwrap();
+    let ptmx_dst = std::ffi::CString::new("/dev/ptmx").unwrap();
+    unsafe {
+        libc::remove(ptmx_dst.as_ptr());
+        libc::symlink(ptmx_src.as_ptr(), ptmx_dst.as_ptr());
+    }
+
     // Mount tmpfs on /tmp so all users can write temp files
     let _ = std::fs::create_dir_all("/tmp");
     let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
