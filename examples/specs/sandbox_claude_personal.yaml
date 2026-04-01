@@ -1,0 +1,17 @@
+# Boots a bare VM with claude-personal credentials mounted.
+# No agent runs — the VM waits for interactive PTY attach.
+#
+# Usage:
+#   voidbox shell --file examples/specs/sandbox_claude_personal.yaml
+#
+# Or explicit two-step:
+#   voidbox run --file examples/specs/sandbox_claude_personal.yaml
+#   voidbox attach <run-id> --program claude
+api_version: v1
+kind: sandbox
+name: claude-sandbox
+sandbox:
+  memory_mb: 2048
+  network: true
+llm:
+  provider: claude-personal

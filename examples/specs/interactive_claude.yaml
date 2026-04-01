@@ -1,0 +1,16 @@
+# Interactive Claude agent — boots a VM with prompt and credentials,
+# then waits for PTY attach instead of running headlessly.
+#
+# Usage:
+#   voidbox shell --file examples/specs/interactive_claude.yaml
+api_version: v1
+kind: agent
+name: interactive-dev
+sandbox:
+  memory_mb: 2048
+  network: true
+agent:
+  prompt: "You are a coding assistant. Help the user with their project."
+  mode: interactive
+llm:
+  provider: claude-personal
