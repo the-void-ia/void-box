@@ -9,6 +9,8 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("guest-agent is Linux-only (runs as PID 1 inside the micro-VM)");
 
+mod pty;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
@@ -22,9 +24,9 @@ use serde::Serialize;
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, MessageType,
-    MkdirPRequest, MkdirPResponse, ProcessMetrics, ReadFileRequest, ReadFileResponse,
-    SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
-    MAX_MESSAGE_SIZE,
+    MkdirPRequest, MkdirPResponse, ProcessMetrics, PtyOpenRequest, ReadFileRequest,
+    ReadFileResponse, SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest,
+    WriteFileResponse, MAX_MESSAGE_SIZE,
 };
 
 /// vsock port we listen on
@@ -160,11 +162,11 @@ thread_local! {
 
 /// Resource limits applied to child processes via setrlimit.
 #[derive(Clone, serde::Deserialize)]
-struct ResourceLimits {
-    max_virtual_memory: u64, // Not enforced — see comment in pre_exec
-    max_open_files: u64,
-    max_processes: u64, // Bun worker threads count towards NPROC on Linux
-    max_file_size: u64,
+pub(crate) struct ResourceLimits {
+    pub(crate) max_virtual_memory: u64,
+    pub(crate) max_open_files: u64,
+    pub(crate) max_processes: u64,
+    pub(crate) max_file_size: u64,
 }
 
 impl Default for ResourceLimits {
@@ -179,7 +181,7 @@ impl Default for ResourceLimits {
 }
 
 /// Loaded resource limits (parsed from /etc/voidbox/resource_limits.json or defaults).
-static RESOURCE_LIMITS: std::sync::OnceLock<ResourceLimits> = std::sync::OnceLock::new();
+pub(crate) static RESOURCE_LIMITS: std::sync::OnceLock<ResourceLimits> = std::sync::OnceLock::new();
 
 /// Loaded command allowlist (parsed from /etc/voidbox/allowed_commands.json or empty = allow all).
 static COMMAND_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -205,8 +207,8 @@ impl CpuJiffies {
     }
 }
 
-/// Write a message to /dev/kmsg so it appears on the kernel serial console
-fn kmsg(msg: &str) {
+/// Writes a message to /dev/kmsg so it appears on the kernel serial console.
+pub(crate) fn kmsg(msg: &str) {
     // Write to both stderr and /dev/kmsg for maximum visibility
     eprintln!("{}", msg);
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
@@ -1932,11 +1934,14 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             MessageType::SnapshotReady => {
                 send_raw_message(fd, MessageType::SnapshotReady, &[])?;
             }
-            MessageType::PtyOpen
-            | MessageType::PtyData
-            | MessageType::PtyResize
-            | MessageType::PtyClose => {
-                eprintln!("PTY message not yet implemented: {:?}", message_type);
+            MessageType::PtyOpen => {
+                let request: PtyOpenRequest = serde_json::from_slice(&payload)
+                    .map_err(|e| format!("Failed to parse PtyOpenRequest: {}", e))?;
+                pty::handle_pty_open(fd, &request, is_command_allowed)?;
+                return Ok(());
+            }
+            MessageType::PtyData | MessageType::PtyResize | MessageType::PtyClose => {
+                eprintln!("Unexpected PTY message outside session: {:?}", message_type);
             }
             MessageType::ExecResponse
             | MessageType::Pong
@@ -1958,9 +1963,8 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
     }
 }
 
-/// Check if a program is allowed by the command allowlist.
-/// Returns the resolved program name (basename) for allowlist matching.
-fn is_command_allowed(program: &str) -> bool {
+/// Checks whether a program is permitted by the command allowlist.
+pub(crate) fn is_command_allowed(program: &str) -> bool {
     match COMMAND_ALLOWLIST.get() {
         None => true, // No allowlist loaded = allow all
         Some(list) if list.is_empty() => true,
