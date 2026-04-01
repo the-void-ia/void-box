@@ -517,6 +517,10 @@ fn init_system() {
     // Create /workspace for user projects and /home/sandbox for the sandbox user
     let _ = std::fs::create_dir_all("/workspace");
     let _ = std::fs::create_dir_all("/home/sandbox/.local/bin");
+    let _ = std::os::unix::fs::symlink(
+        "/usr/local/bin/claude-code",
+        "/home/sandbox/.local/bin/claude",
+    );
     unsafe {
         let workspace = std::ffi::CString::new("/workspace").unwrap();
         libc::chown(workspace.as_ptr(), 1000, 1000);
