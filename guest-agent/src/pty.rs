@@ -8,7 +8,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use void_box_protocol::{
     MessageType, PtyClosedResponse, PtyOpenRequest, PtyOpenedResponse, PtyResizeRequest,
@@ -17,8 +17,11 @@ use void_box_protocol::{
 
 use crate::{kmsg, RESOURCE_LIMITS};
 
-/// Guards against concurrent PTY sessions (only one allowed at a time).
-static PTY_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Tracks the number of active PTY sessions (max [`MAX_PTY_SESSIONS`]).
+static PTY_SESSION_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Maximum number of concurrent PTY sessions per VM.
+const MAX_PTY_SESSIONS: u32 = 4;
 
 /// Buffer size for reads from the PTY master fd.
 const PTY_READ_BUF_SIZE: usize = 4096;
@@ -27,10 +30,29 @@ const PTY_READ_BUF_SIZE: usize = 4096;
 const SANDBOX_UID: libc::uid_t = 1000;
 const SANDBOX_GID: libc::gid_t = 1000;
 
+fn acquire_session() -> bool {
+    loop {
+        let current = PTY_SESSION_COUNT.load(Ordering::SeqCst);
+        if current >= MAX_PTY_SESSIONS {
+            return false;
+        }
+        if PTY_SESSION_COUNT
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn release_session() {
+    PTY_SESSION_COUNT.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Handles a PtyOpen message from the host.
 ///
-/// Validates the command against the allowlist, acquires the single-session
-/// guard, and delegates to `run_pty_session` on success.
+/// Validates the command against the allowlist, acquires a session slot,
+/// and delegates to `run_pty_session` on success.
 ///
 /// # Errors
 ///
@@ -53,14 +75,11 @@ pub fn handle_pty_open(
         return Ok(());
     }
 
-    if PTY_ACTIVE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        kmsg("PTY: session already active");
+    if !acquire_session() {
+        kmsg("PTY: max sessions reached");
         let resp = PtyOpenedResponse {
             success: false,
-            error: Some("A PTY session is already active".into()),
+            error: Some(format!("max PTY sessions ({}) reached", MAX_PTY_SESSIONS)),
         };
         send_json_message(fd, MessageType::PtyOpened, &resp)?;
         return Ok(());
@@ -68,7 +87,7 @@ pub fn handle_pty_open(
 
     let result = run_pty_session(fd, request);
 
-    PTY_ACTIVE.store(false, Ordering::SeqCst);
+    release_session();
 
     result
 }
@@ -413,4 +432,22 @@ fn write_all_raw(fd: RawFd, data: &[u8]) -> Result<(), io::Error> {
         offset += n as usize;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_guard_allows_up_to_max() {
+        PTY_SESSION_COUNT.store(0, Ordering::SeqCst);
+        for i in 0..MAX_PTY_SESSIONS {
+            assert!(acquire_session(), "acquire failed at session {}", i);
+        }
+        assert_eq!(PTY_SESSION_COUNT.load(Ordering::SeqCst), MAX_PTY_SESSIONS);
+        assert!(!acquire_session(), "should reject when full");
+        release_session();
+        assert!(acquire_session(), "should allow after release");
+        PTY_SESSION_COUNT.store(0, Ordering::SeqCst);
+    }
 }
