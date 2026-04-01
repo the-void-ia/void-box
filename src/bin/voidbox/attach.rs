@@ -114,13 +114,8 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         builder = builder.mount(parse_mount_flag(raw)?);
     }
 
-    if let Some(ref creds) = staged_creds {
-        builder = builder.mount(MountConfig {
-            host_path: creds.host_path.clone(),
-            guest_path: "/home/sandbox/.claude".into(),
-            read_only: false,
-        });
-    }
+    // Credentials are written via write_file after boot (not mounted),
+    // because the VMM only supports one 9p device at a time.
 
     for (key, value) in &spec.sandbox.env {
         builder = builder.env(key, value);
@@ -142,6 +137,16 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         let _ = sandbox
             .write_file("/home/sandbox/.claude.json", onboarding.as_bytes())
             .await;
+
+        if let Some(ref creds) = staged_creds {
+            let creds_path = std::path::PathBuf::from(&creds.host_path).join(".credentials.json");
+            if let Ok(content) = std::fs::read(&creds_path) {
+                let _ = sandbox.mkdir_p("/home/sandbox/.claude").await;
+                let _ = sandbox
+                    .write_file("/home/sandbox/.claude/.credentials.json", &content)
+                    .await;
+            }
+        }
     }
 
     let mut pty_env: Vec<(String, String)> = provider.env_vars();
