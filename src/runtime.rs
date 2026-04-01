@@ -102,6 +102,7 @@ pub async fn run_spec(
             .await
         }
         RunKind::Workflow => run_workflow(spec, input, policy, stage_tx, provider, run_id).await,
+        RunKind::Sandbox => run_sandbox(spec).await,
     }
 }
 
@@ -172,6 +173,83 @@ pub async fn run_spec_service(
     let ab = builder.build()?;
     ab.run_service(input.as_deref().map(str::as_bytes), telemetry_buffer)
         .await
+}
+
+/// Run a bare sandbox (no agent, pipeline, or workflow).
+///
+/// Boots the VM, waits for ctrl-c, then stops it. Primarily used for
+/// interactive / shell-attach workflows.
+async fn run_sandbox(spec: &RunSpec) -> Result<RunReport> {
+    let staged_creds = prepare_claude_personal(spec.llm.as_ref())?;
+
+    let guest = if uses_mock_sandbox(spec) {
+        None
+    } else {
+        resolve_guest_image(spec).await
+    };
+
+    let mut builder = Sandbox::local()
+        .memory_mb(spec.sandbox.memory_mb)
+        .vcpus(spec.sandbox.vcpus)
+        .network(spec.sandbox.network);
+
+    if let Some(ref kernel) = spec.sandbox.kernel {
+        builder = builder.kernel(kernel);
+    } else if let Some(ref gi) = guest {
+        builder = builder.kernel(&gi.kernel);
+    } else if let Ok(k) = std::env::var("VOID_BOX_KERNEL") {
+        builder = builder.kernel(k);
+    }
+    if let Some(ref initramfs) = spec.sandbox.initramfs {
+        builder = builder.initramfs(initramfs);
+    } else if let Some(ref gi) = guest {
+        if let Some(ref initramfs) = gi.initramfs {
+            builder = builder.initramfs(initramfs);
+        }
+    } else if let Ok(i) = std::env::var("VOID_BOX_INITRAMFS") {
+        builder = builder.initramfs(i);
+    }
+    if let Some(ref snapshot) = spec.sandbox.snapshot {
+        builder = builder.snapshot(snapshot);
+    }
+
+    for mount in &spec.sandbox.mounts {
+        builder = builder.mount(MountConfig {
+            host_path: mount.host.clone(),
+            guest_path: mount.guest.clone(),
+            read_only: mount.mode != "rw",
+        });
+    }
+
+    if let Some(ref staged) = staged_creds {
+        builder = builder.mount(MountConfig {
+            host_path: staged.host_path.clone(),
+            guest_path: "/home/sandbox/.claude".into(),
+            read_only: false,
+        });
+    }
+
+    for (key, value) in &spec.sandbox.env {
+        builder = builder.env(key, value);
+    }
+
+    let sandbox = builder.build()?;
+    let _ = sandbox.exec("echo", &["ready"]).await;
+
+    tokio::signal::ctrl_c().await.ok();
+    let _ = sandbox.stop().await;
+    drop(staged_creds);
+
+    Ok(RunReport {
+        name: spec.name.clone(),
+        kind: "sandbox".into(),
+        success: true,
+        output: String::new(),
+        stages: 0,
+        total_cost_usd: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+    })
 }
 
 fn uses_mock_sandbox(spec: &RunSpec) -> bool {

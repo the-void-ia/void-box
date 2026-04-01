@@ -2220,6 +2220,7 @@ fn plan_events_from_spec(run_id: &str, environment_id: &str, spec: &RunSpec) -> 
                 ));
             }
         }
+        RunKind::Sandbox => {}
     }
 
     out
@@ -2379,6 +2380,7 @@ fn kind_name(kind: &RunKind) -> &'static str {
         RunKind::Agent => "agent",
         RunKind::Pipeline => "pipeline",
         RunKind::Workflow => "workflow",
+        RunKind::Sandbox => "sandbox",
     }
 }
 

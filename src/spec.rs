@@ -31,6 +31,7 @@ pub enum RunKind {
     Agent,
     Pipeline,
     Workflow,
+    Sandbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +123,7 @@ pub enum AgentMode {
     #[default]
     Task,
     Service,
+    Interactive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,7 +360,7 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
             let Some(agent) = &spec.agent else {
                 return Err(Error::Config("kind=agent requires 'agent' section".into()));
             };
-            if agent.prompt.trim().is_empty() {
+            if agent.prompt.trim().is_empty() && agent.mode != AgentMode::Interactive {
                 return Err(Error::Config("agent.prompt cannot be empty".into()));
             }
             if agent.mode == AgentMode::Service {
@@ -372,6 +374,11 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
                         "agent: mode: service requires output_file".into(),
                     ));
                 }
+            }
+            if agent.mode == AgentMode::Interactive && agent.timeout_secs.is_some() {
+                return Err(Error::Config(
+                    "agent: mode: interactive and timeout_secs are mutually exclusive".into(),
+                ));
             }
         }
         RunKind::Pipeline => {
@@ -400,6 +407,23 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
                         step.name
                     )));
                 }
+            }
+        }
+        RunKind::Sandbox => {
+            if spec.agent.is_some() {
+                return Err(Error::Config(
+                    "kind: sandbox does not accept an agent block".into(),
+                ));
+            }
+            if spec.pipeline.is_some() {
+                return Err(Error::Config(
+                    "kind: sandbox does not accept a pipeline block".into(),
+                ));
+            }
+            if spec.workflow.is_some() {
+                return Err(Error::Config(
+                    "kind: sandbox does not accept a workflow block".into(),
+                ));
             }
         }
     }
@@ -621,5 +645,124 @@ workflow:
         let step = &spec.workflow.unwrap().steps[0];
         assert!(step.mode.is_none());
         assert!(step.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn kind_sandbox_parses() {
+        let yaml = r#"
+api_version: v1
+kind: sandbox
+name: my-sandbox
+sandbox:
+  memory_mb: 2048
+  network: true
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.kind, RunKind::Sandbox);
+        assert!(spec.agent.is_none());
+    }
+
+    #[test]
+    fn kind_sandbox_with_llm_parses() {
+        let yaml = r#"
+api_version: v1
+kind: sandbox
+name: dev-env
+sandbox:
+  memory_mb: 2048
+  network: true
+llm:
+  provider: claude-personal
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.kind, RunKind::Sandbox);
+    }
+
+    #[test]
+    fn kind_sandbox_rejects_agent_block() {
+        let yaml = r#"
+api_version: v1
+kind: sandbox
+name: bad
+sandbox:
+  memory_mb: 2048
+agent:
+  prompt: "should not be here"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("sandbox"), "{}", err);
+    }
+
+    #[test]
+    fn agent_mode_interactive_parses() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: interactive-claude
+sandbox:
+  memory_mb: 2048
+  network: true
+agent:
+  prompt: "You are a coding assistant"
+  mode: interactive
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+        let agent = spec.agent.unwrap();
+        assert_eq!(agent.mode, AgentMode::Interactive);
+    }
+
+    #[test]
+    fn agent_mode_interactive_allows_empty_prompt() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: bare-interactive
+sandbox:
+  memory_mb: 2048
+  network: true
+agent:
+  prompt: ""
+  mode: interactive
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn agent_mode_interactive_rejects_timeout() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: bad
+sandbox:
+  mode: auto
+agent:
+  prompt: "x"
+  mode: interactive
+  timeout_secs: 60
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{}", err);
+    }
+
+    #[test]
+    fn agent_mode_interactive_does_not_require_output_file() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: no-output
+sandbox:
+  mode: auto
+agent:
+  prompt: "hello"
+  mode: interactive
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
     }
 }
