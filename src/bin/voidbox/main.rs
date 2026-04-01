@@ -174,6 +174,9 @@ enum Command {
         /// Guest memory in MB.
         #[arg(long, default_value = "1024")]
         memory_mb: usize,
+        /// Number of vCPUs.
+        #[arg(long, default_value = "2")]
+        vcpus: usize,
         /// Enable guest networking.
         #[arg(long, default_value = "true")]
         network: bool,
@@ -298,6 +301,7 @@ async fn run(
             args,
             working_dir,
             memory_mb,
+            vcpus,
             network,
             provider,
             snapshot,
@@ -310,6 +314,7 @@ async fn run(
                 args: &args,
                 working_dir: working_dir.as_deref(),
                 memory_mb,
+                vcpus,
                 network,
                 provider: provider.as_deref(),
                 snapshot: snapshot.as_deref(),

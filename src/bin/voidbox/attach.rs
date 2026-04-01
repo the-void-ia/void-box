@@ -32,6 +32,8 @@ pub struct ShellOpts<'a> {
     pub working_dir: Option<&'a str>,
     /// Guest memory in MB (used when no spec file).
     pub memory_mb: usize,
+    /// Number of vCPUs (used when no spec file).
+    pub vcpus: usize,
     /// Enable guest networking (used when no spec file).
     pub network: bool,
     /// LLM provider override.
@@ -57,7 +59,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
             spec::validate_spec(&s)?;
             s
         }
-        None => build_ephemeral_spec(opts.memory_mb, opts.network),
+        None => build_ephemeral_spec(opts.memory_mb, opts.vcpus, opts.network),
     };
 
     let provider = resolve_provider(opts.provider, opts.file.is_some(), spec.llm.as_ref())?;
@@ -81,6 +83,11 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     } else {
         opts.memory_mb
     };
+    let effective_vcpus = if opts.file.is_some() {
+        spec.sandbox.vcpus
+    } else {
+        opts.vcpus
+    };
     let effective_network = if opts.file.is_some() {
         spec.sandbox.network
     } else {
@@ -90,6 +97,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let mut builder = void_box::sandbox::Sandbox::local()
         .kernel(&kernel)
         .memory_mb(effective_memory)
+        .vcpus(effective_vcpus)
         .network(effective_network);
 
     if let Some(path) = &initramfs {
@@ -183,7 +191,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
 }
 
 /// Builds a minimal ephemeral `RunSpec` with `kind: sandbox`.
-fn build_ephemeral_spec(memory_mb: usize, network: bool) -> RunSpec {
+fn build_ephemeral_spec(memory_mb: usize, vcpus: usize, network: bool) -> RunSpec {
     RunSpec {
         api_version: "v1".into(),
         kind: RunKind::Sandbox,
@@ -193,7 +201,7 @@ fn build_ephemeral_spec(memory_mb: usize, network: bool) -> RunSpec {
             kernel: None,
             initramfs: None,
             memory_mb,
-            vcpus: 1,
+            vcpus,
             network,
             env: Default::default(),
             mounts: Vec::new(),
