@@ -9,6 +9,7 @@
 //! - **macOS**: `VzBackend` — Apple Virtualization.framework
 
 pub mod control_channel;
+pub mod pty_session;
 
 #[cfg(target_os = "linux")]
 pub mod kvm;
@@ -253,6 +254,12 @@ pub trait VmmBackend: Send + Sync {
 
     /// Set the active span context for TRACEPARENT propagation.
     fn set_span_context(&mut self, ctx: SpanContext);
+
+    /// Opens a PTY session on the guest, returning a handle for interactive I/O.
+    async fn attach_pty(
+        &self,
+        request: void_box_protocol::PtyOpenRequest,
+    ) -> Result<pty_session::PtySession>;
 
     /// Check if the VM is running.
     fn is_running(&self) -> bool;

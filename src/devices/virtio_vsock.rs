@@ -666,6 +666,12 @@ impl Write for VsockStream {
     }
 }
 
+impl AsRawFd for VsockStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
 impl Drop for VsockStream {
     fn drop(&mut self) {
         unsafe {

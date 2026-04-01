@@ -92,4 +92,8 @@ impl GuestStream for VzSocketStream {
             Ok(())
         }
     }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
 }

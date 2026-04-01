@@ -21,6 +21,7 @@
 //! 3. Inside `spawn_blocking`: connect → handshake → send → read loop.
 
 use std::io::{self, Read, Write};
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,8 +32,8 @@ use void_box_protocol::ProtocolError;
 
 use crate::guest::protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, Message,
-    MessageType, MkdirPRequest, MkdirPResponse, ReadFileRequest, ReadFileResponse, TelemetryBatch,
-    TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
+    MessageType, MkdirPRequest, MkdirPResponse, PtyOpenRequest, ReadFileRequest, ReadFileResponse,
+    TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::{Error, Result};
 
@@ -46,6 +47,9 @@ pub const GUEST_AGENT_PORT: u32 = 1234;
 pub trait GuestStream: Read + Write + Send {
     /// Set the read timeout. `None` means blocking (no timeout).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Returns the underlying file descriptor for this stream.
+    fn as_raw_fd(&self) -> RawFd;
 }
 
 /// A function that creates a new connection to the guest agent.
@@ -575,13 +579,33 @@ impl ControlChannel {
         .await
         .map_err(|e| Error::Guest(format!("snapshot_ready task panicked: {e}")))?
     }
+
+    /// Opens a PTY session on the guest, returning a [`PtySession`] that owns the connection.
+    pub async fn open_pty(
+        &self,
+        request: PtyOpenRequest,
+    ) -> Result<super::pty_session::PtySession> {
+        let connector = Arc::clone(&self.connector);
+        let session_secret = self.session_secret;
+        let boot_wait_done = Arc::clone(&self.boot_wait_done);
+        tokio::task::spawn_blocking(move || {
+            super::pty_session::PtySession::open(
+                &connector,
+                &session_secret,
+                &boot_wait_done,
+                &request,
+            )
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("pty task panicked: {e}")))?
+    }
 }
 
 /// Connect to the guest agent and perform a Ping/Pong handshake.
 ///
 /// Fully synchronous — intended to be called from `spawn_blocking` closures.
 /// Uses [`std::thread::sleep`] for backoff delays (not `tokio::time::sleep`).
-fn connect_with_handshake_sync(
+pub(crate) fn connect_with_handshake_sync(
     connector: &GuestConnector,
     session_secret: &[u8; 32],
     boot_wait_done: &AtomicBool,

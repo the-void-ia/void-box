@@ -599,6 +599,17 @@ Build a production guest image with claude-code and set VOID_BOX_INITRAMFS: \
         &self.config
     }
 
+    /// Opens a PTY session on the guest, returning a handle for interactive I/O.
+    pub async fn attach_pty(
+        &self,
+        request: void_box_protocol::PtyOpenRequest,
+    ) -> Result<crate::backend::pty_session::PtySession> {
+        match &self.inner {
+            SandboxInner::Local(local) => local.attach_pty(request).await,
+            SandboxInner::Mock(_) => Err(Error::Config("PTY not supported on mock sandbox".into())),
+        }
+    }
+
     /// Stop the sandbox and cleanup resources gracefully
     pub async fn stop(&self) -> Result<()> {
         match &self.inner {

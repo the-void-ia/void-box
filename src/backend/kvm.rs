@@ -11,7 +11,7 @@ use crate::backend::control_channel::{ControlChannel, GuestStream, GUEST_AGENT_P
 use crate::backend::{BackendConfig, VmmBackend};
 use crate::devices::virtio_vsock::VsockStream;
 use crate::guest::protocol::{
-    build_exec_request, ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest,
+    build_exec_request, ExecOutputChunk, ExecResponse, PtyOpenRequest, TelemetrySubscribeRequest,
 };
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
@@ -24,6 +24,10 @@ use crate::{Error, ExecOutput, Result};
 impl GuestStream for VsockStream {
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
         VsockStream::set_read_timeout(self, timeout)
+    }
+
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        std::os::unix::io::AsRawFd::as_raw_fd(self)
     }
 }
 
@@ -298,6 +302,11 @@ impl VmmBackend for KvmBackend {
 
     fn set_span_context(&mut self, ctx: SpanContext) {
         self.span_context = Some(ctx);
+    }
+
+    async fn attach_pty(&self, request: PtyOpenRequest) -> Result<super::pty_session::PtySession> {
+        let cc = self.control_channel.as_ref().ok_or(Error::VmNotRunning)?;
+        cc.open_pty(request).await
     }
 
     fn is_running(&self) -> bool {

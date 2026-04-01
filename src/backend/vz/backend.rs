@@ -895,6 +895,17 @@ impl VmmBackend for VzBackend {
         self.span_context = Some(ctx);
     }
 
+    async fn attach_pty(
+        &self,
+        request: void_box_protocol::PtyOpenRequest,
+    ) -> Result<super::super::pty_session::PtySession> {
+        let cc = self
+            .control_channel
+            .as_ref()
+            .ok_or(crate::Error::VmNotRunning)?;
+        cc.open_pty(request).await
+    }
+
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }

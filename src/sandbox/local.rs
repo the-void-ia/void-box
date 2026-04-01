@@ -413,6 +413,15 @@ impl LocalSandbox {
         backend.start_telemetry(observer, opts, ring_buffer).await
     }
 
+    /// Opens a PTY session on the guest via the backend.
+    pub async fn attach_pty(
+        &self,
+        request: void_box_protocol::PtyOpenRequest,
+    ) -> Result<crate::backend::pty_session::PtySession> {
+        let backend = self.get_backend().await?;
+        backend.attach_pty(request).await
+    }
+
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
 
