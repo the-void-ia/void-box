@@ -1,3 +1,4 @@
+mod attach;
 mod backend;
 mod banner;
 mod cli_config;
@@ -136,6 +137,47 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:43100")]
         listen: String,
     },
+
+    /// Attach an interactive PTY to a running VM.
+    Attach {
+        /// Run ID of the target VM.
+        #[arg(long)]
+        run_id: String,
+        /// Program to run (default: sh).
+        #[arg(long, default_value = "sh")]
+        program: String,
+        /// Arguments to the program.
+        #[arg(long)]
+        args: Vec<String>,
+        /// Working directory inside the guest.
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Daemon URL override.
+        #[arg(long)]
+        daemon: Option<String>,
+    },
+
+    /// Boot an ephemeral VM and open an interactive shell.
+    Shell {
+        /// Program to run (default: sh).
+        #[arg(long, default_value = "sh")]
+        program: String,
+        /// Arguments to the program.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+        /// Working directory inside the guest.
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Guest memory in MB.
+        #[arg(long, default_value = "512")]
+        memory_mb: usize,
+        /// OCI image to use for the rootfs.
+        #[arg(long)]
+        image: Option<String>,
+        /// Enable guest networking.
+        #[arg(long)]
+        network: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -181,7 +223,8 @@ fn resolved_daemon_url(command: &Command, config: &ResolvedConfig) -> String {
     match command {
         Command::Status { daemon, .. }
         | Command::Logs { daemon, .. }
-        | Command::Tui { daemon, .. } => {
+        | Command::Tui { daemon, .. }
+        | Command::Attach { daemon, .. } => {
             daemon.clone().unwrap_or_else(|| config.daemon_url.clone())
         }
         _ => config.daemon_url.clone(),
@@ -226,6 +269,35 @@ async fn run(
         Command::Config { command } => cmd_config(command, output, config).map(|_| 0),
         Command::Version => cmd_version(output).map(|_| 0),
         Command::Serve { listen } => cmd_serve(&listen).await.map(|_| 0),
+        Command::Attach {
+            run_id,
+            program,
+            args,
+            working_dir,
+            daemon,
+            ..
+        } => {
+            let url = daemon.unwrap_or_else(|| config.daemon_url.clone());
+            attach::cmd_attach(&run_id, Some(&program), &args, working_dir.as_deref(), &url).await
+        }
+        Command::Shell {
+            program,
+            args,
+            working_dir,
+            memory_mb,
+            image,
+            network,
+        } => {
+            attach::cmd_shell(
+                &program,
+                &args,
+                working_dir.as_deref(),
+                memory_mb,
+                image.as_deref(),
+                network,
+            )
+            .await
+        }
     }
 }
 
