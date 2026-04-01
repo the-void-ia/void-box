@@ -30,6 +30,12 @@ struct DnsCacheEntry {
     expires: Instant,
 }
 
+/// A DNS query waiting to be resolved on the net-poll thread.
+struct PendingDnsQuery {
+    query: Vec<u8>,
+    guest_src_port: u16,
+}
+
 /// DNS cache TTL (seconds).  DNS responses carry their own TTL but parsing
 /// every record type is overkill — a short blanket TTL covers 99 % of cases
 /// while keeping the implementation simple.
@@ -252,6 +258,8 @@ pub struct SlirpStack {
     dns_servers: Vec<String>,
     /// DNS response cache keyed by the raw query bytes (question section)
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
+    /// DNS queries waiting to be resolved on the net-poll thread.
+    pending_dns: Vec<PendingDnsQuery>,
 }
 
 impl SlirpStack {
@@ -320,6 +328,7 @@ impl SlirpStack {
             deny_list,
             dns_servers,
             dns_cache: HashMap::new(),
+            pending_dns: Vec::new(),
         })
     }
 
@@ -392,10 +401,13 @@ impl SlirpStack {
         let mut dev = VirtualDevice::new(self.queue.clone());
         let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
 
-        // 2. Process TCP NAT data relay
+        // 2. Resolve pending DNS queries (off vCPU thread)
+        self.resolve_pending_dns();
+
+        // 3. Process TCP NAT data relay
         self.relay_tcp_nat_data();
 
-        // 3. Collect frames: smoltcp ARP responses + our NAT-built frames
+        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames
         let mut frames = Vec::new();
         {
             let mut q = self.queue.lock().unwrap();
@@ -441,6 +453,33 @@ impl SlirpStack {
             return None;
         }
         Some(query[12..pos].to_vec())
+    }
+
+    /// Drains the pending DNS queue and resolves each query. Called from
+    /// `poll()` on the net-poll thread, never from a vCPU thread.
+    fn resolve_pending_dns(&mut self) {
+        if self.pending_dns.is_empty() {
+            return;
+        }
+        let queries: Vec<PendingDnsQuery> = self.pending_dns.drain(..).collect();
+        for pending in queries {
+            if let Some(response) = self.forward_dns_query(&pending.query) {
+                let frame = self.build_udp_response(
+                    SLIRP_DNS_IP,
+                    SLIRP_GUEST_IP,
+                    53,
+                    pending.guest_src_port,
+                    &response,
+                );
+                self.inject_to_guest.push(frame);
+                debug!(
+                    "SLIRP DNS: resolved pending query, {} byte response",
+                    response.len()
+                );
+            } else {
+                warn!("SLIRP DNS: failed to resolve pending query");
+            }
+        }
     }
 
     /// Forward a DNS query to host resolvers and return the response.
@@ -616,21 +655,32 @@ impl SlirpStack {
             query.len()
         );
 
-        // Forward to host DNS
-        if let Some(response) = self.forward_dns_query(query) {
-            // Build response: Ethernet(IP(UDP(dns_response)))
-            let frame = self.build_udp_response(
-                SLIRP_DNS_IP,   // src = DNS server
-                SLIRP_GUEST_IP, // dst = guest
-                53,             // src port
-                src_port,       // dst port
-                &response,
-            );
-            self.inject_to_guest.push(frame);
-            debug!("SLIRP DNS: sent {} byte response", response.len());
-        } else {
-            warn!("SLIRP DNS: failed to resolve query");
+        // Fast path: serve from cache (safe on vCPU thread)
+        if let Some(key) = Self::dns_cache_key(query) {
+            if let Some(entry) = self.dns_cache.get(&key) {
+                if Instant::now() < entry.expires {
+                    let mut resp = entry.response.clone();
+                    if resp.len() >= 2 && query.len() >= 2 {
+                        resp[0] = query[0];
+                        resp[1] = query[1];
+                    }
+                    debug!("SLIRP DNS: cache hit (vCPU fast path)");
+                    let frame =
+                        self.build_udp_response(SLIRP_DNS_IP, SLIRP_GUEST_IP, 53, src_port, &resp);
+                    self.inject_to_guest.push(frame);
+                    return Ok(());
+                } else {
+                    self.dns_cache.remove(&key);
+                }
+            }
         }
+
+        // Slow path: queue for resolution on net-poll thread
+        debug!("SLIRP DNS: queuing for async resolution");
+        self.pending_dns.push(PendingDnsQuery {
+            query: query.to_vec(),
+            guest_src_port: src_port,
+        });
         Ok(())
     }
 
