@@ -516,13 +516,16 @@ fn init_system() {
 
     // Create /workspace for user projects and /home/sandbox for the sandbox user
     let _ = std::fs::create_dir_all("/workspace");
-    let _ = std::fs::create_dir_all("/home/sandbox");
-    // Make them writable by uid 1000 (sandbox user)
+    let _ = std::fs::create_dir_all("/home/sandbox/.local/bin");
     unsafe {
         let workspace = std::ffi::CString::new("/workspace").unwrap();
         libc::chown(workspace.as_ptr(), 1000, 1000);
         let home = std::ffi::CString::new("/home/sandbox").unwrap();
         libc::chown(home.as_ptr(), 1000, 1000);
+        let local = std::ffi::CString::new("/home/sandbox/.local").unwrap();
+        libc::chown(local.as_ptr(), 1000, 1000);
+        let local_bin = std::ffi::CString::new("/home/sandbox/.local/bin").unwrap();
+        libc::chown(local_bin.as_ptr(), 1000, 1000);
     }
 
     // Create /etc for resolv.conf
