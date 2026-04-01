@@ -143,6 +143,18 @@ pub enum MessageType {
     FileStat = 20,
     /// Response to FileStat.
     FileStatResponse = 21,
+    /// Opens a new pseudo-terminal session in the guest.
+    PtyOpen = 22,
+    /// Confirms that a PTY session was opened successfully or reports an error.
+    PtyOpened = 23,
+    /// Carries raw terminal I/O bytes for an open PTY session.
+    PtyData = 24,
+    /// Requests a terminal window size change for an open PTY session.
+    PtyResize = 25,
+    /// Requests teardown of an open PTY session.
+    PtyClose = 26,
+    /// Confirms that a PTY session has been closed and reports its exit code.
+    PtyClosed = 27,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -171,6 +183,12 @@ impl TryFrom<u8> for MessageType {
             19 => Ok(MessageType::ReadFileResponse),
             20 => Ok(MessageType::FileStat),
             21 => Ok(MessageType::FileStatResponse),
+            22 => Ok(MessageType::PtyOpen),
+            23 => Ok(MessageType::PtyOpened),
+            24 => Ok(MessageType::PtyData),
+            25 => Ok(MessageType::PtyResize),
+            26 => Ok(MessageType::PtyClose),
+            27 => Ok(MessageType::PtyClosed),
             _ => Err(ProtocolError::UnknownMessageType(byte)),
         }
     }
@@ -445,6 +463,59 @@ pub struct FileStatResponse {
     pub error: Option<String>,
 }
 
+/// Request to open a pseudo-terminal session in the guest.
+///
+/// The host sends this to spawn a program under a PTY with the given
+/// initial terminal dimensions, environment, and working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyOpenRequest {
+    /// Initial terminal width in columns.
+    pub cols: u16,
+    /// Initial terminal height in rows.
+    pub rows: u16,
+    /// Program to execute under the PTY.
+    pub program: String,
+    /// Arguments to the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables for the PTY process.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Working directory for the PTY process.
+    pub working_dir: Option<String>,
+}
+
+/// Response confirming whether a PTY session was opened.
+///
+/// Sent by the guest after processing a [`PtyOpenRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyOpenedResponse {
+    /// Whether the PTY was opened successfully.
+    pub success: bool,
+    /// Error message if the open failed.
+    pub error: Option<String>,
+}
+
+/// Request to resize the terminal window of an open PTY session.
+///
+/// Sent by the host when the user's terminal dimensions change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyResizeRequest {
+    /// New terminal width in columns.
+    pub cols: u16,
+    /// New terminal height in rows.
+    pub rows: u16,
+}
+
+/// Response confirming that a PTY session has been closed.
+///
+/// Sent by the guest after the PTY process exits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyClosedResponse {
+    /// Exit code of the PTY process.
+    pub exit_code: i32,
+}
+
 // ---------------------------------------------------------------------------
 // Data types: Telemetry
 // ---------------------------------------------------------------------------
@@ -579,7 +650,7 @@ mod tests {
     #[test]
     fn message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
-        assert!(MessageType::try_from(22).is_err());
+        assert!(MessageType::try_from(28).is_err());
         assert!(MessageType::try_from(255).is_err());
     }
 
@@ -949,5 +1020,104 @@ mod tests {
         let bytes = msg.serialize();
         let decoded = Message::deserialize(&bytes).unwrap();
         assert_eq!(decoded.msg_type, MessageType::SubscribeTelemetry);
+    }
+
+    #[test]
+    fn pty_message_types_round_trip() {
+        for &(byte, expected) in &[
+            (22u8, MessageType::PtyOpen),
+            (23, MessageType::PtyOpened),
+            (24, MessageType::PtyData),
+            (25, MessageType::PtyResize),
+            (26, MessageType::PtyClose),
+            (27, MessageType::PtyClosed),
+        ] {
+            assert_eq!(MessageType::try_from(byte).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn pty_open_request_json_round_trip() {
+        let req = PtyOpenRequest {
+            cols: 80,
+            rows: 24,
+            program: "/bin/bash".to_string(),
+            args: vec!["-l".to_string()],
+            env: vec![("TERM".to_string(), "xterm-256color".to_string())],
+            working_dir: Some("/home/user".to_string()),
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let decoded: PtyOpenRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.cols, 80);
+        assert_eq!(decoded.rows, 24);
+        assert_eq!(decoded.program, "/bin/bash");
+        assert_eq!(decoded.args, vec!["-l"]);
+        assert_eq!(decoded.env, vec![("TERM".into(), "xterm-256color".into())]);
+        assert_eq!(decoded.working_dir.as_deref(), Some("/home/user"));
+
+        let minimal: PtyOpenRequest =
+            serde_json::from_str(r#"{"cols":120,"rows":40,"program":"sh"}"#).unwrap();
+        assert!(minimal.args.is_empty());
+        assert!(minimal.env.is_empty());
+        assert!(minimal.working_dir.is_none());
+    }
+
+    #[test]
+    fn pty_opened_response_json_round_trip() {
+        let ok = PtyOpenedResponse {
+            success: true,
+            error: None,
+        };
+        let json = serde_json::to_vec(&ok).unwrap();
+        let decoded: PtyOpenedResponse = serde_json::from_slice(&json).unwrap();
+        assert!(decoded.success);
+        assert!(decoded.error.is_none());
+
+        let fail = PtyOpenedResponse {
+            success: false,
+            error: Some("no such program".to_string()),
+        };
+        let json = serde_json::to_vec(&fail).unwrap();
+        let decoded: PtyOpenedResponse = serde_json::from_slice(&json).unwrap();
+        assert!(!decoded.success);
+        assert_eq!(decoded.error.as_deref(), Some("no such program"));
+    }
+
+    #[test]
+    fn pty_resize_request_json_round_trip() {
+        let req = PtyResizeRequest {
+            cols: 132,
+            rows: 43,
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let decoded: PtyResizeRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.cols, 132);
+        assert_eq!(decoded.rows, 43);
+    }
+
+    #[test]
+    fn pty_closed_response_json_round_trip() {
+        let resp = PtyClosedResponse { exit_code: 0 };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: PtyClosedResponse = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.exit_code, 0);
+
+        let resp = PtyClosedResponse { exit_code: 137 };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: PtyClosedResponse = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.exit_code, 137);
+    }
+
+    #[test]
+    fn pty_data_uses_raw_bytes() {
+        let raw = b"\x1b[31mhello\x1b[0m\r\n";
+        let msg = Message {
+            msg_type: MessageType::PtyData,
+            payload: raw.to_vec(),
+        };
+        let bytes = msg.serialize();
+        let decoded = Message::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::PtyData);
+        assert_eq!(decoded.payload, raw);
     }
 }

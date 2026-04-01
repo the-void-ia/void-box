@@ -1932,6 +1932,12 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             MessageType::SnapshotReady => {
                 send_raw_message(fd, MessageType::SnapshotReady, &[])?;
             }
+            MessageType::PtyOpen
+            | MessageType::PtyData
+            | MessageType::PtyResize
+            | MessageType::PtyClose => {
+                eprintln!("PTY message not yet implemented: {:?}", message_type);
+            }
             MessageType::ExecResponse
             | MessageType::Pong
             | MessageType::FileTransfer
@@ -1943,7 +1949,9 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             | MessageType::ExecOutputChunk
             | MessageType::ExecOutputAck
             | MessageType::ReadFileResponse
-            | MessageType::FileStatResponse => {
+            | MessageType::FileStatResponse
+            | MessageType::PtyOpened
+            | MessageType::PtyClosed => {
                 eprintln!("Unexpected response-type message: {:?}", message_type);
             }
         }
