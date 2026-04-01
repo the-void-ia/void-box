@@ -171,9 +171,17 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
 
     let path =
         std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/sbin".to_string());
-    if !path.contains("/usr/local/bin") {
-        std::env::set_var("PATH", format!("/usr/local/bin:{}", path));
-    }
+    let path = if path.contains("/home/sandbox/.local/bin") {
+        path
+    } else {
+        format!("/home/sandbox/.local/bin:{}", path)
+    };
+    let path = if path.contains("/usr/local/bin") {
+        path
+    } else {
+        format!("/usr/local/bin:{}", path)
+    };
+    std::env::set_var("PATH", &path);
     std::env::set_var("HOME", "/home/sandbox");
     std::env::set_var("TERM", "xterm-256color");
 
