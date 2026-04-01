@@ -224,14 +224,14 @@ fn resolve_provider(
         }
     }
 
-    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return Ok(LlmProvider::Claude);
-    }
-
     let home = std::env::var("HOME").unwrap_or_default();
     let creds_path = PathBuf::from(&home).join(".claude/.credentials.json");
     if creds_path.exists() {
         return Ok(LlmProvider::ClaudePersonal);
+    }
+
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return Ok(LlmProvider::Claude);
     }
 
     Err("no LLM provider detected: set ANTHROPIC_API_KEY or run `claude auth login`".into())
