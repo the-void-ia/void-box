@@ -172,6 +172,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         args: opts.args.to_vec(),
         env: pty_env,
         working_dir: opts.working_dir.map(String::from),
+        interactive: true,
     };
 
     let session = sandbox.attach_pty(request).await?;

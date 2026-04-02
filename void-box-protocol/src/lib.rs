@@ -483,6 +483,9 @@ pub struct PtyOpenRequest {
     pub env: Vec<(String, String)>,
     /// Working directory for the PTY process.
     pub working_dir: Option<String>,
+    /// Interactive mode relaxes resource limits (e.g. no FSIZE cap).
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 /// Response confirming whether a PTY session was opened.
@@ -1045,6 +1048,7 @@ mod tests {
             args: vec!["-l".to_string()],
             env: vec![("TERM".to_string(), "xterm-256color".to_string())],
             working_dir: Some("/home/user".to_string()),
+            interactive: false,
         };
         let json = serde_json::to_vec(&req).unwrap();
         let decoded: PtyOpenRequest = serde_json::from_slice(&json).unwrap();

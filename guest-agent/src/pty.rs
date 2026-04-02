@@ -161,11 +161,13 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
             };
             libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
 
-            let rlim_fsize = libc::rlimit {
-                rlim_cur: limits.max_file_size,
-                rlim_max: limits.max_file_size,
-            };
-            libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+            if !request.interactive {
+                let rlim_fsize = libc::rlimit {
+                    rlim_cur: limits.max_file_size,
+                    rlim_max: limits.max_file_size,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+            }
         }
     }
 

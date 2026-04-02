@@ -47,6 +47,7 @@ mod pty_tests {
             args: vec!["-c".to_string(), "echo hello-pty && exit 0".to_string()],
             env: vec![],
             working_dir: None,
+            interactive: false,
         };
 
         let session = sandbox.attach_pty(request).await.unwrap();
@@ -76,6 +77,7 @@ mod pty_tests {
             args: vec![],
             env: vec![],
             working_dir: None,
+            interactive: false,
         };
 
         let result = sandbox.attach_pty(request).await;
@@ -105,6 +107,7 @@ mod pty_tests {
             args: vec!["-c".to_string(), "exit 42".to_string()],
             env: vec![],
             working_dir: None,
+            interactive: false,
         };
 
         let session = sandbox.attach_pty(request).await.unwrap();
