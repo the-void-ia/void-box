@@ -66,12 +66,13 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  │  - Drops privileges to uid:1000                              │ │
 │  │  - Listens on vsock port 1234                                │ │
 │  │  - pivot_root to OCI rootfs (if sandbox.image set)           │ │
+│  │  - PTY handler: forkpty, up to 4 concurrent sessions         │ │
 │  └────────────────────────┬─────────────────────────────────────┘ │
-│                           │ fork+exec                             │
+│                           │ fork+exec (headless) or forkpty (PTY) │
 │  ┌────────────────────────▼─────────────────────────────────────┐ │
 │  │ claude-code (or claudio mock)                                │ │
-│  │  --output-format stream-json                                 │ │
-│  │  --dangerously-skip-permissions                              │ │
+│  │  Headless: --output-format stream-json                       │ │
+│  │  Interactive PTY: raw terminal I/O over vsock                │ │
 │  │  Skills: ~/.claude/skills/*.md                               │ │
 │  │  MCP:    ~/.claude/mcp.json                                  │ │
 │  │  OCI skills: /skills/{python,go,...} (read-only mounts)      │ │
@@ -141,6 +142,70 @@ Stage flow:
 
 For parallel stages (`fan_out`), each box runs in a separate `tokio::task::JoinSet`. Their outputs are merged as a JSON array for the next stage.
 
+### Interactive shell (`voidbox shell`)
+
+```
+voidbox shell --mount /project:/workspace:rw --program claude --memory-mb 3024 --vcpus 4 --network
+  │
+  ├─ Auto-detect LLM provider     claude-personal (OAuth) or claude (API key)
+  ├─ Build ephemeral spec          kind: sandbox, synthesized from CLI flags
+  │   (or load --file spec.yaml)
+  │
+  ├─ Build Sandbox                 kernel, initramfs, memory, vcpus, network, mounts
+  │   ├─ Stage credentials         Mount ~/.claude as 9p share (claude-personal)
+  │   ├─ Write onboarding flag     /home/sandbox/.claude.json (skip login screen)
+  │   └─ Restore from snapshot     If --snapshot or --auto-snapshot
+  │
+  ├─ attach_pty(PtyOpenRequest)    Connect vsock, handshake, send PtyOpen
+  │       │
+  │   [vsock port 1234]
+  │       │
+  │   guest-agent receives         Validates allowlist
+  │       │                        Acquires session slot (max 4 concurrent)
+  │       │                        forkpty: child drops to uid:1000
+  │       │                        Interactive mode: no RLIMIT_FSIZE
+  │       │
+  │   PtyOpened response           Success or error
+  │       │
+  ├─ RawModeGuard::engage()        Host terminal → raw mode
+  │       │
+  │   ┌─── I/O loop (two threads) ────────────────────────────┐
+  │   │ Writer: stdin → PtyData frames → vsock → guest master │
+  │   │ Reader: guest master → PtyData frames → vsock → stdout│
+  │   └───────────────────────────────────────────────────────┘
+  │       │
+  │   PtyClosed { exit_code }      Guest process exited
+  │       │
+  ├─ drop(RawModeGuard)            Restore terminal
+  ├─ sandbox.stop()                Stop VM
+  │
+  └─ exit(exit_code)               Propagate guest exit code
+```
+
+**Spec kinds:**
+
+| Kind | Agent block | PTY | Use case |
+|------|-------------|-----|----------|
+| `agent` | Required | No (headless exec) | Autonomous task execution |
+| `sandbox` | None | Via `voidbox shell` | Interactive development |
+| `agent` + `mode: interactive` | Required (empty prompt OK) | Yes | Interactive agent with prompt context |
+
+**Security guarantees (same as headless exec):**
+
+Interactive PTY sessions preserve the full defense-in-depth stack:
+- Layer 1: Hardware isolation (KVM/VZ) — separate kernel and memory space
+- Layer 2: Seccomp-BPF on VMM thread
+- Layer 3: Session secret authentication over vsock
+- Layer 4: Command allowlist — only approved binaries can be exec'd via PTY
+- Layer 4: Privilege drop to uid:1000 for the PTY child process
+- Layer 4: Resource limits (RLIMIT_NOFILE, RLIMIT_NPROC) applied to PTY child
+- Layer 5: SLIRP network isolation (rate limiting, deny list)
+
+The only difference: `RLIMIT_FSIZE` (max file size) is skipped for interactive
+sessions (`PtyOpenRequest.interactive = true`). Interactive users need to write
+files freely (e.g. Claude Code conversation logs exceed 100 MB). Batch exec
+retains the 100 MB limit as defense-in-depth.
+
 ## Wire Protocol
 
 Host and guest communicate over AF_VSOCK (port 1234) using the `void-box-protocol` crate.
@@ -174,6 +239,19 @@ Host and guest communicate over AF_VSOCK (port 1234) using the `void-box-protoco
 | 0x0F | guest → host | ExecOutputChunk | Streaming output chunk (stream, data, seq) |
 | 0x10 | host → guest | ExecOutputAck | Flow control ack (optional) |
 | 0x11 | both | SnapshotReady | Guest signals readiness for live snapshot |
+| 0x12 | host → guest | ReadFile | Read file from guest filesystem |
+| 0x13 | guest → host | ReadFileResponse | File contents or error |
+| 0x14 | host → guest | FileStat | Stat a guest file path |
+| 0x15 | guest → host | FileStatResponse | File metadata (size, mode, mtime) |
+| 0x16 | host → guest | PtyOpen | Open interactive PTY session (program, args, env, interactive) |
+| 0x17 | guest → host | PtyOpened | PTY open result (success/error) |
+| 0x18 | both | PtyData | Raw terminal I/O bytes (not JSON-encoded) |
+| 0x19 | host → guest | PtyResize | Terminal window size change (cols, rows) |
+| 0x1A | host → guest | PtyClose | Request PTY session close (SIGHUP to child) |
+| 0x1B | guest → host | PtyClosed | PTY child exited (exit_code) |
+
+**PtyData encoding:** Unlike other messages, `PtyData` payload is raw bytes
+(not JSON). This avoids base64 overhead on terminal I/O.
 
 ### Security
 

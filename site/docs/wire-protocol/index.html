@@ -73,8 +73,19 @@
     <tr><td><code>0x0F</code></td><td>guest &rarr; host</td><td>ExecOutputChunk</td><td>Streaming output chunk (stream, data, seq)</td></tr>
     <tr><td><code>0x10</code></td><td>host &rarr; guest</td><td>ExecOutputAck</td><td>Flow control ack (optional)</td></tr>
     <tr><td><code>0x11</code></td><td>both</td><td>SnapshotReady</td><td>Guest signals readiness for live snapshot</td></tr>
+    <tr><td><code>0x12</code></td><td>host &rarr; guest</td><td>ReadFile</td><td>Read file from guest filesystem</td></tr>
+    <tr><td><code>0x13</code></td><td>guest &rarr; host</td><td>ReadFileResponse</td><td>File contents or error</td></tr>
+    <tr><td><code>0x14</code></td><td>host &rarr; guest</td><td>FileStat</td><td>Stat a guest file path</td></tr>
+    <tr><td><code>0x15</code></td><td>guest &rarr; host</td><td>FileStatResponse</td><td>File metadata (size, mode, mtime)</td></tr>
+    <tr><td><code>0x16</code></td><td>host &rarr; guest</td><td>PtyOpen</td><td>Open interactive PTY session (program, args, env, interactive flag)</td></tr>
+    <tr><td><code>0x17</code></td><td>guest &rarr; host</td><td>PtyOpened</td><td>PTY open result (success or error message)</td></tr>
+    <tr><td><code>0x18</code></td><td>both</td><td>PtyData</td><td>Raw terminal I/O bytes (<strong>not</strong> JSON-encoded)</td></tr>
+    <tr><td><code>0x19</code></td><td>host &rarr; guest</td><td>PtyResize</td><td>Terminal window size change (cols, rows)</td></tr>
+    <tr><td><code>0x1A</code></td><td>host &rarr; guest</td><td>PtyClose</td><td>Request PTY session close (sends SIGHUP to child)</td></tr>
+    <tr><td><code>0x1B</code></td><td>guest &rarr; host</td><td>PtyClosed</td><td>PTY child exited (exit_code)</td></tr>
   </tbody>
 </table>
+<p><strong>Note:</strong> <code>PtyData</code> (0x18) is the only message type where the payload is raw bytes instead of JSON. This avoids base64 encoding overhead on high-throughput terminal I/O.</p>
 </section>
 
 <section>

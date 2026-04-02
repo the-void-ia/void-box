@@ -71,6 +71,42 @@
 </section>
 
 <section>
+<h2>CLI — interactive shell</h2>
+<p><code>voidbox shell</code> boots a micro-VM and attaches an interactive PTY session — like SSH into a sandboxed environment. It auto-detects LLM credentials, stages them into the guest, and opens a raw terminal session over vsock.</p>
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>voidbox shell</code></td><td>Boot a VM with defaults and attach an interactive PTY. Auto-detects <code>claude-personal</code> (OAuth) or <code>claude</code> (API key).</td></tr>
+    <tr><td><code>voidbox shell --file &lt;spec&gt;</code></td><td>Use a YAML spec for full configuration (mounts, env, OCI image, snapshot).</td></tr>
+    <tr><td><code>voidbox shell --program &lt;name&gt;</code></td><td>Program to run in the PTY (default: <code>claude</code>). Must be in the guest allowlist.</td></tr>
+    <tr><td><code>voidbox shell --mount HOST:GUEST[:ro|rw]</code></td><td>Mount a host directory into the guest. Repeatable.</td></tr>
+    <tr><td><code>voidbox shell --memory-mb &lt;N&gt;</code></td><td>Guest memory in MB (default: 1024).</td></tr>
+    <tr><td><code>voidbox shell --vcpus &lt;N&gt;</code></td><td>Number of vCPUs (default: 2).</td></tr>
+    <tr><td><code>voidbox shell --network</code></td><td>Enable SLIRP networking (default: true).</td></tr>
+    <tr><td><code>voidbox shell --snapshot &lt;hash|path&gt;</code></td><td>Restore from a snapshot instead of cold boot.</td></tr>
+    <tr><td><code>voidbox shell --provider &lt;name&gt;</code></td><td>Override LLM provider (<code>claude</code>, <code>claude-personal</code>, <code>ollama</code>).</td></tr>
+    <tr><td><code>voidbox shell --env KEY=VALUE</code></td><td>Set guest environment variable. Repeatable.</td></tr>
+    <tr><td><code>voidbox attach --run-id &lt;id&gt;</code></td><td>Attach PTY to a running VM via the daemon. (Not yet implemented.)</td></tr>
+  </tbody>
+</table>
+<p><strong>Examples:</strong></p>
+<pre><code># Interactive shell (bare sh)
+voidbox shell --program sh --memory-mb 512
+
+# Claude Code with mounted workspace
+voidbox shell \
+  --mount $(pwd):/workspace:rw \
+  --program claude \
+  --memory-mb 3024 \
+  --vcpus 4 \
+  --network</code></pre>
+<p><strong>Security:</strong> Interactive PTY sessions preserve all security layers (KVM isolation, session secret auth, command allowlist, privilege drop to uid:1000, SLIRP network isolation). The only relaxation: <code>RLIMIT_FSIZE</code> is not enforced for interactive sessions, since tools like Claude Code write large conversation logs.</p>
+<p><strong>PTY sessions:</strong> Up to 4 concurrent PTY sessions per VM. Each session is a separate <code>forkpty</code> child process.</p>
+</section>
+
+<section>
 <h2>CLI — daemon and remote-only commands</h2>
 <p>Start the server with <code>voidbox serve</code> (optional <code>--listen</code>, default <code>127.0.0.1:43100</code>). Then:</p>
 <table>
