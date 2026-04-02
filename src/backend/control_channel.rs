@@ -580,7 +580,7 @@ impl ControlChannel {
         .map_err(|e| Error::Guest(format!("snapshot_ready task panicked: {e}")))?
     }
 
-    /// Opens a PTY session on the guest, returning a [`PtySession`] that owns the connection.
+    /// Opens a PTY session on the guest, returning a [`super::pty_session::PtySession`] that owns the connection.
     pub async fn open_pty(
         &self,
         request: PtyOpenRequest,

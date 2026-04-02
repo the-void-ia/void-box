@@ -217,7 +217,7 @@ pub(crate) fn kmsg(msg: &str) {
     }
 }
 
-/// Parse the session secret from /proc/cmdline (voidbox.secret=<hex>).
+/// Parse the session secret from `/proc/cmdline` (`voidbox.secret=HEX`).
 fn parse_session_secret() -> Option<[u8; 32]> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
     for param in cmdline.split_whitespace() {
