@@ -7,13 +7,14 @@
 //!
 //! Host applications connect via AF_UNIX instead of AF_VSOCK.
 
+use std::os::fd::IntoRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use nix::sys::eventfd::{EfdFlags, EventFd};
+use rustix::event::{eventfd, EventfdFlags};
 use tracing::{debug, trace, warn};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -107,11 +108,11 @@ impl VirtioVsockUserspace {
         let mut call_fds = Vec::with_capacity(3);
         for _ in 0..3 {
             kick_fds.push(
-                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC)
                     .map_err(|e| Error::Device(format!("eventfd: {}", e)))?,
             );
             call_fds.push(
-                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC)
                     .map_err(|e| Error::Device(format!("eventfd: {}", e)))?,
             );
         }
@@ -120,11 +121,9 @@ impl VirtioVsockUserspace {
         let mut kick = [None, None, None];
         let mut call = [None, None, None];
         for (i, (k, c)) in kick_fds.into_iter().zip(call_fds).enumerate() {
-            let kfd = k.as_raw_fd();
-            std::mem::forget(k);
+            let kfd = k.into_raw_fd();
             kick[i] = Some(kfd);
-            let cfd = c.as_raw_fd();
-            std::mem::forget(c);
+            let cfd = c.into_raw_fd();
             call[i] = Some(cfd);
         }
 

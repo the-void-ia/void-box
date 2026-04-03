@@ -4,9 +4,12 @@
 //! vhost-vsock backend so host connect(CID, port) reaches the guest.
 
 use std::os::fd::AsRawFd;
+use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
+use rustix::event::{eventfd, EventfdFlags};
+use rustix::fs::{open, Mode, OFlags};
 use tracing::{debug, trace, warn};
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
 
@@ -147,13 +150,9 @@ impl VirtioVsockMmio {
         cid: u32,
         require_vhost: bool,
     ) -> Result<(Option<RawFd>, [Option<RawFd>; 3], [Option<RawFd>; 3])> {
-        use nix::fcntl::{open, OFlag};
-        use nix::sys::eventfd::{EfdFlags, EventFd};
-        use nix::sys::stat::Mode;
-
         let fd = match open(
             Path::new("/dev/vhost-vsock"),
-            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            OFlags::RDWR | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(f) => f,
@@ -189,10 +188,9 @@ impl VirtioVsockMmio {
         let mut kick = [None, None, None];
         let mut call = [None, None, None];
         for i in 0..3 {
-            match EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC) {
+            match eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC) {
                 Ok(k) => {
-                    let f = k.as_raw_fd();
-                    std::mem::forget(k);
+                    let f = k.into_raw_fd();
                     kick[i] = Some(f);
                 }
                 Err(e) => {
@@ -207,10 +205,9 @@ impl VirtioVsockMmio {
                     return Err(Error::Device(format!("eventfd: {}", e)));
                 }
             }
-            match EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC) {
+            match eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC) {
                 Ok(c) => {
-                    let f = c.as_raw_fd();
-                    std::mem::forget(c);
+                    let f = c.into_raw_fd();
                     call[i] = Some(f);
                 }
                 Err(e) => {
@@ -232,8 +229,8 @@ impl VirtioVsockMmio {
             }
         }
 
-        // Keep the fd open (don't close via nix::OwnedFd drop)
-        let _ = fd;
+        // Keep the fd open and transfer ownership to the device.
+        let _ = fd.into_raw_fd();
 
         Ok((Some(raw_fd), kick, call))
     }
