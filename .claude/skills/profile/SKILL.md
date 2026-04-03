@@ -14,9 +14,11 @@ Profile CPU, off-CPU, and hardware counters using the eBPF-based
 
 > perf-agent requires Linux capabilities to run without sudo. Please run:
 > ```bash
-> sudo setcap 'cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore=ep' /tmp/perf-agent
+> sudo setcap 'cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore=ep' $HOME/.local/bin/perf-agent
 > ```
 > (Only needed once after each download.)
+>
+> **Note:** The binary must NOT be on a `nosuid` filesystem (e.g. `/tmp`), as file capabilities are silently ignored there.
 
 Do NOT attempt to run `sudo` yourself. Ask the user and wait for confirmation.
 
@@ -33,19 +35,23 @@ case "$ARCH" in
   aarch64) SUFFIX="linux-arm64" ;;
 esac
 
+mkdir -p "$HOME/.local/bin"
+
 LATEST=$(curl -s https://api.github.com/repos/dpsoft/perf-agent/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
 
-if [ -x /tmp/perf-agent ]; then
-  CURRENT=$(/tmp/perf-agent --version 2>/dev/null || echo "unknown")
+if [ -x "$HOME/.local/bin/perf-agent" ]; then
+  CURRENT=$("$HOME/.local/bin/perf-agent" --version 2>/dev/null || echo "unknown")
   if echo "$CURRENT" | grep -q "${LATEST#v}"; then
     echo "perf-agent up-to-date ($LATEST)"
   else
-    curl -fSL -o /tmp/perf-agent "https://github.com/dpsoft/perf-agent/releases/download/${LATEST}/perf-agent-${SUFFIX}"
-    chmod +x /tmp/perf-agent
+    echo "Downloading perf-agent $LATEST..."
+    curl -fSL -o "$HOME/.local/bin/perf-agent" "https://github.com/dpsoft/perf-agent/releases/download/${LATEST}/perf-agent-${SUFFIX}"
+    chmod +x "$HOME/.local/bin/perf-agent"
   fi
 else
-  curl -fSL -o /tmp/perf-agent "https://github.com/dpsoft/perf-agent/releases/download/${LATEST}/perf-agent-${SUFFIX}"
-  chmod +x /tmp/perf-agent
+  echo "Downloading perf-agent $LATEST..."
+  curl -fSL -o "$HOME/.local/bin/perf-agent" "https://github.com/dpsoft/perf-agent/releases/download/${LATEST}/perf-agent-${SUFFIX}"
+  chmod +x "$HOME/.local/bin/perf-agent"
 fi
 ```
 
@@ -71,7 +77,7 @@ user to start a voidbox process first.
 ## Collect
 
 ```bash
-/tmp/perf-agent --pid <PID> --profile --offcpu --pmu \
+$HOME/.local/bin/perf-agent --pid <PID> --profile --offcpu --pmu \
   --duration 60s \
   --profile-output profile.pb.gz \
   --offcpu-output offcpu.pb.gz \
