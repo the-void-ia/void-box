@@ -36,7 +36,7 @@ use std::sync::Arc;
 mod vm_preflight;
 
 use void_box::agent_box::VoidBox;
-use void_box::backend::MountConfig;
+use void_box::backend::{GuestConsoleSink, MountConfig};
 use void_box::sandbox::Sandbox;
 use void_box::spec::load_spec;
 use void_box::spec::RunSpec;
@@ -310,6 +310,7 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
         rootfs: None,
         network: false,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

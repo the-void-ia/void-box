@@ -2179,6 +2179,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2829,11 +2839,13 @@ dependencies = [
  "opentelemetry_sdk",
  "regex-lite",
  "reqwest",
+ "rustix",
  "seccompiler",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "signal-hook",
  "smoltcp",
  "tempfile",
  "thiserror 2.0.18",

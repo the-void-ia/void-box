@@ -26,7 +26,7 @@ use std::path::PathBuf;
 mod vm_preflight;
 
 #[cfg(target_os = "linux")]
-use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
+use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 #[cfg(target_os = "linux")]
 use void_box::sidecar;
 
@@ -82,6 +82,7 @@ fn build_network_config() -> Option<BackendConfig> {
         rootfs: None,
         network: true,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

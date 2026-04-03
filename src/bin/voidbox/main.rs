@@ -10,10 +10,26 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::EnvFilter;
 
 use backend::{LocalBackend, RemoteBackend};
 use cli_config::ResolvedConfig;
 use output::{format_json_value, print_json_value, OutputFormat};
+
+const RUNTIME_LOG_FILENAME: &str = "voidbox.log";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandIoMode {
+    Standard,
+    InteractivePty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TracingMode {
+    Standard,
+    InteractivePty,
+}
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -34,6 +50,10 @@ struct Cli {
     /// Override log level (trace, debug, info, warn, error).
     #[arg(long, global = true, env = "VOIDBOX_LOG_LEVEL")]
     log_level: Option<String>,
+
+    /// Override log directory for file-based runtime logs.
+    #[arg(long, global = true, env = "VOIDBOX_LOG_DIR")]
+    log_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -214,11 +234,14 @@ async fn main() {
 
     let config = cli_config::load_and_merge(
         cli.log_level.as_deref(),
+        cli.log_dir.as_deref(),
         None, // daemon URL from CLI is per-subcommand
         cli.no_banner,
     );
 
-    init_tracing(&config);
+    if let Some(warning) = init_tracing(tracing_mode_for_command(&cli.command), &config) {
+        eprintln!("{warning}");
+    }
 
     let daemon_url = resolved_daemon_url(&cli.command, &config);
     let remote = RemoteBackend::new(daemon_url);
@@ -243,6 +266,20 @@ fn resolved_daemon_url(command: &Command, config: &ResolvedConfig) -> String {
             daemon.clone().unwrap_or_else(|| config.daemon_url.clone())
         }
         _ => config.daemon_url.clone(),
+    }
+}
+
+fn command_io_mode(command: &Command) -> CommandIoMode {
+    match command {
+        Command::Shell { .. } => CommandIoMode::InteractivePty,
+        _ => CommandIoMode::Standard,
+    }
+}
+
+fn tracing_mode_for_command(command: &Command) -> TracingMode {
+    match command_io_mode(command) {
+        CommandIoMode::Standard => TracingMode::Standard,
+        CommandIoMode::InteractivePty => TracingMode::InteractivePty,
     }
 }
 
@@ -320,6 +357,7 @@ async fn run(
                 snapshot: snapshot.as_deref(),
                 mounts: &mounts,
                 env_vars: &env_vars,
+                log_dir: &config.paths.log_dir,
             })
             .await
         }
@@ -330,25 +368,42 @@ async fn run(
 // Tracing initialization
 // ---------------------------------------------------------------------------
 
-fn init_tracing(config: &ResolvedConfig) {
-    use tracing_subscriber::fmt::writer::MakeWriterExt;
-    use tracing_subscriber::EnvFilter;
-
+fn init_tracing(mode: TracingMode, config: &ResolvedConfig) -> Option<String> {
     let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-
     let log_dir = &config.paths.log_dir;
+    let runtime_log_path = log_dir.join(RUNTIME_LOG_FILENAME);
+
     if log_dir.exists() || std::fs::create_dir_all(log_dir).is_ok() {
-        let file_appender = tracing_appender::rolling::daily(log_dir, "voidbox.log");
+        let file_appender = tracing_appender::rolling::daily(log_dir, RUNTIME_LOG_FILENAME);
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         // Leak the guard so the appender lives for the process lifetime.
         std::mem::forget(_guard);
 
+        let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+        if mode == TracingMode::InteractivePty {
+            subscriber.with_writer(non_blocking).init();
+            Some(format!(
+                "interactive mode: runtime logs will be written to {} to avoid terminal corruption.",
+                runtime_log_path.display()
+            ))
+        } else {
+            subscriber
+                .with_writer(non_blocking.and(std::io::stderr))
+                .init();
+            None
+        }
+    } else if mode == TracingMode::InteractivePty {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_writer(non_blocking.and(std::io::stderr))
+            .with_writer(std::io::sink)
             .init();
+        Some(format!(
+            "warning: interactive logs could not be routed to file at {}. runtime logs will be suppressed for this session to avoid terminal corruption. set --log-dir, VOIDBOX_LOG_DIR, VOIDBOX_HOME, or paths.log_dir to enable interactive log capture.",
+            log_dir.display()
+        ))
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
+        None
     }
 }
 
@@ -1059,6 +1114,16 @@ mod cli_parse_tests {
     }
 
     #[test]
+    fn global_log_dir_override() {
+        let cli =
+            Cli::try_parse_from(["voidbox", "--log-dir", "/tmp/voidbox-log", "version"]).unwrap();
+        assert_eq!(
+            cli.log_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/voidbox-log"))
+        );
+    }
+
+    #[test]
     fn snapshot_list() {
         let cli = Cli::try_parse_from(["voidbox", "snapshot", "list"]).unwrap();
         match cli.command {
@@ -1167,6 +1232,7 @@ mod behavior_tests {
             output: format,
             no_banner: true,
             log_level: None,
+            log_dir: None,
             command,
         };
         run(cli, &config, &remote).await
@@ -1426,6 +1492,7 @@ mod behavior_tests {
             output: OutputFormat::Human,
             no_banner: true,
             log_level: None,
+            log_dir: None,
             command: Command::Config {
                 command: ConfigCommand::Init,
             },
@@ -1436,6 +1503,7 @@ mod behavior_tests {
             output: OutputFormat::Human,
             no_banner: true,
             log_level: None,
+            log_dir: None,
             command: Command::Config {
                 command: ConfigCommand::Init,
             },

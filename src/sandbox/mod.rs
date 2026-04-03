@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 pub use local::LocalSandbox;
 
+use crate::backend::GuestConsoleSink;
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::{ObserveConfig, Observer};
 use crate::{Error, ExecOutput, Result};
@@ -54,6 +55,8 @@ pub struct SandboxConfig {
     pub rootfs: Option<PathBuf>,
     /// Enable vsock for communication
     pub enable_vsock: bool,
+    /// Host-side routing for guest serial console output.
+    pub guest_console: GuestConsoleSink,
     /// Observability configuration
     pub observe: Option<ObserveConfig>,
     /// Shared directory to mount in guest
@@ -82,6 +85,7 @@ impl Default for SandboxConfig {
             initramfs: None,
             rootfs: None,
             enable_vsock: true,
+            guest_console: GuestConsoleSink::Stderr,
             observe: None,
             shared_dir: None,
             mounts: Vec::new(),
@@ -682,6 +686,12 @@ impl SandboxBuilder {
     /// Enable or disable vsock
     pub fn enable_vsock(mut self, enable: bool) -> Self {
         self.config.enable_vsock = enable;
+        self
+    }
+
+    /// Configure host-side routing for guest serial console output.
+    pub fn guest_console(mut self, sink: GuestConsoleSink) -> Self {
+        self.config.guest_console = sink;
         self
     }
 

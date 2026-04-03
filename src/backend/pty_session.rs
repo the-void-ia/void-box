@@ -1,29 +1,40 @@
 //! Host-side PTY session that bridges terminal I/O to a guest PTY over vsock.
 //!
 //! [`PtySession`] owns a vsock connection to the guest agent. After opening,
-//! it enters an interactive I/O loop: host stdin is read on a writer thread
-//! and forwarded as `PtyData` frames, while the main thread reads `PtyData`
-//! and `PtyClosed` frames from the guest.
+//! it enters an interactive I/O loop driven by `poll(2)`: host stdin is
+//! forwarded as `PtyData` frames while guest `PtyData` and `PtyClosed`
+//! frames are read from the vsock stream.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::debug;
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::io::{read, write, Errno};
+use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, Termios};
+use signal_hook::consts::signal::SIGWINCH;
+use signal_hook::{flag as signal_flag, low_level, SigId};
+use tracing::{debug, warn};
 
 use crate::guest::protocol::{
-    Message, MessageType, PtyClosedResponse, PtyOpenRequest, PtyOpenedResponse,
+    Message, MessageType, PtyClosedResponse, PtyOpenRequest, PtyOpenedResponse, PtyResizeRequest,
 };
 use crate::{Error, Result};
 
 use super::control_channel::{connect_with_handshake_sync, GuestConnector};
 
+fn borrow_fd<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
+    // Safety: callers ensure `fd` stays open for the duration of the immediate use.
+    unsafe { BorrowedFd::borrow_raw(fd) }
+}
+
 /// RAII guard that puts the host terminal into raw mode on creation and
 /// restores the original settings on drop.
 pub struct RawModeGuard {
-    original: libc::termios,
+    original: Termios,
     fd: RawFd,
 }
 
@@ -35,24 +46,41 @@ impl RawModeGuard {
     ///
     /// Returns [`io::Error`] if `tcgetattr` or `tcsetattr` fails.
     pub fn engage(fd: RawFd) -> io::Result<Self> {
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let original = tcgetattr(borrow_fd(fd)).map_err(io_error_from_errno)?;
+        let mut raw = original.clone();
+        raw.make_raw();
+        tcsetattr(borrow_fd(fd), OptionalActions::Now, &raw).map_err(io_error_from_errno)?;
         Ok(Self { original, fd })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-        }
+        let _ = tcsetattr(borrow_fd(self.fd), OptionalActions::Now, &self.original);
+    }
+}
+
+struct SigwinchGuard {
+    pending: Arc<AtomicBool>,
+    signal_id: SigId,
+}
+
+impl SigwinchGuard {
+    fn install() -> io::Result<Self> {
+        let pending = Arc::new(AtomicBool::new(false));
+        let signal_id =
+            signal_flag::register(SIGWINCH, Arc::clone(&pending)).map_err(io::Error::other)?;
+        Ok(Self { pending, signal_id })
+    }
+
+    fn pending(&self) -> &AtomicBool {
+        &self.pending
+    }
+}
+
+impl Drop for SigwinchGuard {
+    fn drop(&mut self) {
+        let _ = low_level::unregister(self.signal_id);
     }
 }
 
@@ -124,136 +152,187 @@ impl PtySession {
 
     /// Enters the interactive I/O loop, returning the PTY process exit code.
     ///
-    /// Spawns a writer thread that reads host stdin and sends `PtyData`
-    /// frames to the guest. The calling thread reads frames from the guest:
-    /// `PtyData` bytes are written to stdout, `PtyClosed` terminates the
+    /// Uses a single `poll(2)` loop over host stdin and the guest vsock.
+    /// `PtyData` bytes from stdin are forwarded to the guest; guest
+    /// `PtyData` bytes are written to stdout; `PtyClosed` terminates the
     /// loop and returns the exit code.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Guest`] if the vsock fd cannot be duplicated or
-    /// a protocol read error occurs during the session.
+    /// Returns [`Error::Guest`] if polling, stdin reads, protocol reads,
+    /// or vsock writes fail during the session.
     pub fn run(self) -> Result<i32> {
-        let fd = self.stream.as_raw_fd();
-        let write_fd = unsafe { libc::dup(fd) };
-        if write_fd < 0 {
-            return Err(Error::Guest(format!(
-                "failed to dup vsock fd: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        let done = Arc::new(AtomicBool::new(false));
-
-        let writer_handle = std::thread::spawn({
-            let done = Arc::clone(&done);
-            move || {
-                let mut stdin = io::stdin().lock();
-                let mut buf = [0u8; 4096];
-                loop {
-                    if done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let n = match stdin.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    };
-                    let msg = Message {
-                        msg_type: MessageType::PtyData,
-                        payload: buf[..n].to_vec(),
-                    };
-                    let serialized = msg.serialize();
-                    let ret = unsafe {
-                        libc::write(
-                            write_fd,
-                            serialized.as_ptr() as *const libc::c_void,
-                            serialized.len(),
-                        )
-                    };
-                    if ret < 0 {
-                        break;
-                    }
-                }
-
-                let close_msg = Message {
-                    msg_type: MessageType::PtyClose,
-                    payload: Vec::new(),
-                };
-                let serialized = close_msg.serialize();
-                unsafe {
-                    libc::write(
-                        write_fd,
-                        serialized.as_ptr() as *const libc::c_void,
-                        serialized.len(),
-                    );
-                    libc::close(write_fd);
-                }
-            }
-        });
-
         let mut stream = self.stream;
+        let vsock_fd = stream.as_raw_fd();
+        let stdin_fd = libc::STDIN_FILENO;
         let mut stdout = io::stdout().lock();
-        let exit_code;
+        let mut stdin_buf = [0u8; 4096];
+        let mut stdin_closed = false;
+        let mut close_sent = false;
+        let sigwinch_guard = SigwinchGuard::install()
+            .map_err(|e| Error::Guest(format!("failed to install SIGWINCH handler: {e}")))?;
 
         loop {
-            let msg = match Message::read_from_sync(&mut *stream) {
-                Ok(m) => m,
-                Err(e) => {
-                    done.store(true, Ordering::Relaxed);
-                    let _ = writer_handle.join();
-                    return Err(Error::Guest(format!("pty read error: {e}")));
+            if sigwinch_guard.pending().swap(false, Ordering::Relaxed) {
+                let (cols, rows) = terminal_size(stdout.as_raw_fd())?;
+                debug!("pty_session: sending resize to guest: cols={cols} rows={rows}");
+                send_resize(vsock_fd, cols, rows)
+                    .map_err(|e| Error::Guest(format!("failed to send PtyResize: {e}")))?;
+            }
+
+            let mut pollfds = [
+                PollFd::from_borrowed_fd(
+                    borrow_fd(stdin_fd),
+                    if stdin_closed {
+                        PollFlags::empty()
+                    } else {
+                        PollFlags::IN
+                    },
+                ),
+                PollFd::from_borrowed_fd(borrow_fd(vsock_fd), PollFlags::IN),
+            ];
+
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: 100_000_000,
+            };
+            let rc = match poll(&mut pollfds, Some(&timeout)) {
+                Ok(rc) => rc,
+                Err(Errno::INTR) => continue,
+                Err(err) => {
+                    let err = io_error_from_errno(err);
+                    return Err(Error::Guest(format!("pty poll failed: {err}")));
                 }
             };
-            match msg.msg_type {
-                MessageType::PtyData => {
-                    let _ = stdout.write_all(&msg.payload);
-                    let _ = stdout.flush();
+            if rc == 0 {
+                continue;
+            }
+
+            if !stdin_closed
+                && pollfds[0]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            {
+                let n = match read(borrow_fd(stdin_fd), &mut stdin_buf) {
+                    Ok(n) => n,
+                    Err(Errno::INTR | Errno::AGAIN) => continue,
+                    Err(err) => {
+                        let err = io_error_from_errno(err);
+                        warn!("pty_session: stdin read failed: {err}");
+                        return Err(Error::Guest(format!("stdin read failed: {err}")));
+                    }
+                };
+                if n > 0 {
+                    let msg = Message {
+                        msg_type: MessageType::PtyData,
+                        payload: stdin_buf[..n].to_vec(),
+                    };
+                    write_all_fd(vsock_fd, &msg.serialize())
+                        .map_err(|e| Error::Guest(format!("failed to send PtyData: {e}")))?;
+                } else {
+                    stdin_closed = true;
+                    if !close_sent {
+                        let close_msg = Message {
+                            msg_type: MessageType::PtyClose,
+                            payload: Vec::new(),
+                        };
+                        write_all_fd(vsock_fd, &close_msg.serialize())
+                            .map_err(|e| Error::Guest(format!("failed to send PtyClose: {e}")))?;
+                        close_sent = true;
+                    }
                 }
-                MessageType::PtyClosed => {
-                    let resp: PtyClosedResponse = serde_json::from_slice(&msg.payload)
-                        .unwrap_or(PtyClosedResponse { exit_code: -1 });
-                    exit_code = resp.exit_code;
-                    break;
-                }
-                MessageType::ExecRequest
-                | MessageType::ExecResponse
-                | MessageType::Ping
-                | MessageType::Pong
-                | MessageType::Shutdown
-                | MessageType::FileTransfer
-                | MessageType::FileTransferResponse
-                | MessageType::TelemetryData
-                | MessageType::TelemetryAck
-                | MessageType::SubscribeTelemetry
-                | MessageType::WriteFile
-                | MessageType::WriteFileResponse
-                | MessageType::MkdirP
-                | MessageType::MkdirPResponse
-                | MessageType::ExecOutputChunk
-                | MessageType::ExecOutputAck
-                | MessageType::SnapshotReady
-                | MessageType::ReadFile
-                | MessageType::ReadFileResponse
-                | MessageType::FileStat
-                | MessageType::FileStatResponse
-                | MessageType::PtyOpen
-                | MessageType::PtyOpened
-                | MessageType::PtyResize
-                | MessageType::PtyClose => {
-                    debug!(
-                        "pty_session: ignoring unexpected message {:?}",
-                        msg.msg_type
-                    );
+            }
+
+            if pollfds[1]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            {
+                let msg = match Message::read_from_sync(&mut *stream) {
+                    Ok(m) => m,
+                    Err(e) => return Err(Error::Guest(format!("pty read error: {e}"))),
+                };
+                match msg.msg_type {
+                    MessageType::PtyData => {
+                        let _ = stdout.write_all(&msg.payload);
+                        let _ = stdout.flush();
+                    }
+                    MessageType::PtyClosed => {
+                        let resp: PtyClosedResponse = serde_json::from_slice(&msg.payload)
+                            .unwrap_or(PtyClosedResponse { exit_code: -1 });
+                        debug!("pty_session: finished with exit_code={}", resp.exit_code);
+                        return Ok(resp.exit_code);
+                    }
+                    MessageType::ExecRequest
+                    | MessageType::ExecResponse
+                    | MessageType::Ping
+                    | MessageType::Pong
+                    | MessageType::Shutdown
+                    | MessageType::FileTransfer
+                    | MessageType::FileTransferResponse
+                    | MessageType::TelemetryData
+                    | MessageType::TelemetryAck
+                    | MessageType::SubscribeTelemetry
+                    | MessageType::WriteFile
+                    | MessageType::WriteFileResponse
+                    | MessageType::MkdirP
+                    | MessageType::MkdirPResponse
+                    | MessageType::ExecOutputChunk
+                    | MessageType::ExecOutputAck
+                    | MessageType::SnapshotReady
+                    | MessageType::ReadFile
+                    | MessageType::ReadFileResponse
+                    | MessageType::FileStat
+                    | MessageType::FileStatResponse
+                    | MessageType::PtyOpen
+                    | MessageType::PtyOpened
+                    | MessageType::PtyResize
+                    | MessageType::PtyClose => {
+                        debug!(
+                            "pty_session: ignoring unexpected message {:?}",
+                            msg.msg_type
+                        );
+                    }
                 }
             }
         }
-
-        done.store(true, Ordering::Relaxed);
-        let _ = writer_handle.join();
-
-        debug!("pty_session: finished with exit_code={exit_code}");
-        Ok(exit_code)
     }
+}
+
+fn io_error_from_errno(err: Errno) -> io::Error {
+    io::Error::from_raw_os_error(err.raw_os_error())
+}
+
+fn terminal_size(fd: RawFd) -> Result<(u16, u16)> {
+    let ws = tcgetwinsize(borrow_fd(fd)).map_err(io_error_from_errno)?;
+    Ok((ws.ws_col, ws.ws_row))
+}
+
+fn send_resize(fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
+    let resize = PtyResizeRequest { cols, rows };
+    let msg = Message {
+        msg_type: MessageType::PtyResize,
+        payload: serde_json::to_vec(&resize)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    };
+    write_all_fd(fd, &msg.serialize())
+}
+
+fn write_all_fd(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < buf.len() {
+        match write(borrow_fd(fd), &buf[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short write on PTY stream",
+                ));
+            }
+            Ok(n) => {
+                written += n;
+            }
+            Err(Errno::INTR | Errno::AGAIN) => continue,
+            Err(err) => return Err(io_error_from_errno(err)),
+        }
+    }
+    Ok(())
 }

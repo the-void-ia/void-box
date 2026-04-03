@@ -130,6 +130,7 @@ impl ResolvedConfig {
 /// user config → system config → defaults.
 pub fn load_and_merge(
     cli_log_level: Option<&str>,
+    cli_log_dir: Option<&Path>,
     cli_daemon_url: Option<&str>,
     cli_no_banner: bool,
 ) -> ResolvedConfig {
@@ -158,6 +159,11 @@ pub fn load_and_merge(
         merged.log_level = Some(level);
     }
 
+    // VOIDBOX_LOG_DIR env
+    if let Ok(dir) = std::env::var("VOIDBOX_LOG_DIR") {
+        merged.paths.log_dir = Some(PathBuf::from(dir));
+    }
+
     // VOIDBOX_DAEMON_URL env
     if let Ok(url) = std::env::var("VOIDBOX_DAEMON_URL") {
         merged.daemon_url = Some(url);
@@ -174,6 +180,9 @@ pub fn load_and_merge(
     // CLI flags (highest precedence)
     if let Some(level) = cli_log_level {
         merged.log_level = Some(level.to_string());
+    }
+    if let Some(dir) = cli_log_dir {
+        merged.paths.log_dir = Some(dir.to_path_buf());
     }
     if let Some(url) = cli_daemon_url {
         merged.daemon_url = Some(url.to_string());
@@ -316,5 +325,16 @@ mod tests {
         let loaded = load_config_file(&path).unwrap();
         assert_eq!(loaded.log_level.as_deref(), Some("info"));
         assert!(loaded.banner.unwrap());
+    }
+
+    #[test]
+    fn cli_log_dir_override_wins() {
+        let resolved = load_and_merge(
+            Some("info"),
+            Some(Path::new("/tmp/voidbox-logs")),
+            None,
+            false,
+        );
+        assert_eq!(resolved.paths.log_dir, PathBuf::from("/tmp/voidbox-logs"));
     }
 }

@@ -23,7 +23,7 @@ mod vm_preflight;
 
 use void_box::backend::vz::snapshot::VzSnapshotMeta;
 use void_box::backend::vz::VzBackend;
-use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
+use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::snapshot_store;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,7 @@ fn backend_config() -> Option<BackendConfig> {
         rootfs: None,
         network: false,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

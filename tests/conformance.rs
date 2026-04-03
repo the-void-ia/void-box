@@ -24,7 +24,7 @@ use std::path::PathBuf;
 #[path = "common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
+use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -73,6 +73,7 @@ fn backend_config() -> Option<BackendConfig> {
         rootfs: None,
         network: true,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,
