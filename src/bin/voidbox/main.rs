@@ -31,6 +31,20 @@ enum TracingMode {
     InteractivePty,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TracingWriterMode {
+    StderrOnly,
+    StderrAndFile,
+    FileOnly,
+    SinkOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TracingPlan {
+    writer_mode: TracingWriterMode,
+    notice: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
@@ -372,38 +386,66 @@ fn init_tracing(mode: TracingMode, config: &ResolvedConfig) -> Option<String> {
     let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     let log_dir = &config.paths.log_dir;
     let runtime_log_path = log_dir.join(RUNTIME_LOG_FILENAME);
+    let log_dir_ready = log_dir.exists() || std::fs::create_dir_all(log_dir).is_ok();
+    let plan = tracing_plan(mode, log_dir, log_dir_ready);
 
-    if log_dir.exists() || std::fs::create_dir_all(log_dir).is_ok() {
+    if log_dir_ready {
         let file_appender = tracing_appender::rolling::daily(log_dir, RUNTIME_LOG_FILENAME);
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         // Leak the guard so the appender lives for the process lifetime.
         std::mem::forget(_guard);
 
         let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-        if mode == TracingMode::InteractivePty {
-            subscriber.with_writer(non_blocking).init();
-            Some(format!(
+        match plan.writer_mode {
+            TracingWriterMode::FileOnly => subscriber.with_writer(non_blocking).init(),
+            TracingWriterMode::StderrAndFile => subscriber
+                .with_writer(non_blocking.and(std::io::stderr))
+                .init(),
+            TracingWriterMode::StderrOnly | TracingWriterMode::SinkOnly => unreachable!(),
+        }
+    } else {
+        match plan.writer_mode {
+            TracingWriterMode::SinkOnly => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::sink)
+                    .init();
+            }
+            TracingWriterMode::StderrOnly => {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
+            TracingWriterMode::StderrAndFile | TracingWriterMode::FileOnly => unreachable!(),
+        }
+    }
+    let _ = runtime_log_path;
+    plan.notice
+}
+
+fn tracing_plan(mode: TracingMode, log_dir: &Path, log_dir_ready: bool) -> TracingPlan {
+    let runtime_log_path = log_dir.join(RUNTIME_LOG_FILENAME);
+    match (mode, log_dir_ready) {
+        (TracingMode::InteractivePty, true) => TracingPlan {
+            writer_mode: TracingWriterMode::FileOnly,
+            notice: Some(format!(
                 "interactive mode: runtime logs will be written to {} to avoid terminal corruption.",
                 runtime_log_path.display()
-            ))
-        } else {
-            subscriber
-                .with_writer(non_blocking.and(std::io::stderr))
-                .init();
-            None
-        }
-    } else if mode == TracingMode::InteractivePty {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::sink)
-            .init();
-        Some(format!(
-            "warning: interactive logs could not be routed to file at {}. runtime logs will be suppressed for this session to avoid terminal corruption. set --log-dir, VOIDBOX_LOG_DIR, VOIDBOX_HOME, or paths.log_dir to enable interactive log capture.",
-            log_dir.display()
-        ))
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-        None
+            )),
+        },
+        (TracingMode::InteractivePty, false) => TracingPlan {
+            writer_mode: TracingWriterMode::SinkOnly,
+            notice: Some(format!(
+                "warning: interactive logs could not be routed to file at {}. runtime logs will be suppressed for this session to avoid terminal corruption. set --log-dir, VOIDBOX_LOG_DIR, VOIDBOX_HOME, or paths.log_dir to enable interactive log capture.",
+                log_dir.display()
+            )),
+        },
+        (TracingMode::Standard, true) => TracingPlan {
+            writer_mode: TracingWriterMode::StderrAndFile,
+            notice: None,
+        },
+        (TracingMode::Standard, false) => TracingPlan {
+            writer_mode: TracingWriterMode::StderrOnly,
+            notice: None,
+        },
     }
 }
 
@@ -1184,6 +1226,46 @@ mod cli_parse_tests {
             }
             _ => panic!("expected Status"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    #[test]
+    fn tracing_plan_uses_file_only_for_interactive_mode() {
+        let plan = tracing_plan(
+            TracingMode::InteractivePty,
+            Path::new("/tmp/voidbox-log"),
+            true,
+        );
+        assert_eq!(plan.writer_mode, TracingWriterMode::FileOnly);
+        assert!(plan
+            .notice
+            .unwrap()
+            .contains("interactive mode: runtime logs"));
+    }
+
+    #[test]
+    fn tracing_plan_uses_sink_with_warning_when_interactive_file_logging_unavailable() {
+        let plan = tracing_plan(
+            TracingMode::InteractivePty,
+            Path::new("/tmp/voidbox-log"),
+            false,
+        );
+        assert_eq!(plan.writer_mode, TracingWriterMode::SinkOnly);
+        assert!(plan
+            .notice
+            .unwrap()
+            .contains("runtime logs will be suppressed"));
+    }
+
+    #[test]
+    fn tracing_plan_keeps_stderr_and_file_for_standard_mode() {
+        let plan = tracing_plan(TracingMode::Standard, Path::new("/tmp/voidbox-log"), true);
+        assert_eq!(plan.writer_mode, TracingWriterMode::StderrAndFile);
+        assert!(plan.notice.is_none());
     }
 }
 

@@ -34,6 +34,13 @@ const PTY_POLL_TIMEOUT: Timespec = Timespec {
     tv_nsec: 100_000_000,
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StdinReadAction {
+    Retry,
+    Eof,
+    Data(usize),
+}
+
 fn borrow_fd<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
     // Safety: callers ensure `fd` stays open for the duration of the immediate use.
     unsafe { BorrowedFd::borrow_raw(fd) }
@@ -217,32 +224,32 @@ impl PtySession {
                     .revents()
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             {
-                let bytes_read = match read(borrow_fd(stdin_fd), &mut stdin_buf) {
-                    Ok(bytes_read) => bytes_read,
-                    Err(Errno::INTR | Errno::AGAIN) => continue,
+                match classify_stdin_read_result(read(borrow_fd(stdin_fd), &mut stdin_buf)) {
+                    Ok(StdinReadAction::Retry) => continue,
+                    Ok(StdinReadAction::Data(bytes_read)) => {
+                        let data_msg = Message {
+                            msg_type: MessageType::PtyData,
+                            payload: stdin_buf[..bytes_read].to_vec(),
+                        };
+                        write_all_fd(vsock_fd, &data_msg.serialize())
+                            .map_err(|e| Error::Guest(format!("failed to send PtyData: {e}")))?;
+                    }
+                    Ok(StdinReadAction::Eof) => {
+                        stdin_closed = true;
+                        if !close_sent {
+                            let close_msg = Message {
+                                msg_type: MessageType::PtyClose,
+                                payload: Vec::new(),
+                            };
+                            write_all_fd(vsock_fd, &close_msg.serialize()).map_err(|e| {
+                                Error::Guest(format!("failed to send PtyClose: {e}"))
+                            })?;
+                            close_sent = true;
+                        }
+                    }
                     Err(err) => {
-                        let err = io_error_from_errno(err);
                         warn!("pty_session: stdin read failed: {err}");
                         return Err(Error::Guest(format!("stdin read failed: {err}")));
-                    }
-                };
-                if bytes_read > 0 {
-                    let data_msg = Message {
-                        msg_type: MessageType::PtyData,
-                        payload: stdin_buf[..bytes_read].to_vec(),
-                    };
-                    write_all_fd(vsock_fd, &data_msg.serialize())
-                        .map_err(|e| Error::Guest(format!("failed to send PtyData: {e}")))?;
-                } else {
-                    stdin_closed = true;
-                    if !close_sent {
-                        let close_msg = Message {
-                            msg_type: MessageType::PtyClose,
-                            payload: Vec::new(),
-                        };
-                        write_all_fd(vsock_fd, &close_msg.serialize())
-                            .map_err(|e| Error::Guest(format!("failed to send PtyClose: {e}")))?;
-                        close_sent = true;
                     }
                 }
             }
@@ -310,6 +317,17 @@ fn io_error_from_errno(err: Errno) -> io::Error {
     io::Error::from_raw_os_error(err.raw_os_error())
 }
 
+fn classify_stdin_read_result(
+    result: std::result::Result<usize, Errno>,
+) -> io::Result<StdinReadAction> {
+    match result {
+        Ok(0) => Ok(StdinReadAction::Eof),
+        Ok(bytes_read) => Ok(StdinReadAction::Data(bytes_read)),
+        Err(Errno::INTR | Errno::AGAIN) => Ok(StdinReadAction::Retry),
+        Err(err) => Err(io_error_from_errno(err)),
+    }
+}
+
 fn terminal_size(tty_fd: RawFd) -> Result<(u16, u16)> {
     let winsize = tcgetwinsize(borrow_fd(tty_fd)).map_err(io_error_from_errno)?;
     Ok((winsize.ws_col, winsize.ws_row))
@@ -343,4 +361,27 @@ fn write_all_fd(stream_fd: RawFd, buf: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_again_is_not_treated_as_fatal() {
+        let action = classify_stdin_read_result(Err(Errno::AGAIN)).unwrap();
+        assert_eq!(action, StdinReadAction::Retry);
+    }
+
+    #[test]
+    fn stdin_data_and_eof_are_classified_correctly() {
+        assert_eq!(
+            classify_stdin_read_result(Ok(4)).unwrap(),
+            StdinReadAction::Data(4)
+        );
+        assert_eq!(
+            classify_stdin_read_result(Ok(0)).unwrap(),
+            StdinReadAction::Eof
+        );
+    }
 }

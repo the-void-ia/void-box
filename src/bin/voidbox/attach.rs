@@ -346,3 +346,40 @@ fn terminal_size() -> Result<(u16, u16), Box<dyn std::error::Error>> {
     let ws = tcgetwinsize(std::io::stdout().lock())?;
     Ok((ws.ws_col, ws.ws_row))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_provider_returns_none_for_non_claude_programs() {
+        let provider = resolve_provider("sh", None, false, None).unwrap();
+        assert!(provider.is_none());
+    }
+
+    #[test]
+    fn resolve_provider_respects_explicit_provider_flag() {
+        let provider = resolve_provider("claude", Some("claude-personal"), false, None).unwrap();
+        assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));
+    }
+
+    #[test]
+    fn resolve_provider_uses_spec_provider_when_file_is_present() {
+        let llm_spec = spec::LlmSpec {
+            provider: "claude-personal".into(),
+            model: None,
+            base_url: None,
+            api_key_env: None,
+        };
+        let provider = resolve_provider("claude", None, true, Some(&llm_spec)).unwrap();
+        assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));
+    }
+
+    #[test]
+    fn unknown_provider_defaults_to_claude() {
+        assert!(matches!(
+            provider_from_name("not-a-real-provider"),
+            LlmProvider::Claude
+        ));
+    }
+}

@@ -989,3 +989,51 @@ impl VmmBackend for VzBackend {
         self.cid
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendSecurityConfig;
+
+    fn test_security_config() -> BackendSecurityConfig {
+        BackendSecurityConfig {
+            session_secret: [7u8; 32],
+            command_allowlist: Vec::new(),
+            network_deny_list: Vec::new(),
+            max_connections_per_second: 0,
+            max_concurrent_connections: 0,
+            seccomp: false,
+        }
+    }
+
+    fn test_config(sink: GuestConsoleSink) -> BackendConfig {
+        BackendConfig {
+            memory_mb: 512,
+            vcpus: 1,
+            kernel: "/tmp/kernel".into(),
+            initramfs: None,
+            rootfs: None,
+            network: false,
+            enable_vsock: true,
+            guest_console: sink,
+            shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
+            env: Vec::new(),
+            security: test_security_config(),
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn guest_console_sink_keeps_attachment_for_disabled() {
+        assert!(guest_console_sink(&test_config(GuestConsoleSink::Disabled)).is_some());
+    }
+
+    #[test]
+    fn guest_console_sink_uses_attachment_for_stderr() {
+        assert!(guest_console_sink(&test_config(GuestConsoleSink::Stderr)).is_some());
+    }
+}
