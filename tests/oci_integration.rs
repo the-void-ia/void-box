@@ -36,11 +36,14 @@ use std::sync::Arc;
 mod vm_preflight;
 
 use void_box::agent_box::VoidBox;
-use void_box::backend::{GuestConsoleSink, MountConfig};
+use void_box::backend::MountConfig;
 use void_box::sandbox::Sandbox;
 use void_box::spec::load_spec;
 use void_box::spec::RunSpec;
 use void_box::Error;
+
+#[cfg(target_os = "macos")]
+use void_box::backend::GuestConsoleSink;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 1: Mock-based tests (cross-platform, no hardware required)
