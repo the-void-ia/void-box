@@ -58,39 +58,39 @@ pub struct ShellOpts<'a> {
 /// Returns an error if the spec is invalid, credentials cannot be staged, or
 /// the sandbox fails to start.
 pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::Error>> {
-    let spec = match opts.file {
+    let run_spec = match opts.file {
         Some(path) => {
-            let s = spec::load_spec(path)?;
-            spec::validate_spec(&s)?;
-            s
+            let loaded_spec = spec::load_spec(path)?;
+            spec::validate_spec(&loaded_spec)?;
+            loaded_spec
         }
         None => build_ephemeral_spec(opts.memory_mb, opts.vcpus, opts.network),
     };
 
-    let kernel = spec
+    let kernel = run_spec
         .sandbox
         .kernel
         .clone()
         .or_else(|| std::env::var("VOID_BOX_KERNEL").ok())
         .ok_or("VOID_BOX_KERNEL not set and no kernel in spec")?;
-    let initramfs = spec
+    let initramfs = run_spec
         .sandbox
         .initramfs
         .clone()
         .or_else(|| std::env::var("VOID_BOX_INITRAMFS").ok());
 
     let effective_memory = if opts.file.is_some() {
-        spec.sandbox.memory_mb
+        run_spec.sandbox.memory_mb
     } else {
         opts.memory_mb
     };
     let effective_vcpus = if opts.file.is_some() {
-        spec.sandbox.vcpus
+        run_spec.sandbox.vcpus
     } else {
         opts.vcpus
     };
     let effective_network = if opts.file.is_some() {
-        spec.sandbox.network
+        run_spec.sandbox.network
     } else {
         opts.network
     };
@@ -108,17 +108,17 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         builder = builder.initramfs(path);
     }
 
-    if let Some(snap) = opts.snapshot {
-        builder = builder.snapshot(snap);
-    } else if let Some(ref snap) = spec.sandbox.snapshot {
-        builder = builder.snapshot(snap);
+    if let Some(snapshot_path) = opts.snapshot {
+        builder = builder.snapshot(snapshot_path);
+    } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
+        builder = builder.snapshot(snapshot_path);
     }
 
-    for ms in &spec.sandbox.mounts {
+    for mount_spec in &run_spec.sandbox.mounts {
         builder = builder.mount(MountConfig {
-            host_path: ms.host.clone(),
-            guest_path: ms.guest.clone(),
-            read_only: ms.mode == "ro",
+            host_path: mount_spec.host.clone(),
+            guest_path: mount_spec.guest.clone(),
+            read_only: mount_spec.mode == "ro",
         });
     }
 
@@ -129,13 +129,13 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     // Credentials are written via write_file after boot (not mounted),
     // because the VMM only supports one 9p device at a time.
 
-    for (key, value) in &spec.sandbox.env {
+    for (key, value) in &run_spec.sandbox.env {
         builder = builder.env(key, value);
     }
 
     for raw in opts.env_vars {
-        let (k, v) = parse_env_flag(raw)?;
-        builder = builder.env(k, v);
+        let (key, value) = parse_env_flag(raw)?;
+        builder = builder.env(key, value);
     }
 
     let sandbox = builder.build()?;
@@ -148,7 +148,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         program_base,
         opts.provider,
         opts.file.is_some(),
-        spec.llm.as_ref(),
+        run_spec.llm.as_ref(),
     )?;
     let staged_creds = prepare_credentials(provider.as_ref())?;
     if program_base == "claude" || program_base == "claude-code" {
@@ -159,10 +159,13 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
 
         if let Some(ref creds) = staged_creds {
             let creds_path = std::path::PathBuf::from(&creds.host_path).join(".credentials.json");
-            if let Ok(content) = std::fs::read(&creds_path) {
+            if let Ok(credentials_bytes) = std::fs::read(&creds_path) {
                 let _ = sandbox.mkdir_p("/home/sandbox/.claude").await;
                 let _ = sandbox
-                    .write_file("/home/sandbox/.claude/.credentials.json", &content)
+                    .write_file(
+                        "/home/sandbox/.claude/.credentials.json",
+                        &credentials_bytes,
+                    )
                     .await;
             }
         }
@@ -173,8 +176,8 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         .map(LlmProvider::env_vars)
         .unwrap_or_default();
     for raw in opts.env_vars {
-        let (k, v) = parse_env_flag(raw)?;
-        pty_env.push((k.to_string(), v.to_string()));
+        let (key, value) = parse_env_flag(raw)?;
+        pty_env.push((key.to_string(), value.to_string()));
     }
 
     let (cols, rows) = terminal_size()?;
@@ -189,7 +192,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         interactive: true,
     };
 
-    let result = async {
+    let pty_result = async {
         let session = sandbox.attach_pty(request).await?;
         let guard =
             RawModeGuard::engage(0).map_err(|e| format!("failed to enter raw mode: {e}"))?;
@@ -204,7 +207,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let _ = sandbox.stop().await;
     drop(staged_creds);
 
-    result
+    pty_result
 }
 
 /// Builds a minimal ephemeral `RunSpec` with `kind: sandbox`.

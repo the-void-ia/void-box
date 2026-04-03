@@ -51,7 +51,7 @@ pub struct MountConfig {
 /// Host-side routing for the guest serial console.
 #[derive(Debug, Clone)]
 pub enum GuestConsoleSink {
-    /// Do not attach the guest serial console to the host.
+    /// Suppress host-visible guest serial console output.
     Disabled,
     /// Forward the guest serial console to the host process stderr.
     Stderr,

@@ -37,6 +37,25 @@ fn my_fn() {
 }
 ```
 
+### Data model and policy design
+
+Prefer **explicit single-source models** over overlapping flags that create
+ambiguous or invalid states. If a feature has a small closed set of modes, model
+it as an enum rather than separate booleans/options whose combinations must be
+interpreted later.
+
+Keep **execution policy** separate from persisted or user-resolved config.
+Command-scoped behavior (for example, interactive terminal ownership) should be
+derived at the CLI/runtime boundary and passed inward as a narrow policy type,
+rather than mutating resolved config structs or threading broad command enums
+through lower layers.
+
+Prefer **descriptive local names** and named constants over shorthand locals and
+inline literals. Variables like `rc`, `n`, `msg`, `ws`, `k`, and `v` are only
+acceptable in tiny, obvious scopes; otherwise use names that describe meaning
+directly. Repeated or behavior-defining literals should be lifted to documented
+module-scope constants.
+
 ### VM pre-flight validation
 
 Operations that can fail silently inside the guest (e.g. the kernel dropping
@@ -260,6 +279,19 @@ CLI/config level is set:
 VOIDBOX_LOG_LEVEL=debug cargo run --bin voidbox -- run --file spec.yaml
 # RUST_LOG also applies when VOIDBOX_LOG_LEVEL / config omit log_level
 ```
+
+**Configuration and routing principles:**
+
+- Keep configuration **opt-in by default** unless a different default is needed
+  to prevent a clearly broken UX or unsafe behavior.
+- When a runtime limitation or fallback occurs, emit an **explicit warning** with
+  actionable remediation rather than silently degrading behavior.
+- Prefer making routing and storage locations **user-customizable** (for example,
+  via config or CLI overrides) rather than hard-coding one path.
+- Interactive PTY/TUI sessions should **own the terminal**. Do not mix runtime
+  diagnostics, guest console output, or other non-PTY streams into the same
+  terminal once the interactive session begins; route them to tracing/file sinks
+  instead.
 
 **Convention:** Workflow progress messages use the `[workflow:<name>]` prefix
 pattern, e.g. `[workflow:my-flow] step 1/3: "build" running...`.
@@ -771,6 +803,32 @@ cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=
 `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
 `e2e_claude_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
 to run on macOS.
+
+### Interactive PTY / shell validation
+
+When touching interactive PTY behavior, terminal handling, guest console
+routing, or shell-specific logging, do a manual smoke check on the relevant
+host platforms in addition to automated tests.
+
+Linux (KVM):
+```bash
+export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
+export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
+target/release/voidbox shell --program sh --mount "$PWD:/workspace:rw"
+```
+
+macOS (VZ):
+```bash
+export VOID_BOX_KERNEL=target/vmlinux-arm64
+export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
+target/release/voidbox shell --program sh --mount "$PWD:/workspace:rw"
+```
+
+For both platforms, verify:
+- the PTY stays interactive and does not exit immediately
+- terminal resize is reflected in the guest
+- runtime logs and guest console output do not corrupt the interactive terminal
+- guest console routing honors the configured host sink
 
 ### OpenClaw production validation
 

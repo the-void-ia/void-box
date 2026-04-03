@@ -26,6 +26,14 @@ use crate::{Error, Result};
 
 use super::control_channel::{connect_with_handshake_sync, GuestConnector};
 
+/// Poll timeout for the interactive PTY relay loop.
+///
+/// Keeps resize and shutdown responsive without waking too aggressively.
+const PTY_POLL_TIMEOUT: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 100_000_000,
+};
+
 fn borrow_fd<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
     // Safety: callers ensure `fd` stays open for the duration of the immediate use.
     unsafe { BorrowedFd::borrow_raw(fd) }
@@ -35,7 +43,7 @@ fn borrow_fd<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
 /// restores the original settings on drop.
 pub struct RawModeGuard {
     original: Termios,
-    fd: RawFd,
+    tty_fd: RawFd,
 }
 
 impl RawModeGuard {
@@ -45,18 +53,18 @@ impl RawModeGuard {
     /// # Errors
     ///
     /// Returns [`io::Error`] if `tcgetattr` or `tcsetattr` fails.
-    pub fn engage(fd: RawFd) -> io::Result<Self> {
-        let original = tcgetattr(borrow_fd(fd)).map_err(io_error_from_errno)?;
+    pub fn engage(tty_fd: RawFd) -> io::Result<Self> {
+        let original = tcgetattr(borrow_fd(tty_fd)).map_err(io_error_from_errno)?;
         let mut raw = original.clone();
         raw.make_raw();
-        tcsetattr(borrow_fd(fd), OptionalActions::Now, &raw).map_err(io_error_from_errno)?;
-        Ok(Self { original, fd })
+        tcsetattr(borrow_fd(tty_fd), OptionalActions::Now, &raw).map_err(io_error_from_errno)?;
+        Ok(Self { original, tty_fd })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = tcsetattr(borrow_fd(self.fd), OptionalActions::Now, &self.original);
+        let _ = tcsetattr(borrow_fd(self.tty_fd), OptionalActions::Now, &self.original);
     }
 }
 
@@ -192,19 +200,15 @@ impl PtySession {
                 PollFd::from_borrowed_fd(borrow_fd(vsock_fd), PollFlags::IN),
             ];
 
-            let timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: 100_000_000,
-            };
-            let rc = match poll(&mut pollfds, Some(&timeout)) {
-                Ok(rc) => rc,
+            let ready_count = match poll(&mut pollfds, Some(&PTY_POLL_TIMEOUT)) {
+                Ok(ready_count) => ready_count,
                 Err(Errno::INTR) => continue,
                 Err(err) => {
                     let err = io_error_from_errno(err);
                     return Err(Error::Guest(format!("pty poll failed: {err}")));
                 }
             };
-            if rc == 0 {
+            if ready_count == 0 {
                 continue;
             }
 
@@ -213,8 +217,8 @@ impl PtySession {
                     .revents()
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             {
-                let n = match read(borrow_fd(stdin_fd), &mut stdin_buf) {
-                    Ok(n) => n,
+                let bytes_read = match read(borrow_fd(stdin_fd), &mut stdin_buf) {
+                    Ok(bytes_read) => bytes_read,
                     Err(Errno::INTR | Errno::AGAIN) => continue,
                     Err(err) => {
                         let err = io_error_from_errno(err);
@@ -222,12 +226,12 @@ impl PtySession {
                         return Err(Error::Guest(format!("stdin read failed: {err}")));
                     }
                 };
-                if n > 0 {
-                    let msg = Message {
+                if bytes_read > 0 {
+                    let data_msg = Message {
                         msg_type: MessageType::PtyData,
-                        payload: stdin_buf[..n].to_vec(),
+                        payload: stdin_buf[..bytes_read].to_vec(),
                     };
-                    write_all_fd(vsock_fd, &msg.serialize())
+                    write_all_fd(vsock_fd, &data_msg.serialize())
                         .map_err(|e| Error::Guest(format!("failed to send PtyData: {e}")))?;
                 } else {
                     stdin_closed = true;
@@ -247,20 +251,24 @@ impl PtySession {
                 .revents()
                 .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
             {
-                let msg = match Message::read_from_sync(&mut *stream) {
-                    Ok(m) => m,
+                let incoming_msg = match Message::read_from_sync(&mut *stream) {
+                    Ok(incoming_msg) => incoming_msg,
                     Err(e) => return Err(Error::Guest(format!("pty read error: {e}"))),
                 };
-                match msg.msg_type {
+                match incoming_msg.msg_type {
                     MessageType::PtyData => {
-                        let _ = stdout.write_all(&msg.payload);
+                        let _ = stdout.write_all(&incoming_msg.payload);
                         let _ = stdout.flush();
                     }
                     MessageType::PtyClosed => {
-                        let resp: PtyClosedResponse = serde_json::from_slice(&msg.payload)
-                            .unwrap_or(PtyClosedResponse { exit_code: -1 });
-                        debug!("pty_session: finished with exit_code={}", resp.exit_code);
-                        return Ok(resp.exit_code);
+                        let closed_response: PtyClosedResponse =
+                            serde_json::from_slice(&incoming_msg.payload)
+                                .unwrap_or(PtyClosedResponse { exit_code: -1 });
+                        debug!(
+                            "pty_session: finished with exit_code={}",
+                            closed_response.exit_code
+                        );
+                        return Ok(closed_response.exit_code);
                     }
                     MessageType::ExecRequest
                     | MessageType::ExecResponse
@@ -289,7 +297,7 @@ impl PtySession {
                     | MessageType::PtyClose => {
                         debug!(
                             "pty_session: ignoring unexpected message {:?}",
-                            msg.msg_type
+                            incoming_msg.msg_type
                         );
                     }
                 }
@@ -302,25 +310,25 @@ fn io_error_from_errno(err: Errno) -> io::Error {
     io::Error::from_raw_os_error(err.raw_os_error())
 }
 
-fn terminal_size(fd: RawFd) -> Result<(u16, u16)> {
-    let ws = tcgetwinsize(borrow_fd(fd)).map_err(io_error_from_errno)?;
-    Ok((ws.ws_col, ws.ws_row))
+fn terminal_size(tty_fd: RawFd) -> Result<(u16, u16)> {
+    let winsize = tcgetwinsize(borrow_fd(tty_fd)).map_err(io_error_from_errno)?;
+    Ok((winsize.ws_col, winsize.ws_row))
 }
 
-fn send_resize(fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
+fn send_resize(stream_fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
     let resize = PtyResizeRequest { cols, rows };
     let msg = Message {
         msg_type: MessageType::PtyResize,
         payload: serde_json::to_vec(&resize)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
     };
-    write_all_fd(fd, &msg.serialize())
+    write_all_fd(stream_fd, &msg.serialize())
 }
 
-fn write_all_fd(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+fn write_all_fd(stream_fd: RawFd, buf: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
-        match write(borrow_fd(fd), &buf[written..]) {
+        match write(borrow_fd(stream_fd), &buf[written..]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,

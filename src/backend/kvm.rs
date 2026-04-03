@@ -2,13 +2,17 @@
 //!
 //! This module is only compiled on Linux (`#[cfg(target_os = "linux")]`).
 
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::backend::control_channel::{ControlChannel, GuestStream, GUEST_AGENT_PORT};
-use crate::backend::{BackendConfig, VmmBackend};
+use crate::backend::{BackendConfig, GuestConsoleSink, VmmBackend};
 use crate::devices::virtio_vsock::VsockStream;
 use crate::guest::protocol::{
     build_exec_request, ExecOutputChunk, ExecResponse, PtyOpenRequest, TelemetrySubscribeRequest,
@@ -44,6 +48,8 @@ pub struct KvmBackend {
     cid: u32,
     /// Active span context for TRACEPARENT propagation.
     span_context: Option<SpanContext>,
+    /// Background task draining guest serial output to the configured host sink.
+    guest_console_task: Option<JoinHandle<()>>,
 }
 
 impl Default for KvmBackend {
@@ -60,8 +66,71 @@ impl KvmBackend {
             control_channel: None,
             cid: 0,
             span_context: None,
+            guest_console_task: None,
         }
     }
+}
+
+fn open_guest_console_writer(sink: &GuestConsoleSink) -> Box<dyn Write + Send> {
+    match sink {
+        GuestConsoleSink::Disabled => Box::new(io::sink()),
+        GuestConsoleSink::Stderr => Box::new(io::stderr()),
+        GuestConsoleSink::File(path) => {
+            if let Some(parent) = path.parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    warn!(
+                        "KvmBackend: failed to create guest console log dir {}: {}; falling back to sink",
+                        parent.display(),
+                        err
+                    );
+                    return Box::new(io::sink());
+                }
+            }
+
+            match open_guest_console_file(path) {
+                Ok(file) => Box::new(file),
+                Err(err) => {
+                    warn!(
+                        "KvmBackend: failed to open guest console log {}: {}; falling back to sink",
+                        path.display(),
+                        err
+                    );
+                    Box::new(io::sink())
+                }
+            }
+        }
+    }
+}
+
+fn open_guest_console_file(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn spawn_guest_console_task(
+    mut serial_output: mpsc::Receiver<u8>,
+    sink: GuestConsoleSink,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut writer = open_guest_console_writer(&sink);
+        let mut buffer = Vec::with_capacity(1024);
+
+        while let Some(byte) = serial_output.recv().await {
+            buffer.push(byte);
+            while let Ok(next_byte) = serial_output.try_recv() {
+                buffer.push(next_byte);
+                if buffer.len() >= 1024 {
+                    break;
+                }
+            }
+
+            if let Err(err) = writer.write_all(&buffer) {
+                warn!("KvmBackend: failed writing guest console output: {}", err);
+                break;
+            }
+            let _ = writer.flush();
+            buffer.clear();
+        }
+    })
 }
 
 #[async_trait::async_trait]
@@ -73,7 +142,7 @@ impl VmmBackend for KvmBackend {
         // Snapshot restore path: skip cold boot entirely
         if let Some(ref snapshot_dir) = config.snapshot {
             info!("Restoring VM from snapshot: {}", snapshot_dir.display());
-            let vm = MicroVm::from_snapshot(snapshot_dir).await?;
+            let mut vm = MicroVm::from_snapshot(snapshot_dir).await?;
             self.cid = vm.cid();
 
             // The session secret comes from the snapshot (baked into kernel cmdline)
@@ -95,6 +164,12 @@ impl VmmBackend for KvmBackend {
                 Ok(Box::new(stream))
             });
             self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+            if let Some(serial_output) = vm.take_serial_output() {
+                self.guest_console_task = Some(spawn_guest_console_task(
+                    serial_output,
+                    config.guest_console.clone(),
+                ));
+            }
             self.vm = Some(vm);
 
             debug!("KvmBackend restored from snapshot with CID {}", self.cid);
@@ -136,7 +211,7 @@ impl VmmBackend for KvmBackend {
             seccomp: config.security.seccomp,
         };
 
-        let vm = MicroVm::new(vm_config).await?;
+        let mut vm = MicroVm::new(vm_config).await?;
         self.cid = vm.cid();
 
         // Build the control channel with AF_VSOCK connector
@@ -147,6 +222,12 @@ impl VmmBackend for KvmBackend {
             Ok(Box::new(stream))
         });
         self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+        if let Some(serial_output) = vm.take_serial_output() {
+            self.guest_console_task = Some(spawn_guest_console_task(
+                serial_output,
+                config.guest_console.clone(),
+            ));
+        }
         self.vm = Some(vm);
 
         debug!("KvmBackend started with CID {}", self.cid);
@@ -316,6 +397,9 @@ impl VmmBackend for KvmBackend {
     async fn stop(&mut self) -> Result<()> {
         if let Some(mut vm) = self.vm.take() {
             vm.stop().await?;
+        }
+        if let Some(task) = self.guest_console_task.take() {
+            let _ = task.await;
         }
         self.control_channel = None;
         Ok(())

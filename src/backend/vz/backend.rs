@@ -115,8 +115,8 @@ unsafe impl Sync for VzBackend {}
 fn guest_console_sink(config: &BackendConfig) -> Option<Retained<NSFileHandle>> {
     match &config.guest_console {
         GuestConsoleSink::Disabled => {
-            debug!("VzBackend: guest serial console attachment disabled");
-            None
+            debug!("VzBackend: routing guest serial console to null device");
+            Some(NSFileHandle::fileHandleWithNullDevice())
         }
         GuestConsoleSink::Stderr => {
             debug!("VzBackend: routing guest serial console to stderr");
@@ -306,23 +306,23 @@ impl VzBackend {
         }
 
         // 5. Serial console for guest kernel/init output.
-        if let Some(console_sink) = guest_console_sink(config) {
-            let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
-            let stdio_attachment = unsafe {
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    None,
-                    Some(&console_sink),
-                )
-            };
-            unsafe {
-                serial_config.setAttachment(Some(&stdio_attachment));
-            }
-            let serial_configs: Retained<NSArray<VZSerialPortConfiguration>> =
-                NSArray::arrayWithObject(&serial_config);
-            unsafe {
-                vm_config.setSerialPorts(&serial_configs);
-            }
+        let console_sink = guest_console_sink(config)
+            .expect("guest console sink must always provide a VZ serial attachment");
+        let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        let stdio_attachment = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&console_sink),
+            )
+        };
+        unsafe {
+            serial_config.setAttachment(Some(&stdio_attachment));
+        }
+        let serial_configs: Retained<NSArray<VZSerialPortConfiguration>> =
+            NSArray::arrayWithObject(&serial_config);
+        unsafe {
+            vm_config.setSerialPorts(&serial_configs);
         }
 
         // 6. Shared directories (virtiofs)
