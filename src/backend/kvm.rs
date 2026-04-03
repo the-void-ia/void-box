@@ -133,30 +133,6 @@ fn spawn_guest_console_task(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disabled_guest_console_writer_accepts_writes() {
-        let mut writer = open_guest_console_writer(&GuestConsoleSink::Disabled);
-        writer.write_all(b"discarded").unwrap();
-        writer.flush().unwrap();
-    }
-
-    #[test]
-    fn file_guest_console_writer_writes_to_file() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let log_path = tempdir.path().join("guest-console.log");
-        {
-            let mut writer = open_guest_console_writer(&GuestConsoleSink::File(log_path.clone()));
-            writer.write_all(b"hello").unwrap();
-            writer.flush().unwrap();
-        }
-        assert_eq!(std::fs::read(&log_path).unwrap(), b"hello");
-    }
-}
-
 #[async_trait::async_trait]
 impl VmmBackend for KvmBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
@@ -431,5 +407,29 @@ impl VmmBackend for KvmBackend {
 
     fn cid(&self) -> u32 {
         self.cid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_guest_console_writer_accepts_writes() {
+        let mut writer = open_guest_console_writer(&GuestConsoleSink::Disabled);
+        writer.write_all(b"discarded").unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn file_guest_console_writer_writes_to_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_path = tempdir.path().join("guest-console.log");
+        {
+            let mut writer = open_guest_console_writer(&GuestConsoleSink::File(log_path.clone()));
+            writer.write_all(b"hello").unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"hello");
     }
 }
