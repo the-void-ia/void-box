@@ -8,7 +8,7 @@
 //! Host applications connect via AF_UNIX instead of AF_VSOCK.
 
 use std::os::fd::IntoRawFd;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
