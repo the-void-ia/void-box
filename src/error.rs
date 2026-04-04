@@ -224,10 +224,10 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// System call errors (Linux only — nix crate)
+    /// System call errors (Linux only).
     #[cfg(target_os = "linux")]
     #[error("System error: {0}")]
-    System(#[from] nix::Error),
+    System(#[from] rustix::io::Errno),
 
     /// Workflow execution errors
     #[error("Workflow error: {0}")]

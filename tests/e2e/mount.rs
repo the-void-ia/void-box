@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::backend::{BackendConfig, BackendSecurityConfig, MountConfig, VmmBackend};
+use void_box::backend::{
+    BackendConfig, BackendSecurityConfig, GuestConsoleSink, MountConfig, VmmBackend,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -91,6 +93,7 @@ fn build_config_with_mount(
         rootfs: None,
         network: true,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![MountConfig {
             host_path: host_dir.to_string_lossy().into_owned(),

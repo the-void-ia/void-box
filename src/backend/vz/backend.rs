@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::control_channel::{ControlChannel, GuestConnector, GUEST_AGENT_PORT};
-use crate::backend::{BackendConfig, VmmBackend};
+use crate::backend::{BackendConfig, GuestConsoleSink, VmmBackend};
 use crate::error::Result;
 use crate::guest::protocol::{
     build_exec_request, ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest,
@@ -59,7 +59,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSString, NSURL};
+use objc2_foundation::{NSArray, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 
 /// Wrapper to assert `Send + Sync` for `Retained<VZVirtioSocketDevice>`.
@@ -111,6 +111,57 @@ struct StartedConfigInfo {
 // `Arc<ControlChannel>` which is already Send + Sync.
 unsafe impl Send for VzBackend {}
 unsafe impl Sync for VzBackend {}
+
+fn guest_console_sink(config: &BackendConfig) -> Option<Retained<NSFileHandle>> {
+    match &config.guest_console {
+        GuestConsoleSink::Disabled => {
+            debug!("VzBackend: routing guest serial console to null device");
+            Some(NSFileHandle::fileHandleWithNullDevice())
+        }
+        GuestConsoleSink::Stderr => {
+            debug!("VzBackend: routing guest serial console to stderr");
+            Some(NSFileHandle::fileHandleWithStandardError())
+        }
+        GuestConsoleSink::File(path) => {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    warn!(
+                        "VzBackend: failed to create guest console log dir {}: {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(file) => {
+                    debug!(
+                        "VzBackend: routing guest serial console to {}",
+                        path.display()
+                    );
+                    let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+                    Some(NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                        NSFileHandle::alloc(),
+                        fd,
+                        true,
+                    ))
+                }
+                Err(e) => {
+                    warn!(
+                        "VzBackend: failed to open guest console log {}: {}; falling back to null device",
+                        path.display(),
+                        e
+                    );
+                    Some(NSFileHandle::fileHandleWithNullDevice())
+                }
+            }
+        }
+    }
+}
 
 impl Default for VzBackend {
     fn default() -> Self {
@@ -255,12 +306,14 @@ impl VzBackend {
         }
 
         // 5. Serial console for guest kernel/init output.
+        let console_sink = guest_console_sink(config)
+            .expect("guest console sink must always provide a VZ serial attachment");
         let serial_config = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
         let stdio_attachment = unsafe {
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
                 None,
-                Some(&objc2_foundation::NSFileHandle::fileHandleWithStandardError()),
+                Some(&console_sink),
             )
         };
         unsafe {
@@ -934,5 +987,53 @@ impl VmmBackend for VzBackend {
 
     fn cid(&self) -> u32 {
         self.cid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendSecurityConfig;
+
+    fn test_security_config() -> BackendSecurityConfig {
+        BackendSecurityConfig {
+            session_secret: [7u8; 32],
+            command_allowlist: Vec::new(),
+            network_deny_list: Vec::new(),
+            max_connections_per_second: 0,
+            max_concurrent_connections: 0,
+            seccomp: false,
+        }
+    }
+
+    fn test_config(sink: GuestConsoleSink) -> BackendConfig {
+        BackendConfig {
+            memory_mb: 512,
+            vcpus: 1,
+            kernel: "/tmp/kernel".into(),
+            initramfs: None,
+            rootfs: None,
+            network: false,
+            enable_vsock: true,
+            guest_console: sink,
+            shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
+            env: Vec::new(),
+            security: test_security_config(),
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn guest_console_sink_keeps_attachment_for_disabled() {
+        assert!(guest_console_sink(&test_config(GuestConsoleSink::Disabled)).is_some());
+    }
+
+    #[test]
+    fn guest_console_sink_uses_attachment_for_stderr() {
+        assert!(guest_console_sink(&test_config(GuestConsoleSink::Stderr)).is_some());
     }
 }

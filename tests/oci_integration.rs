@@ -42,6 +42,9 @@ use void_box::spec::load_spec;
 use void_box::spec::RunSpec;
 use void_box::Error;
 
+#[cfg(target_os = "macos")]
+use void_box::backend::GuestConsoleSink;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 1: Mock-based tests (cross-platform, no hardware required)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -310,6 +313,7 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
         rootfs: None,
         network: false,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

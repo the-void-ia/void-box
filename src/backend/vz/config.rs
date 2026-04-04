@@ -74,7 +74,7 @@ pub fn memory_bytes(config: &BackendConfig) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendConfig, BackendSecurityConfig};
+    use crate::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
     use std::path::PathBuf;
 
     fn test_config() -> BackendConfig {
@@ -86,6 +86,7 @@ mod tests {
             rootfs: None,
             network: true,
             enable_vsock: true,
+            guest_console: GuestConsoleSink::Stderr,
             shared_dir: None,
             mounts: vec![],
             oci_rootfs: None,

@@ -48,6 +48,17 @@ pub struct MountConfig {
     pub read_only: bool,
 }
 
+/// Host-side routing for the guest serial console.
+#[derive(Debug, Clone)]
+pub enum GuestConsoleSink {
+    /// Suppress host-visible guest serial console output.
+    Disabled,
+    /// Forward the guest serial console to the host process stderr.
+    Stderr,
+    /// Append the guest serial console to a host-side log file.
+    File(PathBuf),
+}
+
 /// Configuration passed to [`VmmBackend::start`].
 ///
 /// This is a backend-agnostic description of what the caller wants.
@@ -68,6 +79,8 @@ pub struct BackendConfig {
     pub network: bool,
     /// Enable vsock for host-guest communication.
     pub enable_vsock: bool,
+    /// Host-side routing for guest serial console output.
+    pub guest_console: GuestConsoleSink,
     /// Host directory to share with guest (virtiofs on macOS, future on Linux).
     pub shared_dir: Option<PathBuf>,
     /// Host directory mounts into the guest.
@@ -104,6 +117,7 @@ impl BackendConfig {
             rootfs: None,
             network: false,
             enable_vsock: true,
+            guest_console: GuestConsoleSink::Stderr,
             shared_dir: None,
             mounts: Vec::new(),
             oci_rootfs: None,

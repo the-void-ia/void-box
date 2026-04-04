@@ -67,6 +67,7 @@ impl LocalSandbox {
             rootfs: self.config.rootfs.clone(),
             network: self.config.network,
             enable_vsock: self.config.enable_vsock,
+            guest_console: self.config.guest_console.clone(),
             shared_dir: self.config.shared_dir.clone(),
             mounts: self.config.mounts.clone(),
             oci_rootfs: self.config.oci_rootfs.clone(),

@@ -228,7 +228,7 @@ async fn real_claude_uses_void_mcp_tools() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs"]
 async fn diagnostic_void_mcp_starts_in_guest() {
-    use void_box::backend::{BackendConfig, BackendSecurityConfig};
+    use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
 
     if vm_preflight::require_kvm_usable().is_err() {
         eprintln!("skipping: KVM not available");
@@ -271,6 +271,7 @@ async fn diagnostic_void_mcp_starts_in_guest() {
         rootfs: None,
         network: true,
         enable_vsock: true,
+        guest_console: GuestConsoleSink::Stderr,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

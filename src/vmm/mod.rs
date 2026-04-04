@@ -55,7 +55,7 @@ pub struct MicroVm {
     /// Flag indicating if VM is running
     running: Arc<AtomicBool>,
     /// Serial output receiver
-    serial_output: mpsc::Receiver<u8>,
+    serial_output: Option<mpsc::Receiver<u8>>,
     /// Context ID for vsock communication
     cid: u32,
     /// Vsock device for guest communication
@@ -459,7 +459,7 @@ impl MicroVm {
             vm,
             vcpu_handles,
             running,
-            serial_output: serial_rx,
+            serial_output: Some(serial_rx),
             cid,
             vsock,
             virtio_vsock_mmio: mmio_devices.virtio_vsock,
@@ -747,7 +747,7 @@ impl MicroVm {
             vm,
             vcpu_handles,
             running,
-            serial_output: serial_rx,
+            serial_output: Some(serial_rx),
             cid,
             vsock: Some(vsock),
             virtio_vsock_mmio: mmio_devices.virtio_vsock,
@@ -1233,10 +1233,17 @@ impl MicroVm {
     /// Read available serial output
     pub fn read_serial_output(&mut self) -> Vec<u8> {
         let mut output = Vec::new();
-        while let Ok(byte) = self.serial_output.try_recv() {
-            output.push(byte);
+        if let Some(serial_output) = self.serial_output.as_mut() {
+            while let Ok(byte) = serial_output.try_recv() {
+                output.push(byte);
+            }
         }
         output
+    }
+
+    /// Take ownership of the serial output stream.
+    pub fn take_serial_output(&mut self) -> Option<mpsc::Receiver<u8>> {
+        self.serial_output.take()
     }
 
     /// Stop the VM

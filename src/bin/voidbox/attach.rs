@@ -1,13 +1,16 @@
 //! CLI handlers for `voidbox attach` and `voidbox shell`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use rustix::termios::tcgetwinsize;
 use void_box::backend::pty_session::RawModeGuard;
-use void_box::backend::MountConfig;
+use void_box::backend::{GuestConsoleSink, MountConfig};
 use void_box::credentials::{discover_oauth_credentials, stage_credentials, StagedCredentials};
 use void_box::llm::LlmProvider;
 use void_box::spec::{self, RunKind, RunSpec, SandboxSpec};
 use void_box_protocol::PtyOpenRequest;
+
+const GUEST_CONSOLE_LOG_FILENAME: &str = "guest-console.log";
 
 /// Attaches to a running VM by run ID (not yet implemented).
 pub async fn cmd_attach(
@@ -44,6 +47,8 @@ pub struct ShellOpts<'a> {
     pub mounts: &'a [String],
     /// Env flags (KEY=VALUE).
     pub env_vars: &'a [String],
+    /// Directory for interactive runtime logs.
+    pub log_dir: &'a Path,
 }
 
 /// Boots a VM from a spec file or ephemeral config and attaches an interactive PTY.
@@ -53,43 +58,39 @@ pub struct ShellOpts<'a> {
 /// Returns an error if the spec is invalid, credentials cannot be staged, or
 /// the sandbox fails to start.
 pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::Error>> {
-    let spec = match opts.file {
+    let run_spec = match opts.file {
         Some(path) => {
-            let s = spec::load_spec(path)?;
-            spec::validate_spec(&s)?;
-            s
+            let loaded_spec = spec::load_spec(path)?;
+            spec::validate_spec(&loaded_spec)?;
+            loaded_spec
         }
         None => build_ephemeral_spec(opts.memory_mb, opts.vcpus, opts.network),
     };
 
-    let provider = resolve_provider(opts.provider, opts.file.is_some(), spec.llm.as_ref())?;
-
-    let staged_creds = prepare_credentials(&provider)?;
-
-    let kernel = spec
+    let kernel = run_spec
         .sandbox
         .kernel
         .clone()
         .or_else(|| std::env::var("VOID_BOX_KERNEL").ok())
         .ok_or("VOID_BOX_KERNEL not set and no kernel in spec")?;
-    let initramfs = spec
+    let initramfs = run_spec
         .sandbox
         .initramfs
         .clone()
         .or_else(|| std::env::var("VOID_BOX_INITRAMFS").ok());
 
     let effective_memory = if opts.file.is_some() {
-        spec.sandbox.memory_mb
+        run_spec.sandbox.memory_mb
     } else {
         opts.memory_mb
     };
     let effective_vcpus = if opts.file.is_some() {
-        spec.sandbox.vcpus
+        run_spec.sandbox.vcpus
     } else {
         opts.vcpus
     };
     let effective_network = if opts.file.is_some() {
-        spec.sandbox.network
+        run_spec.sandbox.network
     } else {
         opts.network
     };
@@ -98,23 +99,26 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         .kernel(&kernel)
         .memory_mb(effective_memory)
         .vcpus(effective_vcpus)
-        .network(effective_network);
+        .network(effective_network)
+        .guest_console(GuestConsoleSink::File(
+            opts.log_dir.join(GUEST_CONSOLE_LOG_FILENAME),
+        ));
 
     if let Some(path) = &initramfs {
         builder = builder.initramfs(path);
     }
 
-    if let Some(snap) = opts.snapshot {
-        builder = builder.snapshot(snap);
-    } else if let Some(ref snap) = spec.sandbox.snapshot {
-        builder = builder.snapshot(snap);
+    if let Some(snapshot_path) = opts.snapshot {
+        builder = builder.snapshot(snapshot_path);
+    } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
+        builder = builder.snapshot(snapshot_path);
     }
 
-    for ms in &spec.sandbox.mounts {
+    for mount_spec in &run_spec.sandbox.mounts {
         builder = builder.mount(MountConfig {
-            host_path: ms.host.clone(),
-            guest_path: ms.guest.clone(),
-            read_only: ms.mode == "ro",
+            host_path: mount_spec.host.clone(),
+            guest_path: mount_spec.guest.clone(),
+            read_only: mount_spec.mode == "ro",
         });
     }
 
@@ -125,13 +129,13 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     // Credentials are written via write_file after boot (not mounted),
     // because the VMM only supports one 9p device at a time.
 
-    for (key, value) in &spec.sandbox.env {
+    for (key, value) in &run_spec.sandbox.env {
         builder = builder.env(key, value);
     }
 
     for raw in opts.env_vars {
-        let (k, v) = parse_env_flag(raw)?;
-        builder = builder.env(k, v);
+        let (key, value) = parse_env_flag(raw)?;
+        builder = builder.env(key, value);
     }
 
     let sandbox = builder.build()?;
@@ -140,6 +144,13 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         Some(name) => name.to_str().unwrap_or(opts.program),
         None => opts.program,
     };
+    let provider = resolve_provider(
+        program_base,
+        opts.provider,
+        opts.file.is_some(),
+        run_spec.llm.as_ref(),
+    )?;
+    let staged_creds = prepare_credentials(provider.as_ref())?;
     if program_base == "claude" || program_base == "claude-code" {
         let onboarding = r#"{"hasCompletedOnboarding":true}"#;
         let _ = sandbox
@@ -148,19 +159,25 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
 
         if let Some(ref creds) = staged_creds {
             let creds_path = std::path::PathBuf::from(&creds.host_path).join(".credentials.json");
-            if let Ok(content) = std::fs::read(&creds_path) {
+            if let Ok(credentials_bytes) = std::fs::read(&creds_path) {
                 let _ = sandbox.mkdir_p("/home/sandbox/.claude").await;
                 let _ = sandbox
-                    .write_file("/home/sandbox/.claude/.credentials.json", &content)
+                    .write_file(
+                        "/home/sandbox/.claude/.credentials.json",
+                        &credentials_bytes,
+                    )
                     .await;
             }
         }
     }
 
-    let mut pty_env: Vec<(String, String)> = provider.env_vars();
+    let mut pty_env: Vec<(String, String)> = provider
+        .as_ref()
+        .map(LlmProvider::env_vars)
+        .unwrap_or_default();
     for raw in opts.env_vars {
-        let (k, v) = parse_env_flag(raw)?;
-        pty_env.push((k.to_string(), v.to_string()));
+        let (key, value) = parse_env_flag(raw)?;
+        pty_env.push((key.to_string(), value.to_string()));
     }
 
     let (cols, rows) = terminal_size()?;
@@ -175,20 +192,22 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         interactive: true,
     };
 
-    let session = sandbox.attach_pty(request).await?;
+    let pty_result = async {
+        let session = sandbox.attach_pty(request).await?;
+        let guard =
+            RawModeGuard::engage(0).map_err(|e| format!("failed to enter raw mode: {e}"))?;
+        let exit_code = tokio::task::spawn_blocking(move || session.run())
+            .await
+            .map_err(|e| format!("pty task panicked: {e}"))??;
+        drop(guard);
+        Ok::<i32, Box<dyn std::error::Error>>(exit_code)
+    }
+    .await;
 
-    let guard = RawModeGuard::engage(0).map_err(|e| format!("failed to enter raw mode: {e}"))?;
-
-    let exit_code = tokio::task::spawn_blocking(move || session.run())
-        .await
-        .map_err(|e| format!("pty task panicked: {e}"))??;
-
-    drop(guard);
     let _ = sandbox.stop().await;
-
     drop(staged_creds);
 
-    Ok(exit_code)
+    pty_result
 }
 
 /// Builds a minimal ephemeral `RunSpec` with `kind: sandbox`.
@@ -218,37 +237,45 @@ fn build_ephemeral_spec(memory_mb: usize, vcpus: usize, network: bool) -> RunSpe
     }
 }
 
-/// Resolves the LLM provider from the flag, spec, or environment auto-detection.
+/// Resolves the LLM provider for Claude-based shell programs.
 ///
 /// # Errors
 ///
-/// Returns an error if no provider can be determined and no API key is available.
+/// Returns `Ok(None)` for non-Claude programs. Returns an error when the target
+/// program is Claude-based and no provider can be determined.
 fn resolve_provider(
+    program: &str,
     flag: Option<&str>,
     has_file: bool,
     llm_spec: Option<&spec::LlmSpec>,
-) -> Result<LlmProvider, Box<dyn std::error::Error>> {
+) -> Result<Option<LlmProvider>, Box<dyn std::error::Error>> {
+    if !matches!(program, "claude" | "claude-code") {
+        return Ok(None);
+    }
+
     if let Some(name) = flag {
-        return Ok(provider_from_name(name));
+        return Ok(Some(provider_from_name(name)));
     }
 
     if has_file {
         if let Some(llm) = llm_spec {
-            return Ok(provider_from_name(&llm.provider));
+            return Ok(Some(provider_from_name(&llm.provider)));
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let creds_path = PathBuf::from(&home).join(".claude/.credentials.json");
-    if creds_path.exists() {
-        return Ok(LlmProvider::ClaudePersonal);
+    if claude_personal_available() {
+        return Ok(Some(LlmProvider::ClaudePersonal));
     }
 
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return Ok(LlmProvider::Claude);
+        return Ok(Some(LlmProvider::Claude));
     }
 
     Err("no LLM provider detected: set ANTHROPIC_API_KEY or run `claude auth login`".into())
+}
+
+fn claude_personal_available() -> bool {
+    discover_oauth_credentials().is_ok()
 }
 
 /// Maps a provider name string to an `LlmProvider` variant.
@@ -256,7 +283,10 @@ fn provider_from_name(name: &str) -> LlmProvider {
     match name.to_ascii_lowercase().as_str() {
         "claude" => LlmProvider::Claude,
         "claude-personal" => LlmProvider::ClaudePersonal,
-        _ => LlmProvider::Claude,
+        other => {
+            tracing::warn!("unknown LLM provider '{}'; defaulting to claude", other);
+            LlmProvider::Claude
+        }
     }
 }
 
@@ -266,9 +296,9 @@ fn provider_from_name(name: &str) -> LlmProvider {
 ///
 /// Returns an error if credential discovery or staging fails.
 fn prepare_credentials(
-    provider: &LlmProvider,
+    provider: Option<&LlmProvider>,
 ) -> Result<Option<StagedCredentials>, Box<dyn std::error::Error>> {
-    if !matches!(provider, LlmProvider::ClaudePersonal) {
+    if !matches!(provider, Some(LlmProvider::ClaudePersonal)) {
         return Ok(None);
     }
     let json = discover_oauth_credentials()?;
@@ -315,10 +345,43 @@ fn parse_env_flag(raw: &str) -> Result<(&str, &str), Box<dyn std::error::Error>>
 
 /// Reads the current terminal size via ioctl.
 fn terminal_size() -> Result<(u16, u16), Box<dyn std::error::Error>> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if ret < 0 {
-        return Err(format!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error()).into());
-    }
+    let ws = tcgetwinsize(std::io::stdout().lock())?;
     Ok((ws.ws_col, ws.ws_row))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_provider_returns_none_for_non_claude_programs() {
+        let provider = resolve_provider("sh", None, false, None).unwrap();
+        assert!(provider.is_none());
+    }
+
+    #[test]
+    fn resolve_provider_respects_explicit_provider_flag() {
+        let provider = resolve_provider("claude", Some("claude-personal"), false, None).unwrap();
+        assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));
+    }
+
+    #[test]
+    fn resolve_provider_uses_spec_provider_when_file_is_present() {
+        let llm_spec = spec::LlmSpec {
+            provider: "claude-personal".into(),
+            model: None,
+            base_url: None,
+            api_key_env: None,
+        };
+        let provider = resolve_provider("claude", None, true, Some(&llm_spec)).unwrap();
+        assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));
+    }
+
+    #[test]
+    fn unknown_provider_defaults_to_claude() {
+        assert!(matches!(
+            provider_from_name("not-a-real-provider"),
+            LlmProvider::Claude
+        ));
+    }
 }
