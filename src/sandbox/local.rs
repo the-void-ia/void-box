@@ -429,6 +429,7 @@ impl LocalSandbox {
         snapshot_dir: &std::path::Path,
         config_hash: String,
     ) -> Result<()> {
+        self.ensure_started().await?;
         let mut backend_lock = self.backend.lock().await;
         let Some(ref mut backend) = *backend_lock else {
             return Err(Error::VmNotRunning);
