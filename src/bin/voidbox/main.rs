@@ -422,13 +422,13 @@ fn init_tracing(mode: TracingMode, config: &ResolvedConfig) -> Option<String> {
 }
 
 fn tracing_plan(mode: TracingMode, log_dir: &Path, log_dir_ready: bool) -> TracingPlan {
-    let runtime_log_path = log_dir.join(RUNTIME_LOG_FILENAME);
     match (mode, log_dir_ready) {
         (TracingMode::InteractivePty, true) => TracingPlan {
             writer_mode: TracingWriterMode::FileOnly,
             notice: Some(format!(
-                "interactive mode: runtime logs will be written to {} to avoid terminal corruption.",
-                runtime_log_path.display()
+                "interactive mode: runtime logs will be written to the daily {}.* file in {} to avoid terminal corruption.",
+                RUNTIME_LOG_FILENAME,
+                log_dir.display()
             )),
         },
         (TracingMode::InteractivePty, false) => TracingPlan {

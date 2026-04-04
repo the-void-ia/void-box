@@ -1,6 +1,6 @@
 //! CLI handlers for `voidbox attach` and `voidbox shell`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::termios::tcgetwinsize;
 use void_box::backend::pty_session::RawModeGuard;
@@ -263,9 +263,7 @@ fn resolve_provider(
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let creds_path = PathBuf::from(&home).join(".claude/.credentials.json");
-    if creds_path.exists() {
+    if claude_personal_available() {
         return Ok(Some(LlmProvider::ClaudePersonal));
     }
 
@@ -274,6 +272,10 @@ fn resolve_provider(
     }
 
     Err("no LLM provider detected: set ANTHROPIC_API_KEY or run `claude auth login`".into())
+}
+
+fn claude_personal_available() -> bool {
+    discover_oauth_credentials().is_ok()
 }
 
 /// Maps a provider name string to an `LlmProvider` variant.

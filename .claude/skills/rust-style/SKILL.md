@@ -260,6 +260,80 @@ let is_ready = match state {
 let is_ready = matches!(state, State::Ready);
 ```
 
+## Data Models: Prefer Explicit Enums Over Overlapping Flags
+
+If a feature has a small closed set of modes, model it as an enum instead of
+combining booleans and options that create ambiguous states.
+
+```rust
+// DO
+enum GuestConsoleSink {
+    Disabled,
+    Stderr,
+    File(PathBuf),
+}
+
+// DON'T
+struct GuestConsoleConfig {
+    attach_guest_console: bool,
+    guest_console_log: Option<PathBuf>,
+}
+```
+
+## Policy Boundaries: Keep Execution Policy Out of Persisted Config
+
+When behavior is specific to one command or runtime mode, derive that policy at
+the boundary and pass a narrow type inward. Do not mutate resolved config just
+to express command-scoped behavior.
+
+```rust
+// DO
+enum TracingMode {
+    Standard,
+    InteractivePty,
+}
+
+let mode = tracing_mode_for_command(&cli.command);
+init_tracing(mode, &config);
+
+// DON'T
+if matches!(cli.command, Command::Shell { .. }) {
+    config.log_to_stderr = false;
+}
+init_tracing(&config);
+```
+
+## Naming: Prefer Meaningful Locals Over Shorthand
+
+Use names that describe the role of a value. Avoid short names like `rc`, `n`,
+`msg`, `ws`, `k`, and `v` outside tiny, obvious scopes.
+
+```rust
+// DO
+let ready_count = poll(...)?;
+let bytes_read = read(...)?;
+let winsize = tcgetwinsize(...)?;
+
+// DON'T
+let rc = poll(...)?;
+let n = read(...)?;
+let ws = tcgetwinsize(...)?;
+```
+
+## Constants: Name Repeated or Meaningful Literals
+
+Lift repeated or behavior-defining literals into documented module-scope
+constants instead of keeping them inline.
+
+```rust
+// DO
+/// Poll timeout for the interactive PTY relay loop.
+const PTY_POLL_TIMEOUT_MS: i32 = 100;
+
+// DON'T
+poll(&mut pollfds, 100)?;
+```
+
 ## Destructuring: Always Use Explicit Destructuring
 
 Destructure structs and tuples explicitly to get compiler errors when fields change.
