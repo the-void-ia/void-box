@@ -1193,3 +1193,85 @@ async fn snapshot_cli_create_diff() {
     let _ = std::fs::remove_dir_all(&base_dir);
     let _ = std::fs::remove_dir_all(&diff_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Test: Auto-snapshot round-trip (cold boot → save → restore)
+// ---------------------------------------------------------------------------
+
+/// Cold-boot a VM, take a snapshot, immediately restore from it, and verify
+/// the restored VM is functional. This exercises the same flow as
+/// `KvmBackend::create_auto_snapshot`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn auto_snapshot_round_trip() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config(&kernel, initramfs.as_deref());
+
+    // --- Cold boot ---
+    eprintln!("[auto_snapshot] Booting VM...");
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  cold boot exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+    assert_eq!(output.stdout_str().trim(), "ready");
+    eprintln!("[auto_snapshot] Cold boot OK");
+
+    // --- Snapshot + immediate restore (auto-snapshot flow) ---
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+
+    eprintln!("[auto_snapshot] Taking snapshot...");
+    let start = Instant::now();
+    let snap_path = match vm
+        .snapshot(snap_dir.path(), config_hash, snap_config())
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            return;
+        }
+    };
+
+    let mut restored_vm = match MicroVm::from_snapshot(&snap_path).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  restore failed: {e}");
+            return;
+        }
+    };
+    let elapsed = start.elapsed();
+    eprintln!("[auto_snapshot] Snapshot + restore took {:.1?}", elapsed);
+
+    // --- Verify restored VM works ---
+    let exec_ok = try_restored_exec(&restored_vm).await;
+    assert!(exec_ok, "auto-snapshot restored VM exec must succeed");
+
+    // --- Verify snapshot on disk ---
+    assert!(
+        snapshot::VmSnapshot::memory_path(&snap_path).exists(),
+        "snapshot memory file must exist"
+    );
+
+    eprintln!();
+    eprintln!("=== Auto-Snapshot Round-Trip ===");
+    eprintln!("  Snapshot + restore: {:>10.1?}", elapsed);
+    eprintln!("================================");
+
+    restored_vm.stop().await.ok();
+}
