@@ -1220,6 +1220,11 @@ impl MicroVm {
         self.cid
     }
 
+    /// Whether this VM has virtio-net enabled.
+    pub fn has_network(&self) -> bool {
+        self.virtio_net.is_some()
+    }
+
     /// Get the vsock Unix socket path (set on restored VMs).
     pub fn vsock_socket_path(&self) -> Option<&Path> {
         self.vsock_socket_path.as_deref()
