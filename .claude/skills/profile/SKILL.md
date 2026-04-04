@@ -14,7 +14,7 @@ Profile CPU, off-CPU, and hardware counters using the eBPF-based
 
 > perf-agent requires Linux capabilities to run without sudo. Please run:
 > ```bash
-> sudo setcap 'cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore=ep' $HOME/.local/bin/perf-agent
+> sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_checkpoint_restore=ep' $HOME/.local/bin/perf-agent
 > ```
 > (Only needed once after each download.)
 >
