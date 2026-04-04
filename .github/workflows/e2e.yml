@@ -104,7 +104,6 @@ jobs:
           cargo test --test e2e_mount -- --ignored --test-threads=1
 
       - name: Run snapshot integration tests
-        continue-on-error: true
         env:
           VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz

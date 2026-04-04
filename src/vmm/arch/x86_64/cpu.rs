@@ -58,6 +58,7 @@ const SNAPSHOT_MSR_INDICES: &[u32] = &[
     0x4b56_4d01, // MSR_KVM_SYSTEM_TIME_NEW (kvm-clock)
     0x4b56_4d00, // MSR_KVM_WALL_CLOCK_NEW
     0x0000_06E0, // IA32_TSC_DEADLINE (LAPIC deadline timer)
+    0x0000_0DA0, // IA32_XSS (XSAVES/XRSTORS supervisor features — CET, etc.)
 ];
 
 /// Configure a freshly-created vCPU for cold boot (CPUID + sregs + regs).

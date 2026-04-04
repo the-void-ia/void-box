@@ -936,13 +936,32 @@ the serial channel buffer from 4096 to 65536 if kernel messages overflow it.
    (dst_cid doesn't match cached value). **Fix:** `snapshot_internal()`
    stores `self.cid` in the snapshot; `from_snapshot()` reuses that CID.
 
+4. **Missing IA32_XSS restore → XRSTORS #GP → stack overflow → kernel panic.**
+   On kernels with CET (Control-flow Enforcement Technology, kernel ≥ 6.x on
+   Fedora/Ubuntu), `IA32_XSS` (MSR 0x0DA0) has bits 11-12 set (CET_U/CET_S).
+   The guest kernel's `XRSTORS` instruction uses the combined mask
+   `XCR0 ∪ IA32_XSS` to restore process FPU state in compacted format.  After
+   snapshot restore, `IA32_XSS` defaulted to 0 because the MSR was not
+   captured.  `XRSTORS` then #GP'd on the CET features referenced by the
+   fpstate's `xcomp_bv` but not enabled in `XCR0 ∪ IA32_XSS`.  The #GP
+   triggered the kernel's `fixup_exception` handler, which itself tried to
+   context-switch (calling `restore_fpregs_from_fpstate` again), causing a
+   recursive #GP that overflowed the TASK stack guard page → kernel panic →
+   `VcpuExit::Shutdown`.
+   **Fix:** Added `IA32_XSS` (0x0DA0) to `SNAPSHOT_MSR_INDICES`.  Safe on
+   older CPUs: the per-MSR capture loop silently skips unsupported MSRs, and
+   restore only writes MSRs present in the snapshot.
+
 **Debugging tip:** Guest reboots (port 0x64 write of 0xFE) indicate kernel
 panic, not a hang. Add `panic=-1 loglevel=7 earlyprintk=serial` to kernel
 cmdline and read serial output via `vm.read_serial_output()` to capture the
-actual panic message.
+actual panic message.  Increase the serial channel buffer from 4096 to 65536
+if kernel messages overflow it.
 
 **Key files:** `src/vmm/cpu.rs` (capture/restore order), `src/vmm/mod.rs`
-(CID preservation), `src/vmm/snapshot.rs` (VcpuState with xcrs field).
+(CID preservation), `src/vmm/snapshot.rs` (VcpuState with xcrs field),
+`src/vmm/arch/x86_64/cpu.rs` (`SNAPSHOT_MSR_INDICES`, `capture_vcpu_state`,
+`restore_vcpu_state`).
 
 ### EPERM during OCI layer unpack
 

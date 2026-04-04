@@ -5,8 +5,8 @@
 > **Depends on:** snapshot infrastructure (`src/vmm/snapshot.rs`, `src/snapshot_store.rs`), `voidbox shell` (`src/bin/voidbox/attach.rs`)
 >
 > **Blockers (must resolve before implementation):**
-> 1. **Fix snapshot_integration test regressions** — 4/7 tests failing locally (`snapshot_cold_boot_vs_restore`, `snapshot_diff_restore`, `snapshot_multi_vcpu`, `snapshot_net_restore`). Auto-snapshot depends on a working snapshot/restore pipeline.
-> 2. **Enable snapshot_integration in CI** — currently all tests are `#[ignore]` and skipped in CI. Must run in CI to prevent future regressions before building on top.
+> 1. ~~**Fix snapshot_integration test regressions**~~ — **Resolved.** Root cause: missing `IA32_XSS` MSR capture/restore caused XRSTORS #GP on CET-enabled kernels. Fixed by adding `IA32_XSS` (0x0DA0) to `SNAPSHOT_MSR_INDICES`. All 7/7 tests pass.
+> 2. ~~**Enable snapshot_integration in CI**~~ — **Resolved.** Removed `continue-on-error: true` from `e2e.yml` so snapshot test failures block the pipeline.
 
 ## Problem
 
