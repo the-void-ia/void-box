@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use rustix::termios::tcgetwinsize;
+use tracing::info;
 use void_box::backend::pty_session::RawModeGuard;
 use void_box::backend::{GuestConsoleSink, MountConfig};
 use void_box::credentials::{discover_oauth_credentials, stage_credentials, StagedCredentials};
@@ -114,7 +115,27 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         builder = builder.initramfs(path);
     }
 
-    if let Some(snapshot_path) = opts.snapshot {
+    let mut auto_snapshot_pending = false;
+
+    if opts.auto_snapshot {
+        let config_hash = void_box::vmm::snapshot::compute_config_hash(
+            Path::new(&kernel),
+            initramfs.as_deref().map(Path::new),
+            effective_memory,
+            effective_vcpus,
+        )?;
+        let snap_dir = void_box::vmm::snapshot::snapshot_dir_for_hash(&config_hash);
+        if void_box::vmm::snapshot::snapshot_exists(&snap_dir) {
+            info!("Auto-snapshot: restoring from {}", snap_dir.display());
+            builder = builder.snapshot(&snap_dir);
+        } else {
+            info!(
+                "Auto-snapshot: no snapshot for hash {}, will cold boot and save",
+                &config_hash[..16]
+            );
+            auto_snapshot_pending = true;
+        }
+    } else if let Some(snapshot_path) = opts.snapshot {
         builder = builder.snapshot(snapshot_path);
     } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
         builder = builder.snapshot(snapshot_path);
@@ -145,6 +166,19 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     }
 
     let sandbox = builder.build()?;
+
+    if auto_snapshot_pending {
+        let config_hash = void_box::vmm::snapshot::compute_config_hash(
+            Path::new(&kernel),
+            initramfs.as_deref().map(Path::new),
+            effective_memory,
+            effective_vcpus,
+        )?;
+        let snap_dir = void_box::vmm::snapshot::snapshot_dir_for_hash(&config_hash);
+        std::fs::create_dir_all(&snap_dir)?;
+        sandbox.create_auto_snapshot(&snap_dir, config_hash).await?;
+        info!("Auto-snapshot: saved for next run");
+    }
 
     let program_base = match Path::new(opts.program).file_name() {
         Some(name) => name.to_str().unwrap_or(opts.program),

@@ -614,6 +614,20 @@ Build a production guest image with claude-code and set VOID_BOX_INITRAMFS: \
         }
     }
 
+    /// Create an auto-snapshot: stop the VM, save state, restore immediately.
+    pub async fn create_auto_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+        config_hash: String,
+    ) -> Result<()> {
+        match &self.inner {
+            SandboxInner::Local(local) => {
+                local.create_auto_snapshot(snapshot_dir, config_hash).await
+            }
+            SandboxInner::Mock(_) => Ok(()),
+        }
+    }
+
     /// Stop the sandbox and cleanup resources gracefully
     pub async fn stop(&self) -> Result<()> {
         match &self.inner {
