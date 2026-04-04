@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `voidbox --log-dir` and `VOIDBOX_LOG_DIR` overrides for file-based runtime logs
+
 ### Changed
 - Rust MSRV bumped to 1.88
+- Interactive `voidbox shell` sessions now route runtime logs to the daily log file and route guest console output away from the active terminal to avoid TUI corruption
+- `voidbox shell` now prefers Claude Personal when personal OAuth credentials are available via the host's cross-platform credential discovery path
+
+### Fixed
+- Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
+- Guest console routing semantics are now consistent across macOS/VZ and Linux/KVM
 
 ## [0.1.2] - 2026-03-16
 
