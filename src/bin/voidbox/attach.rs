@@ -43,6 +43,8 @@ pub struct ShellOpts<'a> {
     pub provider: Option<&'a str>,
     /// Restore from snapshot.
     pub snapshot: Option<&'a str>,
+    /// Automatically snapshot the VM on exit.
+    pub auto_snapshot: bool,
     /// Mount flags (HOST:GUEST[:ro|rw]).
     pub mounts: &'a [String],
     /// Env flags (KEY=VALUE).
@@ -58,6 +60,10 @@ pub struct ShellOpts<'a> {
 /// Returns an error if the spec is invalid, credentials cannot be staged, or
 /// the sandbox fails to start.
 pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::Error>> {
+    if opts.auto_snapshot && opts.snapshot.is_some() {
+        return Err("--auto-snapshot and --snapshot are mutually exclusive".into());
+    }
+
     let run_spec = match opts.file {
         Some(path) => {
             let loaded_spec = spec::load_spec(path)?;
