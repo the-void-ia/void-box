@@ -20,7 +20,7 @@ use crate::guest::protocol::{
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
-use crate::vmm::config::{SecurityConfig, VoidBoxConfig};
+use crate::vmm::config::{SecurityConfig, VoidBoxConfig, VsockBackendType};
 use crate::vmm::MicroVm;
 use crate::{Error, ExecOutput, Result};
 
@@ -172,7 +172,10 @@ impl VmmBackend for KvmBackend {
                 let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
-            self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+            self.control_channel = Some(Arc::new(ControlChannel::new_restored(
+                connector,
+                session_secret,
+            )));
             if let Some(serial_output) = vm.take_serial_output() {
                 self.guest_console_task = Some(spawn_guest_console_task(
                     serial_output,
@@ -188,13 +191,19 @@ impl VmmBackend for KvmBackend {
             return Ok(());
         }
 
-        // Normal cold-boot path
+        // Normal cold-boot path.
+        //
+        // Use the Userspace vsock backend so the device state can be cleanly
+        // captured by snapshot() and restored by from_snapshot() (which
+        // always restores into VirtioVsockUserspace).  Vhost-vsock state is
+        // not snapshot-compatible.
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .kernel(&config.kernel)
             .network(config.network)
-            .enable_vsock(config.enable_vsock);
+            .enable_vsock(config.enable_vsock)
+            .vsock_backend(VsockBackendType::Userspace);
 
         if let Some(ref initramfs) = config.initramfs {
             vm_config = vm_config.initramfs(initramfs);
@@ -229,11 +238,16 @@ impl VmmBackend for KvmBackend {
         self.vcpus = config.vcpus;
         self.network = config.network;
 
-        // Build the control channel with AF_VSOCK connector
-        let cid = self.cid;
+        // Build the control channel with the Userspace Unix-socket connector
+        // (matches the Userspace vsock backend chosen above for snapshot
+        // compatibility).
         let session_secret = config.security.session_secret;
+        let socket_path = vm
+            .vsock_socket_path()
+            .expect("Userspace vsock backend must have socket path")
+            .to_path_buf();
         let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
-            let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
+            let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
         self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
@@ -463,7 +477,10 @@ impl VmmBackend for KvmBackend {
             let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
-        self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+        self.control_channel = Some(Arc::new(ControlChannel::new_restored(
+            connector,
+            session_secret,
+        )));
         self.cid = restored_vm.cid();
         self.memory_mb = snap.config.memory_mb;
         self.vcpus = snap.config.vcpus;

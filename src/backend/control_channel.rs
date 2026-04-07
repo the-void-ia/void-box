@@ -82,6 +82,15 @@ impl ControlChannel {
         }
     }
 
+    /// Create a control channel for a restored VM (skip the boot wait).
+    pub fn new_restored(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
+        Self {
+            connector,
+            session_secret,
+            boot_wait_done: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// Send an exec request and wait for the response.
     ///
     /// Performs a connect+handshake, sends the request, then reads messages

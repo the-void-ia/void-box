@@ -153,10 +153,12 @@ impl MicroVm {
         });
 
         // Vsock device for host->guest exec (connect to guest agent)
+        let mut cold_boot_socket_path: Option<PathBuf> = None;
         let vsock = if config.enable_vsock {
             if config.vsock_backend == config::VsockBackendType::Userspace {
                 let socket_path =
                     std::path::PathBuf::from(format!("/tmp/void-box-vsock-{}.sock", cid));
+                cold_boot_socket_path = Some(socket_path.clone());
                 Some(Arc::new(VsockDevice::with_unix_socket(
                     cid,
                     config.security.session_secret,
@@ -470,7 +472,7 @@ impl MicroVm {
             net_poll_handle,
             telemetry: None,
             active_span_context: None,
-            vsock_socket_path: None,
+            vsock_socket_path: cold_boot_socket_path,
         })
     }
 

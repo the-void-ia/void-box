@@ -66,6 +66,15 @@ fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
     Some((kernel, initramfs))
 }
 
+/// Test memory size in MB. Override with `VOID_BOX_TEST_MEMORY_MB` for the
+/// production initramfs (which needs ~1024MB+).
+fn test_memory_mb() -> usize {
+    std::env::var("VOID_BOX_TEST_MEMORY_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
 /// Build a `VoidBoxConfig` from kernel/initramfs paths.
 fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -> VoidBoxConfig {
     build_config_vcpus(kernel, initramfs, 1)
@@ -78,7 +87,7 @@ fn build_config_vcpus(
     vcpus: usize,
 ) -> VoidBoxConfig {
     let mut cfg = VoidBoxConfig::new()
-        .memory_mb(256)
+        .memory_mb(test_memory_mb())
         .vcpus(vcpus)
         .kernel(kernel)
         .enable_vsock(true)
@@ -100,7 +109,7 @@ fn snap_config() -> SnapshotConfig {
 /// Build a `SnapshotConfig` with a specific vCPU count.
 fn snap_config_vcpus(vcpus: usize) -> SnapshotConfig {
     SnapshotConfig {
-        memory_mb: 256,
+        memory_mb: test_memory_mb(),
         vcpus,
         cid: 0, // overwritten by snapshot_internal()
         vsock_mmio_base: 0xd080_0000,
@@ -114,7 +123,7 @@ fn build_config_net(
     initramfs: Option<&std::path::Path>,
 ) -> VoidBoxConfig {
     let mut cfg = VoidBoxConfig::new()
-        .memory_mb(256)
+        .memory_mb(test_memory_mb())
         .vcpus(1)
         .kernel(kernel)
         .enable_vsock(true)
@@ -130,7 +139,7 @@ fn build_config_net(
 /// Build a `SnapshotConfig` with networking enabled.
 fn snap_config_net() -> SnapshotConfig {
     SnapshotConfig {
-        memory_mb: 256,
+        memory_mb: test_memory_mb(),
         vcpus: 1,
         cid: 0,
         vsock_mmio_base: 0xd080_0000,
@@ -249,9 +258,13 @@ async fn snapshot_cold_boot_vs_restore() {
         snap.config.cid, cold_cid
     );
     assert_eq!(snap.version, snapshot::SNAPSHOT_VERSION);
-    assert_eq!(snap.config.memory_mb, 256);
+    assert_eq!(snap.config.memory_mb, test_memory_mb());
     assert_eq!(snap.config.vcpus, 1);
     assert!(snap.config.cid >= 3, "snapshot must preserve real CID");
+    assert_eq!(
+        snap.config.cid, cold_cid,
+        "snapshot CID must match cold boot CID"
+    );
     assert!(
         !snap.vcpu_states.is_empty(),
         "snapshot must contain vCPU states"
@@ -259,7 +272,11 @@ async fn snapshot_cold_boot_vs_restore() {
     let mem_path = VmSnapshot::memory_path(&snapshot_path);
     assert!(mem_path.exists(), "memory dump must exist");
     let mem_size = std::fs::metadata(&mem_path).unwrap().len();
-    assert_eq!(mem_size, 256 * 1024 * 1024, "memory dump must be 256MB");
+    assert_eq!(
+        mem_size,
+        (test_memory_mb() * 1024 * 1024) as u64,
+        "memory dump size mismatch"
+    );
 
     // --- Restore ---
     eprintln!("[cold_boot_vs_restore] Restoring from snapshot...");
@@ -276,6 +293,11 @@ async fn snapshot_cold_boot_vs_restore() {
         "[cold_boot_vs_restore] Restored VM CID={} (restore took {:.1?})",
         restored_vm.cid(),
         restore_time
+    );
+    assert_eq!(
+        restored_vm.cid(),
+        cold_cid,
+        "restored VM CID must match cold boot CID"
     );
 
     // Verify the Unix socket exists
@@ -931,7 +953,7 @@ async fn snapshot_cli_create_and_list() {
     );
 
     let info = found.unwrap();
-    assert_eq!(info.memory_mb, 256);
+    assert_eq!(info.memory_mb, test_memory_mb());
     assert_eq!(info.vcpus, 1);
     assert_eq!(info.snapshot_type, snapshot::SnapshotType::Base);
     assert!(
