@@ -8,6 +8,7 @@ use void_box::backend::pty_session::RawModeGuard;
 use void_box::backend::{GuestConsoleSink, MountConfig};
 use void_box::credentials::{discover_oauth_credentials, stage_credentials, StagedCredentials};
 use void_box::llm::LlmProvider;
+use void_box::snapshot_store::{compute_config_hash, snapshot_dir_for_hash, snapshot_exists};
 use void_box::spec::{self, RunKind, RunSpec, SandboxSpec};
 use void_box_protocol::PtyOpenRequest;
 
@@ -118,14 +119,14 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let mut auto_snapshot_pending = false;
 
     if opts.auto_snapshot {
-        let config_hash = void_box::vmm::snapshot::compute_config_hash(
+        let config_hash = compute_config_hash(
             Path::new(&kernel),
             initramfs.as_deref().map(Path::new),
             effective_memory,
             effective_vcpus,
         )?;
-        let snap_dir = void_box::vmm::snapshot::snapshot_dir_for_hash(&config_hash);
-        if void_box::vmm::snapshot::snapshot_exists(&snap_dir) {
+        let snap_dir = snapshot_dir_for_hash(&config_hash);
+        if snapshot_exists(&snap_dir) {
             info!("Auto-snapshot: restoring from {}", snap_dir.display());
             builder = builder.snapshot(&snap_dir);
         } else {
@@ -168,13 +169,13 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let sandbox = builder.build()?;
 
     if auto_snapshot_pending {
-        let config_hash = void_box::vmm::snapshot::compute_config_hash(
+        let config_hash = compute_config_hash(
             Path::new(&kernel),
             initramfs.as_deref().map(Path::new),
             effective_memory,
             effective_vcpus,
         )?;
-        let snap_dir = void_box::vmm::snapshot::snapshot_dir_for_hash(&config_hash);
+        let snap_dir = snapshot_dir_for_hash(&config_hash);
         std::fs::create_dir_all(&snap_dir)?;
         sandbox.create_auto_snapshot(&snap_dir, config_hash).await?;
         info!("Auto-snapshot: saved for next run");
