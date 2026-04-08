@@ -220,6 +220,10 @@ enum Command {
         /// Restore from snapshot.
         #[arg(long)]
         snapshot: Option<String>,
+        /// Automatically snapshot after first cold boot and restore on subsequent runs.
+        /// Mutually exclusive with --snapshot.
+        #[arg(long)]
+        auto_snapshot: bool,
         /// Mount host directory (HOST:GUEST[:ro|rw], repeatable).
         #[arg(long = "mount")]
         mounts: Vec<String>,
@@ -356,6 +360,7 @@ async fn run(
             network,
             provider,
             snapshot,
+            auto_snapshot,
             mounts,
             env_vars,
         } => {
@@ -369,6 +374,7 @@ async fn run(
                 network,
                 provider: provider.as_deref(),
                 snapshot: snapshot.as_deref(),
+                auto_snapshot,
                 mounts: &mounts,
                 env_vars: &env_vars,
                 log_dir: &config.paths.log_dir,

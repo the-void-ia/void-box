@@ -281,6 +281,16 @@ pub trait VmmBackend: Send + Sync {
     /// Stop the VM and clean up resources.
     async fn stop(&mut self) -> Result<()>;
 
+    /// Take a snapshot of the running VM, save it, then restore from it so
+    /// the VM continues running (~500 ms stop-and-restart overhead).
+    async fn create_auto_snapshot(
+        &mut self,
+        _snapshot_dir: &std::path::Path,
+        _config_hash: String,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get the vsock CID for this VM.
     fn cid(&self) -> u32;
 }

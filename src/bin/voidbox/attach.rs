@@ -3,10 +3,12 @@
 use std::path::Path;
 
 use rustix::termios::tcgetwinsize;
+use tracing::info;
 use void_box::backend::pty_session::RawModeGuard;
 use void_box::backend::{GuestConsoleSink, MountConfig};
 use void_box::credentials::{discover_oauth_credentials, stage_credentials, StagedCredentials};
 use void_box::llm::LlmProvider;
+use void_box::snapshot_store::{compute_config_hash, snapshot_dir_for_hash, snapshot_exists};
 use void_box::spec::{self, RunKind, RunSpec, SandboxSpec};
 use void_box_protocol::PtyOpenRequest;
 
@@ -43,6 +45,8 @@ pub struct ShellOpts<'a> {
     pub provider: Option<&'a str>,
     /// Restore from snapshot.
     pub snapshot: Option<&'a str>,
+    /// Automatically snapshot the VM on exit.
+    pub auto_snapshot: bool,
     /// Mount flags (HOST:GUEST[:ro|rw]).
     pub mounts: &'a [String],
     /// Env flags (KEY=VALUE).
@@ -58,6 +62,10 @@ pub struct ShellOpts<'a> {
 /// Returns an error if the spec is invalid, credentials cannot be staged, or
 /// the sandbox fails to start.
 pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::Error>> {
+    if opts.auto_snapshot && opts.snapshot.is_some() {
+        return Err("--auto-snapshot and --snapshot are mutually exclusive".into());
+    }
+
     let run_spec = match opts.file {
         Some(path) => {
             let loaded_spec = spec::load_spec(path)?;
@@ -108,7 +116,27 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         builder = builder.initramfs(path);
     }
 
-    if let Some(snapshot_path) = opts.snapshot {
+    let mut auto_snapshot_pending = false;
+
+    if opts.auto_snapshot {
+        let config_hash = compute_config_hash(
+            Path::new(&kernel),
+            initramfs.as_deref().map(Path::new),
+            effective_memory,
+            effective_vcpus,
+        )?;
+        let snap_dir = snapshot_dir_for_hash(&config_hash);
+        if snapshot_exists(&snap_dir) {
+            info!("Auto-snapshot: restoring from {}", snap_dir.display());
+            builder = builder.snapshot(&snap_dir);
+        } else {
+            info!(
+                "Auto-snapshot: no snapshot for hash {}, will cold boot and save",
+                &config_hash[..16]
+            );
+            auto_snapshot_pending = true;
+        }
+    } else if let Some(snapshot_path) = opts.snapshot {
         builder = builder.snapshot(snapshot_path);
     } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
         builder = builder.snapshot(snapshot_path);
@@ -139,6 +167,19 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     }
 
     let sandbox = builder.build()?;
+
+    if auto_snapshot_pending {
+        let config_hash = compute_config_hash(
+            Path::new(&kernel),
+            initramfs.as_deref().map(Path::new),
+            effective_memory,
+            effective_vcpus,
+        )?;
+        let snap_dir = snapshot_dir_for_hash(&config_hash);
+        std::fs::create_dir_all(&snap_dir)?;
+        sandbox.create_auto_snapshot(&snap_dir, config_hash).await?;
+        info!("Auto-snapshot: saved for next run");
+    }
 
     let program_base = match Path::new(opts.program).file_name() {
         Some(name) => name.to_str().unwrap_or(opts.program),

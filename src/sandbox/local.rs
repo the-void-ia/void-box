@@ -423,6 +423,24 @@ impl LocalSandbox {
         backend.attach_pty(request).await
     }
 
+    /// Delegate auto-snapshot to the VM backend.
+    pub async fn create_auto_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+        config_hash: String,
+    ) -> Result<()> {
+        self.ensure_started().await?;
+        let mut backend_lock = self.backend.lock().await;
+        let Some(ref mut backend) = *backend_lock else {
+            return Err(Error::VmNotRunning);
+        };
+        let backend_mut = Arc::get_mut(backend)
+            .ok_or_else(|| Error::Config("backend has outstanding references".into()))?;
+        backend_mut
+            .create_auto_snapshot(snapshot_dir, config_hash)
+            .await
+    }
+
     pub async fn stop(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
 

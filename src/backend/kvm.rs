@@ -20,7 +20,7 @@ use crate::guest::protocol::{
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
-use crate::vmm::config::{SecurityConfig, VoidBoxConfig};
+use crate::vmm::config::{SecurityConfig, VoidBoxConfig, VsockBackendType};
 use crate::vmm::MicroVm;
 use crate::{Error, ExecOutput, Result};
 
@@ -50,6 +50,12 @@ pub struct KvmBackend {
     span_context: Option<SpanContext>,
     /// Background task draining guest serial output to the configured host sink.
     guest_console_task: Option<JoinHandle<()>>,
+    /// VM memory in megabytes (cached from `BackendConfig` for snapshot).
+    memory_mb: usize,
+    /// Number of vCPUs (cached from `BackendConfig` for snapshot).
+    vcpus: usize,
+    /// Whether networking is enabled (cached from `BackendConfig` for snapshot).
+    network: bool,
 }
 
 impl Default for KvmBackend {
@@ -67,6 +73,9 @@ impl KvmBackend {
             cid: 0,
             span_context: None,
             guest_console_task: None,
+            memory_mb: 0,
+            vcpus: 0,
+            network: false,
         }
     }
 }
@@ -163,26 +172,38 @@ impl VmmBackend for KvmBackend {
                 let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
-            self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+            self.control_channel = Some(Arc::new(ControlChannel::new_restored(
+                connector,
+                session_secret,
+            )));
             if let Some(serial_output) = vm.take_serial_output() {
                 self.guest_console_task = Some(spawn_guest_console_task(
                     serial_output,
                     config.guest_console.clone(),
                 ));
             }
+            self.memory_mb = snap.config.memory_mb;
+            self.vcpus = snap.config.vcpus;
+            self.network = snap.config.network;
             self.vm = Some(vm);
 
             debug!("KvmBackend restored from snapshot with CID {}", self.cid);
             return Ok(());
         }
 
-        // Normal cold-boot path
+        // Normal cold-boot path.
+        //
+        // Use the Userspace vsock backend so the device state can be cleanly
+        // captured by snapshot() and restored by from_snapshot() (which
+        // always restores into VirtioVsockUserspace).  Vhost-vsock state is
+        // not snapshot-compatible.
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .kernel(&config.kernel)
             .network(config.network)
-            .enable_vsock(config.enable_vsock);
+            .enable_vsock(config.enable_vsock)
+            .vsock_backend(VsockBackendType::Userspace);
 
         if let Some(ref initramfs) = config.initramfs {
             vm_config = vm_config.initramfs(initramfs);
@@ -213,12 +234,20 @@ impl VmmBackend for KvmBackend {
 
         let mut vm = MicroVm::new(vm_config).await?;
         self.cid = vm.cid();
+        self.memory_mb = config.memory_mb;
+        self.vcpus = config.vcpus;
+        self.network = config.network;
 
-        // Build the control channel with AF_VSOCK connector
-        let cid = self.cid;
+        // Build the control channel with the Userspace Unix-socket connector
+        // (matches the Userspace vsock backend chosen above for snapshot
+        // compatibility).
         let session_secret = config.security.session_secret;
+        let socket_path = vm
+            .vsock_socket_path()
+            .expect("Userspace vsock backend must have socket path")
+            .to_path_buf();
         let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
-            let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
+            let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
         self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
@@ -402,6 +431,75 @@ impl VmmBackend for KvmBackend {
             let _ = task.await;
         }
         self.control_channel = None;
+        Ok(())
+    }
+
+    async fn create_auto_snapshot(
+        &mut self,
+        snapshot_dir: &std::path::Path,
+        config_hash: String,
+    ) -> Result<()> {
+        let channel = self
+            .control_channel
+            .as_ref()
+            .ok_or_else(|| Error::Guest("no control channel".into()))?;
+        channel
+            .wait_for_snapshot_ready(std::time::Duration::from_secs(30))
+            .await?;
+
+        let vm = self.vm.take().ok_or(Error::VmNotRunning)?;
+
+        let snap_config = crate::vmm::snapshot::SnapshotConfig {
+            memory_mb: self.memory_mb,
+            vcpus: self.vcpus,
+            cid: 0, // overwritten by snapshot_internal
+            vsock_mmio_base: 0xd080_0000,
+            network: vm.has_network(),
+        };
+
+        let snap_path = vm.snapshot(snapshot_dir, config_hash, snap_config).await?;
+        info!("Auto-snapshot saved to {}", snap_path.display());
+
+        let mut restored_vm = MicroVm::from_snapshot(&snap_path).await?;
+
+        let snap = crate::vmm::snapshot::VmSnapshot::load(&snap_path)?;
+        let session_secret: [u8; 32] = snap
+            .session_secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+
+        let socket_path = restored_vm
+            .vsock_socket_path()
+            .expect("restored VM must have vsock socket path")
+            .to_path_buf();
+        let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
+            let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
+            Ok(Box::new(stream))
+        });
+        self.control_channel = Some(Arc::new(ControlChannel::new_restored(
+            connector,
+            session_secret,
+        )));
+        self.cid = restored_vm.cid();
+        self.memory_mb = snap.config.memory_mb;
+        self.vcpus = snap.config.vcpus;
+        self.network = snap.config.network;
+
+        // The old console task dies when the old VM is consumed by snapshot.
+        // Drain and reconnect serial output from the restored VM.
+        if let Some(serial_output) = restored_vm.take_serial_output() {
+            if let Some(old_task) = self.guest_console_task.take() {
+                old_task.abort();
+            }
+            self.guest_console_task = Some(spawn_guest_console_task(
+                serial_output,
+                GuestConsoleSink::Stderr,
+            ));
+        }
+
+        self.vm = Some(restored_vm);
+        info!("Auto-snapshot restored, VM running with CID {}", self.cid);
         Ok(())
     }
 
