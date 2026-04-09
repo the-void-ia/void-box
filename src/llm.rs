@@ -42,6 +42,11 @@
 /// allowing the guest to reach host services like Ollama.
 const SLIRP_GATEWAY: &str = "10.0.2.2";
 
+/// The guest binary name for Claude Code and all Claude-compatible
+/// providers (Ollama, LmStudio, Custom, ClaudePersonal). These all route
+/// through the same Bun-built `claude-code` binary via `ANTHROPIC_BASE_URL`.
+const CLAUDE_CODE_BINARY: &str = "claude-code";
+
 /// LLM backend provider for an [`VoidBox`](crate::agent_box::VoidBox).
 ///
 /// Determines which LLM service the agent talks to. The provider is
@@ -212,11 +217,11 @@ impl LlmProvider {
     /// script installs the matching binary into `/usr/local/bin/`.
     pub fn binary_name(&self) -> &'static str {
         match self {
-            LlmProvider::Claude => "claude-code",
-            LlmProvider::ClaudePersonal => "claude-code",
-            LlmProvider::Ollama { .. } => "claude-code",
-            LlmProvider::LmStudio { .. } => "claude-code",
-            LlmProvider::Custom { .. } => "claude-code",
+            LlmProvider::Claude => CLAUDE_CODE_BINARY,
+            LlmProvider::ClaudePersonal => CLAUDE_CODE_BINARY,
+            LlmProvider::Ollama { .. } => CLAUDE_CODE_BINARY,
+            LlmProvider::LmStudio { .. } => CLAUDE_CODE_BINARY,
+            LlmProvider::Custom { .. } => CLAUDE_CODE_BINARY,
             LlmProvider::Codex => "codex",
         }
     }
@@ -242,13 +247,20 @@ impl LlmProvider {
     ///
     /// Returns the complete args list (subcommand, flags, prompt) that the
     /// guest-agent passes to the agent binary. The caller pairs this with
-    /// `binary_name()` to form the full exec invocation.
+    /// [`binary_name`](Self::binary_name) to form the full exec invocation.
+    ///
+    /// Provider-specific args from [`cli_args`](Self::cli_args) (for example,
+    /// Ollama's `--model <name>`) are already folded into the Claude-shape
+    /// variants. **Callers must NOT separately append `cli_args()` output**
+    /// or they will produce duplicate flags.
     ///
     /// - `prompt`: the user prompt text.
     /// - `dangerously_skip_permissions`: whether to pass the bypass-approvals
     ///   flag (Claude's `--dangerously-skip-permissions` or Codex's
     ///   `--dangerously-bypass-approvals-and-sandbox`).
-    /// - `extra_args`: caller-supplied extra args appended at the end.
+    /// - `extra_args`: caller-supplied extra args appended after the
+    ///   provider-specific args and (for Codex) before the trailing prompt
+    ///   positional.
     pub fn build_exec_args(
         &self,
         prompt: &str,
@@ -664,17 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_env_vars_openai_api_key_conditional() {
+        // Capture and clear any existing value so the "unset" branch is
+        // deterministic regardless of the developer's shell environment.
+        let prior = std::env::var("OPENAI_API_KEY").ok();
+
+        // Absent case
+        std::env::remove_var("OPENAI_API_KEY");
+        let vars_absent = LlmProvider::Codex.env_vars();
+        let absent_found = vars_absent.iter().any(|(k, _)| k == "OPENAI_API_KEY");
+
+        // Present case
+        std::env::set_var("OPENAI_API_KEY", "test-key-xyz");
+        let vars_present = LlmProvider::Codex.env_vars();
+        let present_ok = vars_present
+            .iter()
+            .any(|(k, v)| k == "OPENAI_API_KEY" && v == "test-key-xyz");
+
+        // Restore
+        match prior {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+
+        assert!(
+            !absent_found,
+            "OPENAI_API_KEY should be absent when not set on host"
+        );
+        assert!(present_ok, "OPENAI_API_KEY should be forwarded when set");
+    }
+
+    #[test]
     fn test_codex_binary_name() {
         let provider = LlmProvider::Codex;
         assert_eq!(provider.binary_name(), "codex");
     }
 
     #[test]
-    fn test_claude_binary_name() {
-        let provider = LlmProvider::Claude;
-        assert_eq!(provider.binary_name(), "claude-code");
-        let personal = LlmProvider::ClaudePersonal;
-        assert_eq!(personal.binary_name(), "claude-code");
+    fn test_claude_shaped_binary_names_all_return_claude_code() {
+        assert_eq!(LlmProvider::Claude.binary_name(), "claude-code");
+        assert_eq!(LlmProvider::ClaudePersonal.binary_name(), "claude-code");
+        assert_eq!(
+            LlmProvider::ollama("test-model").binary_name(),
+            "claude-code"
+        );
+        assert_eq!(
+            LlmProvider::lm_studio("test-model").binary_name(),
+            "claude-code"
+        );
+        assert_eq!(
+            LlmProvider::custom("http://localhost:1234").binary_name(),
+            "claude-code"
+        );
     }
 
     #[test]
