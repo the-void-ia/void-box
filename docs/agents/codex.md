@@ -10,9 +10,11 @@ Production OpenAI-Codex-capable rootfs/initramfs.
 
 ## When to use
 
-- Validating workflows that exec `codex` from a `kind: workflow` step.
-- Future `kind: agent` runs with `provider: codex` (added in PR 2 of
-  the Codex flavor effort — see
+- `kind: workflow` specs that exec `codex` as a workflow step.
+- `kind: agent` specs with `llm.provider: codex`. Requires
+  `OPENAI_API_KEY` in the host environment. Streaming output is
+  passthrough in PR 2; structured tool-call and token accounting is
+  added by PR 3 (see
   `docs/superpowers/specs/2026-04-07-codex-flavor-design.md`).
 
 ## Discovery
@@ -36,9 +38,22 @@ VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
 cargo run --bin voidbox -- run --file examples/specs/codex_workflow_smoke.yaml
 ```
 
+For `kind: agent` usage:
+
+```bash
+OPENAI_API_KEY=sk-... \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/codex_smoke.yaml
+```
+
 ## Validation
 
-The smoke spec at `examples/specs/codex_workflow_smoke.yaml` runs
-`codex --version` inside the guest VM, which is self-contained and
-does not require `OPENAI_API_KEY`. This verifies the bundled binary
-is present, executable, and allowlisted.
+Two smoke specs exercise different entry points:
+
+- `examples/specs/codex_workflow_smoke.yaml` — `kind: workflow` step
+  running `codex --version`. Self-contained, no API key needed.
+  Verifies the bundled binary is present and allowlisted.
+- `examples/specs/codex_smoke.yaml` — `kind: agent` with
+  `provider: codex`. Requires `OPENAI_API_KEY`. Verifies the full
+  exec path through `LlmProvider::Codex`.
