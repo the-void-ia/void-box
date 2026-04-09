@@ -25,8 +25,10 @@
 | `scripts/build_codex_rootfs.sh` | Create | Codex flavor entry point |
 | `src/backend/mod.rs` | Modify (line 294 area) | Add `"codex"` to `DEFAULT_COMMAND_ALLOWLIST` |
 | `examples/specs/codex_workflow_smoke.yaml` | Create | `kind: workflow` smoke spec |
-| `AGENTS.md` | Modify ("Guest image build scripts" section) | Document codex flavor |
-| `examples/README.md` | Modify | Index entry |
+| `docs/agents/claude.md` | Create | Per-agent Claude flavor doc (extracted from AGENTS.md) |
+| `docs/agents/codex.md` | Create | Per-agent Codex flavor doc (new) |
+| `AGENTS.md` | Modify (Guest image build scripts section) | Replace claude paragraph with `@docs/agents/claude.md` and `@docs/agents/codex.md` discovery imports |
+| `examples/README.md` | Modify | Index entry for codex_workflow_smoke.yaml |
 
 **Sequencing rationale:** Task 1 lands the refactor in isolation (verify no claude regression). Task 2 adds the codex install function (no callers yet). Task 3 wires it into the base script. Task 4 creates the codex flavor entry point. Task 5 adds the allowlist. Task 6 adds the smoke spec. Task 7 updates docs. Each task ends in a commit so the branch history reflects independently revertable units.
 
@@ -669,31 +671,152 @@ EOF
 
 ---
 
-### Task 7: Documentation updates
+### Task 7: Split per-agent docs and wire `@` discovery imports
 
 **Files:**
-- Modify: `AGENTS.md` (under "Guest image build scripts" section)
+- Create: `docs/agents/claude.md`
+- Create: `docs/agents/codex.md`
+- Modify: `AGENTS.md` (Guest image build scripts section, lines ~1072-1082)
 - Modify: `examples/README.md`
 
-- [ ] **Step 1: Add the AGENTS.md subsection**
+**Why split:** future agent flavors (codex, pi, …) deserve their own doc files rather than accreting paragraphs in `AGENTS.md`. Using `@docs/agents/<name>.md` discovery imports lets the loader pull each per-agent doc on demand. This task lands the split for claude and codex; the existing inline `build_claude_rootfs.sh` paragraph in `AGENTS.md` is replaced by a pair of `@` imports.
 
-Find the "## Guest image build scripts" section in `AGENTS.md`. After the `build_claude_rootfs.sh` paragraph (which currently ends with "Required for OpenClaw Telegram gateway example runs."), insert this new subsection:
+- [ ] **Step 1: Create `docs/agents/claude.md`**
+
+Create the file `docs/agents/claude.md` with this exact content:
 
 ```markdown
-`scripts/build_codex_rootfs.sh`:
+# Claude flavor — `scripts/build_claude_rootfs.sh`
 
-- Production OpenAI-Codex-capable rootfs/initramfs.
-- Includes the codex CLI binary (musl-static, no shared libraries needed),
-  CA certs, and the sandbox user.
-- Use when validating workflows or future `kind: agent` runs that exec
-  `codex`.
-- Codex binary discovery: `CODEX_BIN` env var, then `codex` on PATH (Linux
-  host only), then `CODEX_VERSION` for automatic GitHub download.
+Production Claude-capable rootfs/initramfs.
+
+## What it bundles
+
+- Native `claude-code` binary (Bun single-executable, glibc-linked).
+- Glibc shared libraries auto-detected via `ldd`.
+- SSL CA certificates for HTTPS API calls.
+- `/etc/passwd` + `/etc/group` for the sandbox user (uid 1000).
+- `/usr/local/bin/claude` symlink to `claude-code`.
+
+## When to use
+
+- Validating production-like Claude execution paths.
+- OpenClaw Telegram gateway example runs.
+
+## Discovery
+
+The script locates the claude binary in priority order:
+
+1. `CLAUDE_BIN` env var pointing at a Linux ELF binary.
+2. `~/.local/bin/claude` or `claude` on PATH (Linux host only).
+3. `CLAUDE_CODE_VERSION` set → automatic download of the Linux build
+   from the official GCS bucket. On macOS, the version is
+   auto-detected from the local install.
+
+## Usage
+
+```bash
+scripts/build_claude_rootfs.sh
+
+ANTHROPIC_API_KEY=sk-ant-... \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+cargo run --example claude_in_voidbox_example
 ```
 
-Then update the "Recommended default:" list at the end of that section to include codex if relevant — keep it short, one bullet for codex parallel to the existing claude bullet.
+## Validation
 
-- [ ] **Step 2: Add the examples/README.md entry**
+Required when changing the claude flavor or the shared
+`scripts/lib/agent_rootfs_common.sh` helpers:
+
+- Run `e2e_agent_mcp` (the agent-agnostic MCP integration test that
+  uses Claude as the consumer):
+  ```bash
+  ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
+  ```
+```
+
+- [ ] **Step 2: Create `docs/agents/codex.md`**
+
+Create the file `docs/agents/codex.md` with this exact content:
+
+```markdown
+# Codex flavor — `scripts/build_codex_rootfs.sh`
+
+Production OpenAI-Codex-capable rootfs/initramfs.
+
+## What it bundles
+
+- The `codex` CLI binary (Rust musl-static, no shared libraries needed).
+- SSL CA certificates for HTTPS API calls.
+- `/etc/passwd` + `/etc/group` for the sandbox user (uid 1000).
+
+## When to use
+
+- Validating workflows that exec `codex` from a `kind: workflow` step.
+- Future `kind: agent` runs with `provider: codex` (added in PR 2 of
+  the Codex flavor effort — see
+  `docs/superpowers/specs/2026-04-07-codex-flavor-design.md`).
+
+## Discovery
+
+The script locates the codex binary in priority order:
+
+1. `CODEX_BIN` env var pointing at a Linux ELF binary.
+2. `codex` on PATH (Linux host only — the macOS Mach-O binary cannot
+   run inside the Linux guest).
+3. `CODEX_VERSION` set → automatic download of the musl-static Linux
+   build from the openai/codex GitHub releases (`rust-v<version>` tag).
+
+## Usage
+
+```bash
+CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh
+
+OPENAI_API_KEY=sk-... \
+VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+cargo run --bin voidbox -- run --file examples/specs/codex_workflow_smoke.yaml
+```
+
+## Validation
+
+The smoke spec at `examples/specs/codex_workflow_smoke.yaml` runs
+`codex --version` inside the guest VM, which is self-contained and
+does not require `OPENAI_API_KEY`. This verifies the bundled binary
+is present, executable, and allowlisted.
+```
+
+- [ ] **Step 3: Replace the `build_claude_rootfs.sh` paragraph in `AGENTS.md`**
+
+In `AGENTS.md`, find the "## Guest image build scripts" section. Locate the `\`scripts/build_claude_rootfs.sh\`:` paragraph (currently around lines 1072-1077, ending with "Required for OpenClaw Telegram gateway example runs."). Replace that paragraph with this `@` import block:
+
+```markdown
+@docs/agents/claude.md
+
+@docs/agents/codex.md
+```
+
+The `build_guest_image.sh` paragraph above (the base image) stays unchanged. The "Recommended default:" list at the end of the section also stays, but update its content to mention codex alongside claude:
+
+Find:
+```markdown
+Recommended default:
+
+- Use `build_guest_image.sh` for broad test cycles.
+- Use `build_claude_rootfs.sh` for production gateway/runtime validation.
+```
+
+Replace with:
+```markdown
+Recommended default:
+
+- Use `build_guest_image.sh` for broad test cycles.
+- Use `build_claude_rootfs.sh` for production Claude gateway/runtime validation.
+- Use `build_codex_rootfs.sh` for Codex CLI workflows.
+```
+
+- [ ] **Step 4: Add the examples/README.md entry**
 
 In `examples/README.md`, find the section that lists `examples/specs/*.yaml` entries (look for `smoke_test.yaml` or `workflow.yaml` references). Add a new line for `codex_workflow_smoke.yaml`:
 
@@ -704,20 +827,27 @@ In `examples/README.md`, find the section that lists `examples/specs/*.yaml` ent
   `CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh`.
 ```
 
-- [ ] **Step 3: Verify the markdown**
+- [ ] **Step 5: Verify the markdown**
 
-Read both files back to confirm formatting matches surrounding entries. No tooling check needed — these are docs, not code.
+Read all four files back to confirm:
+- Both new `docs/agents/*.md` files exist with the exact content above.
+- The `AGENTS.md` section has the `@` imports replacing the inline claude paragraph, and the recommended-defaults list mentions codex.
+- The `examples/README.md` entry matches the format of surrounding entries.
 
-- [ ] **Step 4: Commit Task 7**
+No tooling check needed — these are docs, not code.
+
+- [ ] **Step 6: Commit Task 7**
 
 ```bash
-git add AGENTS.md examples/README.md
+git add docs/agents/claude.md docs/agents/codex.md AGENTS.md examples/README.md
 git commit -m "$(cat <<'EOF'
-docs: document codex flavor build script and smoke spec
+docs: split per-agent flavor docs and wire @ discovery imports
 
-Adds a Guest-image-build-scripts subsection for build_codex_rootfs.sh
-in AGENTS.md and an examples/README.md entry for the codex workflow
-smoke spec.
+Extracts the build_claude_rootfs.sh paragraph from AGENTS.md into a
+new docs/agents/claude.md, adds a parallel docs/agents/codex.md for
+the new flavor, and replaces the inline claude paragraph with @
+discovery imports for both. Future agent flavors (pi, ...) follow
+the same template.
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 EOF
