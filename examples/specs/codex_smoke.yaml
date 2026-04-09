@@ -1,0 +1,27 @@
+api_version: v1
+kind: agent
+name: codex_smoke
+
+# End-to-end smoke test: verify `provider: codex` wires through the
+# agent exec path and produces output. Requires OPENAI_API_KEY.
+#
+# Build the initramfs first:
+#   CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh
+#
+# Then run:
+#   OPENAI_API_KEY=sk-... \
+#   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+#   VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+#   cargo run --bin voidbox -- run --file examples/specs/codex_smoke.yaml
+
+sandbox:
+  memory_mb: 3072
+  vcpus: 2
+  network: true
+
+llm:
+  provider: codex
+
+agent:
+  prompt: "Say exactly: Hello from void-box! Then stop."
+  timeout_secs: 120
