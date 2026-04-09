@@ -103,6 +103,15 @@ pub enum LlmProvider {
         /// Model name override.
         model: Option<String>,
     },
+
+    /// OpenAI Codex CLI.
+    ///
+    /// Requires `OPENAI_API_KEY` in the host environment. The guest executes
+    /// the bundled `codex` binary (see `scripts/build_codex_rootfs.sh`) with
+    /// `codex exec --json --dangerously-bypass-approvals-and-sandbox
+    /// --skip-git-repo-check <prompt>`. Passthrough output — structured
+    /// event parsing is deferred to PR 3.
+    Codex,
 }
 
 impl LlmProvider {
@@ -194,6 +203,100 @@ impl LlmProvider {
         self
     }
 
+    // -- Provider-aware exec helpers --
+
+    /// Binary name that the guest-agent exec's for this provider.
+    ///
+    /// Used by `Sandbox::exec_agent_streaming` to resolve which bundled
+    /// agent binary to run inside the VM. Each flavor's `build_*_rootfs.sh`
+    /// script installs the matching binary into `/usr/local/bin/`.
+    pub fn binary_name(&self) -> &'static str {
+        match self {
+            LlmProvider::Claude => "claude-code",
+            LlmProvider::ClaudePersonal => "claude-code",
+            LlmProvider::Ollama { .. } => "claude-code",
+            LlmProvider::LmStudio { .. } => "claude-code",
+            LlmProvider::Custom { .. } => "claude-code",
+            LlmProvider::Codex => "codex",
+        }
+    }
+
+    /// Whether this provider understands the Claude-specific `--settings`
+    /// and `--mcp-config` CLI flags.
+    ///
+    /// Claude and Claude-compatible proxies (Ollama, LmStudio, Custom)
+    /// return `true`; Codex returns `false`. Used by `agent_box.rs` to gate
+    /// flag emission on the exec command line.
+    pub fn supports_claude_settings(&self) -> bool {
+        match self {
+            LlmProvider::Claude
+            | LlmProvider::ClaudePersonal
+            | LlmProvider::Ollama { .. }
+            | LlmProvider::LmStudio { .. }
+            | LlmProvider::Custom { .. } => true,
+            LlmProvider::Codex => false,
+        }
+    }
+
+    /// Build the full `exec` argument vector for this provider.
+    ///
+    /// Returns the complete args list (subcommand, flags, prompt) that the
+    /// guest-agent passes to the agent binary. The caller pairs this with
+    /// `binary_name()` to form the full exec invocation.
+    ///
+    /// - `prompt`: the user prompt text.
+    /// - `dangerously_skip_permissions`: whether to pass the bypass-approvals
+    ///   flag (Claude's `--dangerously-skip-permissions` or Codex's
+    ///   `--dangerously-bypass-approvals-and-sandbox`).
+    /// - `extra_args`: caller-supplied extra args appended at the end.
+    pub fn build_exec_args(
+        &self,
+        prompt: &str,
+        dangerously_skip_permissions: bool,
+        extra_args: &[String],
+    ) -> Vec<String> {
+        match self {
+            LlmProvider::Claude
+            | LlmProvider::ClaudePersonal
+            | LlmProvider::Ollama { .. }
+            | LlmProvider::LmStudio { .. }
+            | LlmProvider::Custom { .. } => {
+                let mut args = vec![
+                    "-p".to_string(),
+                    prompt.to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--verbose".to_string(),
+                ];
+                if dangerously_skip_permissions {
+                    args.push("--dangerously-skip-permissions".to_string());
+                }
+                for provider_arg in self.cli_args() {
+                    args.push(provider_arg);
+                }
+                for extra in extra_args {
+                    args.push(extra.clone());
+                }
+                args
+            }
+            LlmProvider::Codex => {
+                let mut args = vec![
+                    "exec".to_string(),
+                    "--json".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                ];
+                if dangerously_skip_permissions {
+                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                }
+                for extra in extra_args {
+                    args.push(extra.clone());
+                }
+                args.push(prompt.to_string());
+                args
+            }
+        }
+    }
+
     // -- Internal helpers --
 
     /// Generate extra CLI arguments for `claude-code`.
@@ -204,7 +307,7 @@ impl LlmProvider {
     /// arbitrary Ollama model names when `ANTHROPIC_API_KEY` is empty.
     pub(crate) fn cli_args(&self) -> Vec<String> {
         match self {
-            LlmProvider::Claude | LlmProvider::ClaudePersonal => Vec::new(),
+            LlmProvider::Claude | LlmProvider::ClaudePersonal | LlmProvider::Codex => Vec::new(),
             LlmProvider::Ollama { model, .. } => {
                 vec!["--model".into(), model.clone()]
             }
@@ -280,6 +383,13 @@ impl LlmProvider {
                 }
                 vars
             }
+            LlmProvider::Codex => {
+                let mut vars = vec![("HOME".into(), "/home/sandbox".into())];
+                if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                    vars.push(("OPENAI_API_KEY".into(), key));
+                }
+                vars
+            }
         }
     }
 
@@ -321,6 +431,7 @@ impl LlmProvider {
                 let m = model.as_deref().unwrap_or("default");
                 format!("Custom ({} @ {})", m, base_url)
             }
+            LlmProvider::Codex => "Codex (OpenAI API)".into(),
         }
     }
 }
@@ -538,5 +649,71 @@ mod tests {
             LlmProvider::lm_studio("qwen2.5-coder-7b-instruct").description(),
             "LM Studio (qwen2.5-coder-7b-instruct @ localhost:1234)"
         );
+    }
+
+    #[test]
+    fn test_codex_env_vars() {
+        let provider = LlmProvider::Codex;
+        let vars = provider.env_vars();
+        let mut keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort();
+        assert!(keys.contains(&"HOME"));
+        assert!(vars
+            .iter()
+            .any(|(k, v)| k == "HOME" && v == "/home/sandbox"));
+    }
+
+    #[test]
+    fn test_codex_binary_name() {
+        let provider = LlmProvider::Codex;
+        assert_eq!(provider.binary_name(), "codex");
+    }
+
+    #[test]
+    fn test_claude_binary_name() {
+        let provider = LlmProvider::Claude;
+        assert_eq!(provider.binary_name(), "claude-code");
+        let personal = LlmProvider::ClaudePersonal;
+        assert_eq!(personal.binary_name(), "claude-code");
+    }
+
+    #[test]
+    fn test_codex_supports_claude_settings() {
+        let provider = LlmProvider::Codex;
+        assert!(!provider.supports_claude_settings());
+    }
+
+    #[test]
+    fn test_claude_supports_claude_settings() {
+        assert!(LlmProvider::Claude.supports_claude_settings());
+        assert!(LlmProvider::ClaudePersonal.supports_claude_settings());
+    }
+
+    #[test]
+    fn test_codex_is_not_local() {
+        assert!(!LlmProvider::Codex.is_local());
+    }
+
+    #[test]
+    fn test_codex_requires_network() {
+        assert!(LlmProvider::Codex.requires_network());
+    }
+
+    #[test]
+    fn test_codex_build_exec_args_contains_prompt() {
+        let provider = LlmProvider::Codex;
+        let args = provider.build_exec_args("hello world", true, &[]);
+        assert_eq!(args[0], "exec");
+        assert!(args.contains(&"--json".to_string()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(args.last().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_codex_build_exec_args_without_skip_permissions() {
+        let provider = LlmProvider::Codex;
+        let args = provider.build_exec_args("prompt", false, &[]);
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
     }
 }
