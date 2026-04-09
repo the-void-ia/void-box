@@ -52,12 +52,13 @@ install_ca_certificates() {
     return 1
   fi
 
+  local link_dir
   for link_path in \
     /etc/pki/tls/certs/ca-bundle.crt \
     /etc/ssl/certs/ca-bundle.crt \
     /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
     ; do
-    local link_dir="$out_dir$(dirname "$link_path")"
+    link_dir="$out_dir$(dirname "$link_path")"
     mkdir -p "$link_dir"
     ln -sf /etc/ssl/certs/ca-certificates.crt "$out_dir$link_path"
   done
@@ -75,7 +76,8 @@ finalize_initramfs() {
   final_size="$(du -sh "$out_cpio" | awk '{print $1}')"
   local uncompressed_bytes
   uncompressed_bytes="$(gzip -dc "$out_cpio" | wc -c | tr -d ' ')"
-  local uncompressed_mb=$(( (uncompressed_bytes + 1048575) / 1048576 ))
+  local uncompressed_mb
+  uncompressed_mb=$(( (uncompressed_bytes + 1048575) / 1048576 ))
   echo "[agent-rootfs] Done. Initramfs: $out_cpio ($final_size)"
-  echo "[agent-rootfs] Uncompressed size: ~${uncompressed_mb} MB — guest RAM must be larger."
+  echo "[agent-rootfs] Uncompressed size: ~${uncompressed_mb} MB — guest RAM must be larger (e.g. voidbox snapshot create --memory 512)."
 }
