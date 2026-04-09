@@ -698,22 +698,25 @@ impl VoidBox {
             full_prompt.len()
         );
 
-        // Execute the agent.
-        // Pass skipWebFetchPreflight via --settings so WebFetch skips the
-        // preflight call to claude.ai/api/web/domain_info (unreachable from
-        // inside SLIRP in many environments — see anthropics/claude-code#6388).
-        let mut extra_args = vec![
-            "--settings".to_string(),
-            r#"{"skipWebFetchPreflight":true}"#.to_string(),
-        ];
+        let mut extra_args: Vec<String> = Vec::new();
+        if self.config.llm.supports_claude_settings() {
+            extra_args.extend([
+                "--settings".to_string(),
+                r#"{"skipWebFetchPreflight":true}"#.to_string(),
+            ]);
 
-        // If MCP servers were provisioned, explicitly point claude-code to the config
-        let has_mcp = self
-            .skills
-            .iter()
-            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
-        if has_mcp {
-            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+            let has_mcp = self.skills.iter().any(|s| match &s.kind {
+                SkillKind::Mcp { .. } => true,
+                SkillKind::Cli { .. }
+                | SkillKind::Agent { .. }
+                | SkillKind::Remote { .. }
+                | SkillKind::File { .. }
+                | SkillKind::Oci { .. }
+                | SkillKind::Inline { .. } => false,
+            });
+            if has_mcp {
+                extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+            }
         }
 
         let tag_clone = tag.to_string();
@@ -839,17 +842,25 @@ impl VoidBox {
 
         // ── Build CLI args ─────────────────────────────────────────────
 
-        let mut extra_args = vec![
-            "--settings".to_string(),
-            r#"{"skipWebFetchPreflight":true}"#.to_string(),
-        ];
+        let mut extra_args: Vec<String> = Vec::new();
+        if self.config.llm.supports_claude_settings() {
+            extra_args.extend([
+                "--settings".to_string(),
+                r#"{"skipWebFetchPreflight":true}"#.to_string(),
+            ]);
 
-        let has_mcp = self
-            .skills
-            .iter()
-            .any(|s| matches!(s.kind, SkillKind::Mcp { .. }));
-        if has_mcp {
-            extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+            let has_mcp = self.skills.iter().any(|s| match &s.kind {
+                SkillKind::Mcp { .. } => true,
+                SkillKind::Cli { .. }
+                | SkillKind::Agent { .. }
+                | SkillKind::Remote { .. }
+                | SkillKind::File { .. }
+                | SkillKind::Oci { .. }
+                | SkillKind::Inline { .. } => false,
+            });
+            if has_mcp {
+                extra_args.extend(["--mcp-config".to_string(), MCP_CONFIG_PATH.to_string()]);
+            }
         }
 
         let is_local_llm = self.config.llm.is_local();
