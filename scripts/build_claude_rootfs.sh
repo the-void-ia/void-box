@@ -31,6 +31,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/agent_rootfs_common.sh"
 
 OUT_DIR="${OUT_DIR:-target/void-box-rootfs}"
 OUT_CPIO="${OUT_CPIO:-target/void-box-rootfs.cpio.gz}"
@@ -173,62 +174,20 @@ bash "$ROOT_DIR/scripts/build_guest_image.sh"
 
 echo "[claude-rootfs] Extending image with CA certificates and sandbox user..."
 
-# ── Step 3: Create sandbox user (passwd + group) ─────────────────────────────
-# Claude Code refuses --dangerously-skip-permissions when running as root.
-# The guest-agent drops privileges to uid 1000 before exec-ing claude-code.
-mkdir -p "$OUT_DIR/etc" "$OUT_DIR/home/sandbox"
-cat > "$OUT_DIR/etc/passwd" << 'PASSWD'
-root:x:0:0:root:/root:/bin/sh
-sandbox:x:1000:1000:sandbox:/home/sandbox:/bin/sh
-PASSWD
-cat > "$OUT_DIR/etc/group" << 'GROUP'
-root:x:0:
-sandbox:x:1000:
-GROUP
+# ── Step 3: Create sandbox user (uid 1000) ───────────────────────────────────
+install_sandbox_user "$OUT_DIR"
+echo "[claude-rootfs] Installed sandbox user"
 
 # Create 'claude' symlink (base script installs as 'claude-code')
 ln -sf claude-code "$OUT_DIR/usr/local/bin/claude"
-echo "[claude-rootfs] Installed sandbox user and /usr/local/bin/claude symlink"
+echo "[claude-rootfs] Installed /usr/local/bin/claude symlink"
 
 # ── Step 4: Install SSL CA certificates ──────────────────────────────────────
-# Install the CA bundle at the canonical path and create symlinks for every
-# common location so that curl, OpenSSL, Bun, etc. all find it regardless
-# of which distro compiled them.
-CANONICAL_CERT="$OUT_DIR/etc/ssl/certs/ca-certificates.crt"
-mkdir -p "$(dirname "$CANONICAL_CERT")"
-for cert_path in \
-  /etc/ssl/certs/ca-certificates.crt \
-  /etc/pki/tls/certs/ca-bundle.crt \
-  /etc/ssl/certs/ca-bundle.crt \
-  /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-  ; do
-  if [[ -f "$cert_path" ]]; then
-    cp "$cert_path" "$CANONICAL_CERT"
-    echo "[claude-rootfs] Installed CA certificates from $cert_path"
-    break
-  fi
-done
-
-# Symlinks so all common paths resolve to the same bundle
-for link_path in \
-  /etc/pki/tls/certs/ca-bundle.crt \
-  /etc/ssl/certs/ca-bundle.crt \
-  /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-  ; do
-  link_dir="$OUT_DIR$(dirname "$link_path")"
-  mkdir -p "$link_dir"
-  ln -sf /etc/ssl/certs/ca-certificates.crt "$OUT_DIR$link_path"
-done
+install_ca_certificates "$OUT_DIR"
 
 # ── Step 5: Create final initramfs ───────────────────────────────────────────
-echo "[claude-rootfs] Creating initramfs at: $OUT_CPIO"
-( cd "$OUT_DIR" && find . | cpio -o -H newc | gzip ) > "$OUT_CPIO"
+finalize_initramfs "$OUT_DIR" "$OUT_CPIO"
 
-FINAL_SIZE="$(du -sh "$OUT_CPIO" | awk '{print $1}')"
-echo "[claude-rootfs] Done. Initramfs: $OUT_CPIO ($FINAL_SIZE)"
-UNCOMPRESSED_BYTES="$(gzip -dc "$OUT_CPIO" | wc -c | tr -d ' ')"
-UNCOMPRESSED_MB="$(( (UNCOMPRESSED_BYTES + 1048575) / 1048576 ))"
-echo "[claude-rootfs] Uncompressed size: ~${UNCOMPRESSED_MB} MB — guest RAM must be larger (e.g. voidbox snapshot create --memory 512)."
 echo ""
 echo "Usage:"
 echo "  ANTHROPIC_API_KEY=sk-ant-... \\"
