@@ -115,22 +115,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("=== Results ===");
     println!("Box: {}", result.box_name);
-    println!("Session: {}", result.claude_result.session_id);
-    println!("Model: {}", result.claude_result.model);
-    println!("Error: {}", result.claude_result.is_error);
+    println!("Session: {}", result.agent_result.session_id);
+    println!("Model: {}", result.agent_result.model);
+    println!("Error: {}", result.agent_result.is_error);
     println!(
         "Tokens: {} in / {} out",
-        result.claude_result.input_tokens, result.claude_result.output_tokens
+        result.agent_result.input_tokens, result.agent_result.output_tokens
     );
-    println!("Cost: ${:.4}", result.claude_result.total_cost_usd);
-    println!("Duration: {}ms", result.claude_result.duration_ms);
-    println!("Tool calls: {}", result.claude_result.tool_calls.len());
-    for tc in &result.claude_result.tool_calls {
+    println!("Cost: ${:.4}", result.agent_result.total_cost_usd);
+    println!("Duration: {}ms", result.agent_result.duration_ms);
+    println!("Tool calls: {}", result.agent_result.tool_calls.len());
+    for tc in &result.agent_result.tool_calls {
         println!("  - {}", tc.tool_name);
     }
     println!();
     println!("Result text:");
-    println!("{}", result.claude_result.result_text);
+    println!("{}", result.agent_result.result_text);
 
     if let Some(ref output) = result.file_output {
         println!();

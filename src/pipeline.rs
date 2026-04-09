@@ -38,7 +38,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent_box::VoidBox;
 use crate::guest::protocol::ExecOutputChunk;
-use crate::observe::claude::{create_otel_spans, ClaudeExecResult};
+use crate::observe::claude::{create_otel_spans, AgentExecResult};
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::observe::tracer::SpanStatus;
 use crate::observe::{ObserveConfig, ObservedResult, Observer};
@@ -62,7 +62,7 @@ pub struct StageResult {
     /// Name of the Box that produced this result
     pub box_name: String,
     /// The structured Claude execution result
-    pub claude_result: ClaudeExecResult,
+    pub agent_result: AgentExecResult,
     /// Raw file output read from the Box (if any)
     pub file_output: Option<Vec<u8>>,
 }
@@ -70,14 +70,14 @@ pub struct StageResult {
 impl PipelineResult {
     /// Check if all stages succeeded.
     pub fn success(&self) -> bool {
-        self.stages.iter().all(|s| !s.claude_result.is_error)
+        self.stages.iter().all(|s| !s.agent_result.is_error)
     }
 
     /// Total cost across all stages.
     pub fn total_cost_usd(&self) -> f64 {
         self.stages
             .iter()
-            .map(|s| s.claude_result.total_cost_usd)
+            .map(|s| s.agent_result.total_cost_usd)
             .sum()
     }
 
@@ -85,7 +85,7 @@ impl PipelineResult {
     pub fn total_input_tokens(&self) -> u64 {
         self.stages
             .iter()
-            .map(|s| s.claude_result.input_tokens)
+            .map(|s| s.agent_result.input_tokens)
             .sum()
     }
 
@@ -93,7 +93,7 @@ impl PipelineResult {
     pub fn total_output_tokens(&self) -> u64 {
         self.stages
             .iter()
-            .map(|s| s.claude_result.output_tokens)
+            .map(|s| s.agent_result.output_tokens)
             .sum()
     }
 
@@ -101,7 +101,7 @@ impl PipelineResult {
     pub fn total_tool_calls(&self) -> usize {
         self.stages
             .iter()
-            .map(|s| s.claude_result.tool_calls.len())
+            .map(|s| s.agent_result.tool_calls.len())
             .sum()
     }
 }
@@ -383,7 +383,7 @@ async fn run_pipeline_core(
 
                 log_stage_complete(i, total_stages, &box_name, &stage_result);
 
-                if stage_result.claude_result.is_error {
+                if stage_result.agent_result.is_error {
                     // Emit StageFailed
                     if let Some(ref tx) = stage_tx {
                         let _ = tx.send(crate::persistence::stage_event_failed(
@@ -393,14 +393,14 @@ async fn run_pipeline_core(
                             elapsed.as_millis() as u64,
                             1,
                             stage_result
-                                .claude_result
+                                .agent_result
                                 .error
                                 .as_deref()
                                 .unwrap_or("stage error"),
                             1,
                         ));
                     }
-                    log_stage_error(&box_name, &stage_result.claude_result);
+                    log_stage_error(&box_name, &stage_result.agent_result);
                     had_pipeline_error = true;
                     stages.push(stage_result);
                     break;
@@ -467,7 +467,7 @@ async fn run_pipeline_core(
 
                         // Emit StageSucceeded or StageFailed
                         match &result {
-                            Ok(sr) if sr.claude_result.is_error => {
+                            Ok(sr) if sr.agent_result.is_error => {
                                 if let Some(ref tx) = stx {
                                     let _ = tx.send(crate::persistence::stage_event_failed(
                                         &bname,
@@ -475,7 +475,7 @@ async fn run_pipeline_core(
                                         &gid,
                                         elapsed_ms,
                                         1,
-                                        sr.claude_result.error.as_deref().unwrap_or("stage error"),
+                                        sr.agent_result.error.as_deref().unwrap_or("stage error"),
                                         1,
                                     ));
                                 }
@@ -528,13 +528,13 @@ async fn run_pipeline_core(
                     eprintln!(
                         "[pipeline]   [vm:{}] fan-out complete | {} tokens, ${:.4}",
                         stage_result.box_name,
-                        stage_result.claude_result.input_tokens
-                            + stage_result.claude_result.output_tokens,
-                        stage_result.claude_result.total_cost_usd,
+                        stage_result.agent_result.input_tokens
+                            + stage_result.agent_result.output_tokens,
+                        stage_result.agent_result.total_cost_usd,
                     );
 
-                    if stage_result.claude_result.is_error {
-                        log_stage_error(&stage_result.box_name, &stage_result.claude_result);
+                    if stage_result.agent_result.is_error {
+                        log_stage_error(&stage_result.box_name, &stage_result.agent_result);
                         had_error = true;
                     }
 
@@ -566,7 +566,7 @@ async fn run_pipeline_core(
 
     let output = stages
         .last()
-        .map(|s| s.claude_result.result_text.clone())
+        .map(|s| s.agent_result.result_text.clone())
         .unwrap_or_default();
 
     if let (Some(t), Some((mut span, start))) = (tracer.as_ref(), root_span.take()) {
@@ -624,17 +624,17 @@ fn finish_parallel_stage_span(
     instrument_stage_result(stage_result, &ctx, observer);
     set_stage_span_attrs(&mut span, stage_result);
     span.duration = Some(std::time::Duration::from_millis(
-        stage_result.claude_result.duration_ms,
+        stage_result.agent_result.duration_ms,
     ));
     span.status = stage_status(stage_result);
     tracer.finish_span(span);
 }
 
 fn stage_status(result: &StageResult) -> SpanStatus {
-    if result.claude_result.is_error {
+    if result.agent_result.is_error {
         SpanStatus::Error(
             result
-                .claude_result
+                .agent_result
                 .error
                 .clone()
                 .unwrap_or_else(|| "stage error".into()),
@@ -650,8 +650,8 @@ fn log_stage_complete(stage_idx: usize, total_stages: usize, box_name: &str, res
         stage_idx + 1,
         total_stages,
         box_name,
-        result.claude_result.input_tokens + result.claude_result.output_tokens,
-        result.claude_result.total_cost_usd,
+        result.agent_result.input_tokens + result.agent_result.output_tokens,
+        result.agent_result.total_cost_usd,
     );
 }
 
@@ -714,7 +714,7 @@ fn instrument_stage_result(
     stage_ctx: &crate::observe::tracer::SpanContext,
     observer: &Observer,
 ) {
-    let r = &stage_result.claude_result;
+    let r = &stage_result.agent_result;
     let box_name = stage_result.box_name.as_str();
 
     // Create claude.exec + claude.tool.* child spans via the existing helper
@@ -740,7 +740,7 @@ fn instrument_stage_result(
 
 /// Set GenAI semantic convention attributes on a stage span.
 fn set_stage_span_attrs(span: &mut crate::observe::tracer::Span, stage_result: &StageResult) {
-    let r = &stage_result.claude_result;
+    let r = &stage_result.agent_result;
     span.set_attribute("gen_ai.usage.input_tokens", r.input_tokens.to_string());
     span.set_attribute("gen_ai.usage.output_tokens", r.output_tokens.to_string());
     span.set_attribute("claude.total_cost_usd", format!("{:.6}", r.total_cost_usd));
@@ -756,15 +756,15 @@ fn set_stage_span_attrs(span: &mut crate::observe::tracer::Span, stage_result: &
 fn extract_carry_data(result: &StageResult) -> Option<Vec<u8>> {
     if result.file_output.is_some() {
         result.file_output.clone()
-    } else if !result.claude_result.result_text.is_empty() {
-        Some(result.claude_result.result_text.as_bytes().to_vec())
+    } else if !result.agent_result.result_text.is_empty() {
+        Some(result.agent_result.result_text.as_bytes().to_vec())
     } else {
         None
     }
 }
 
 /// Log a stage error with appropriate messaging.
-fn log_stage_error(box_name: &str, result: &ClaudeExecResult) {
+fn log_stage_error(box_name: &str, result: &AgentExecResult) {
     if looks_like_login_error(result) {
         eprintln!(
             "[pipeline] [vm:{}] FAILED: agent authentication error. \
@@ -785,12 +785,12 @@ fn emit_synthetic_chunk<F>(result: &StageResult, box_name: &str, on_output: &mut
 where
     F: FnMut(&str, &ExecOutputChunk),
 {
-    if !result.claude_result.result_text.is_empty() {
+    if !result.agent_result.result_text.is_empty() {
         on_output(
             box_name,
             &ExecOutputChunk {
                 stream: "stdout".to_string(),
-                data: result.claude_result.result_text.as_bytes().to_vec(),
+                data: result.agent_result.result_text.as_bytes().to_vec(),
                 seq: 0,
             },
         );
@@ -803,12 +803,12 @@ where
 fn merge_parallel_outputs(results: &[StageResult]) -> Vec<u8> {
     let texts: Vec<&str> = results
         .iter()
-        .map(|r| r.claude_result.result_text.as_str())
+        .map(|r| r.agent_result.result_text.as_str())
         .collect();
     serde_json::to_vec(&texts).unwrap_or_else(|_| b"[]".to_vec())
 }
 
-fn looks_like_login_error(result: &ClaudeExecResult) -> bool {
+fn looks_like_login_error(result: &AgentExecResult) -> bool {
     let text = format!(
         "{} {}",
         result.result_text.to_ascii_lowercase(),
@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_detects_login_error_from_result_text() {
-        let r = ClaudeExecResult {
+        let r = AgentExecResult {
             result_text: "Not logged in · Please run /login".into(),
             model: String::new(),
             session_id: String::new(),
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_detects_login_error_from_error_field() {
-        let r = ClaudeExecResult {
+        let r = AgentExecResult {
             result_text: String::new(),
             model: String::new(),
             session_id: String::new(),
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_non_login_error_is_not_detected() {
-        let r = ClaudeExecResult {
+        let r = AgentExecResult {
             result_text: String::new(),
             model: String::new(),
             session_id: String::new(),

@@ -272,7 +272,7 @@ impl Sandbox {
     ///
     /// This is a high-level wrapper that:
     /// 1. Runs `claude-code -p <prompt> --output-format stream-json`
-    /// 2. Parses the JSONL stdout into structured `ClaudeExecResult`
+    /// 2. Parses the JSONL stdout into structured `AgentExecResult`
     /// 3. Returns both the text result and full telemetry (tokens, cost, tool calls)
     ///
     /// When the `opentelemetry` feature is enabled, OTel spans are created
@@ -280,8 +280,8 @@ impl Sandbox {
     pub async fn exec_claude(
         &self,
         prompt: &str,
-        opts: crate::observe::claude::ClaudeExecOpts,
-    ) -> Result<crate::observe::claude::ClaudeExecResult> {
+        opts: crate::observe::claude::AgentExecOpts,
+    ) -> Result<crate::observe::claude::AgentExecResult> {
         if let SandboxInner::Local(local) = &self.inner {
             self.verify_claude_code_compat(local, &opts.env).await?;
         }
@@ -399,18 +399,18 @@ impl Sandbox {
     ///
     /// Like [`exec_claude()`](Self::exec_claude), but parses JSONL lines as
     /// they arrive from the guest VM and calls `on_event` for each tool-use
-    /// event in real-time.  Returns the same `ClaudeExecResult` as the
+    /// event in real-time.  Returns the same `AgentExecResult` as the
     /// non-streaming variant.
     pub async fn exec_claude_streaming<F>(
         &self,
         prompt: &str,
-        opts: crate::observe::claude::ClaudeExecOpts,
+        opts: crate::observe::claude::AgentExecOpts,
         mut on_event: F,
-    ) -> Result<crate::observe::claude::ClaudeExecResult>
+    ) -> Result<crate::observe::claude::AgentExecResult>
     where
-        F: FnMut(crate::observe::claude::ClaudeStreamEvent),
+        F: FnMut(crate::observe::claude::AgentStreamEvent),
     {
-        use crate::observe::claude::{parse_jsonl_line, ClaudeExecResult, ClaudeStreamEvent};
+        use crate::observe::claude::{parse_jsonl_line, AgentExecResult, AgentStreamEvent};
         use std::collections::HashMap;
 
         if let SandboxInner::Local(local) = &self.inner {
@@ -441,7 +441,7 @@ impl Sandbox {
                     .exec_claude_streaming_internal(&args_refs, &opts.env, opts.timeout_secs)
                     .await?;
 
-                let mut state = ClaudeExecResult {
+                let mut state = AgentExecResult {
                     result_text: String::new(),
                     model: String::new(),
                     session_id: String::new(),
@@ -538,7 +538,7 @@ impl Sandbox {
                 let result = crate::observe::claude::parse_stream_json(&output.stdout);
 
                 for tc in &result.tool_calls {
-                    on_event(ClaudeStreamEvent::ToolUse(tc.clone()));
+                    on_event(AgentStreamEvent::ToolUse(tc.clone()));
                 }
 
                 Ok(result)

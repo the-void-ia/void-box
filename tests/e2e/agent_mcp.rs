@@ -159,16 +159,16 @@ async fn real_claude_uses_void_mcp_tools() {
     };
 
     eprintln!("=== Claude Result ===");
-    eprintln!("model: {}", result.claude_result.model);
-    eprintln!("session: {}", result.claude_result.session_id);
-    eprintln!("is_error: {}", result.claude_result.is_error);
-    eprintln!("tools used: {:?}", result.claude_result.tool_calls);
-    eprintln!("result text: {}", result.claude_result.result_text);
-    eprintln!("cost: ${:.4}", result.claude_result.total_cost_usd);
+    eprintln!("model: {}", result.agent_result.model);
+    eprintln!("session: {}", result.agent_result.session_id);
+    eprintln!("is_error: {}", result.agent_result.is_error);
+    eprintln!("tools used: {:?}", result.agent_result.tool_calls);
+    eprintln!("result text: {}", result.agent_result.result_text);
+    eprintln!("cost: ${:.4}", result.agent_result.total_cost_usd);
 
     // Check if void-mcp tools were used
     let mcp_tool_used = result
-        .claude_result
+        .agent_result
         .tool_calls
         .iter()
         .any(|t| t.tool_name.contains("mcp__void-mcp") || t.tool_name.contains("void-mcp"));
@@ -189,15 +189,15 @@ async fn real_claude_uses_void_mcp_tools() {
 
     // Assertions — at minimum Claude should have completed without error
     assert!(
-        !result.claude_result.is_error,
+        !result.agent_result.is_error,
         "Claude reported an error: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     // The key assertion: did Claude actually use MCP tools?
     if !mcp_tool_used {
         eprintln!("WARNING: Claude did NOT use void-mcp tools!");
-        eprintln!("Tool calls were: {:?}", result.claude_result.tool_calls);
+        eprintln!("Tool calls were: {:?}", result.agent_result.tool_calls);
         eprintln!("This may indicate MCP server failed to start inside the guest.");
     }
 
@@ -214,7 +214,7 @@ async fn real_claude_uses_void_mcp_tools() {
         !drained.is_empty(),
         "Expected at least one intent from Claude via void-mcp. \
          Tool calls: {:?}",
-        result.claude_result.tool_calls
+        result.agent_result.tool_calls
     );
 }
 

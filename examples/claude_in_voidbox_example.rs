@@ -25,7 +25,7 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use void_box::observe::claude::{parse_stream_json, ClaudeExecResult};
+use void_box::observe::claude::{parse_stream_json, AgentExecResult};
 use void_box::sandbox::Sandbox;
 
 const WORKSPACE: &str = "/workspace";
@@ -134,7 +134,7 @@ fn try_kvm_sandbox() -> Result<Option<Arc<Sandbox>>, Box<dyn Error>> {
 }
 
 /// Run claude-code with stream-json output and parse the result.
-async fn run_claude(sandbox: &Sandbox, prompt: &str) -> Result<ClaudeExecResult, Box<dyn Error>> {
+async fn run_claude(sandbox: &Sandbox, prompt: &str) -> Result<AgentExecResult, Box<dyn Error>> {
     let out = sandbox
         .exec(
             "claude-code",
@@ -156,8 +156,8 @@ async fn run_claude(sandbox: &Sandbox, prompt: &str) -> Result<ClaudeExecResult,
     Ok(result)
 }
 
-/// Print a structured telemetry summary from a ClaudeExecResult.
-fn print_telemetry(label: &str, result: &ClaudeExecResult) {
+/// Print a structured telemetry summary from a AgentExecResult.
+fn print_telemetry(label: &str, result: &AgentExecResult) {
     println!("\n--- {} Telemetry ---", label);
     println!("  Session:     {}", result.session_id);
     println!("  Model:       {}", result.model);
@@ -212,7 +212,7 @@ fn print_telemetry(label: &str, result: &ClaudeExecResult) {
 }
 
 /// Optionally create OTel spans from the result.
-fn maybe_create_otel_spans(result: &ClaudeExecResult) {
+fn maybe_create_otel_spans(result: &AgentExecResult) {
     // Check if OTLP endpoint is configured
     let otlp_configured = std::env::var("VOIDBOX_OTLP_ENDPOINT").is_ok()
         || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok();

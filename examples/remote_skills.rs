@@ -140,10 +140,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!();
     println!("--- Result ---");
     println!("  Box:     {}", result.box_name);
-    println!("  Error:   {}", result.claude_result.is_error);
+    println!("  Error:   {}", result.agent_result.is_error);
     println!(
         "  Tokens:  {} in / {} out",
-        result.claude_result.input_tokens, result.claude_result.output_tokens
+        result.agent_result.input_tokens, result.agent_result.output_tokens
     );
     println!();
     println!(

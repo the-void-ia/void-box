@@ -32,7 +32,7 @@ async fn test_provision_local_skill_file() {
 
     let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "data_analyst");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 #[tokio::test]
@@ -55,7 +55,7 @@ async fn test_provision_mcp_skill() {
 
     let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "mcp_box");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 #[tokio::test]
@@ -103,7 +103,7 @@ async fn test_provision_mixed_skills() {
     // Should succeed even though remote fetch will 404 (fallback kicks in)
     let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "mixed_box");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 #[tokio::test]
@@ -124,7 +124,7 @@ async fn test_provision_remote_skill_fallback() {
     // The Box should run successfully -- fallback content is written instead
     let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "fallback_box");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 // ─── Remote Fetching (live network, ignored) ────────────────────────────────
@@ -146,7 +146,7 @@ async fn test_remote_skill_provision_live() {
 
     let result = ab.run(None, None).await.unwrap();
     assert_eq!(result.box_name, "live_fetch_box");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 #[tokio::test]
@@ -352,7 +352,7 @@ async fn test_agent_box_with_input_data() {
     let result = ab.run(Some(input), None).await.unwrap();
 
     assert_eq!(result.box_name, "processor");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 }
 
 // ─── Skill URL Generation ───────────────────────────────────────────────────

@@ -129,30 +129,30 @@ async fn test_agent_box_with_local_skill() {
 
     // Basic checks
     assert_eq!(result.box_name, "data_analyst");
-    assert!(!result.claude_result.is_error, "should not be an error");
+    assert!(!result.agent_result.is_error, "should not be an error");
     assert!(
-        !result.claude_result.session_id.is_empty(),
+        !result.agent_result.session_id.is_empty(),
         "session_id should be populated"
     );
     assert!(
-        !result.claude_result.tool_calls.is_empty(),
+        !result.agent_result.tool_calls.is_empty(),
         "should have tool calls"
     );
 
     // Verify claudio discovered the provisioned skill
     assert!(
         result
-            .claude_result
+            .agent_result
             .result_text
             .contains("financial-data-analysis"),
         "result should mention the provisioned skill name, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     eprintln!("PASSED: test_agent_box_with_local_skill");
-    eprintln!("  session: {}", result.claude_result.session_id);
-    eprintln!("  tools: {}", result.claude_result.tool_calls.len());
-    eprintln!("  result: {}", result.claude_result.result_text);
+    eprintln!("  session: {}", result.agent_result.session_id);
+    eprintln!("  tools: {}", result.agent_result.tool_calls.len());
+    eprintln!("  result: {}", result.agent_result.result_text);
 }
 
 // ===========================================================================
@@ -185,24 +185,24 @@ async fn test_agent_box_with_multiple_skills() {
         Err(e) => panic!("VoidBox::run failed: {e}"),
     };
 
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 
     // Both skills should be discovered by claudio
     assert!(
         result
-            .claude_result
+            .agent_result
             .result_text
             .contains("financial-data-analysis"),
         "should discover financial-data-analysis skill, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
     assert!(
         result
-            .claude_result
+            .agent_result
             .result_text
             .contains("quant-technical-analysis"),
         "should discover quant-technical-analysis skill, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     eprintln!("PASSED: test_agent_box_with_multiple_skills");
@@ -240,18 +240,18 @@ async fn test_agent_box_with_mcp_skill() {
         Err(e) => panic!("VoidBox::run failed: {e}"),
     };
 
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 
     // claudio should discover the MCP server
     assert!(
-        result.claude_result.result_text.contains("market-data-mcp"),
+        result.agent_result.result_text.contains("market-data-mcp"),
         "should discover MCP server, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     // claudio should have simulated an MCP tool call
     let mcp_tools: Vec<_> = result
-        .claude_result
+        .agent_result
         .tool_calls
         .iter()
         .filter(|tc| tc.tool_name.contains("mcp__"))
@@ -260,7 +260,7 @@ async fn test_agent_box_with_mcp_skill() {
         !mcp_tools.is_empty(),
         "should have at least one MCP tool call, tools: {:?}",
         result
-            .claude_result
+            .agent_result
             .tool_calls
             .iter()
             .map(|t| &t.tool_name)
@@ -301,10 +301,10 @@ async fn test_agent_box_mixed_skills() {
         Err(e) => panic!("VoidBox::run failed: {e}"),
     };
 
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
 
     // Both skill and MCP should be discovered
-    let text = &result.claude_result.result_text;
+    let text = &result.agent_result.result_text;
     assert!(
         text.contains("financial-data-analysis"),
         "should discover file skill: {}",
@@ -370,19 +370,19 @@ async fn test_pipeline_two_stages_kvm() {
     // Verify each stage discovered its skill
     assert!(
         result.stages[0]
-            .claude_result
+            .agent_result
             .result_text
             .contains("financial-data-analysis"),
         "stage 1 should have financial skill: {}",
-        result.stages[0].claude_result.result_text
+        result.stages[0].agent_result.result_text
     );
     assert!(
         result.stages[1]
-            .claude_result
+            .agent_result
             .result_text
             .contains("quant-technical-analysis"),
         "stage 2 should have quant skill: {}",
-        result.stages[1].claude_result.result_text
+        result.stages[1].agent_result.result_text
     );
 
     eprintln!("PASSED: test_pipeline_two_stages_kvm");
@@ -424,9 +424,9 @@ async fn test_agent_box_with_input_data_kvm() {
     };
 
     assert_eq!(result.box_name, "input_box");
-    assert!(!result.claude_result.is_error);
+    assert!(!result.agent_result.is_error);
     assert!(
-        !result.claude_result.session_id.is_empty(),
+        !result.agent_result.session_id.is_empty(),
         "should have session_id"
     );
 

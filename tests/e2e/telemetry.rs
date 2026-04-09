@@ -27,7 +27,7 @@ use std::sync::Arc;
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::observe::claude::{parse_stream_json, ClaudeExecOpts};
+use void_box::observe::claude::{parse_stream_json, AgentExecOpts};
 use void_box::observe::tracer::{SpanContext, Tracer, TracerConfig};
 use void_box::sandbox::Sandbox;
 use void_box::vmm::config::VoidBoxConfig;
@@ -164,7 +164,7 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
 async fn run_claudio(
     sandbox: &Sandbox,
     prompt: &str,
-) -> void_box::observe::claude::ClaudeExecResult {
+) -> void_box::observe::claude::AgentExecResult {
     let output = sandbox
         .exec(
             "claude-code",
@@ -273,7 +273,7 @@ async fn test_default_scenario() {
     eprintln!("  [B] OTel spans created correctly");
 
     // --- C) exec_claude() high-level wrapper ---
-    let opts = ClaudeExecOpts {
+    let opts = AgentExecOpts {
         dangerously_skip_permissions: true,
         ..Default::default()
     };

@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     for (i, stage) in result.stages.iter().enumerate() {
-        let r = &stage.claude_result;
+        let r = &stage.agent_result;
         let status = if r.is_error { "FAILED" } else { "OK" };
         println!(
             "  Stage {}: {} [{}] -- {} in + {} out tokens, {} tools, ${:.4}",

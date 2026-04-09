@@ -355,8 +355,8 @@ async fn run_agent(
 
     // Prefer the JSONL result_text, but fall back to file_output when
     // claude-code is killed before emitting the result event.
-    let output = if !stage.claude_result.result_text.is_empty() {
-        stage.claude_result.result_text.clone()
+    let output = if !stage.agent_result.result_text.is_empty() {
+        stage.agent_result.result_text.clone()
     } else if let Some(ref data) = stage.file_output {
         String::from_utf8_lossy(data).into_owned()
     } else {
@@ -364,7 +364,7 @@ async fn run_agent(
     };
 
     let duration_ms = stage_start.elapsed().as_millis() as u64;
-    if stage.claude_result.is_error {
+    if stage.agent_result.is_error {
         emit_stage_event(
             &stage_tx,
             crate::persistence::stage_event_failed(
@@ -374,7 +374,7 @@ async fn run_agent(
                 duration_ms,
                 1,
                 stage
-                    .claude_result
+                    .agent_result
                     .error
                     .as_deref()
                     .unwrap_or("agent execution failed"),
@@ -398,12 +398,12 @@ async fn run_agent(
     Ok(RunReport {
         name: spec.name.clone(),
         kind: "agent".to_string(),
-        success: !stage.claude_result.is_error,
+        success: !stage.agent_result.is_error,
         output,
         stages: 1,
-        total_cost_usd: stage.claude_result.total_cost_usd,
-        input_tokens: stage.claude_result.input_tokens,
-        output_tokens: stage.claude_result.output_tokens,
+        total_cost_usd: stage.agent_result.total_cost_usd,
+        input_tokens: stage.agent_result.input_tokens,
+        output_tokens: stage.agent_result.output_tokens,
     })
 }
 

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 /// Parsed result of a claude-code execution via `--output-format stream-json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeExecResult {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentExecResult {
     /// Final text answer (from the `result` event).
     pub result_text: String,
     /// Model used (e.g. "sonnet", "opus").
@@ -118,7 +118,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Event emitted during incremental JSONL parsing.
 #[derive(Debug, Clone)]
-pub enum ClaudeStreamEvent {
+pub enum AgentStreamEvent {
     /// A tool_use block was found in an assistant message.
     ToolUse(ClaudeToolCall),
 }
@@ -130,9 +130,9 @@ pub enum ClaudeStreamEvent {
 /// The `tool_id_map` tracks tool_use_id → index for matching results.
 pub fn parse_jsonl_line(
     line: &str,
-    state: &mut ClaudeExecResult,
+    state: &mut AgentExecResult,
     tool_id_map: &mut HashMap<String, usize>,
-) -> Vec<ClaudeStreamEvent> {
+) -> Vec<AgentStreamEvent> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -191,7 +191,7 @@ pub fn parse_jsonl_line(
                             };
                             let idx = state.tool_calls.len();
                             tool_id_map.insert(tool.tool_use_id.clone(), idx);
-                            events.push(ClaudeStreamEvent::ToolUse(tool.clone()));
+                            events.push(AgentStreamEvent::ToolUse(tool.clone()));
                             state.tool_calls.push(tool);
                         }
                     }
@@ -272,7 +272,7 @@ pub fn parse_jsonl_line(
 
 /// Options for `exec_claude()`.
 #[derive(Debug, Clone, Default)]
-pub struct ClaudeExecOpts {
+pub struct AgentExecOpts {
     /// Skip permission prompts (`--dangerously-skip-permissions`).
     pub dangerously_skip_permissions: bool,
     /// Extra arguments to pass to claude-code.
@@ -290,10 +290,10 @@ pub struct ClaudeExecOpts {
 
 /// Parse JSONL stdout from `claude-code --output-format stream-json`.
 ///
-/// Returns a `ClaudeExecResult` with all extracted telemetry.
-pub fn parse_stream_json(stdout: &[u8]) -> ClaudeExecResult {
+/// Returns a `AgentExecResult` with all extracted telemetry.
+pub fn parse_stream_json(stdout: &[u8]) -> AgentExecResult {
     let text = String::from_utf8_lossy(stdout);
-    let mut result = ClaudeExecResult {
+    let mut result = AgentExecResult {
         result_text: String::new(),
         model: String::new(),
         session_id: String::new(),
@@ -483,7 +483,7 @@ fn extract_tool_result_text(block: &serde_json::Value) -> String {
 // OTel span creation (feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Create spans from a parsed `ClaudeExecResult`.
+/// Create spans from a parsed `AgentExecResult`.
 ///
 /// Creates a root `claude.exec` span with child spans for each tool call,
 /// following the [OTel GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/).
@@ -494,7 +494,7 @@ fn extract_tool_result_text(block: &serde_json::Value) -> String {
 /// when the `opentelemetry` feature is enabled, also exported via the
 /// OTel SDK bridge.
 pub fn create_otel_spans(
-    result: &ClaudeExecResult,
+    result: &AgentExecResult,
     parent_context: Option<&crate::observe::tracer::SpanContext>,
     tracer: &crate::observe::tracer::Tracer,
 ) {
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_parse_jsonl_line_tool_events() {
-        let mut state = ClaudeExecResult {
+        let mut state = AgentExecResult {
             result_text: String::new(),
             model: String::new(),
             session_id: String::new(),
@@ -797,7 +797,7 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ClaudeStreamEvent::ToolUse(tc) => {
+            AgentStreamEvent::ToolUse(tc) => {
                 assert_eq!(tc.tool_name, "Bash");
                 assert_eq!(tc.tool_summary(), "ls -la");
             }
@@ -820,7 +820,7 @@ mod tests {
         let jsonl = sample_session_jsonl();
         let batch_result = parse_stream_json(jsonl.as_bytes());
 
-        let mut incr_result = ClaudeExecResult {
+        let mut incr_result = AgentExecResult {
             result_text: String::new(),
             model: String::new(),
             session_id: String::new(),

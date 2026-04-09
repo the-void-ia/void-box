@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::llm::LlmProvider;
-use crate::observe::claude::ClaudeExecOpts;
+use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::sandbox::Sandbox;
@@ -718,17 +718,17 @@ impl VoidBox {
         }
 
         let tag_clone = tag.to_string();
-        let mut claude_result = sandbox
+        let mut agent_result = sandbox
             .exec_claude_streaming(
                 &full_prompt,
-                ClaudeExecOpts {
+                AgentExecOpts {
                     dangerously_skip_permissions: true,
                     extra_args,
                     timeout_secs: self.config.timeout_secs,
                     ..Default::default()
                 },
                 |event| match event {
-                    crate::observe::claude::ClaudeStreamEvent::ToolUse(ref tc) => {
+                    crate::observe::claude::AgentStreamEvent::ToolUse(ref tc) => {
                         let summary = tc.tool_summary();
                         if summary.is_empty() {
                             eprintln!("[vm:{}]   tool: {}", tag_clone, tc.tool_name);
@@ -743,17 +743,17 @@ impl VoidBox {
         // Local providers (Ollama) have no real API cost; claude-code
         // still reports a dollar amount using Anthropic pricing, so zero it.
         if self.config.llm.is_local() {
-            claude_result.total_cost_usd = 0.0;
+            agent_result.total_cost_usd = 0.0;
         }
 
         eprintln!(
             "[vm:{}] Agent finished | tokens={}in/{}out | tools={} | cost=${:.4} | error={}",
             tag,
-            claude_result.input_tokens,
-            claude_result.output_tokens,
-            claude_result.tool_calls.len(),
-            claude_result.total_cost_usd,
-            claude_result.is_error,
+            agent_result.input_tokens,
+            agent_result.output_tokens,
+            agent_result.tool_calls.len(),
+            agent_result.total_cost_usd,
+            agent_result.is_error,
         );
 
         // Try to read the output file
@@ -772,7 +772,7 @@ impl VoidBox {
 
         Ok(StageResult {
             box_name: self.name.clone(),
-            claude_result,
+            agent_result,
             file_output,
         })
     }
@@ -885,14 +885,14 @@ impl VoidBox {
             // timeout_secs = Some(0) means infinite timeout for service mode.
             let result = sandbox_agent.exec_claude_streaming(
                 &full_prompt,
-                ClaudeExecOpts {
+                AgentExecOpts {
                     dangerously_skip_permissions: true,
                     extra_args,
                     timeout_secs: Some(0),
                     ..Default::default()
                 },
                 |event| match event {
-                    crate::observe::claude::ClaudeStreamEvent::ToolUse(ref tc) => {
+                    crate::observe::claude::AgentStreamEvent::ToolUse(ref tc) => {
                         let summary = tc.tool_summary();
                         if summary.is_empty() {
                             eprintln!("[vm:{}]   tool: {}", tag, tc.tool_name);

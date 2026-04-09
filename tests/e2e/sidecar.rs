@@ -480,14 +480,14 @@ async fn claudio_discovers_injected_messaging_skill() {
         }
     };
 
-    eprintln!("claudio result_text: {}", result.claude_result.result_text);
+    eprintln!("claudio result_text: {}", result.agent_result.result_text);
 
     // Claudio should have discovered the void-messaging skill file
     // It reports discovered skills in the result text
     assert!(
-        result.claude_result.result_text.contains("void-messaging"),
+        result.agent_result.result_text.contains("void-messaging"),
         "claudio should discover void-messaging skill, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     handle.stop().await;
@@ -668,13 +668,13 @@ async fn claudio_discovers_void_mcp_tools() {
         }
     };
 
-    eprintln!("claudio result: {}", result.claude_result.result_text);
+    eprintln!("claudio result: {}", result.agent_result.result_text);
 
     // Claudio should discover void-mcp as an MCP server in mcp.json
     assert!(
-        result.claude_result.result_text.contains("void-mcp"),
+        result.agent_result.result_text.contains("void-mcp"),
         "claudio should discover void-mcp MCP server, got: {}",
-        result.claude_result.result_text
+        result.agent_result.result_text
     );
 
     handle.stop().await;
