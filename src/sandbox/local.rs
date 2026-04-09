@@ -274,15 +274,16 @@ impl LocalSandbox {
         backend.read_file_native(path).await
     }
 
-    /// Internal helper for `exec_claude` -- runs claude-code with extra env and optional timeout.
-    pub(crate) async fn exec_claude_internal(
+    /// Internal helper for `exec_agent` -- runs the given binary with extra env and optional timeout.
+    pub(crate) async fn exec_agent_internal(
         &self,
+        binary: &str,
         args: &[&str],
         extra_env: &[(String, String)],
         timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
         if self.config.kernel.is_none() {
-            return self.simulate_exec("claude-code", args, &[]);
+            return self.simulate_exec(binary, args, &[]);
         }
 
         let backend = self.get_backend().await?;
@@ -290,7 +291,7 @@ impl LocalSandbox {
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
         backend
-            .exec("claude-code", args, &[], &env, None, timeout_secs)
+            .exec(binary, args, &[], &env, None, timeout_secs)
             .await
     }
 
@@ -341,13 +342,14 @@ impl LocalSandbox {
             .await
     }
 
-    /// Streaming variant of `exec_claude_internal`.
+    /// Streaming variant of `exec_agent_internal`.
     ///
     /// Returns a channel of `ExecOutputChunk` and a oneshot for the final
     /// `ExecResponse`.  In simulation mode (no kernel), falls back to the
     /// non-streaming path and synthesises a single stdout chunk.
-    pub(crate) async fn exec_claude_streaming_internal(
+    pub(crate) async fn exec_agent_streaming_internal(
         &self,
+        binary: &str,
         args: &[&str],
         extra_env: &[(String, String)],
         timeout_secs: Option<u64>,
@@ -359,7 +361,7 @@ impl LocalSandbox {
 
         if self.config.kernel.is_none() {
             // Simulation mode — run synchronously, wrap in channels
-            let output = self.simulate_exec("claude-code", args, &[])?;
+            let output = self.simulate_exec(binary, args, &[])?;
             let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(1);
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
@@ -386,7 +388,7 @@ impl LocalSandbox {
         let mut env = self.config.env.clone();
         env.extend(extra_env.iter().cloned());
         backend
-            .exec_streaming("claude-code", args, &env, Some("/workspace"), timeout_secs)
+            .exec_streaming(binary, args, &env, Some("/workspace"), timeout_secs)
             .await
     }
 

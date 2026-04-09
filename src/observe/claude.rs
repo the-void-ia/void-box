@@ -270,7 +270,7 @@ pub fn parse_jsonl_line(
     events
 }
 
-/// Options for `exec_claude()`.
+/// Options for `exec_agent()`.
 #[derive(Debug, Clone, Default)]
 pub struct AgentExecOpts {
     /// Skip permission prompts (`--dangerously-skip-permissions`).

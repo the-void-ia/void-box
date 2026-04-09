@@ -702,11 +702,10 @@ impl VoidBox {
         // Pass skipWebFetchPreflight via --settings so WebFetch skips the
         // preflight call to claude.ai/api/web/domain_info (unreachable from
         // inside SLIRP in many environments — see anthropics/claude-code#6388).
-        let mut extra_args = self.config.llm.cli_args();
-        extra_args.extend([
+        let mut extra_args = vec![
             "--settings".to_string(),
             r#"{"skipWebFetchPreflight":true}"#.to_string(),
-        ]);
+        ];
 
         // If MCP servers were provisioned, explicitly point claude-code to the config
         let has_mcp = self
@@ -719,7 +718,8 @@ impl VoidBox {
 
         let tag_clone = tag.to_string();
         let mut agent_result = sandbox
-            .exec_claude_streaming(
+            .exec_agent_streaming(
+                &self.config.llm,
                 &full_prompt,
                 AgentExecOpts {
                     dangerously_skip_permissions: true,
@@ -839,11 +839,10 @@ impl VoidBox {
 
         // ── Build CLI args ─────────────────────────────────────────────
 
-        let mut extra_args = self.config.llm.cli_args();
-        extra_args.extend([
+        let mut extra_args = vec![
             "--settings".to_string(),
             r#"{"skipWebFetchPreflight":true}"#.to_string(),
-        ]);
+        ];
 
         let has_mcp = self
             .skills
@@ -854,6 +853,7 @@ impl VoidBox {
         }
 
         let is_local_llm = self.config.llm.is_local();
+        let llm_provider = self.config.llm.clone();
         let output_file = self.config.output_file.clone();
         let box_name = self.name.clone();
 
@@ -883,7 +883,8 @@ impl VoidBox {
             let tag = tag_agent;
 
             // timeout_secs = Some(0) means infinite timeout for service mode.
-            let result = sandbox_agent.exec_claude_streaming(
+            let result = sandbox_agent.exec_agent_streaming(
+                &llm_provider,
                 &full_prompt,
                 AgentExecOpts {
                     dangerously_skip_permissions: true,

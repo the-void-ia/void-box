@@ -268,40 +268,30 @@ impl Sandbox {
         }
     }
 
-    /// Execute `claude-code` with `--output-format stream-json` and parse the result.
+    /// Execute an LLM agent binary and parse the result.
     ///
     /// This is a high-level wrapper that:
-    /// 1. Runs `claude-code -p <prompt> --output-format stream-json`
-    /// 2. Parses the JSONL stdout into structured `AgentExecResult`
-    /// 3. Returns both the text result and full telemetry (tokens, cost, tool calls)
+    /// 1. Builds CLI args via `provider.build_exec_args()`
+    /// 2. For claude-code: parses the JSONL stdout into structured `AgentExecResult`
+    /// 3. For other providers: forwards stdout as `result_text`
+    /// 4. Returns both the text result and full telemetry (tokens, cost, tool calls)
     ///
     /// When the `opentelemetry` feature is enabled, OTel spans are created
     /// for the execution and each tool call.
-    pub async fn exec_claude(
+    pub async fn exec_agent(
         &self,
+        provider: &crate::llm::LlmProvider,
         prompt: &str,
         opts: crate::observe::claude::AgentExecOpts,
     ) -> Result<crate::observe::claude::AgentExecResult> {
         if let SandboxInner::Local(local) = &self.inner {
-            self.verify_claude_code_compat(local, &opts.env).await?;
+            if provider.binary_name() == "claude-code" {
+                self.verify_claude_code_compat(local, &opts.env).await?;
+            }
         }
 
-        let mut args = vec![
-            "-p".to_string(),
-            prompt.to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-        ];
-
-        if opts.dangerously_skip_permissions {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-
-        for extra in &opts.extra_args {
-            args.push(extra.clone());
-        }
-
+        let args: Vec<String> =
+            provider.build_exec_args(prompt, opts.dangerously_skip_permissions, &opts.extra_args);
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         // Execute via the normal sandbox path
@@ -309,11 +299,17 @@ impl Sandbox {
             SandboxInner::Local(local) => {
                 // For local sandbox, pass extra env and timeout through
                 local
-                    .exec_claude_internal(&args_refs, &opts.env, opts.timeout_secs)
+                    .exec_agent_internal(
+                        provider.binary_name(),
+                        &args_refs,
+                        &opts.env,
+                        opts.timeout_secs,
+                    )
                     .await?
             }
             SandboxInner::Mock(mock) => {
-                mock.exec_with_stdin("claude-code", &args_refs, &[]).await?
+                mock.exec_with_stdin(provider.binary_name(), &args_refs, &[])
+                    .await?
             }
         };
 
@@ -330,7 +326,8 @@ impl Sandbox {
             if output.exit_code != 0 {
                 tracing::warn!(
                     exit_code = output.exit_code,
-                    "claude-code failed; stderr={}, stdout_head={}",
+                    "{} failed; stderr={}, stdout_head={}",
+                    provider.binary_name(),
                     if stderr_str.is_empty() {
                         "(empty)"
                     } else {
@@ -343,7 +340,8 @@ impl Sandbox {
                     exit_code = output.exit_code,
                     stdout_len = output.stdout.len(),
                     stderr_len = output.stderr.len(),
-                    "claude-code finished; stdout_head={}, stderr={}",
+                    "{} finished; stdout_head={}, stderr={}",
+                    provider.binary_name(),
                     stdout_preview,
                     if stderr_str.is_empty() {
                         "(empty)"
@@ -354,11 +352,18 @@ impl Sandbox {
             }
         }
 
-        // Parse the stream-json output even on non-zero exit codes.
-        // claude-code exits 1 when the task fails or has errors, but still
-        // produces valid stream-json with a result event. Only treat it as
-        // a hard failure if we get NO parseable stream-json output at all.
-        let result = crate::observe::claude::parse_stream_json(&output.stdout);
+        // For claude-code: parse stream-json output even on non-zero exit codes.
+        // claude-code exits 1 when the task fails but still produces valid stream-json.
+        // For other providers: forward raw stdout as result_text.
+        let result = if provider.binary_name() == "claude-code" {
+            crate::observe::claude::parse_stream_json(&output.stdout)
+        } else {
+            crate::observe::claude::AgentExecResult {
+                result_text: String::from_utf8_lossy(&output.stdout).into_owned(),
+                is_error: output.exit_code != 0,
+                ..Default::default()
+            }
+        };
 
         let no_stream_output = result.session_id.is_empty()
             && result.model.is_empty()
@@ -368,7 +373,7 @@ impl Sandbox {
             && result.output_tokens == 0
             && !result.is_error;
 
-        if no_stream_output {
+        if provider.binary_name() == "claude-code" && no_stream_output {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let stdout_preview = if stdout_str.len() > 500 {
@@ -395,14 +400,17 @@ impl Sandbox {
         Ok(result)
     }
 
-    /// Execute `claude-code` with streaming output and incremental JSONL parsing.
+    /// Execute an LLM agent binary with streaming output and incremental parsing.
     ///
-    /// Like [`exec_claude()`](Self::exec_claude), but parses JSONL lines as
+    /// Like [`exec_agent()`](Self::exec_agent), but parses JSONL lines as
     /// they arrive from the guest VM and calls `on_event` for each tool-use
-    /// event in real-time.  Returns the same `AgentExecResult` as the
-    /// non-streaming variant.
-    pub async fn exec_claude_streaming<F>(
+    /// event in real-time.  For claude-code this uses the stream-json observer;
+    /// for other providers stdout lines are forwarded to tracing and
+    /// accumulated into `result_text`.  Returns the same `AgentExecResult` as
+    /// the non-streaming variant.
+    pub async fn exec_agent_streaming<F>(
         &self,
+        provider: &crate::llm::LlmProvider,
         prompt: &str,
         opts: crate::observe::claude::AgentExecOpts,
         mut on_event: F,
@@ -414,127 +422,153 @@ impl Sandbox {
         use std::collections::HashMap;
 
         if let SandboxInner::Local(local) = &self.inner {
-            self.verify_claude_code_compat(local, &opts.env).await?;
+            if provider.binary_name() == "claude-code" {
+                self.verify_claude_code_compat(local, &opts.env).await?;
+            }
         }
 
-        let mut args = vec![
-            "-p".to_string(),
-            prompt.to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-        ];
-
-        if opts.dangerously_skip_permissions {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-
-        for extra in &opts.extra_args {
-            args.push(extra.clone());
-        }
-
+        let args: Vec<String> =
+            provider.build_exec_args(prompt, opts.dangerously_skip_permissions, &opts.extra_args);
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         match &self.inner {
             SandboxInner::Local(local) => {
                 let (mut chunk_rx, response_rx) = local
-                    .exec_claude_streaming_internal(&args_refs, &opts.env, opts.timeout_secs)
+                    .exec_agent_streaming_internal(
+                        provider.binary_name(),
+                        &args_refs,
+                        &opts.env,
+                        opts.timeout_secs,
+                    )
                     .await?;
 
-                let mut state = AgentExecResult {
-                    result_text: String::new(),
-                    model: String::new(),
-                    session_id: String::new(),
-                    total_cost_usd: 0.0,
-                    duration_ms: 0,
-                    duration_api_ms: 0,
-                    num_turns: 0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    is_error: false,
-                    error: None,
-                    tool_calls: Vec::new(),
-                };
-                let mut tool_id_map: HashMap<String, usize> = HashMap::new();
-                let mut line_buf = String::new();
+                if provider.binary_name() == "claude-code" {
+                    let mut state = AgentExecResult {
+                        result_text: String::new(),
+                        model: String::new(),
+                        session_id: String::new(),
+                        total_cost_usd: 0.0,
+                        duration_ms: 0,
+                        duration_api_ms: 0,
+                        num_turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        is_error: false,
+                        error: None,
+                        tool_calls: Vec::new(),
+                    };
+                    let mut tool_id_map: HashMap<String, usize> = HashMap::new();
+                    let mut line_buf = String::new();
 
-                // Process stdout chunks as they arrive
-                while let Some(chunk) = chunk_rx.recv().await {
-                    if chunk.stream != "stdout" {
-                        continue;
+                    // Process stdout chunks as they arrive
+                    while let Some(chunk) = chunk_rx.recv().await {
+                        if chunk.stream != "stdout" {
+                            continue;
+                        }
+
+                        let text = String::from_utf8_lossy(&chunk.data);
+                        line_buf.push_str(&text);
+
+                        // Process all complete lines in the buffer
+                        while let Some(newline_pos) = line_buf.find('\n') {
+                            let line: String = line_buf.drain(..=newline_pos).collect();
+                            for event in parse_jsonl_line(&line, &mut state, &mut tool_id_map) {
+                                on_event(event);
+                            }
+                        }
                     }
 
-                    let text = String::from_utf8_lossy(&chunk.data);
-                    line_buf.push_str(&text);
-
-                    // Process all complete lines in the buffer
-                    while let Some(newline_pos) = line_buf.find('\n') {
-                        let line: String = line_buf.drain(..=newline_pos).collect();
-                        for event in parse_jsonl_line(&line, &mut state, &mut tool_id_map) {
+                    // Process any remaining partial line
+                    if !line_buf.trim().is_empty() {
+                        for event in parse_jsonl_line(&line_buf, &mut state, &mut tool_id_map) {
                             on_event(event);
                         }
                     }
-                }
 
-                // Process any remaining partial line
-                if !line_buf.trim().is_empty() {
-                    for event in parse_jsonl_line(&line_buf, &mut state, &mut tool_id_map) {
-                        on_event(event);
+                    // Wait for the final response (for exit code / error info)
+                    let response = response_rx
+                        .await
+                        .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+
+                    // Log raw output on failure
+                    if let Ok(ref resp) = response {
+                        if resp.exit_code != 0 {
+                            let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                            tracing::warn!(
+                                exit_code = resp.exit_code,
+                                "claude-code failed; stderr={}",
+                                if stderr_str.is_empty() {
+                                    "(empty)"
+                                } else {
+                                    stderr_str.trim()
+                                },
+                            );
+                        }
                     }
-                }
 
-                // Wait for the final response (for exit code / error info)
-                let response = response_rx
-                    .await
-                    .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+                    // Check for empty stream output
+                    let no_stream_output = state.session_id.is_empty()
+                        && state.model.is_empty()
+                        && state.result_text.is_empty()
+                        && state.tool_calls.is_empty()
+                        && state.input_tokens == 0
+                        && state.output_tokens == 0
+                        && !state.is_error;
 
-                // Log raw output on failure
-                if let Ok(ref resp) = response {
-                    if resp.exit_code != 0 {
-                        let stderr_str = String::from_utf8_lossy(&resp.stderr);
-                        tracing::warn!(
-                            exit_code = resp.exit_code,
-                            "claude-code failed; stderr={}",
-                            if stderr_str.is_empty() {
-                                "(empty)"
-                            } else {
-                                stderr_str.trim()
-                            },
-                        );
+                    if no_stream_output {
+                        let (stderr_str, exit_code, error_str) = match &response {
+                            Ok(resp) => (
+                                String::from_utf8_lossy(&resp.stderr).to_string(),
+                                resp.exit_code,
+                                resp.error.clone().unwrap_or_default(),
+                            ),
+                            Err(e) => (format!("{}", e), -1, String::new()),
+                        };
+                        return Err(Error::Guest(format!(
+                            "claude-code returned no stream-json events (exit_code={}). stderr: {}. error: {}",
+                            exit_code,
+                            if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
+                            if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
+                        )));
                     }
-                }
 
-                // Check for empty stream output
-                let no_stream_output = state.session_id.is_empty()
-                    && state.model.is_empty()
-                    && state.result_text.is_empty()
-                    && state.tool_calls.is_empty()
-                    && state.input_tokens == 0
-                    && state.output_tokens == 0
-                    && !state.is_error;
+                    Ok(state)
+                } else {
+                    // Passthrough: non-Claude provider (e.g. Codex). PR 3 adds a typed
+                    // observer_kind() selector and a structured parser. For now, forward
+                    // stdout lines to tracing and accumulate into result_text.
+                    let mut stdout_accum: Vec<u8> = Vec::new();
+                    while let Some(chunk) = chunk_rx.recv().await {
+                        if chunk.stream != "stdout" {
+                            continue;
+                        }
+                        stdout_accum.extend_from_slice(&chunk.data);
+                        for line in String::from_utf8_lossy(&chunk.data).lines() {
+                            tracing::info!(target: "agent_stdout", "{}", line);
+                        }
+                    }
 
-                if no_stream_output {
-                    let (stderr_str, exit_code, error_str) = match &response {
-                        Ok(resp) => (
-                            String::from_utf8_lossy(&resp.stderr).to_string(),
-                            resp.exit_code,
-                            resp.error.clone().unwrap_or_default(),
-                        ),
-                        Err(e) => (format!("{}", e), -1, String::new()),
+                    let response = response_rx
+                        .await
+                        .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+
+                    let exit_code = match &response {
+                        Ok(resp) => resp.exit_code,
+                        Err(_) => -1,
                     };
-                    return Err(Error::Guest(format!(
-                        "claude-code returned no stream-json events (exit_code={}). stderr: {}. error: {}",
-                        exit_code,
-                        if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
-                        if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
-                    )));
-                }
 
-                Ok(state)
+                    Ok(AgentExecResult {
+                        result_text: String::from_utf8_lossy(&stdout_accum).into_owned(),
+                        is_error: exit_code != 0,
+                        ..Default::default()
+                    })
+                }
             }
             SandboxInner::Mock(mock) => {
                 // Mock: fall back to non-streaming, emit events from batch result
-                let output = mock.exec_with_stdin("claude-code", &args_refs, &[]).await?;
+                let output = mock
+                    .exec_with_stdin(provider.binary_name(), &args_refs, &[])
+                    .await?;
                 let result = crate::observe::claude::parse_stream_json(&output.stdout);
 
                 for tc in &result.tool_calls {
