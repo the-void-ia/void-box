@@ -83,6 +83,9 @@ if install_claude_code_binary; then
   fi
 fi
 
+# Codex CLI: install binary if CODEX_BIN is set (musl-static, no libs needed)
+install_codex_binary || true
+
 if [[ "$HOST_OS" == "Darwin" ]]; then
   ensure_busybox_macos
 fi
