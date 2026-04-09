@@ -59,10 +59,21 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   IS_CROSS_BUILD=true
 fi
 
-if [[ -z "$CODEX_BIN" && "$IS_CROSS_BUILD" == "false" ]]; then
+# PATH probe only runs when the user has NOT explicitly requested a specific
+# version via CODEX_VERSION. An explicit CODEX_VERSION should take priority
+# so the user always gets the requested build even if a stale/wrapper `codex`
+# happens to be on PATH (e.g. the npm package ships a Node.js launcher script
+# that is not a valid Linux ELF for the guest).
+if [[ -z "$CODEX_BIN" && -z "${CODEX_VERSION:-}" && "$IS_CROSS_BUILD" == "false" ]]; then
   LOCAL_CODEX="$(command -v codex 2>/dev/null || true)"
   if [[ -n "$LOCAL_CODEX" && -f "$LOCAL_CODEX" ]]; then
-    CODEX_BIN="$(readlink -f "$LOCAL_CODEX")"
+    # Only accept the PATH hit if it's a real ELF binary — skip npm wrapper
+    # scripts (codex.js) and other non-native launchers.
+    if file -L "$LOCAL_CODEX" 2>/dev/null | grep -q "ELF.*executable"; then
+      CODEX_BIN="$(readlink -f "$LOCAL_CODEX")"
+    else
+      echo "[codex-rootfs] PATH has a non-ELF codex ($LOCAL_CODEX) — skipping; set CODEX_VERSION to download a native build." >&2
+    fi
   fi
 fi
 
@@ -84,9 +95,17 @@ if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
       exit 1
     fi
     tar -xzf "$TMP_TAR" -C "$TMP_DIR"
-    EXTRACTED_BIN="$(find "$TMP_DIR" -name codex -type f | head -1)"
+    # The upstream openai/codex release tarball contains a single binary named
+    # after the target triple (e.g. codex-x86_64-unknown-linux-musl), not a
+    # plain "codex". Match any executable file that isn't the tarball itself
+    # or a signature/checksum artifact.
+    EXTRACTED_BIN="$(find "$TMP_DIR" -type f -executable \
+      ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
+      ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
+      ! -name '*.sha256' ! -name '*.txt' \
+      | head -1)"
     if [[ -z "$EXTRACTED_BIN" ]]; then
-      echo "ERROR: tarball did not contain a 'codex' binary" >&2
+      echo "ERROR: tarball did not contain an executable codex binary" >&2
       ls -laR "$TMP_DIR" >&2
       exit 1
     fi
