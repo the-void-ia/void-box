@@ -75,25 +75,25 @@ if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
 
   if [[ ! -f "$CACHED_BIN" ]]; then
     echo "[codex-rootfs] Downloading codex v${CODEX_VERSION} (${CODEX_TARGET})..."
-    TMP_TAR="$(mktemp --suffix=.tar.gz)"
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    TMP_TAR="$TMP_DIR/codex.tar.gz"
     if ! curl -fSL --progress-bar -o "$TMP_TAR" "$RELEASE_URL"; then
       echo "ERROR: Failed to download codex from $RELEASE_URL" >&2
       echo "  Check that version $CODEX_VERSION exists for $CODEX_TARGET." >&2
-      rm -f "$TMP_TAR"
       exit 1
     fi
-    TMP_EXTRACT="$(mktemp -d)"
-    tar -xzf "$TMP_TAR" -C "$TMP_EXTRACT"
-    EXTRACTED_BIN="$(find "$TMP_EXTRACT" -name codex -type f -executable | head -1)"
+    tar -xzf "$TMP_TAR" -C "$TMP_DIR"
+    EXTRACTED_BIN="$(find "$TMP_DIR" -name codex -type f | head -1)"
     if [[ -z "$EXTRACTED_BIN" ]]; then
-      echo "ERROR: tarball did not contain a 'codex' executable" >&2
-      ls -laR "$TMP_EXTRACT" >&2
-      rm -rf "$TMP_TAR" "$TMP_EXTRACT"
+      echo "ERROR: tarball did not contain a 'codex' binary" >&2
+      ls -laR "$TMP_DIR" >&2
       exit 1
     fi
     cp "$EXTRACTED_BIN" "$CACHED_BIN"
     chmod +x "$CACHED_BIN"
-    rm -rf "$TMP_TAR" "$TMP_EXTRACT"
+    trap - EXIT
+    rm -rf "$TMP_DIR"
   else
     echo "[codex-rootfs] Using cached download: $CACHED_BIN"
   fi
@@ -104,7 +104,7 @@ if [[ -z "$CODEX_BIN" || ! -f "$CODEX_BIN" ]]; then
   echo "ERROR: codex binary not found." >&2
   echo "" >&2
   echo "Options:" >&2
-  echo "  1. Install codex on your PATH (Linux host only)" >&2
+  echo "  1. Install codex on your PATH (Linux host only; macOS Mach-O binaries cannot run in the Linux guest)" >&2
   echo "  2. Set CODEX_BIN=/path/to/linux/codex (must be a Linux ELF binary)" >&2
   echo "  3. Set CODEX_VERSION=0.118.0 for automatic download" >&2
   exit 1
