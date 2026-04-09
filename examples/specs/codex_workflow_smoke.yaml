@@ -1,0 +1,29 @@
+api_version: v1
+kind: workflow
+name: codex_workflow_smoke
+
+# Smoke test: verify the bundled codex CLI binary is present, executable,
+# and allowlisted. Does not exercise the OpenAI API — `codex --version`
+# is a self-contained subcommand that prints the version and exits 0.
+#
+# Build the initramfs first:
+#   CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh
+#
+# Then run:
+#   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+#   VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+#   cargo run --bin voidbox -- run --file examples/specs/codex_workflow_smoke.yaml
+
+sandbox:
+  memory_mb: 1024
+  vcpus: 1
+  network: false
+
+workflow:
+  steps:
+    - name: codex_version
+      run:
+        program: codex
+        args: ["--version"]
+
+  output_step: codex_version
