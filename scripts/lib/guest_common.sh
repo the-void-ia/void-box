@@ -64,6 +64,21 @@ install_claude_code_binary() {
   return 1
 }
 
+# ── Codex CLI binary ──────────────────────────────────────────────────────────
+# Codex is musl-static (no glibc shipping needed). Idempotent: only installs
+# when CODEX_BIN env var is set, so default builds are unaffected.
+
+install_codex_binary() {
+  local bin="${CODEX_BIN:-}"
+  if [[ -n "$bin" && -f "$bin" ]]; then
+    echo "[void-box] Installing codex from \$CODEX_BIN at /usr/local/bin/codex..."
+    cp "$bin" "$OUT_DIR/usr/local/bin/codex"
+    chmod +x "$OUT_DIR/usr/local/bin/codex"
+    return 0
+  fi
+  return 1
+}
+
 # ── Shared-library copying (for dynamically linked ELF binaries on Linux) ─────
 
 copy_shared_libs() {
