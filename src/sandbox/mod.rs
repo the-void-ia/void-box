@@ -554,34 +554,27 @@ impl Sandbox {
                         }
                     }
 
-                    let response = response_rx
-                        .await
-                        .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+                    let response = response_rx.await.map_err(|_| {
+                        Error::Guest("Failed to receive passthrough streaming response".into())
+                    })??;
 
-                    let exit_code = match &response {
-                        Ok(resp) => resp.exit_code,
-                        Err(_) => -1,
-                    };
-
-                    if exit_code != 0 {
-                        if let Ok(ref resp) = response {
-                            let stderr_str = String::from_utf8_lossy(&resp.stderr);
-                            tracing::warn!(
-                                exit_code = exit_code,
-                                "{} failed; stderr={}",
-                                provider.binary_name(),
-                                if stderr_str.is_empty() {
-                                    "(empty)"
-                                } else {
-                                    stderr_str.trim()
-                                },
-                            );
-                        }
+                    if response.exit_code != 0 {
+                        let stderr_str = String::from_utf8_lossy(&response.stderr);
+                        tracing::warn!(
+                            exit_code = response.exit_code,
+                            "{} failed; stderr={}",
+                            provider.binary_name(),
+                            if stderr_str.is_empty() {
+                                "(empty)"
+                            } else {
+                                stderr_str.trim()
+                            },
+                        );
                     }
 
                     Ok(AgentExecResult {
                         result_text: String::from_utf8_lossy(&stdout_accum).into_owned(),
-                        is_error: exit_code != 0,
+                        is_error: response.exit_code != 0,
                         ..Default::default()
                     })
                 }

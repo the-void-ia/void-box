@@ -661,6 +661,25 @@ impl VoidBox {
             }
         }
 
+        // Warn when a non-Claude provider is combined with MCP skills (PR 4 adds config.toml discovery)
+        if !self.config.llm.supports_claude_settings() {
+            let has_mcp = self.skills.iter().any(|s| match &s.kind {
+                SkillKind::Mcp { .. } => true,
+                SkillKind::Cli { .. }
+                | SkillKind::Agent { .. }
+                | SkillKind::Remote { .. }
+                | SkillKind::File { .. }
+                | SkillKind::Oci { .. }
+                | SkillKind::Inline { .. } => false,
+            });
+            if has_mcp {
+                tracing::warn!(
+                    "Provider {} does not yet support MCP skill discovery — the void-mcp server is still provisioned inside the guest, but the agent won't be told where to find it. Codex MCP config.toml support is planned for PR 4.",
+                    self.config.llm.binary_name(),
+                );
+            }
+        }
+
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
 
@@ -809,6 +828,25 @@ impl VoidBox {
             }
             Err(e) => {
                 eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
+            }
+        }
+
+        // Warn when a non-Claude provider is combined with MCP skills (PR 4 adds config.toml discovery)
+        if !self.config.llm.supports_claude_settings() {
+            let has_mcp = self.skills.iter().any(|s| match &s.kind {
+                SkillKind::Mcp { .. } => true,
+                SkillKind::Cli { .. }
+                | SkillKind::Agent { .. }
+                | SkillKind::Remote { .. }
+                | SkillKind::File { .. }
+                | SkillKind::Oci { .. }
+                | SkillKind::Inline { .. } => false,
+            });
+            if has_mcp {
+                tracing::warn!(
+                    "Provider {} does not yet support MCP skill discovery — the void-mcp server is still provisioned inside the guest, but the agent won't be told where to find it. Codex MCP config.toml support is planned for PR 4.",
+                    self.config.llm.binary_name(),
+                );
             }
         }
 
