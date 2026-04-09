@@ -31,6 +31,15 @@ pub mod local;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Tracing target for raw agent stdout lines forwarded during passthrough
+/// observer dispatch. Non-Claude providers (Codex, pi, …) route stdout
+/// through this target until PR 3 adds structured parsers.
+const AGENT_STDOUT_TARGET: &str = "agent_stdout";
+
+/// Shared with `crate::llm::CLAUDE_CODE_BINARY`. Kept duplicated (not
+/// re-exported) to avoid widening the llm module's pub(crate) surface.
+const CLAUDE_CODE_BINARY: &str = "claude-code";
+
 pub use local::LocalSandbox;
 
 use crate::backend::GuestConsoleSink;
@@ -285,7 +294,7 @@ impl Sandbox {
         opts: crate::observe::claude::AgentExecOpts,
     ) -> Result<crate::observe::claude::AgentExecResult> {
         if let SandboxInner::Local(local) = &self.inner {
-            if provider.binary_name() == "claude-code" {
+            if provider.binary_name() == CLAUDE_CODE_BINARY {
                 self.verify_claude_code_compat(local, &opts.env).await?;
             }
         }
@@ -355,7 +364,7 @@ impl Sandbox {
         // For claude-code: parse stream-json output even on non-zero exit codes.
         // claude-code exits 1 when the task fails but still produces valid stream-json.
         // For other providers: forward raw stdout as result_text.
-        let result = if provider.binary_name() == "claude-code" {
+        let result = if provider.binary_name() == CLAUDE_CODE_BINARY {
             crate::observe::claude::parse_stream_json(&output.stdout)
         } else {
             crate::observe::claude::AgentExecResult {
@@ -373,7 +382,7 @@ impl Sandbox {
             && result.output_tokens == 0
             && !result.is_error;
 
-        if provider.binary_name() == "claude-code" && no_stream_output {
+        if provider.binary_name() == CLAUDE_CODE_BINARY && no_stream_output {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let stdout_preview = if stdout_str.len() > 500 {
@@ -422,7 +431,7 @@ impl Sandbox {
         use std::collections::HashMap;
 
         if let SandboxInner::Local(local) = &self.inner {
-            if provider.binary_name() == "claude-code" {
+            if provider.binary_name() == CLAUDE_CODE_BINARY {
                 self.verify_claude_code_compat(local, &opts.env).await?;
             }
         }
@@ -442,7 +451,7 @@ impl Sandbox {
                     )
                     .await?;
 
-                if provider.binary_name() == "claude-code" {
+                if provider.binary_name() == CLAUDE_CODE_BINARY {
                     let mut state = AgentExecResult {
                         result_text: String::new(),
                         model: String::new(),
@@ -534,9 +543,6 @@ impl Sandbox {
 
                     Ok(state)
                 } else {
-                    // Passthrough: non-Claude provider (e.g. Codex). PR 3 adds a typed
-                    // observer_kind() selector and a structured parser. For now, forward
-                    // stdout lines to tracing and accumulate into result_text.
                     let mut stdout_accum: Vec<u8> = Vec::new();
                     while let Some(chunk) = chunk_rx.recv().await {
                         if chunk.stream != "stdout" {
@@ -544,7 +550,7 @@ impl Sandbox {
                         }
                         stdout_accum.extend_from_slice(&chunk.data);
                         for line in String::from_utf8_lossy(&chunk.data).lines() {
-                            tracing::info!(target: "agent_stdout", "{}", line);
+                            tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line);
                         }
                     }
 
@@ -556,6 +562,22 @@ impl Sandbox {
                         Ok(resp) => resp.exit_code,
                         Err(_) => -1,
                     };
+
+                    if exit_code != 0 {
+                        if let Ok(ref resp) = response {
+                            let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                            tracing::warn!(
+                                exit_code = exit_code,
+                                "{} failed; stderr={}",
+                                provider.binary_name(),
+                                if stderr_str.is_empty() {
+                                    "(empty)"
+                                } else {
+                                    stderr_str.trim()
+                                },
+                            );
+                        }
+                    }
 
                     Ok(AgentExecResult {
                         result_text: String::from_utf8_lossy(&stdout_accum).into_owned(),
