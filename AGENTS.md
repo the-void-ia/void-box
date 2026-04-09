@@ -1069,17 +1069,15 @@ If the environment lacks usable KVM/vsock or outbound network, VM suites should 
 - Does not require bundling production Claude runtime.
 - Preferred for general development and most integration tests.
 
-`scripts/build_claude_rootfs.sh`:
+@docs/agents/claude.md
 
-- Production Claude-capable rootfs/initramfs.
-- Includes native `claude-code`, CA certs, and sandbox user.
-- Use when validating production-like Claude execution paths.
-- Required for OpenClaw Telegram gateway example runs.
+@docs/agents/codex.md
 
 Recommended default:
 
 - Use `build_guest_image.sh` for broad test cycles.
-- Use `build_claude_rootfs.sh` for production gateway/runtime validation.
+- Use `build_claude_rootfs.sh` for production Claude gateway/runtime validation.
+- Use `build_codex_rootfs.sh` for Codex CLI workflows.
 
 ## VM memory sizing
 
