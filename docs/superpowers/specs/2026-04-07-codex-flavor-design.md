@@ -166,7 +166,7 @@ is needed; the dynamic-link path in `guest_linux.sh` stays claude-only.
 - Re-run `build_claude_rootfs.sh` to confirm the refactor didn't change
   the output. Diff the file list of the produced cpio against
   pre-refactor (`gzip -dc … | cpio -t | sort`).
-- `e2e_claude_mcp` still passes (closest existing gate for the claude
+- `e2e_agent_mcp` still passes (closest existing gate for the claude
   path).
 
 ### PR 2 — `LlmProvider::Codex` + provider-aware exec (rename to AgentExec*)
@@ -252,7 +252,7 @@ self-contained.
   Claude tests.
 - New unit test in `src/spec.rs`: deserializing
   `llm:\n  provider: codex` produces `LlmProvider::Codex`.
-- `e2e_claude_mcp` still passes — the rename touches every call site
+- `e2e_agent_mcp` still passes — the rename touches every call site
   and this is the most important regression gate.
 - Manual smoke: `examples/specs/codex_smoke.yaml` runs end-to-end on
   Linux/KVM with `OPENAI_API_KEY` set. Output file contains a

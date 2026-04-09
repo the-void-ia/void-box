@@ -11,7 +11,7 @@
 //!   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
 //!   VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 //!   ANTHROPIC_API_KEY=sk-... \
-//!   cargo test --test e2e_claude_mcp -- --ignored --test-threads=1 --nocapture
+//!   cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
 
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;

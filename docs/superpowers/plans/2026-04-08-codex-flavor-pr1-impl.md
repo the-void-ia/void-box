@@ -182,7 +182,7 @@ diff /tmp/cpio.before /tmp/cpio.after
 
 Expected: empty diff. If the diff is non-empty, the refactor changed something — investigate before proceeding.
 
-**Note for the implementer:** if `scripts/build_claude_rootfs.sh` cannot be run in your environment (e.g. no `claude` binary available, no internet for download), skip Step 3 and rely on Task 1's commit landing on a branch that CI runs `e2e_claude_mcp` against. Document the skip in the commit message.
+**Note for the implementer:** if `scripts/build_claude_rootfs.sh` cannot be run in your environment (e.g. no `claude` binary available, no internet for download), skip Step 3 and rely on Task 1's commit landing on a branch that CI runs `e2e_agent_mcp` against. Document the skip in the commit message.
 
 - [ ] **Step 4: Commit Task 1**
 
@@ -749,14 +749,14 @@ gzip -dc target/void-box-rootfs.cpio.gz | cpio -t 2>/dev/null | sort > /tmp/cpio
 # Compare against the saved baseline if available, or manually inspect.
 ```
 
-- [ ] **Step 3: `e2e_claude_mcp` integration test**
+- [ ] **Step 3: `e2e_agent_mcp` integration test**
 
 If your environment supports it (Linux/KVM, ANTHROPIC_API_KEY available):
 ```bash
 scripts/build_test_image.sh
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
 export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
-ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 Expected: passes. This is the gate that catches any accidental claude regression from the shared-lib refactor in Task 1.
 

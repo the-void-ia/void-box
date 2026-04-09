@@ -663,7 +663,7 @@ cargo test --test e2e_mount -- --ignored --test-threads=1
 # Service mode + sidecar + MCP e2e suites:
 cargo test --test e2e_service_mode -- --ignored --test-threads=1
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
-ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
 ### Test initramfs and BusyBox
@@ -781,7 +781,7 @@ cargo test --test e2e_mount -- --ignored --test-threads=1
 # Service mode + sidecar + MCP e2e suites (Linux-only):
 cargo test --test e2e_service_mode -- --ignored --test-threads=1
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
-ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -801,7 +801,7 @@ cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=
 ```
 
 `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
-`e2e_claude_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
+`e2e_agent_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
 to run on macOS.
 
 ### Interactive PTY / shell validation
@@ -1053,9 +1053,11 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
   daemon service lifecycle, or `ServiceStageHandle`.
 - `e2e_sidecar`: sidecar intent flow — submit, inbox polling, context identity,
   idempotency. **Must pass** for changes to sidecar state, types, or server.
-- `e2e_claude_mcp`: end-to-end Claude Code with void-mcp tools inside a real VM.
-  Requires `ANTHROPIC_API_KEY`. **Must pass** for changes to void-mcp tools or
-  MCP provisioning.
+- `e2e_agent_mcp`: end-to-end agent (currently Claude Code) with void-mcp
+  tools inside a real VM. void-mcp itself is agent-agnostic; the test
+  uses Claude as the consumer because it's the only LlmProvider wired to
+  consume MCP today. Requires `ANTHROPIC_API_KEY`. **Must pass** for
+  changes to void-mcp tools or MCP provisioning.
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 
