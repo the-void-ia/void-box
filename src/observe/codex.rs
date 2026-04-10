@@ -66,8 +66,14 @@ pub fn parse_codex_line(line: &str, result: &mut AgentExecResult) {
             tracing::warn!(message = %message, "codex emitted recoverable error event");
         }
         CodexEvent::TurnFailed { error } => {
+            // turn.failed is terminal — overwrite any partial agent_message
+            // text so the user sees the actual failure cause, not stale
+            // mid-turn reasoning.
             result.is_error = true;
             result.result_text = error.message;
+        }
+        CodexEvent::Unknown => {
+            tracing::debug!("codex parser: unknown top-level event type, skipping");
         }
     }
 }
@@ -122,20 +128,10 @@ fn apply_item_completed(item: &serde_json::Value, result: &mut AgentExecResult) 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let exit_code = item.get("exit_code").and_then(|v| v.as_i64());
-            let status = item
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             result.tool_calls.push(ClaudeToolCall {
                 tool_name: "command_execution".to_string(),
                 tool_use_id: id,
-                input: serde_json::json!({
-                    "command": command,
-                    "exit_code": exit_code,
-                    "status": status,
-                }),
+                input: serde_json::json!({ "command": command }),
                 output: Some(aggregated_output),
             });
         }
@@ -161,6 +157,8 @@ enum CodexEvent {
 
     #[serde(rename = "item.started")]
     ItemStarted {
+        // Field is required for serde to match the JSON shape, but the
+        // parser only commits state on item.completed.
         #[allow(dead_code)]
         item: serde_json::Value,
     },
@@ -176,11 +174,20 @@ enum CodexEvent {
 
     #[serde(rename = "turn.failed")]
     TurnFailed { error: CodexErrorPayload },
+
+    /// Forward-compatible fallback for unknown top-level event types.
+    /// Matches the graceful-degradation behavior of `apply_item_completed`
+    /// so future codex CLI versions don't break this parser.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
 struct CodexUsage {
     input_tokens: u64,
+    // Reported by codex but not tracked separately in AgentExecResult
+    // today. Leaving the field present so deserialization is forward-
+    // compatible with codex versions that always emit it.
     #[serde(default)]
     #[allow(dead_code)]
     cached_input_tokens: u64,
@@ -288,8 +295,21 @@ mod tests {
     fn malformed_json_is_skipped() {
         let mut result = AgentExecResult::default();
         parse_codex_line("not json at all", &mut result);
-        parse_codex_line(r#"{"type":"unknown_event"}"#, &mut result);
+        parse_codex_line("{ not valid json", &mut result);
         assert_eq!(result.session_id, "");
+    }
+
+    #[test]
+    fn unknown_top_level_event_type_is_skipped() {
+        let mut result = AgentExecResult::default();
+        parse_codex_line(
+            r#"{"type":"some_future_event","data":{"x":1}}"#,
+            &mut result,
+        );
+        assert_eq!(result.session_id, "");
+        assert_eq!(result.result_text, "");
+        assert_eq!(result.tool_calls.len(), 0);
+        assert!(!result.is_error);
     }
 
     #[test]
@@ -315,5 +335,13 @@ mod tests {
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].tool_name, "command_execution");
         assert_eq!(result.tool_calls[0].output.as_deref(), Some("total 0\n"));
+        // input should contain only the command, not exit_code/status
+        let input = &result.tool_calls[0].input;
+        assert_eq!(
+            input.get("command").and_then(|v| v.as_str()),
+            Some("ls -la")
+        );
+        assert!(input.get("exit_code").is_none());
+        assert!(input.get("status").is_none());
     }
 }
