@@ -3,13 +3,20 @@
 //! This test uses a real Anthropic API key to verify that Claude Code
 //! discovers and uses void-mcp tools inside the VM. It requires:
 //!
-//! 1. Real kernel + initramfs with void-mcp binary
+//! 1. Real kernel + initramfs with the **production** claude-code binary
+//!    (NOT the claudio mock from `scripts/build_test_image.sh` — claudio
+//!    fakes tool calls without actually invoking the void-mcp HTTP server,
+//!    so the sidecar receives zero intents and the test's
+//!    `assert!(!drained.is_empty())` always fails). Build the right
+//!    initramfs with `scripts/build_claude_rootfs.sh` (writes to
+//!    `target/void-box-rootfs.cpio.gz`).
 //! 2. ANTHROPIC_API_KEY environment variable set
 //! 3. Network access to api.anthropic.com from the host
 //!
 //! Run with:
+//!   scripts/build_claude_rootfs.sh
 //!   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!   VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
+//!   VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
 //!   ANTHROPIC_API_KEY=sk-... \
 //!   cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
 
