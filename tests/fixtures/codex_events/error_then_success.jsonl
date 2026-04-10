@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"test-error-recovery"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (We're currently experiencing high demand, which may cause temporary errors.)"}
+{"type":"error","message":"Reconnecting... 2/5"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Recovered after retries."}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}

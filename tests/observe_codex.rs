@@ -40,3 +40,44 @@ fn parses_hello_world_fixture() {
     // No errors.
     assert!(!result.is_error);
 }
+
+#[test]
+fn parses_error_then_success_fixture() {
+    let raw = std::fs::read_to_string("tests/fixtures/codex_events/error_then_success.jsonl")
+        .expect("fixture must exist — see PR 3 plan Task 4");
+
+    let mut result = AgentExecResult::default();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        parse_codex_line(line, &mut result);
+    }
+
+    // Recoverable error events are warnings, not failures
+    assert!(!result.is_error);
+    assert_eq!(result.session_id, "test-error-recovery");
+    assert_eq!(result.result_text, "Recovered after retries.");
+    assert_eq!(result.input_tokens, 100);
+    assert_eq!(result.output_tokens, 50);
+    // No tool calls — only an agent_message
+    assert!(result.tool_calls.is_empty());
+}
+
+#[test]
+fn turn_failed_overrides_result_text() {
+    let raw = r#"
+{"type":"thread.started","thread_id":"test-fail"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"intermediate"}}
+{"type":"turn.failed","error":{"message":"401 Unauthorized: Missing bearer"}}
+"#;
+    let mut result = AgentExecResult::default();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        parse_codex_line(line, &mut result);
+    }
+    assert!(result.is_error);
+    assert_eq!(result.result_text, "401 Unauthorized: Missing bearer");
+}

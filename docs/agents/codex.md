@@ -12,10 +12,8 @@ Production OpenAI-Codex-capable rootfs/initramfs.
 
 - `kind: workflow` specs that exec `codex` as a workflow step.
 - `kind: agent` specs with `llm.provider: codex`. Requires
-  `OPENAI_API_KEY` in the host environment. Streaming output is
-  passthrough in PR 2; structured tool-call and token accounting is
-  added by PR 3 (see
-  `docs/superpowers/specs/2026-04-07-codex-flavor-design.md`).
+  `OPENAI_API_KEY` in the host environment or a valid `~/.codex/auth.json`
+  (see Auth section below).
 
 ## Discovery
 
@@ -80,3 +78,20 @@ Two smoke specs exercise different entry points:
   `~/.codex/auth.json` exists for void-box to mount) or a working
   `OPENAI_API_KEY`. Verifies the full exec path through
   `LlmProvider::Codex`.
+
+## Streaming output
+
+Codex's `exec --json` event stream is parsed by
+`src/observe/codex.rs::parse_codex_line` and populates the same
+`AgentExecResult` struct that the Claude parser produces. The summary
+line emitted by `agent_box.rs` reports real token counts, tool calls,
+and the final agent message — for example:
+
+```
+[vm:my-spec] Agent finished | tokens=22578in/251out | tools=1 | cost=$0.0000 | error=false
+```
+
+Tool call tracking covers `file_change` (file edits) and
+`command_execution` (shell commands codex runs in the guest).
+Unknown item types are recorded as generic tool calls so future codex
+event types don't break the parser.
