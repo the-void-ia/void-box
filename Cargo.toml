@@ -160,6 +160,10 @@ path = "tests/e2e/service_mode.rs"
 name = "oci_integration"
 path = "tests/oci_integration.rs"
 
+[[test]]
+name = "observe_codex"
+path = "tests/observe_codex.rs"
+
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]
 
