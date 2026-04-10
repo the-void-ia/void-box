@@ -36,10 +36,6 @@ use std::sync::Arc;
 /// through this target until PR 3 adds structured parsers.
 const AGENT_STDOUT_TARGET: &str = "agent_stdout";
 
-/// Shared with `crate::llm::CLAUDE_CODE_BINARY`. Kept duplicated (not
-/// re-exported) to avoid widening the llm module's pub(crate) surface.
-const CLAUDE_CODE_BINARY: &str = "claude-code";
-
 pub use local::LocalSandbox;
 
 use crate::backend::GuestConsoleSink;
@@ -294,7 +290,7 @@ impl Sandbox {
         opts: crate::observe::claude::AgentExecOpts,
     ) -> Result<crate::observe::claude::AgentExecResult> {
         if let SandboxInner::Local(local) = &self.inner {
-            if provider.binary_name() == CLAUDE_CODE_BINARY {
+            if provider.observer_kind() == crate::llm::ObserverKind::ClaudeStreamJson {
                 self.verify_claude_code_compat(local, &opts.env).await?;
             }
         }
@@ -361,16 +357,24 @@ impl Sandbox {
             }
         }
 
-        // For claude-code: parse stream-json output even on non-zero exit codes.
+        // Dispatch to the provider-appropriate stdout parser.
+        // ClaudeStreamJson: parse stream-json output even on non-zero exit codes —
         // claude-code exits 1 when the task fails but still produces valid stream-json.
-        // For other providers: forward raw stdout as result_text.
-        let result = if provider.binary_name() == CLAUDE_CODE_BINARY {
-            crate::observe::claude::parse_stream_json(&output.stdout)
-        } else {
-            crate::observe::claude::AgentExecResult {
-                result_text: String::from_utf8_lossy(&output.stdout).into_owned(),
-                is_error: output.exit_code != 0,
-                ..Default::default()
+        // Codex: parse codex JSONL events; fall back to is_error on non-zero exit.
+        let result = match provider.observer_kind() {
+            crate::llm::ObserverKind::ClaudeStreamJson => {
+                crate::observe::claude::parse_stream_json(&output.stdout)
+            }
+            crate::llm::ObserverKind::Codex => {
+                let stdout_text = String::from_utf8_lossy(&output.stdout);
+                let mut result = crate::observe::claude::AgentExecResult::default();
+                for line in stdout_text.lines() {
+                    crate::observe::codex::parse_codex_line(line, &mut result);
+                }
+                if output.exit_code != 0 && !result.is_error {
+                    result.is_error = true;
+                }
+                result
             }
         };
 
@@ -382,7 +386,9 @@ impl Sandbox {
             && result.output_tokens == 0
             && !result.is_error;
 
-        if provider.binary_name() == CLAUDE_CODE_BINARY && no_stream_output {
+        if provider.observer_kind() == crate::llm::ObserverKind::ClaudeStreamJson
+            && no_stream_output
+        {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let stdout_preview = if stdout_str.len() > 500 {
@@ -431,7 +437,7 @@ impl Sandbox {
         use std::collections::HashMap;
 
         if let SandboxInner::Local(local) = &self.inner {
-            if provider.binary_name() == CLAUDE_CODE_BINARY {
+            if provider.observer_kind() == crate::llm::ObserverKind::ClaudeStreamJson {
                 self.verify_claude_code_compat(local, &opts.env).await?;
             }
         }
@@ -451,132 +457,133 @@ impl Sandbox {
                     )
                     .await?;
 
-                if provider.binary_name() == CLAUDE_CODE_BINARY {
-                    let mut state = AgentExecResult {
-                        result_text: String::new(),
-                        model: String::new(),
-                        session_id: String::new(),
-                        total_cost_usd: 0.0,
-                        duration_ms: 0,
-                        duration_api_ms: 0,
-                        num_turns: 0,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        is_error: false,
-                        error: None,
-                        tool_calls: Vec::new(),
-                    };
-                    let mut tool_id_map: HashMap<String, usize> = HashMap::new();
-                    let mut line_buf = String::new();
+                match provider.observer_kind() {
+                    crate::llm::ObserverKind::ClaudeStreamJson => {
+                        let mut state = AgentExecResult {
+                            result_text: String::new(),
+                            model: String::new(),
+                            session_id: String::new(),
+                            total_cost_usd: 0.0,
+                            duration_ms: 0,
+                            duration_api_ms: 0,
+                            num_turns: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            is_error: false,
+                            error: None,
+                            tool_calls: Vec::new(),
+                        };
+                        let mut tool_id_map: HashMap<String, usize> = HashMap::new();
+                        let mut line_buf = String::new();
 
-                    // Process stdout chunks as they arrive
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        if chunk.stream != "stdout" {
-                            continue;
+                        // Process stdout chunks as they arrive
+                        while let Some(chunk) = chunk_rx.recv().await {
+                            if chunk.stream != "stdout" {
+                                continue;
+                            }
+
+                            let text = String::from_utf8_lossy(&chunk.data);
+                            line_buf.push_str(&text);
+
+                            // Process all complete lines in the buffer
+                            while let Some(newline_pos) = line_buf.find('\n') {
+                                let line: String = line_buf.drain(..=newline_pos).collect();
+                                for event in parse_jsonl_line(&line, &mut state, &mut tool_id_map) {
+                                    on_event(event);
+                                }
+                            }
                         }
 
-                        let text = String::from_utf8_lossy(&chunk.data);
-                        line_buf.push_str(&text);
-
-                        // Process all complete lines in the buffer
-                        while let Some(newline_pos) = line_buf.find('\n') {
-                            let line: String = line_buf.drain(..=newline_pos).collect();
-                            for event in parse_jsonl_line(&line, &mut state, &mut tool_id_map) {
+                        // Process any remaining partial line
+                        if !line_buf.trim().is_empty() {
+                            for event in parse_jsonl_line(&line_buf, &mut state, &mut tool_id_map) {
                                 on_event(event);
                             }
                         }
-                    }
 
-                    // Process any remaining partial line
-                    if !line_buf.trim().is_empty() {
-                        for event in parse_jsonl_line(&line_buf, &mut state, &mut tool_id_map) {
-                            on_event(event);
+                        // Wait for the final response (for exit code / error info)
+                        let response = response_rx.await.map_err(|_| {
+                            Error::Guest("Failed to receive streaming response".into())
+                        })?;
+
+                        // Log raw output on failure
+                        if let Ok(ref resp) = response {
+                            if resp.exit_code != 0 {
+                                let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                                tracing::warn!(
+                                    exit_code = resp.exit_code,
+                                    "claude-code failed; stderr={}",
+                                    if stderr_str.is_empty() {
+                                        "(empty)"
+                                    } else {
+                                        stderr_str.trim()
+                                    },
+                                );
+                            }
                         }
+
+                        // Check for empty stream output
+                        let no_stream_output = state.session_id.is_empty()
+                            && state.model.is_empty()
+                            && state.result_text.is_empty()
+                            && state.tool_calls.is_empty()
+                            && state.input_tokens == 0
+                            && state.output_tokens == 0
+                            && !state.is_error;
+
+                        if no_stream_output {
+                            let (stderr_str, exit_code, error_str) = match &response {
+                                Ok(resp) => (
+                                    String::from_utf8_lossy(&resp.stderr).to_string(),
+                                    resp.exit_code,
+                                    resp.error.clone().unwrap_or_default(),
+                                ),
+                                Err(e) => (format!("{}", e), -1, String::new()),
+                            };
+                            return Err(Error::Guest(format!(
+                            "claude-code returned no stream-json events (exit_code={}). stderr: {}. error: {}",
+                            exit_code,
+                            if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
+                            if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
+                        )));
+                        }
+
+                        Ok(state)
                     }
+                    crate::llm::ObserverKind::Codex => {
+                        let mut result = AgentExecResult::default();
+                        while let Some(chunk) = chunk_rx.recv().await {
+                            if chunk.stream == "stdout" {
+                                for line in String::from_utf8_lossy(&chunk.data).lines() {
+                                    tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line);
+                                    crate::observe::codex::parse_codex_line(line, &mut result);
+                                }
+                            }
+                        }
 
-                    // Wait for the final response (for exit code / error info)
-                    let response = response_rx
-                        .await
-                        .map_err(|_| Error::Guest("Failed to receive streaming response".into()))?;
+                        let response = response_rx.await.map_err(|_| {
+                            Error::Guest("Failed to receive codex streaming response".into())
+                        })??;
 
-                    // Log raw output on failure
-                    if let Ok(ref resp) = response {
-                        if resp.exit_code != 0 {
-                            let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                        if response.exit_code != 0 {
+                            let stderr_str = String::from_utf8_lossy(&response.stderr);
                             tracing::warn!(
-                                exit_code = resp.exit_code,
-                                "claude-code failed; stderr={}",
+                                exit_code = response.exit_code,
+                                "{} failed; stderr={}",
+                                provider.binary_name(),
                                 if stderr_str.is_empty() {
                                     "(empty)"
                                 } else {
                                     stderr_str.trim()
                                 },
                             );
+                            if !result.is_error {
+                                result.is_error = true;
+                            }
                         }
+
+                        Ok(result)
                     }
-
-                    // Check for empty stream output
-                    let no_stream_output = state.session_id.is_empty()
-                        && state.model.is_empty()
-                        && state.result_text.is_empty()
-                        && state.tool_calls.is_empty()
-                        && state.input_tokens == 0
-                        && state.output_tokens == 0
-                        && !state.is_error;
-
-                    if no_stream_output {
-                        let (stderr_str, exit_code, error_str) = match &response {
-                            Ok(resp) => (
-                                String::from_utf8_lossy(&resp.stderr).to_string(),
-                                resp.exit_code,
-                                resp.error.clone().unwrap_or_default(),
-                            ),
-                            Err(e) => (format!("{}", e), -1, String::new()),
-                        };
-                        return Err(Error::Guest(format!(
-                            "claude-code returned no stream-json events (exit_code={}). stderr: {}. error: {}",
-                            exit_code,
-                            if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
-                            if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
-                        )));
-                    }
-
-                    Ok(state)
-                } else {
-                    let mut stdout_accum: Vec<u8> = Vec::new();
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        if chunk.stream != "stdout" {
-                            continue;
-                        }
-                        stdout_accum.extend_from_slice(&chunk.data);
-                        for line in String::from_utf8_lossy(&chunk.data).lines() {
-                            tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line);
-                        }
-                    }
-
-                    let response = response_rx.await.map_err(|_| {
-                        Error::Guest("Failed to receive passthrough streaming response".into())
-                    })??;
-
-                    if response.exit_code != 0 {
-                        let stderr_str = String::from_utf8_lossy(&response.stderr);
-                        tracing::warn!(
-                            exit_code = response.exit_code,
-                            "{} failed; stderr={}",
-                            provider.binary_name(),
-                            if stderr_str.is_empty() {
-                                "(empty)"
-                            } else {
-                                stderr_str.trim()
-                            },
-                        );
-                    }
-
-                    Ok(AgentExecResult {
-                        result_text: String::from_utf8_lossy(&stdout_accum).into_owned(),
-                        is_error: response.exit_code != 0,
-                        ..Default::default()
-                    })
                 }
             }
             SandboxInner::Mock(mock) => {

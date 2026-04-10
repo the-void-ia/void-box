@@ -119,6 +119,21 @@ pub enum LlmProvider {
     Codex,
 }
 
+/// Stream observer dispatcher for [`Sandbox::exec_agent_streaming`].
+///
+/// Each provider tells the sandbox which parser to use for its agent's
+/// stdout. The sandbox dispatches to the matching `parse_*_line` function
+/// from the appropriate `observe::*` module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverKind {
+    /// Claude Code's `--output-format stream-json` JSONL events.
+    /// Parsed by `crate::observe::claude::parse_jsonl_line`.
+    ClaudeStreamJson,
+    /// Codex's `exec --json` JSONL events.
+    /// Parsed by `crate::observe::codex::parse_codex_line`.
+    Codex,
+}
+
 impl LlmProvider {
     // -- Constructors --
 
@@ -223,6 +238,21 @@ impl LlmProvider {
             LlmProvider::LmStudio { .. } => CLAUDE_CODE_BINARY,
             LlmProvider::Custom { .. } => CLAUDE_CODE_BINARY,
             LlmProvider::Codex => "codex",
+        }
+    }
+
+    /// Stream observer to use for this provider's agent stdout.
+    ///
+    /// Drives dispatch in [`Sandbox::exec_agent_streaming`]: each
+    /// [`ObserverKind`] maps to a different `parse_*_line` function.
+    pub fn observer_kind(&self) -> ObserverKind {
+        match self {
+            LlmProvider::Claude
+            | LlmProvider::ClaudePersonal
+            | LlmProvider::Ollama { .. }
+            | LlmProvider::LmStudio { .. }
+            | LlmProvider::Custom { .. } => ObserverKind::ClaudeStreamJson,
+            LlmProvider::Codex => ObserverKind::Codex,
         }
     }
 
@@ -704,6 +734,35 @@ mod tests {
             "OPENAI_API_KEY should be absent when not set on host"
         );
         assert!(present_ok, "OPENAI_API_KEY should be forwarded when set");
+    }
+
+    #[test]
+    fn test_codex_observer_kind() {
+        assert_eq!(LlmProvider::Codex.observer_kind(), ObserverKind::Codex);
+    }
+
+    #[test]
+    fn test_claude_shaped_observer_kinds() {
+        assert_eq!(
+            LlmProvider::Claude.observer_kind(),
+            ObserverKind::ClaudeStreamJson
+        );
+        assert_eq!(
+            LlmProvider::ClaudePersonal.observer_kind(),
+            ObserverKind::ClaudeStreamJson
+        );
+        assert_eq!(
+            LlmProvider::ollama("test-model").observer_kind(),
+            ObserverKind::ClaudeStreamJson
+        );
+        assert_eq!(
+            LlmProvider::lm_studio("test-model").observer_kind(),
+            ObserverKind::ClaudeStreamJson
+        );
+        assert_eq!(
+            LlmProvider::custom("http://localhost:1234").observer_kind(),
+            ObserverKind::ClaudeStreamJson
+        );
     }
 
     #[test]
