@@ -1,9 +1,17 @@
-//! OAuth credential discovery and staging for the `claude-personal` provider.
+//! OAuth credential discovery and staging for personal-auth providers.
 //!
-//! This module locates Claude personal-plan OAuth credentials on the host
-//! (macOS Keychain or Linux filesystem), stages them into a secure temp
-//! directory, and exposes the host path so the runtime can mount them into
-//! the guest VM at `/home/sandbox/.claude`.
+//! This module locates per-agent credentials on the host (macOS Keychain or
+//! Linux filesystem), stages them into a secure temp directory, and exposes
+//! the host path so the runtime can mount them into the guest VM at the
+//! agent's expected `$HOME` config directory.
+//!
+//! - **Claude personal**: `~/.claude/.credentials.json` (Linux) or macOS
+//!   Keychain `Claude Code-credentials` entry. Mounted into the guest at
+//!   `/home/sandbox/.claude`.
+//! - **Codex**: `~/.codex/auth.json` (both Linux and macOS — codex stores
+//!   plain JSON, no Keychain integration). Mounted into the guest at
+//!   `/home/sandbox/.codex`. Supports both `auth_mode: "chatgpt"` (cached
+//!   OAuth bearer from `codex login`) and `auth_mode: "api_key"`.
 //!
 //! Cleanup is automatic: [`StagedCredentials`] wraps a [`tempfile::TempDir`]
 //! whose `Drop` impl removes the directory when the value goes out of scope.
@@ -137,6 +145,78 @@ pub fn stage_credentials(creds_json: &str) -> Result<StagedCredentials> {
 }
 
 // ---------------------------------------------------------------------------
+// Codex credentials
+// ---------------------------------------------------------------------------
+
+/// Discover Codex credentials from the host.
+///
+/// Codex stores credentials as plain JSON at `~/.codex/auth.json` on both
+/// Linux and macOS — there is no Keychain integration. The file contains
+/// the OAuth tokens (when authenticated via `codex login`) and/or a stored
+/// API key. Returns the raw JSON string on success.
+pub fn discover_codex_credentials() -> Result<String> {
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::Config("HOME not set; cannot locate ~/.codex/auth.json".into()))?;
+    let path = std::path::Path::new(&home).join(".codex/auth.json");
+
+    let json = fs::read_to_string(&path).map_err(|_| {
+        Error::Config(format!(
+            "Codex credentials not found at {} \u{2014} run 'codex login' first, then retry. \
+             (Or set OPENAI_API_KEY for API-key auth without the host file mount.)",
+            path.display()
+        ))
+    })?;
+
+    validate_codex_credentials_json(&json)?;
+    Ok(json)
+}
+
+/// Light validation: parse as JSON and check for the expected `auth_mode` key.
+fn validate_codex_credentials_json(json: &str) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| Error::Config("codex auth.json is not valid JSON".into()))?;
+    if value.get("auth_mode").is_none() {
+        return Err(Error::Config(
+            "codex auth.json missing 'auth_mode' key \u{2014} \
+             re-run 'codex login' to refresh."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage codex credentials into a secure temp directory.
+///
+/// Creates a temp directory containing `auth.json` (0600 permissions). The
+/// returned [`StagedCredentials`] holds the directory alive; dropping it
+/// removes the staged file. Mount the temp dir at `/home/sandbox/.codex`
+/// in the guest.
+pub fn stage_codex_credentials(creds_json: &str) -> Result<StagedCredentials> {
+    let dir = tempfile::Builder::new()
+        .prefix("voidbox-codex-creds-")
+        .tempdir()
+        .map_err(|e| Error::Config(format!("failed to create temp dir for codex creds: {e}")))?;
+
+    let auth_path = dir.path().join("auth.json");
+    fs::write(&auth_path, creds_json)
+        .map_err(|e| Error::Config(format!("failed to write codex auth.json: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            Error::Config(format!("failed to set codex auth.json permissions: {e}"))
+        })?;
+    }
+
+    let host_path = dir.path().to_string_lossy().into_owned();
+    Ok(StagedCredentials {
+        _dir: dir,
+        host_path,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -182,6 +262,64 @@ mod tests {
             let perms = fs::metadata(&creds_path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
+    }
+
+    // ---- Codex credential tests ----
+
+    #[test]
+    fn test_validate_codex_chatgpt_mode() {
+        let json = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"x","access_token":"y","refresh_token":"z","account_id":"a"},"OPENAI_API_KEY":null}"#;
+        assert!(validate_codex_credentials_json(json).is_ok());
+    }
+
+    #[test]
+    fn test_validate_codex_api_key_mode() {
+        let json = r#"{"auth_mode":"api_key","OPENAI_API_KEY":"sk-...","tokens":null}"#;
+        assert!(validate_codex_credentials_json(json).is_ok());
+    }
+
+    #[test]
+    fn test_validate_codex_missing_auth_mode() {
+        let json = r#"{"OPENAI_API_KEY":"sk-..."}"#;
+        let err = validate_codex_credentials_json(json).unwrap_err();
+        assert!(err.to_string().contains("auth_mode"));
+    }
+
+    #[test]
+    fn test_validate_codex_invalid_json() {
+        let err = validate_codex_credentials_json("not json").unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn test_stage_codex_credentials() {
+        let json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok"}}"#;
+        let staged = stage_codex_credentials(json).unwrap();
+
+        let auth_path = Path::new(&staged.host_path).join("auth.json");
+        assert!(auth_path.exists());
+
+        let content = fs::read_to_string(&auth_path).unwrap();
+        assert_eq!(content, json);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(&auth_path).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_stage_codex_credentials_cleanup_on_drop() {
+        let json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok"}}"#;
+        let path;
+        {
+            let staged = stage_codex_credentials(json).unwrap();
+            path = staged.host_path.clone();
+            assert!(Path::new(&path).exists());
+        }
+        assert!(!Path::new(&path).exists());
     }
 
     #[test]
