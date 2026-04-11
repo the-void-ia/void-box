@@ -587,7 +587,9 @@ impl VoidBox {
             }
         }
 
-        // Write MCP config if any MCP servers were registered
+        // Write MCP config if any MCP servers were registered.
+        // Claude reads .mcp.json; codex reads ~/.codex/config.toml. The
+        // void-mcp HTTP server is the same — only the discovery file differs.
         if !mcp_servers.is_empty() {
             let mcp_config = serde_json::json!({
                 "mcpServers": mcp_servers
@@ -604,6 +606,30 @@ impl VoidBox {
                 mcp_servers.len(),
                 MCP_CONFIG_PATH,
             );
+
+            if !self.config.llm.supports_claude_settings() {
+                let mut toml_buf = String::new();
+                for (name, entry) in &mcp_servers {
+                    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+                        toml_buf.push_str(&format!(
+                            "[mcp_servers.\"{}\"]\nurl = \"{}\"\n\n",
+                            name, url
+                        ));
+                    }
+                }
+                if !toml_buf.is_empty() {
+                    let codex_config_path = "/home/sandbox/.codex/config.toml";
+                    sandbox
+                        .write_file(codex_config_path, toml_buf.as_bytes())
+                        .await?;
+                    eprintln!(
+                        "[vm:{}] Wrote codex MCP config ({} servers) to {}",
+                        tag,
+                        mcp_servers.len(),
+                        codex_config_path,
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -658,25 +684,6 @@ impl VoidBox {
             }
             Err(e) => {
                 eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
-            }
-        }
-
-        // Warn when a non-Claude provider is combined with MCP skills (PR 4 adds config.toml discovery)
-        if !self.config.llm.supports_claude_settings() {
-            let has_mcp = self.skills.iter().any(|s| match &s.kind {
-                SkillKind::Mcp { .. } => true,
-                SkillKind::Cli { .. }
-                | SkillKind::Agent { .. }
-                | SkillKind::Remote { .. }
-                | SkillKind::File { .. }
-                | SkillKind::Oci { .. }
-                | SkillKind::Inline { .. } => false,
-            });
-            if has_mcp {
-                tracing::warn!(
-                    "Provider {} does not yet support MCP skill discovery — the void-mcp server is still provisioned inside the guest, but the agent won't be told where to find it. Codex MCP config.toml support is planned for PR 4.",
-                    self.config.llm.binary_name(),
-                );
             }
         }
 
@@ -828,25 +835,6 @@ impl VoidBox {
             }
             Err(e) => {
                 eprintln!("[vm:{}] Guest telemetry unavailable: {}", tag, e);
-            }
-        }
-
-        // Warn when a non-Claude provider is combined with MCP skills (PR 4 adds config.toml discovery)
-        if !self.config.llm.supports_claude_settings() {
-            let has_mcp = self.skills.iter().any(|s| match &s.kind {
-                SkillKind::Mcp { .. } => true,
-                SkillKind::Cli { .. }
-                | SkillKind::Agent { .. }
-                | SkillKind::Remote { .. }
-                | SkillKind::File { .. }
-                | SkillKind::Oci { .. }
-                | SkillKind::Inline { .. } => false,
-            });
-            if has_mcp {
-                tracing::warn!(
-                    "Provider {} does not yet support MCP skill discovery — the void-mcp server is still provisioned inside the guest, but the agent won't be told where to find it. Codex MCP config.toml support is planned for PR 4.",
-                    self.config.llm.binary_name(),
-                );
             }
         }
 
