@@ -119,7 +119,7 @@ pub enum LlmProvider {
     Codex,
 }
 
-/// Stream observer dispatcher for [`Sandbox::exec_agent_streaming`].
+/// Stream observer dispatcher for `Sandbox::exec_agent_streaming`.
 ///
 /// Each provider tells the sandbox which parser to use for its agent's
 /// stdout. The sandbox dispatches to the matching `parse_*_line` function
@@ -243,7 +243,7 @@ impl LlmProvider {
 
     /// Stream observer to use for this provider's agent stdout.
     ///
-    /// Drives dispatch in [`Sandbox::exec_agent_streaming`]: each
+    /// Drives dispatch in `Sandbox::exec_agent_streaming`: each
     /// [`ObserverKind`] maps to a different `parse_*_line` function.
     pub fn observer_kind(&self) -> ObserverKind {
         match self {
@@ -279,7 +279,7 @@ impl LlmProvider {
     /// guest-agent passes to the agent binary. The caller pairs this with
     /// [`binary_name`](Self::binary_name) to form the full exec invocation.
     ///
-    /// Provider-specific args from [`cli_args`](Self::cli_args) (for example,
+    /// Provider-specific args from `cli_args()` (for example,
     /// Ollama's `--model <name>`) are already folded into the Claude-shape
     /// variants. **Callers must NOT separately append `cli_args()` output**
     /// or they will produce duplicate flags.

@@ -2,7 +2,7 @@
 //!
 //! Codex emits one JSON object per line with a top-level `type` discriminant.
 //! This module deserializes the event stream into structured updates on a
-//! shared [`AgentExecResult`](crate::observe::claude::AgentExecResult), the
+//! shared [`AgentExecResult`], the
 //! same struct populated by the Claude parser. Both parsers produce the same
 //! result shape so downstream consumers (`agent_box::run`,
 //! `Sandbox::exec_agent_streaming`) don't branch on provider.
