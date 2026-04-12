@@ -37,7 +37,7 @@
   Local-first. Cloud-ready. Runs on any Linux host with <code>/dev/kvm</code>.
 </p>
 
-> **Status:** v0 (early release). Production-ready architecture; APIs are still stabilizing.
+> **Status:** v0.1. Vendor-neutral agent runtime with hardware-isolated execution. APIs stabilizing.
 
 <p align="center">
   <img src="site/assets/img/hn_demo.gif" alt="hn_demo — two-stage stock analysis pipeline" width="800">
