@@ -135,13 +135,24 @@ sandbox:
   memory_mb: 1024
   network: true
 llm:
-  provider: claude
+  provider: claude        # or: codex, claude-personal, ollama, lm-studio, custom
 agent:
   prompt: "Your task…"
   skills:
     - "file:examples/hackernews/skills/hackernews-api.md"
   timeout_secs: 600
 ```
+
+Supported `llm.provider` values:
+
+| Provider | Agent binary | Auth | Build script |
+|---|---|---|---|
+| `claude` | `claude-code` | `ANTHROPIC_API_KEY` | `scripts/build_claude_rootfs.sh` |
+| `claude-personal` | `claude-code` | Host `~/.claude` OAuth credentials | `scripts/build_claude_rootfs.sh` |
+| `codex` | `codex` | Host `~/.codex/auth.json` (ChatGPT login) or `OPENAI_API_KEY` | `scripts/build_codex_rootfs.sh` |
+| `ollama` | `claude-code` | Ollama on host (via SLIRP gateway) | `scripts/build_claude_rootfs.sh` |
+| `lm-studio` | `claude-code` | LM Studio on host (via SLIRP gateway) | `scripts/build_claude_rootfs.sh` |
+| `custom` | `claude-code` | Custom `ANTHROPIC_BASE_URL` | `scripts/build_claude_rootfs.sh` |
 
 ### Using the Rust library
 

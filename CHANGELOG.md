@@ -9,11 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `voidbox --log-dir` and `VOIDBOX_LOG_DIR` overrides for file-based runtime logs
+- **Codex CLI as first-class agent peer** — `llm.provider: codex` in YAML specs exec's the bundled OpenAI Codex CLI inside the guest VM with full structured observability
+- `scripts/build_codex_rootfs.sh` — production Codex-capable initramfs with auto-download from GitHub releases (musl-static, no glibc shipping)
+- `scripts/lib/agent_rootfs_common.sh` — shared rootfs helpers (sandbox user, CA certs, finalize) extracted from the Claude flavor for reuse across agent flavors
+- `src/observe/codex.rs` — structured stream parser for Codex's `exec --json` JSONL events (tool calls, token counts, error handling)
+- `ObserverKind` enum on `LlmProvider` — typed dispatch replacing the binary-name string comparison for stream observer selection
+- `LlmProvider::Codex` variant with `binary_name()`, `supports_claude_settings()`, `build_exec_args()`, `observer_kind()`, `image_flavor()` methods
+- Auth via host `~/.codex/auth.json` mount (ChatGPT OAuth) alongside `OPENAI_API_KEY` env var fallback
+- Codex MCP discovery — writes `~/.codex/config.toml` with `[mcp_servers]` streamable-HTTP entries pointing at the existing void-mcp server
+- Per-agent docs at `docs/agents/claude.md` and `docs/agents/codex.md` with `@` discovery imports in AGENTS.md
+- `examples/specs/codex_smoke.yaml` (`kind: agent`) and `examples/specs/codex_workflow_smoke.yaml` (`kind: workflow`)
 
 ### Changed
 - Rust MSRV bumped to 1.88
 - Interactive `voidbox shell` sessions now route runtime logs to the daily log file and route guest console output away from the active terminal to avoid TUI corruption
 - `voidbox shell` now prefers Claude Personal when personal OAuth credentials are available via the host's cross-platform credential discovery path
+- **Renamed** `ClaudeExecOpts` / `ClaudeExecResult` / `ClaudeStreamEvent` → `AgentExecOpts` / `AgentExecResult` / `AgentStreamEvent` (flat rename, no wrapper enum — both providers populate the same struct)
+- **Renamed** `Sandbox::exec_claude()` / `exec_claude_streaming()` → `exec_agent()` / `exec_agent_streaming()` with `&LlmProvider` parameter threading
+- **Renamed** `StageResult.claude_result` → `agent_result`
+- **Renamed** `e2e_claude_mcp` test → `e2e_agent_mcp` (MCP infrastructure is agent-agnostic)
+- `build_claude_rootfs.sh` refactored to source shared `agent_rootfs_common.sh` helpers
+- Claude-specific `--settings` and `--mcp-config` flags gated behind `provider.supports_claude_settings()`
 
 ### Fixed
 - Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
@@ -79,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streaming tool events — real-time `[vm:NAME] tool: Bash <cmd>` output during execution
 - Descriptive tool logging with `tool_summary()` (shows command/file_path/pattern instead of tool ID)
 - Incremental JSONL parser (`parse_jsonl_line`) for stream processing
-- `exec_claude_streaming()` sandbox API
+- `exec_agent_streaming()` sandbox API (renamed from `exec_claude_streaming()` in the Codex flavor effort)
 - HackerNews agent example (`examples/hackernews/`)
 - Code review agent example with two-stage pipeline and remote skills
 - Comprehensive CI/CD pipeline with GitHub Actions

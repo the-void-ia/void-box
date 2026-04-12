@@ -70,13 +70,16 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
 │  └────────────────────────┬─────────────────────────────────────┘ │
 │                           │ fork+exec (headless) or forkpty (PTY) │
 │  ┌────────────────────────▼─────────────────────────────────────┐ │
-│  │ claude-code (or claudio mock)                                │ │
-│  │  Headless: --output-format stream-json                       │ │
+│  │ Agent binary (selected by LlmProvider::binary_name())        │ │
+│  │  claude-code: -p <prompt> --output-format stream-json        │ │
+│  │  codex:       exec --json <prompt>                           │ │
+│  │  (or claudio mock for deterministic tests)                   │ │
 │  │  Interactive PTY: raw terminal I/O over vsock                │ │
-│  │  Skills: ~/.claude/skills/*.md                               │ │
-│  │  MCP:    ~/.claude/mcp.json                                  │ │
+│  │  Skills: ~/.claude/skills/*.md (Claude)                      │ │
+│  │          ~/.codex/config.toml [mcp_servers] (Codex)          │ │
+│  │  MCP:    ~/.claude/mcp.json (Claude) or config.toml (Codex) │ │
 │  │  OCI skills: /skills/{python,go,...} (read-only mounts)      │ │
-│  │  LLM:    Claude API / Ollama (via SLIRP → host:11434)        │ │
+│  │  LLM:    Claude API / OpenAI API / Ollama (via SLIRP)        │ │
 │  └──────────────────────────────────────────────────────────────┘ │
 │                                                                   │
 │  eth0: 10.0.2.15/24  gw: 10.0.2.2  dns: 10.0.2.3                  │
@@ -103,7 +106,7 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
    │                              Write mcp.json to ~/.claude/
    ├─ write input                 Write /workspace/input.json (if piped from previous stage)
    │
-   ├─ sandbox.exec_claude()       Send ExecRequest over vsock
+   ├─ sandbox.exec_agent()        Send ExecRequest over vsock (binary from provider)
    │       │
    │   [vsock port 1234]
    │       │
@@ -112,16 +115,16 @@ A **VoidBox** binds declared skills (MCP servers, CLI tools, procedural knowledg
    │       │                      Applies resource limits (setrlimit)
    │       │                      Drops privileges (uid:1000)
    │       │
-   │   fork+exec claude-code      Runs with --output-format stream-json
+   │   fork+exec agent binary     claude-code or codex (per LlmProvider)
    │       │
-   │   claude-code executes       Reads skills, calls LLM, uses tools
+   │   agent executes             Reads skills, calls LLM, uses tools
    │       │
    │   ExecResponse sent          stdout/stderr/exit_code over vsock
    │       │
-   ├─ parse stream-json           Extract ClaudeExecResult (tokens, cost, tools)
+   ├─ parse agent output          ObserverKind dispatch → AgentExecResult (tokens, cost, tools)
    ├─ read output file            /workspace/output.json
    │
-5. StageResult                    box_name, claude_result, file_output
+5. StageResult                    box_name, agent_result, file_output
 ```
 
 ### Pipeline execution
@@ -560,7 +563,7 @@ For runtime setup commands and end-user usage examples, see `README.md`.
 
 | Type | Constructor | Provisioned as | Example |
 |---|---|---|---|
-| Agent | `Skill::agent("claude-code")` | Reasoning engine designation | The LLM itself |
+| Agent | `Skill::agent("claude-code")` or `Skill::agent("codex")` | Reasoning engine designation | Selected by `LlmProvider::binary_name()` |
 | File | `Skill::file("path/to/SKILL.md")` | `~/.claude/skills/{name}.md` | Domain methodology |
 | Remote | `Skill::remote("owner/repo/skill")` | Fetched from GitHub, written to skills/ | `obra/superpowers/brainstorming` |
 | MCP | `Skill::mcp("server-name")` | Entry in `~/.claude/mcp.json` | Structured tool server |
