@@ -26,15 +26,15 @@ set -euo pipefail
 #   CLAUDE_BIN            Path to a pre-downloaded native claude binary
 #   CLAUDE_CODE_VERSION   Version to download (e.g. "2.1.45"); requires curl
 #   BUSYBOX              Path to a static busybox (default: /usr/bin/busybox)
-#   OUT_DIR              Rootfs staging directory (default: target/void-box-rootfs)
-#   OUT_CPIO             Output initramfs path (default: target/void-box-rootfs.cpio.gz)
+#   OUT_DIR              Rootfs staging directory (default: target/void-box-claude-rootfs)
+#   OUT_CPIO             Output initramfs path (default: target/void-box-claude.cpio.gz)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 source "$ROOT_DIR/scripts/lib/agent_rootfs_common.sh"
 
-OUT_DIR="${OUT_DIR:-target/void-box-rootfs}"
-OUT_CPIO="${OUT_CPIO:-target/void-box-rootfs.cpio.gz}"
+OUT_DIR="${OUT_DIR:-target/void-box-claude-rootfs}"
+OUT_CPIO="${OUT_CPIO:-target/void-box-claude.cpio.gz}"
 
 # ── Step 1: Locate or download the native claude binary ──────────────────────
 CLAUDE_BIN="${CLAUDE_BIN:-}"

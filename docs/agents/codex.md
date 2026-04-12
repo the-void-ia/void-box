@@ -32,7 +32,7 @@ CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh
 
 OPENAI_API_KEY=sk-... \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-codex.cpio.gz \
 cargo run --bin voidbox -- run --file examples/specs/codex_workflow_smoke.yaml
 ```
 
@@ -41,7 +41,7 @@ For `kind: agent` usage:
 ```bash
 OPENAI_API_KEY=sk-... \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-codex.cpio.gz \
 cargo run --bin voidbox -- run --file examples/specs/codex_smoke.yaml
 ```
 

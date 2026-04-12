@@ -11,7 +11,7 @@ name: codex_workflow_smoke
 #
 # Then run:
 #   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-#   VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+#   VOID_BOX_INITRAMFS=$PWD/target/void-box-codex.cpio.gz \
 #   cargo run --bin voidbox -- run --file examples/specs/codex_workflow_smoke.yaml
 
 sandbox:

@@ -32,7 +32,7 @@ scripts/build_claude_rootfs.sh
 
 ANTHROPIC_API_KEY=sk-ant-... \
 VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz \
 cargo run --example claude_in_voidbox_example
 ```
 

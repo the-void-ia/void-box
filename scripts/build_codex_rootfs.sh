@@ -24,16 +24,16 @@ set -euo pipefail
 #   CODEX_BIN       Path to a pre-downloaded codex binary
 #   CODEX_VERSION   Version to download (e.g. "0.118.0"); requires curl
 #   BUSYBOX         Path to a static busybox (default: /usr/bin/busybox)
-#   OUT_DIR         Rootfs staging directory (default: target/void-box-rootfs)
-#   OUT_CPIO        Output initramfs path (default: target/void-box-rootfs.cpio.gz)
+#   OUT_DIR         Rootfs staging directory (default: target/void-box-codex-rootfs)
+#   OUT_CPIO        Output initramfs path (default: target/void-box-codex.cpio.gz)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 source "$ROOT_DIR/scripts/lib/agent_rootfs_common.sh"
 
-OUT_DIR="${OUT_DIR:-target/void-box-rootfs}"
-OUT_CPIO="${OUT_CPIO:-target/void-box-rootfs.cpio.gz}"
+OUT_DIR="${OUT_DIR:-target/void-box-codex-rootfs}"
+OUT_CPIO="${OUT_CPIO:-target/void-box-codex.cpio.gz}"
 
 # ── Step 1: Locate or download the codex binary ──────────────────────────────
 CODEX_BIN="${CODEX_BIN:-}"
