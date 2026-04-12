@@ -25,7 +25,7 @@ Set guest artifacts:
 
 ```bash
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 ```
 
 **macOS (VZ):**
@@ -33,7 +33,7 @@ export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
 ```bash
 scripts/download_kernel.sh
 export VOID_BOX_KERNEL=$PWD/target/vmlinux-arm64
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 ```
 
 Important:
@@ -221,7 +221,7 @@ kill "$(cat target/tmp/openclaw_telegram_lmstudio.pid)"
 
 - `Kvm(Error(13))`: current user/process lacks `/dev/kvm` access (Linux only).
 - Boot log contains `Initramfs unpacking failed: read error` or `/dev/root: Can't open blockdev`:
-  wrong/truncated initramfs was used. Rebuild with `scripts/build_claude_rootfs.sh` and point `VOID_BOX_INITRAMFS` to `target/void-box-rootfs.cpio.gz`.
+  wrong/truncated initramfs was used. Rebuild with `scripts/build_claude_rootfs.sh` and point `VOID_BOX_INITRAMFS` to `target/void-box-claude.cpio.gz`.
 - OCI unpack/cache issues: inspect `~/.voidbox/oci/{rootfs,disks}` and clear only the failing image key.
 - Telegram startup message appears but no replies: verify `TELEGRAM_CHAT_ID`, bot `/start`, and `ANTHROPIC_API_KEY`.
 - Telegram shows `fetch failed` on Ollama flow:

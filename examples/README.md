@@ -80,7 +80,7 @@ Then set runtime image env:
 
 ```bash
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=target/void-box-claude.cpio.gz
 ```
 
 Run the HackerNews agent spec (Claude default):
