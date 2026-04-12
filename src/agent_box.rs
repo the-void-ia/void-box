@@ -611,9 +611,11 @@ impl VoidBox {
                 let mut toml_buf = String::new();
                 for (name, entry) in &mcp_servers {
                     if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+                        let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+                        let escaped_url = url.replace('\\', "\\\\").replace('"', "\\\"");
                         toml_buf.push_str(&format!(
                             "[mcp_servers.\"{}\"]\nurl = \"{}\"\n\n",
-                            name, url
+                            escaped_name, escaped_url
                         ));
                     }
                 }

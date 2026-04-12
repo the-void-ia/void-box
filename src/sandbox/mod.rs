@@ -31,9 +31,10 @@ pub mod local;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Tracing target for raw agent stdout lines forwarded during passthrough
-/// observer dispatch. Non-Claude providers (Codex, pi, …) route stdout
-/// through this target until PR 3 adds structured parsers.
+/// Tracing target for agent stdout lines. All providers (Claude, Codex, …)
+/// forward stdout lines through this target for structured logging. Providers
+/// with a dedicated observer (e.g. `ObserverKind::Codex`) parse lines AND
+/// forward; providers without one forward only.
 const AGENT_STDOUT_TARGET: &str = "agent_stdout";
 
 pub use local::LocalSandbox;
@@ -552,13 +553,26 @@ impl Sandbox {
                     }
                     crate::llm::ObserverKind::Codex => {
                         let mut result = AgentExecResult::default();
+                        let mut line_buf = String::new();
+
                         while let Some(chunk) = chunk_rx.recv().await {
-                            if chunk.stream == "stdout" {
-                                for line in String::from_utf8_lossy(&chunk.data).lines() {
-                                    tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line);
-                                    crate::observe::codex::parse_codex_line(line, &mut result);
-                                }
+                            if chunk.stream != "stdout" {
+                                continue;
                             }
+
+                            let text = String::from_utf8_lossy(&chunk.data);
+                            line_buf.push_str(&text);
+
+                            while let Some(newline_pos) = line_buf.find('\n') {
+                                let line: String = line_buf.drain(..=newline_pos).collect();
+                                tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line.trim_end());
+                                crate::observe::codex::parse_codex_line(&line, &mut result);
+                            }
+                        }
+
+                        if !line_buf.trim().is_empty() {
+                            tracing::info!(target: AGENT_STDOUT_TARGET, "{}", line_buf.trim_end());
+                            crate::observe::codex::parse_codex_line(&line_buf, &mut result);
                         }
 
                         let response = response_rx.await.map_err(|_| {

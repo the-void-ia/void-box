@@ -111,11 +111,17 @@ pub enum LlmProvider {
 
     /// OpenAI Codex CLI.
     ///
-    /// Requires `OPENAI_API_KEY` in the host environment. The guest executes
-    /// the bundled `codex` binary (see `scripts/build_codex_rootfs.sh`) with
+    /// Auth is provided primarily via a mounted `~/.codex/auth.json`
+    /// (from `codex login` on the host), with `OPENAI_API_KEY` available
+    /// as a fallback for endpoints that accept it.
+    ///
+    /// The guest executes the bundled `codex` binary (see
+    /// `scripts/build_codex_rootfs.sh`) with
     /// `codex exec --json --dangerously-bypass-approvals-and-sandbox
-    /// --skip-git-repo-check <prompt>`. Passthrough output — structured
-    /// event parsing is deferred to PR 3.
+    /// --skip-git-repo-check <prompt>`.
+    ///
+    /// Output is emitted as JSONL and parsed via the Codex observer
+    /// (`crate::observe::codex::parse_codex_line`).
     Codex,
 }
 
