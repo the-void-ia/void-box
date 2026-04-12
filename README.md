@@ -222,7 +222,6 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 
 - **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
 - **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
-- **Codex-style backend support** — Optional execution backend for code-first workflows.
 - **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 
 ## License
