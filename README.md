@@ -51,7 +51,7 @@
 - **Policy-enforced runtime** — Command allowlists, resource limits, seccomp-BPF, and controlled network egress.
 - **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
-- **Multi-agent runtime** — Each stage runs `claude-code` or `codex` (selected by `llm.provider`), backed by Claude API, OpenAI API, Ollama, LM Studio, or a custom endpoint.
+- **Vendor-neutral agent runtime** — Bring your own agent: Claude Code, OpenAI Codex, Ollama, LM Studio, or any Anthropic-compatible endpoint. The `llm.provider` field selects the agent binary and auth — void-box handles the isolation, not the model choice.
 - **OCI-native** — Auto-pulls guest images from GHCR; mount container images as base OS or skill providers.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
 - **Persistent host mounts** — Share host directories into guest VMs via 9p/virtiofs with read-only or read-write mode.
