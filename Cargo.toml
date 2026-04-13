@@ -60,6 +60,7 @@ rustix = { version = "1", features = ["event", "fs", "termios"] }
 signal-hook = "0.3"
 byteorder = "1"
 sha2 = "0.10"
+indicatif = "0.17"
 tempfile = "3"
 
 # --- Linux-only dependencies ---

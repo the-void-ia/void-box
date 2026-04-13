@@ -2,6 +2,7 @@ mod attach;
 mod backend;
 mod banner;
 mod cli_config;
+mod image;
 mod output;
 mod snapshot;
 
@@ -154,6 +155,12 @@ enum Command {
     Snapshot {
         #[command(subcommand)]
         command: snapshot::SnapshotCommand,
+    },
+
+    /// Manage pre-built images (pull, list, clean).
+    Image {
+        #[command(subcommand)]
+        command: image::ImageCommand,
     },
 
     /// Manage CLI configuration.
@@ -336,6 +343,7 @@ async fn run(
                 .await
                 .map(|_| 0)
         }
+        Command::Image { command } => image::handle(command).await.map(|_| 0),
         Command::Config { command } => cmd_config(command, output, config).map(|_| 0),
         Command::Version => cmd_version(output).map(|_| 0),
         Command::Serve { listen } => cmd_serve(&listen).await.map(|_| 0),
