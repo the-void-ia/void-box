@@ -477,4 +477,76 @@ mod tests {
             LlmProvider::Claude
         ));
     }
+
+    #[tokio::test]
+    async fn resolve_shell_images_uses_spec_kernel_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel_path = dir.path().join("vmlinuz");
+        let initramfs_path = dir.path().join("rootfs.cpio.gz");
+        std::fs::write(&kernel_path, b"fake-kernel").unwrap();
+        std::fs::write(&initramfs_path, b"fake-initramfs").unwrap();
+
+        let spec = RunSpec {
+            api_version: "v1".into(),
+            kind: RunKind::Sandbox,
+            name: "test".into(),
+            sandbox: SandboxSpec {
+                mode: "interactive".into(),
+                kernel: Some(kernel_path.display().to_string()),
+                initramfs: Some(initramfs_path.display().to_string()),
+                memory_mb: 512,
+                vcpus: 1,
+                network: false,
+                env: Default::default(),
+                mounts: Vec::new(),
+                image: None,
+                guest_image: None,
+                snapshot: None,
+            },
+            llm: None,
+            observe: None,
+            agent: None,
+            pipeline: None,
+            workflow: None,
+        };
+
+        let (kernel, initramfs) = resolve_shell_images(&spec, "claude").await.unwrap();
+        assert_eq!(kernel, kernel_path.display().to_string());
+        assert_eq!(initramfs, Some(initramfs_path.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_shell_images_skips_nonexistent_spec_kernel() {
+        let spec = RunSpec {
+            api_version: "v1".into(),
+            kind: RunKind::Sandbox,
+            name: "test".into(),
+            sandbox: SandboxSpec {
+                mode: "interactive".into(),
+                kernel: Some("/nonexistent/vmlinuz".into()),
+                initramfs: None,
+                memory_mb: 512,
+                vcpus: 1,
+                network: false,
+                env: Default::default(),
+                mounts: Vec::new(),
+                image: None,
+                guest_image: None,
+                snapshot: None,
+            },
+            llm: None,
+            observe: None,
+            agent: None,
+            pipeline: None,
+            workflow: None,
+        };
+
+        // Should not return the nonexistent path — falls through to
+        // installed paths or download (which will also fail in test,
+        // but we're testing that it doesn't blindly return the bad path).
+        let result = resolve_shell_images(&spec, "claude").await;
+        if let Ok((k, _)) = result {
+            assert_ne!(k, "/nonexistent/vmlinuz");
+        }
+    }
 }
