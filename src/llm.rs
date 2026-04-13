@@ -247,6 +247,24 @@ impl LlmProvider {
         }
     }
 
+    /// Initramfs flavor used by the auto image resolver.
+    ///
+    /// Maps each provider to the pre-built initramfs artifact name:
+    /// - `"codex"` → `void-box-codex-<arch>.cpio.gz`
+    /// - `"claude"` → `void-box-claude-<arch>.cpio.gz` (all Claude-compatible providers)
+    ///
+    /// Used by [`crate::image`] to construct the download URL and cache path.
+    pub fn image_flavor(&self) -> &'static str {
+        match self {
+            LlmProvider::Codex => "codex",
+            LlmProvider::Claude
+            | LlmProvider::ClaudePersonal
+            | LlmProvider::Ollama { .. }
+            | LlmProvider::LmStudio { .. }
+            | LlmProvider::Custom { .. } => "claude",
+        }
+    }
+
     /// Stream observer to use for this provider's agent stdout.
     ///
     /// Drives dispatch in `Sandbox::exec_agent_streaming`: each
@@ -833,5 +851,19 @@ mod tests {
         let provider = LlmProvider::Codex;
         let args = provider.build_exec_args("prompt", false, &[]);
         assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+    }
+
+    #[test]
+    fn test_image_flavor_codex() {
+        assert_eq!(LlmProvider::Codex.image_flavor(), "codex");
+    }
+
+    #[test]
+    fn test_image_flavor_claude_variants() {
+        assert_eq!(LlmProvider::Claude.image_flavor(), "claude");
+        assert_eq!(LlmProvider::ClaudePersonal.image_flavor(), "claude");
+        assert_eq!(LlmProvider::ollama("x").image_flavor(), "claude");
+        assert_eq!(LlmProvider::lm_studio("x").image_flavor(), "claude");
+        assert_eq!(LlmProvider::custom("x").image_flavor(), "claude");
     }
 }
