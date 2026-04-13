@@ -843,13 +843,16 @@ impl SandboxBuilder {
     ///     .unwrap();
     /// ```
     pub fn with_prebuilt_artifacts(
-        mut self,
-        version: &str,
+        self,
+        _version: &str,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let artifacts = crate::artifacts::download_prebuilt_artifacts(version)?;
-        self.config.kernel = Some(artifacts.kernel);
-        self.config.initramfs = Some(artifacts.initramfs);
-        Ok(self)
+        // Previously delegated to artifacts::download_prebuilt_artifacts which
+        // was never implemented.  Use `image::resolve_kernel` /
+        // `image::resolve_initramfs` for auto-download support instead.
+        Err(
+            "with_prebuilt_artifacts is deprecated — use image::resolve_kernel / resolve_initramfs"
+                .into(),
+        )
     }
 
     /// Load artifacts from environment variables
@@ -868,9 +871,20 @@ impl SandboxBuilder {
     ///     .unwrap();
     /// ```
     pub fn from_env(mut self) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let artifacts = crate::artifacts::from_env()?;
-        self.config.kernel = Some(artifacts.kernel);
-        self.config.initramfs = Some(artifacts.initramfs);
+        let kernel = std::env::var("VOID_BOX_KERNEL")
+            .map(std::path::PathBuf::from)
+            .map_err(|_| "VOID_BOX_KERNEL not set")?;
+        let initramfs = std::env::var("VOID_BOX_INITRAMFS")
+            .map(std::path::PathBuf::from)
+            .map_err(|_| "VOID_BOX_INITRAMFS not set")?;
+        if !kernel.exists() {
+            return Err(format!("Kernel not found: {:?}", kernel).into());
+        }
+        if !initramfs.exists() {
+            return Err(format!("Initramfs not found: {:?}", initramfs).into());
+        }
+        self.config.kernel = Some(kernel);
+        self.config.initramfs = Some(initramfs);
         Ok(self)
     }
 
