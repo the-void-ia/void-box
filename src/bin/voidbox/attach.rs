@@ -75,17 +75,16 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         None => build_ephemeral_spec(opts.memory_mb, opts.vcpus, opts.network),
     };
 
-    let kernel = run_spec
-        .sandbox
-        .kernel
-        .clone()
-        .or_else(|| std::env::var("VOID_BOX_KERNEL").ok())
-        .ok_or("VOID_BOX_KERNEL not set and no kernel in spec")?;
-    let initramfs = run_spec
-        .sandbox
-        .initramfs
-        .clone()
-        .or_else(|| std::env::var("VOID_BOX_INITRAMFS").ok());
+    // Resolve kernel: spec → env var → installed paths → auto-download.
+    let flavor = opts
+        .provider
+        .map(|p| match p.to_ascii_lowercase().as_str() {
+            "codex" => "codex",
+            _ => "claude",
+        })
+        .unwrap_or("claude");
+
+    let (kernel, initramfs) = resolve_shell_images(&run_spec, flavor).await?;
 
     let effective_memory = if opts.file.is_some() {
         run_spec.sandbox.memory_mb
@@ -249,6 +248,59 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     drop(staged_creds);
 
     pty_result
+}
+
+/// Resolve kernel and initramfs for `voidbox shell`, using the same
+/// fallback chain as `voidbox run`: spec → env var → installed paths →
+/// auto-download from GitHub Releases.
+async fn resolve_shell_images(
+    spec: &RunSpec,
+    flavor: &str,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    // 1. Spec field or env var
+    let kernel_explicit = spec
+        .sandbox
+        .kernel
+        .clone()
+        .or_else(|| std::env::var("VOID_BOX_KERNEL").ok());
+    let initramfs_explicit = spec
+        .sandbox
+        .initramfs
+        .clone()
+        .or_else(|| std::env::var("VOID_BOX_INITRAMFS").ok());
+
+    if let Some(ref k) = kernel_explicit {
+        if std::path::Path::new(k).exists() {
+            return Ok((k.clone(), initramfs_explicit));
+        }
+    }
+
+    // 2. Well-known installed paths
+    if let Some(installed) = void_box::image::resolve_installed_artifacts() {
+        return Ok((
+            installed.kernel.display().to_string(),
+            Some(installed.initramfs.display().to_string()),
+        ));
+    }
+
+    // 3. Auto-download from GitHub Releases
+    let cache_root = void_box::image::default_cache_root()?;
+    let kernel_path = void_box::image::resolve_kernel(
+        kernel_explicit.as_deref().map(std::path::Path::new),
+        &cache_root,
+    )
+    .await?;
+    let initramfs_path = void_box::image::resolve_initramfs(
+        initramfs_explicit.as_deref().map(std::path::Path::new),
+        flavor,
+        &cache_root,
+    )
+    .await?;
+
+    Ok((
+        kernel_path.display().to_string(),
+        Some(initramfs_path.display().to_string()),
+    ))
 }
 
 /// Builds a minimal ephemeral `RunSpec` with `kind: sandbox`.
