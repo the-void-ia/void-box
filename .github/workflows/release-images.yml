@@ -1,0 +1,144 @@
+name: Release Images
+
+# Build flavor-specific initramfs artifacts and kernels for auto image
+# resolution. Attaches all artifacts + SHA-256 checksums to the GitHub Release.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write  # Attach assets to release
+
+env:
+  CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION || '2.1.53' }}
+  CODEX_VERSION: ${{ vars.CODEX_VERSION || '0.118.0' }}
+
+jobs:
+  build-images:
+    name: Build Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools cpio gzip xz-utils zstd file
+
+      - name: Install aarch64 cross-linker
+        if: matrix.arch == 'aarch64' && runner.arch == 'X64'
+        run: |
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE' >> "$GITHUB_ENV"
+
+      - name: Download static busybox
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_amd64.deb"
+              ;;
+            aarch64)
+              DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb"
+              ;;
+          esac
+          curl -fsSL --retry 3 --retry-delay 5 "$DEB_URL" -o /tmp/busybox-static.deb
+          cd /tmp && ar x busybox-static.deb && tar xf data.tar* ./usr/bin/busybox
+          chmod +x /tmp/usr/bin/busybox
+          echo "BUSYBOX=/tmp/usr/bin/busybox" >> "$GITHUB_ENV"
+
+      - name: Build base image
+        run: |
+          export ARCH=${{ matrix.arch }}
+          export OUT_CPIO=$PWD/target/void-box-base-${{ matrix.arch }}.cpio.gz
+          export VOID_BOX_PINNED_KMODS=1
+          scripts/build_guest_image.sh
+
+      - name: Build claude image
+        run: |
+          export ARCH=${{ matrix.arch }}
+          export OUT_CPIO=$PWD/target/void-box-claude-${{ matrix.arch }}.cpio.gz
+          export VOID_BOX_PINNED_KMODS=1
+          scripts/build_claude_rootfs.sh
+
+      - name: Build codex image
+        run: |
+          export ARCH=${{ matrix.arch }}
+          export OUT_CPIO=$PWD/target/void-box-codex-${{ matrix.arch }}.cpio.gz
+          export VOID_BOX_PINNED_KMODS=1
+          scripts/build_codex_rootfs.sh
+
+      - name: Build agents image
+        run: |
+          export ARCH=${{ matrix.arch }}
+          export OUT_CPIO=$PWD/target/void-box-agents-${{ matrix.arch }}.cpio.gz
+          export VOID_BOX_PINNED_KMODS=1
+          scripts/build_agents_rootfs.sh
+
+      - name: Download kernel
+        run: |
+          export ARCH=${{ matrix.arch }}
+          scripts/download_kernel.sh
+          # Rename to spec-expected names
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cp target/vmlinuz-amd64 target/vmlinuz-x86_64
+          else
+            cp target/vmlinux-arm64 target/vmlinux-aarch64
+          fi
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd target
+          for f in \
+            void-box-base-${{ matrix.arch }}.cpio.gz \
+            void-box-claude-${{ matrix.arch }}.cpio.gz \
+            void-box-codex-${{ matrix.arch }}.cpio.gz \
+            void-box-agents-${{ matrix.arch }}.cpio.gz; do
+            sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
+          done
+          # Kernel (name varies by arch)
+          for f in $(ls vmlinuz-${{ matrix.arch }} vmlinux-${{ matrix.arch }} 2>/dev/null); do
+            sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
+          done
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          cd target
+          # Upload all image artifacts and their checksums
+          for f in \
+            void-box-base-${{ matrix.arch }}.cpio.gz \
+            void-box-claude-${{ matrix.arch }}.cpio.gz \
+            void-box-codex-${{ matrix.arch }}.cpio.gz \
+            void-box-agents-${{ matrix.arch }}.cpio.gz \
+            void-box-base-${{ matrix.arch }}.cpio.gz.sha256 \
+            void-box-claude-${{ matrix.arch }}.cpio.gz.sha256 \
+            void-box-codex-${{ matrix.arch }}.cpio.gz.sha256 \
+            void-box-agents-${{ matrix.arch }}.cpio.gz.sha256; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+          # Upload kernel + checksum
+          for f in $(ls \
+            vmlinuz-${{ matrix.arch }} vmlinuz-${{ matrix.arch }}.sha256 \
+            vmlinux-${{ matrix.arch }} vmlinux-${{ matrix.arch }}.sha256 \
+            2>/dev/null); do
+            gh release upload "$TAG" "$f" --clobber
+          done
