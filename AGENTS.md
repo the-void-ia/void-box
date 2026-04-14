@@ -609,6 +609,68 @@ Skill::mcp("void-mcp")
 | `src/agent_box.rs` | `provision_skills()` — MCP server startup, `.mcp.json` generation |
 | `src/backend/mod.rs` | `DEFAULT_COMMAND_ALLOWLIST` (includes `void-mcp`) |
 
+## Auto image resolution
+
+`voidbox run --file spec.yaml` and `voidbox shell` auto-resolve kernel and
+initramfs without requiring `VOID_BOX_KERNEL` or `VOID_BOX_INITRAMFS` env vars.
+Images are downloaded from GitHub Releases, verified with SHA-256 checksums, and
+cached under `~/.void-box/images/v{version}/`.
+
+### Resolution chain
+
+Both kernel and initramfs follow a fallback chain:
+
+```
+1. --kernel / --initramfs flag or VOID_BOX_KERNEL / VOID_BOX_INITRAMFS env var
+2. Linux only (kernel): /boot/vmlinuz-$(uname -r) — use host kernel
+3. Well-known install paths: /usr/lib/voidbox/ (Linux), /opt/homebrew/lib/voidbox/ (macOS)
+4. Cache hit: ~/.void-box/images/v{version}/<artifact>
+5. Download from GitHub Release → verify SHA-256 → cache
+6. OCI fallback (ghcr.io/the-void-ia/voidbox-guest)
+```
+
+### Flavor selection
+
+The initramfs flavor is derived from `spec.llm.provider`:
+
+| Provider | Flavor | Artifact |
+|---|---|---|
+| `codex` | codex | `void-box-codex-{arch}.cpio.gz` |
+| `claude`, `claude-personal`, `ollama`, `lm-studio`, `custom` | claude | `void-box-claude-{arch}.cpio.gz` |
+| absent (`kind: workflow`, no `llm` section) | base | `void-box-base-{arch}.cpio.gz` |
+
+The mapping is centralized in `image::flavor_for_provider()`.
+
+### `voidbox image` subcommand
+
+```bash
+voidbox image pull <flavor>     # Download: base, claude, codex, agents, kernel, or all
+voidbox image list              # Show cached images (version, flavor, arch, size, path)
+voidbox image clean             # Remove old versions (keep current)
+voidbox image clean --all       # Remove everything
+```
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/image.rs` | `resolve_kernel()`, `resolve_initramfs()`, `download_and_cache()`, checksum, retry, `flavor_for_provider()` |
+| `src/bin/voidbox/image.rs` | `voidbox image` CLI subcommand |
+| `src/llm.rs` | `LlmProvider::image_flavor()` |
+| `scripts/build_agents_rootfs.sh` | Combined claude+codex initramfs builder |
+| `.github/workflows/release-images.yml` | CI: build 4 flavors × 2 arches per release |
+
+### Cache layout
+
+```
+~/.void-box/images/
+  v0.1.2/
+    void-box-claude-x86_64.cpio.gz
+    void-box-claude-x86_64.cpio.gz.sha256
+    vmlinuz-x86_64
+    vmlinuz-x86_64.sha256
+```
+
 ## Testing
 
 Static quality:
@@ -873,13 +935,19 @@ Do not use `/tmp/void-box-test-rootfs.cpio.gz` for OpenClaw gateway validation.
 
 Use placeholders for secrets (`...`) and keep real tokens out of docs/commits.
 
-Baseline smoke spec:
+Baseline smoke spec (auto-resolves images):
 
 ```bash
 cargo run --bin voidbox -- run --file examples/specs/smoke_test.yaml
 ```
 
-OCI node sanity (base image mount/exec):
+OCI node sanity (auto-resolves images):
+
+```bash
+cargo run --bin voidbox -- run --file examples/openclaw/node_version.yaml
+```
+
+To use a manually built image instead of auto-resolution, set the env vars:
 
 ```bash
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
@@ -890,21 +958,23 @@ cargo run --bin voidbox -- run --file examples/openclaw/node_version.yaml
 OpenClaw Telegram gateway (production path):
 
 ```bash
-TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
-export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 export ANTHROPIC_API_KEY=...
 cargo run --bin voidbox -- run --file examples/openclaw/openclaw_telegram.yaml
 ```
 
-OpenClaw Telegram gateway with host Ollama (production path):
+To use a locally built production image instead of auto-resolution:
 
 ```bash
 TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
 export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
+```
+
+OpenClaw Telegram gateway with host Ollama (production path):
+
+```bash
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 export OLLAMA_BASE_URL=http://10.0.2.2:11434
