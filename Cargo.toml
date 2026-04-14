@@ -33,7 +33,8 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 
 # HTTP client (for fetching remote skills from skills.sh)
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
+futures-util = "0.3"
 
 # Security (cross-platform)
 getrandom = "0.3"
@@ -60,6 +61,7 @@ rustix = { version = "1", features = ["event", "fs", "termios"] }
 signal-hook = "0.3"
 byteorder = "1"
 sha2 = "0.10"
+indicatif = "0.17"
 tempfile = "3"
 
 # --- Linux-only dependencies ---

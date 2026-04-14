@@ -987,6 +987,9 @@ struct GuestFiles {
 /// 1. `spec.sandbox.kernel` / `spec.sandbox.initramfs` (explicit paths)
 /// 2. `$VOID_BOX_KERNEL` / `$VOID_BOX_INITRAMFS` env vars
 /// 3. Well-known installed paths (`/usr/lib/voidbox/`, Homebrew prefix, etc.)
+///
+/// 3.5. Auto-resolve from GitHub Releases based on `llm.provider`
+///
 /// 4. `spec.sandbox.guest_image` OCI ref (explicit)
 /// 5. Default: `ghcr.io/the-void-ia/voidbox-guest:v{CARGO_PKG_VERSION}`
 /// 6. `None` → mock fallback when `mode: auto`
@@ -1000,7 +1003,7 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
     }
 
     // Step 3: well-known installed paths (package manager installs).
-    if let Some(installed) = crate::artifacts::resolve_installed_artifacts() {
+    if let Some(installed) = crate::image::resolve_installed_artifacts() {
         eprintln!(
             "[void-box] Using installed artifacts: kernel={}, initramfs={}",
             installed.kernel.display(),
@@ -1012,6 +1015,67 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
         });
     }
 
+    // Step 3.5: auto-resolve from GitHub Releases based on llm.provider.
+    let flavor = spec
+        .llm
+        .as_ref()
+        .and_then(|llm| crate::image::flavor_for_provider(&llm.provider))
+        .or_else(|| {
+            // kind: workflow with no llm section → base
+            if spec.kind == crate::spec::RunKind::Workflow {
+                Some("base")
+            } else {
+                None
+            }
+        });
+
+    if let Some(flavor) = flavor {
+        let cache_root = match crate::image::default_cache_root() {
+            Ok(root) => root,
+            Err(e) => {
+                tracing::warn!("cannot resolve image cache dir: {}", e);
+                return resolve_guest_image_oci(spec).await;
+            }
+        };
+
+        let kernel_explicit = spec
+            .sandbox
+            .kernel
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("VOID_BOX_KERNEL").map(PathBuf::from));
+        let initramfs_explicit = spec
+            .sandbox
+            .initramfs
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from));
+
+        // Download kernel and initramfs concurrently (halves cold-start wait).
+        let (kernel_result, initramfs_result) = tokio::join!(
+            crate::image::resolve_kernel(kernel_explicit.as_deref(), &cache_root,),
+            crate::image::resolve_initramfs(initramfs_explicit.as_deref(), flavor, &cache_root,)
+        );
+
+        match (kernel_result, initramfs_result) {
+            (Ok(kernel), Ok(initramfs)) => {
+                return Some(GuestFiles {
+                    kernel,
+                    initramfs: Some(initramfs),
+                });
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("auto image resolution failed: {}. Falling back to OCI.", e);
+            }
+        }
+    }
+
+    // Step 4+: OCI fallback (existing logic).
+    resolve_guest_image_oci(spec).await
+}
+
+/// OCI fallback for guest image resolution (steps 4-5).
+async fn resolve_guest_image_oci(spec: &RunSpec) -> Option<GuestFiles> {
     // Step 4: explicit guest_image in spec.
     // An empty string means "disable auto-pull".
     if let Some(ref guest_image) = spec.sandbox.guest_image {
@@ -1025,15 +1089,12 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
                     "[void-box] Failed to resolve guest image '{}': {}",
                     guest_image, e
                 );
-                if spec.sandbox.mode.eq_ignore_ascii_case("auto") {
-                    return None;
-                }
                 return None;
             }
         }
     }
 
-    // Step 4: default OCI image reference.
+    // Step 5: default OCI image reference.
     let version = env!("CARGO_PKG_VERSION");
     let default_ref = format!("ghcr.io/the-void-ia/voidbox-guest:v{}", version);
     match resolve_oci_guest_image(&default_ref).await {
@@ -1043,7 +1104,7 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
                 "[void-box] Failed to resolve default guest image '{}': {}",
                 default_ref, e
             );
-            // Step 5: None → callers will fall back to mock when mode=auto.
+            // Step 6: None → callers will fall back to mock when mode=auto.
             None
         }
     }

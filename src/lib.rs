@@ -88,9 +88,9 @@ pub mod snapshot_store;
 
 // Agent(Skills) + Isolation = VoidBox
 pub mod agent_box;
-pub mod artifacts;
 pub mod credentials;
 pub mod daemon;
+pub mod image;
 pub mod llm;
 pub mod persistence;
 pub mod pipeline;
