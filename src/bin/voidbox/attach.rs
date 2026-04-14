@@ -76,13 +76,10 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     };
 
     // Resolve kernel: spec → env var → installed paths → auto-download.
-    let flavor = opts
-        .provider
-        .map(|p| match p.to_ascii_lowercase().as_str() {
-            "codex" => "codex",
-            _ => "claude",
-        })
-        .unwrap_or("claude");
+    let flavor = match opts.provider {
+        Some(p) => void_box::image::flavor_for_provider(p).unwrap_or("claude"),
+        None => "claude",
+    };
 
     let (kernel, initramfs) = resolve_shell_images(&run_spec, flavor).await?;
 

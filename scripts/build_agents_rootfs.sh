@@ -171,8 +171,8 @@ fi
 if [[ -z "${VOID_BOX_KMOD_VERSION:-}" ]]; then
   if [[ "${VOID_BOX_PINNED_KMODS:-0}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
     _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
-    _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
-    _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    _DL_KERNEL_VER=$(sed -n 's/^KERNEL_VER="\${KERNEL_VER:-\([^}]*\)}"/\1/p' "$_DL_SCRIPT" 2>/dev/null | head -n 1)
+    _DL_KERNEL_UPLOAD=$(sed -n 's/^KERNEL_UPLOAD="\${KERNEL_UPLOAD:-\([^}]*\)}"/\1/p' "$_DL_SCRIPT" 2>/dev/null | head -n 1)
     export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
     export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
     echo "[agents-rootfs] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION}"

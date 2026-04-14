@@ -1019,11 +1019,7 @@ async fn resolve_guest_image(spec: &RunSpec) -> Option<GuestFiles> {
     let flavor = spec
         .llm
         .as_ref()
-        .and_then(|llm| match llm.provider.to_ascii_lowercase().as_str() {
-            "codex" => Some("codex"),
-            "claude" | "claude-personal" | "ollama" | "lm-studio" | "custom" => Some("claude"),
-            _ => None,
-        })
+        .and_then(|llm| crate::image::flavor_for_provider(&llm.provider))
         .or_else(|| {
             // kind: workflow with no llm section → base
             if spec.kind == crate::spec::RunKind::Workflow {

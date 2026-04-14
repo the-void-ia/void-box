@@ -18,7 +18,7 @@ const GITHUB_RELEASES_URL: &str = "https://github.com/the-void-ia/void-box/relea
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Maximum number of download retries on transient errors.
-const MAX_RETRIES: u32 = 3;
+const MAX_ATTEMPTS: u32 = 4;
 
 /// Base backoff duration (doubles on each retry).
 const BASE_BACKOFF: Duration = Duration::from_secs(1);
@@ -26,6 +26,18 @@ const BASE_BACKOFF: Duration = Duration::from_secs(1);
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Map a provider name string to an image flavor.
+///
+/// Single source of truth for the provider → artifact mapping used by
+/// both `runtime.rs` (spec-driven resolution) and `attach.rs` (shell).
+pub fn flavor_for_provider(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "claude" | "claude-personal" | "ollama" | "lm-studio" | "custom" => Some("claude"),
+        _ => None,
+    }
+}
 
 /// Detect host CPU architecture, returning `"x86_64"` or `"aarch64"`.
 pub fn detect_arch() -> Result<&'static str, ImageError> {
@@ -88,11 +100,25 @@ pub fn parse_checksum_hex(content: &str) -> Result<String, ImageError> {
     Ok(hex.to_string())
 }
 
-/// Verify a file's SHA-256 digest against an expected hex string.
+/// Verifies a file's SHA-256 digest against an expected hex string.
+///
+/// Uses buffered I/O to avoid loading the entire file into memory.
 pub fn verify_checksum(file_path: &Path, expected_hex: &str) -> Result<(), ImageError> {
-    let data = fs::read(file_path).map_err(|e| ImageError::Io(file_path.to_path_buf(), e))?;
+    use std::io::Read;
+
+    let file = fs::File::open(file_path).map_err(|e| ImageError::Io(file_path.to_path_buf(), e))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut buf = [0u8; 8192];
+    loop {
+        let bytes_read = reader
+            .read(&mut buf)
+            .map_err(|e| ImageError::Io(file_path.to_path_buf(), e))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buf[..bytes_read]);
+    }
     let actual = format!("{:x}", hasher.finalize());
     if actual != expected_hex {
         return Err(ImageError::ChecksumMismatch {
@@ -124,28 +150,28 @@ pub async fn download_and_cache(
     let checksum_url = format!("{}.sha256", artifact_url);
     let dest = ver_dir.join(artifact_name);
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             let backoff = BASE_BACKOFF * 2u32.pow(attempt - 1);
             warn!(attempt, "retrying download after {:?}", backoff);
             tokio::time::sleep(backoff).await;
         }
 
-        // Download artifact
+        let last_attempt = attempt + 1 == MAX_ATTEMPTS;
+        let checksum_dest = ver_dir.join(format!("{}.sha256", artifact_name));
+
         match download_file(&artifact_url, &dest).await {
             Ok(()) => {}
-            Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
+            Err(e) if e.is_retryable() && !last_attempt => {
                 warn!(%artifact_url, error = %e, "download failed, will retry");
                 continue;
             }
             Err(e) => return Err(e),
         }
 
-        // Download checksum
-        let checksum_dest = ver_dir.join(format!("{}.sha256", artifact_name));
         match download_file(&checksum_url, &checksum_dest).await {
             Ok(()) => {}
-            Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
+            Err(e) if e.is_retryable() && !last_attempt => {
                 let _ = fs::remove_file(&dest);
                 warn!("checksum download failed, will retry: {}", e);
                 continue;
@@ -156,10 +182,26 @@ pub async fn download_and_cache(
             }
         }
 
-        // Verify checksum
-        let checksum_content = fs::read_to_string(&checksum_dest)
-            .map_err(|e| ImageError::Io(checksum_dest.clone(), e))?;
-        let expected_hex = parse_checksum_hex(&checksum_content)?;
+        let checksum_content = match fs::read_to_string(&checksum_dest) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&checksum_dest);
+                return Err(ImageError::Io(checksum_dest, e));
+            }
+        };
+        let expected_hex = match parse_checksum_hex(&checksum_content) {
+            Ok(hex) => hex,
+            Err(e) => {
+                let _ = fs::remove_file(&dest);
+                let _ = fs::remove_file(&checksum_dest);
+                if !last_attempt {
+                    warn!("checksum parse failed, will retry: {}", e);
+                    continue;
+                }
+                return Err(e);
+            }
+        };
 
         match verify_checksum(&dest, &expected_hex) {
             Ok(()) => {
@@ -169,7 +211,7 @@ pub async fn download_and_cache(
             Err(e) => {
                 let _ = fs::remove_file(&dest);
                 let _ = fs::remove_file(&checksum_dest);
-                if attempt < MAX_RETRIES {
+                if !last_attempt {
                     warn!("checksum mismatch, will retry: {}", e);
                     continue;
                 }
@@ -258,8 +300,10 @@ pub async fn resolve_initramfs(
     download_and_cache(cache_root, &artifact).await
 }
 
-/// Download a file from `url` to `dest` with a progress bar on stderr.
+/// Downloads a file from `url` to `dest` with streaming I/O and a progress bar.
 async fn download_file(url: &str, dest: &Path) -> Result<(), ImageError> {
+    use futures_util::StreamExt;
+
     let client = reqwest::Client::new();
     let resp = client
         .get(url)
@@ -296,19 +340,20 @@ async fn download_file(url: &str, dest: &Path) -> Result<(), ImageError> {
         None
     };
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ImageError::Network(url.to_string(), e.to_string()))?;
-
-    if let Some(ref pb) = pb {
-        pb.set_position(bytes.len() as u64);
-        pb.finish_and_clear();
+    let mut file = fs::File::create(dest).map_err(|e| ImageError::Io(dest.to_path_buf(), e))?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ImageError::Network(url.to_string(), e.to_string()))?;
+        file.write_all(&chunk)
+            .map_err(|e| ImageError::Io(dest.to_path_buf(), e))?;
+        if let Some(ref pb) = pb {
+            pb.inc(chunk.len() as u64);
+        }
     }
 
-    let mut file = fs::File::create(dest).map_err(|e| ImageError::Io(dest.to_path_buf(), e))?;
-    file.write_all(&bytes)
-        .map_err(|e| ImageError::Io(dest.to_path_buf(), e))?;
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
 
     Ok(())
 }
@@ -590,6 +635,18 @@ mod tests {
         fs::write(&file_path, data).unwrap();
 
         assert!(verify_checksum(&file_path, &hex).is_ok());
+    }
+
+    #[test]
+    fn test_flavor_for_provider() {
+        assert_eq!(flavor_for_provider("codex"), Some("codex"));
+        assert_eq!(flavor_for_provider("claude"), Some("claude"));
+        assert_eq!(flavor_for_provider("Claude"), Some("claude"));
+        assert_eq!(flavor_for_provider("claude-personal"), Some("claude"));
+        assert_eq!(flavor_for_provider("ollama"), Some("claude"));
+        assert_eq!(flavor_for_provider("lm-studio"), Some("claude"));
+        assert_eq!(flavor_for_provider("custom"), Some("claude"));
+        assert_eq!(flavor_for_provider("unknown-thing"), None);
     }
 
     #[test]

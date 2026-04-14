@@ -827,30 +827,19 @@ impl SandboxBuilder {
         self
     }
 
-    /// Use pre-built artifacts from GitHub releases
+    /// Use pre-built artifacts from GitHub releases.
     ///
-    /// Downloads kernel and initramfs artifacts from the specified version.
+    /// # Deprecated
     ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use void_box::sandbox::Sandbox;
-    ///
-    /// let sandbox = Sandbox::local()
-    ///     .with_prebuilt_artifacts("v0.1.0")
-    ///     .unwrap()
-    ///     .build()
-    ///     .unwrap();
-    /// ```
+    /// This method was never implemented. Use [`crate::image::resolve_kernel`]
+    /// and [`crate::image::resolve_initramfs`] for auto-download support.
+    #[deprecated(note = "use image::resolve_kernel / resolve_initramfs instead")]
     pub fn with_prebuilt_artifacts(
         self,
         _version: &str,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        // Previously delegated to artifacts::download_prebuilt_artifacts which
-        // was never implemented.  Use `image::resolve_kernel` /
-        // `image::resolve_initramfs` for auto-download support instead.
         Err(
-            "with_prebuilt_artifacts is deprecated — use image::resolve_kernel / resolve_initramfs"
+            "with_prebuilt_artifacts is removed — use image::resolve_kernel / resolve_initramfs"
                 .into(),
         )
     }
