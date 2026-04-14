@@ -26,6 +26,7 @@ set -euo pipefail
 #   BUSYBOX         Path to a static busybox (default: /usr/bin/busybox)
 #   OUT_DIR         Rootfs staging directory (default: target/void-box-codex-rootfs)
 #   OUT_CPIO        Output initramfs path (default: target/void-box-codex.cpio.gz)
+#   VOID_BOX_CA_BUNDLE   Optional host CA bundle override (PEM file)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
