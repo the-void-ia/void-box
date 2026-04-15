@@ -87,6 +87,7 @@ install_ca_certificates() {
     /etc/pki/tls/certs/ca-bundle.crt \
     /etc/ssl/certs/ca-bundle.crt \
     /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /etc/ssl/cert.pem \
     ; do
     link_dir="$out_dir$(dirname "$link_path")"
     mkdir -p "$link_dir"

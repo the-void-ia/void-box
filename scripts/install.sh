@@ -127,8 +127,8 @@ codesign_macos_binary() {
         return
     fi
 
-    ENTITLEMENTS_FILE="$(mktemp "${CODESIGN_TMPDIR}/voidbox-entitlements.XXXXXX")"
-    cat > "$ENTITLEMENTS_FILE" <<'EOF'
+    CODESIGN_ENTITLEMENTS_FILE="$(mktemp "${CODESIGN_TMPDIR}/voidbox-entitlements.XXXXXX")"
+    cat > "$CODESIGN_ENTITLEMENTS_FILE" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -140,7 +140,7 @@ codesign_macos_binary() {
 EOF
 
     echo "Applying macOS virtualization entitlement to ${INSTALL_BIN}/voidbox..."
-    $CODESIGN_SUDO "$CODESIGN_BIN" --force --sign - --entitlements "$ENTITLEMENTS_FILE" "${INSTALL_BIN}/voidbox"
+    $CODESIGN_SUDO "$CODESIGN_BIN" --force --sign - --entitlements "$CODESIGN_ENTITLEMENTS_FILE" "${INSTALL_BIN}/voidbox"
 }
 
 verify_install() {
