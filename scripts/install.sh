@@ -114,9 +114,9 @@ download_and_install() {
 }
 
 codesign_macos_binary() {
-    SUDO="${1:-}"
-    TMP_INSTALL_DIR="${2:-}"
-    if [ -z "$TMP_INSTALL_DIR" ]; then
+    CODESIGN_SUDO="${1:-}"
+    CODESIGN_TMPDIR="${2:-}"
+    if [ -z "$CODESIGN_TMPDIR" ]; then
         echo "Error: internal installer error: missing temp install dir for codesign" >&2
         return 1
     fi
@@ -127,7 +127,7 @@ codesign_macos_binary() {
         return
     fi
 
-    ENTITLEMENTS_FILE="$(mktemp "${TMP_INSTALL_DIR}/voidbox-entitlements.XXXXXX")"
+    ENTITLEMENTS_FILE="$(mktemp "${CODESIGN_TMPDIR}/voidbox-entitlements.XXXXXX")"
     cat > "$ENTITLEMENTS_FILE" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -140,7 +140,7 @@ codesign_macos_binary() {
 EOF
 
     echo "Applying macOS virtualization entitlement to ${INSTALL_BIN}/voidbox..."
-    $SUDO "$CODESIGN_BIN" --force --sign - --entitlements "$ENTITLEMENTS_FILE" "${INSTALL_BIN}/voidbox"
+    $CODESIGN_SUDO "$CODESIGN_BIN" --force --sign - --entitlements "$ENTITLEMENTS_FILE" "${INSTALL_BIN}/voidbox"
 }
 
 verify_install() {
