@@ -28,6 +28,7 @@ set -euo pipefail
 #   BUSYBOX              Path to a static busybox (default: /usr/bin/busybox)
 #   OUT_DIR              Rootfs staging directory (default: target/void-box-claude-rootfs)
 #   OUT_CPIO             Output initramfs path (default: target/void-box-claude.cpio.gz)
+#   VOID_BOX_CA_BUNDLE   Optional host CA bundle override (PEM file)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -154,8 +155,8 @@ if [[ -z "${VOID_BOX_KMOD_VERSION:-}" ]]; then
   if [[ "${VOID_BOX_PINNED_KMODS:-0}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
     # Extract pinned KERNEL_VER and KERNEL_UPLOAD from download_kernel.sh.
     _DL_SCRIPT="$ROOT_DIR/scripts/download_kernel.sh"
-    _DL_KERNEL_VER=$(grep -oP '(?<=^KERNEL_VER="\$\{KERNEL_VER:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
-    _DL_KERNEL_UPLOAD=$(grep -oP '(?<=^KERNEL_UPLOAD="\$\{KERNEL_UPLOAD:-)[^}]+' "$_DL_SCRIPT" 2>/dev/null || true)
+    _DL_KERNEL_VER=$(sed -n 's/^KERNEL_VER="\${KERNEL_VER:-\([^}]*\)}"/\1/p' "$_DL_SCRIPT" 2>/dev/null | head -n 1)
+    _DL_KERNEL_UPLOAD=$(sed -n 's/^KERNEL_UPLOAD="\${KERNEL_UPLOAD:-\([^}]*\)}"/\1/p' "$_DL_SCRIPT" 2>/dev/null | head -n 1)
     export VOID_BOX_KMOD_VERSION="${_DL_KERNEL_VER:-6.8.0-51}"
     export VOID_BOX_KMOD_UPLOAD="${_DL_KERNEL_UPLOAD:-52}"
     echo "[claude-rootfs] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"

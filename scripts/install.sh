@@ -107,6 +107,40 @@ download_and_install() {
     fi
 
     $SUDO install -m 644 "${TMPDIR_INSTALL}/initramfs.cpio.gz" "$INSTALL_LIB/initramfs.cpio.gz"
+
+    if [ "$PLATFORM" = "darwin" ]; then
+        codesign_macos_binary "$SUDO" "$TMPDIR_INSTALL"
+    fi
+}
+
+codesign_macos_binary() {
+    CODESIGN_SUDO="${1:-}"
+    CODESIGN_TMPDIR="${2:-}"
+    if [ -z "$CODESIGN_TMPDIR" ]; then
+        echo "Error: internal installer error: missing temp install dir for codesign" >&2
+        return 1
+    fi
+
+    CODESIGN_BIN="$(command -v codesign || true)"
+    if [ -z "$CODESIGN_BIN" ]; then
+        echo "Warning: codesign not found; macOS virtualization entitlement was not applied." >&2
+        return
+    fi
+
+    CODESIGN_ENTITLEMENTS_FILE="$(mktemp "${CODESIGN_TMPDIR}/voidbox-entitlements.XXXXXX")"
+    cat > "$CODESIGN_ENTITLEMENTS_FILE" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    echo "Applying macOS virtualization entitlement to ${INSTALL_BIN}/voidbox..."
+    $CODESIGN_SUDO "$CODESIGN_BIN" --force --sign - --entitlements "$CODESIGN_ENTITLEMENTS_FILE" "${INSTALL_BIN}/voidbox"
 }
 
 verify_install() {

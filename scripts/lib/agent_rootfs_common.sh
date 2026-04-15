@@ -21,10 +21,33 @@ sandbox:x:1000:
 GROUP
 }
 
+# ── Download artifact helpers ────────────────────────────────────────────────
+
+find_extracted_executable() {
+  local search_dir="$1"
+  local candidate
+
+  while IFS= read -r candidate; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(
+    find "$search_dir" -type f \
+      ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
+      ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
+      ! -name '*.sha256' ! -name '*.txt'
+  )
+
+  return 1
+}
+
 # ── SSL CA certificates ──────────────────────────────────────────────────────
 # Install the host CA bundle at the canonical path and create symlinks for
 # every common location so that curl, OpenSSL, Bun, etc. all find it
 # regardless of which distro compiled them.
+# Supports Linux + macOS host paths and optional override via VOID_BOX_CA_BUNDLE
+# (or SSL_CERT_FILE).
 # Returns 1 if no host CA bundle is found — both Claude and Codex need TLS.
 
 install_ca_certificates() {
@@ -32,13 +55,39 @@ install_ca_certificates() {
   local canonical="$out_dir/etc/ssl/certs/ca-certificates.crt"
   mkdir -p "$(dirname "$canonical")"
 
+  local cert_candidates=()
+  if [[ -n "${VOID_BOX_CA_BUNDLE:-}" ]]; then
+    cert_candidates+=("${VOID_BOX_CA_BUNDLE}")
+  fi
+  if [[ -n "${SSL_CERT_FILE:-}" ]]; then
+    cert_candidates+=("${SSL_CERT_FILE}")
+  fi
+
+  # Ordered by precedence:
+  # 1. Common Linux distro locations
+  # 2. macOS system bundle
+  # 3. Homebrew-managed cert bundle paths
+  cert_candidates+=(
+    /etc/ssl/certs/ca-certificates.crt
+    /etc/pki/tls/certs/ca-bundle.crt
+    /etc/ssl/certs/ca-bundle.crt
+    /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    /etc/ssl/cert.pem
+    /private/etc/ssl/cert.pem
+    /opt/homebrew/etc/ca-certificates/cert.pem
+    /usr/local/etc/ca-certificates/cert.pem
+    /opt/homebrew/etc/openssl@3/cert.pem
+    /usr/local/etc/openssl@3/cert.pem
+  )
+
   local found=""
-  for cert_path in \
-    /etc/ssl/certs/ca-certificates.crt \
-    /etc/pki/tls/certs/ca-bundle.crt \
-    /etc/ssl/certs/ca-bundle.crt \
-    /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-    ; do
+  local searched=""
+  local cert_path
+  for cert_path in "${cert_candidates[@]}"; do
+    if [[ -n "$searched" ]]; then
+      searched="${searched}, "
+    fi
+    searched="${searched}${cert_path}"
     if [[ -f "$cert_path" ]]; then
       cp "$cert_path" "$canonical"
       echo "[agent-rootfs] Installed CA certificates from $cert_path"
@@ -48,7 +97,9 @@ install_ca_certificates() {
   done
 
   if [[ -z "$found" ]]; then
-    echo "ERROR: no host CA bundle found in any standard location" >&2
+    echo "ERROR: no host CA bundle found in any known location" >&2
+    echo "  Checked: $searched" >&2
+    echo "  Set VOID_BOX_CA_BUNDLE=/path/to/ca-bundle.pem and retry." >&2
     return 1
   fi
 
@@ -57,6 +108,7 @@ install_ca_certificates() {
     /etc/pki/tls/certs/ca-bundle.crt \
     /etc/ssl/certs/ca-bundle.crt \
     /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /etc/ssl/cert.pem \
     ; do
     link_dir="$out_dir$(dirname "$link_path")"
     mkdir -p "$link_dir"

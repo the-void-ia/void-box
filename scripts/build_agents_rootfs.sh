@@ -126,11 +126,7 @@ if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
       exit 1
     fi
     tar -xzf "$TMP_DIR/codex.tar.gz" -C "$TMP_DIR"
-    EXTRACTED_BIN="$(find "$TMP_DIR" -type f -executable \
-      ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
-      ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
-      ! -name '*.sha256' ! -name '*.txt' \
-      | head -1)"
+    EXTRACTED_BIN="$(find_extracted_executable "$TMP_DIR" || true)"
     if [[ -z "$EXTRACTED_BIN" ]]; then
       echo "ERROR: tarball did not contain an executable codex binary" >&2
       exit 1
