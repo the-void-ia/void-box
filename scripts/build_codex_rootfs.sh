@@ -100,11 +100,7 @@ if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
     # after the target triple (e.g. codex-x86_64-unknown-linux-musl), not a
     # plain "codex". Match any executable file that isn't the tarball itself
     # or a signature/checksum artifact.
-    EXTRACTED_BIN="$(find "$TMP_DIR" -type f -executable \
-      ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
-      ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
-      ! -name '*.sha256' ! -name '*.txt' \
-      | head -1)"
+    EXTRACTED_BIN="$(find_extracted_executable "$TMP_DIR" || true)"
     if [[ -z "$EXTRACTED_BIN" ]]; then
       echo "ERROR: tarball did not contain an executable codex binary" >&2
       ls -laR "$TMP_DIR" >&2

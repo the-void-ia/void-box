@@ -21,6 +21,27 @@ sandbox:x:1000:
 GROUP
 }
 
+# ── Download artifact helpers ────────────────────────────────────────────────
+
+find_extracted_executable() {
+  local search_dir="$1"
+  local candidate
+
+  while IFS= read -r candidate; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(
+    find "$search_dir" -type f \
+      ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
+      ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
+      ! -name '*.sha256' ! -name '*.txt'
+  )
+
+  return 1
+}
+
 # ── SSL CA certificates ──────────────────────────────────────────────────────
 # Install the host CA bundle at the canonical path and create symlinks for
 # every common location so that curl, OpenSSL, Bun, etc. all find it
