@@ -161,10 +161,7 @@ async fn snapshot_vz_round_trip() {
     let secret: [u8; 32] = meta.session_secret.as_slice().try_into().unwrap();
     restore_cfg.security.session_secret = secret;
 
-    if let Err(e) = restored.start(restore_cfg).await {
-        eprintln!("[vz_snapshot] restore failed: {e}");
-        return;
-    }
+    restored.start(restore_cfg).await.expect("restore failed");
     let restore_time = restore_start.elapsed();
     eprintln!("[vz_snapshot] Restored in {:.1?}", restore_time);
     assert!(restored.is_running());
@@ -229,41 +226,31 @@ async fn auto_snapshot_vz_round_trip() {
         "[vz_auto_snapshot] Creating auto-snapshot at {}...",
         snap_dir.path().display()
     );
-    // create_auto_snapshot's restart step calls restoreMachineStateFromURL,
-    // which currently fails on VZ with VZErrorRestore ("invalid argument") —
-    // the same pre-existing bug surfaced (silently) by snapshot_vz_round_trip.
-    // Until that is fixed, we validate the pieces that do work:
-    //   1. The save step wrote vm.vzvmsave + vz_meta.json.
-    //   2. The sidecar carries the config_hash supplied by the caller.
-    // When the restore bug is fixed, tighten this back to expect success and
-    // exercise the restored VM with a post-snapshot exec.
-    let auto_result = backend
+    backend
         .create_auto_snapshot(snap_dir.path(), config_hash.clone())
-        .await;
+        .await
+        .expect("create_auto_snapshot failed");
 
     let save_path = VzSnapshotMeta::save_file_path(snap_dir.path());
     assert!(save_path.exists(), "vm.vzvmsave must exist after save step");
     let meta = VzSnapshotMeta::load(snap_dir.path()).expect("load vz_meta.json");
     assert_eq!(meta.config_hash.as_deref(), Some(config_hash.as_str()));
+    assert!(
+        meta.machine_identifier.is_some(),
+        "sidecar must carry the VZGenericMachineIdentifier for restore"
+    );
 
-    match auto_result {
-        Ok(()) => {
-            assert!(
-                backend.is_running(),
-                "backend should be running against the restored VM"
-            );
-            let output = backend
-                .exec("echo", &["after-auto-snap"], &[], &[], None, Some(30))
-                .await
-                .expect("exec failed after auto-snapshot restore");
-            assert_eq!(output.exit_code, 0);
-            assert_eq!(output.stdout_str().trim(), "after-auto-snap");
-            backend.stop().await.expect("stop failed");
-        }
-        Err(e) => {
-            eprintln!("[vz_auto_snapshot] restore-after-save failed (pre-existing VZ bug): {e}");
-        }
-    }
+    assert!(
+        backend.is_running(),
+        "backend should be running against the restored VM"
+    );
+    let output = backend
+        .exec("echo", &["after-auto-snap"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed after auto-snapshot restore");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout_str().trim(), "after-auto-snap");
+    backend.stop().await.expect("stop failed");
 }
 
 // ---------------------------------------------------------------------------

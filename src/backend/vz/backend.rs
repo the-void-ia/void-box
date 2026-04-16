@@ -59,7 +59,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSFileHandle, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 
 const GUEST_NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
@@ -138,6 +138,12 @@ pub struct VzBackend {
     started_config: Option<StartedConfigInfo>,
     /// Full backend config for restart flows such as auto-snapshot.
     start_config: Option<BackendConfig>,
+    /// `VZGenericMachineIdentifier.dataRepresentation` for the running VM.
+    ///
+    /// Baked into the `vz_meta.json` sidecar so that a later restore can
+    /// reconstruct the exact same platform identifier — Apple rejects restores
+    /// whose `VZGenericPlatformConfiguration` has a different identifier.
+    machine_identifier: Option<Vec<u8>>,
 }
 
 /// Subset of BackendConfig we need to persist in the snapshot sidecar.
@@ -306,6 +312,7 @@ impl VzBackend {
             session_secret: None,
             started_config: None,
             start_config: None,
+            machine_identifier: None,
         }
     }
 
@@ -314,10 +321,17 @@ impl VzBackend {
     /// This contains steps 1–7 of the original `start()`: boot loader,
     /// memory/cpu, vsock, networking, serial, virtiofs, and validation.
     /// Both cold-boot and snapshot-restore paths call this.
+    ///
+    /// `machine_identifier_data` reuses the `VZGenericMachineIdentifier` from a
+    /// saved snapshot so that `restoreMachineStateFromURL:` accepts the
+    /// reconstructed config. `None` generates a fresh identifier (cold boot).
+    /// The returned `Vec<u8>` is the `dataRepresentation` of the identifier in
+    /// effect, ready to persist in the snapshot sidecar.
     fn configure_vm(
         config: &BackendConfig,
         boot_clock_secs: u64,
-    ) -> Result<Retained<VZVirtualMachineConfiguration>> {
+        machine_identifier_data: Option<&[u8]>,
+    ) -> Result<(Retained<VZVirtualMachineConfiguration>, Vec<u8>)> {
         // 1. Boot loader
         let kernel_url =
             NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")));
@@ -345,6 +359,38 @@ impl VzBackend {
             vm_config.setBootLoader(Some(&boot_loader));
             vm_config.setMemorySize(config::memory_bytes(config));
             vm_config.setCPUCount(config.vcpus);
+        }
+
+        // 2a. Platform configuration with a stable machine identifier.
+        //
+        // `VZVirtualMachineConfiguration` otherwise hands out a fresh random
+        // `VZGenericMachineIdentifier` every time it's constructed. That
+        // identifier is baked into the save file, so the restore-time config
+        // must carry the same one — otherwise Apple rejects the restore with
+        // `VZErrorRestore` / "invalid argument".
+        let machine_identifier = match machine_identifier_data {
+            Some(bytes) => {
+                let ns_data = NSData::with_bytes(bytes);
+                unsafe {
+                    VZGenericMachineIdentifier::initWithDataRepresentation(
+                        VZGenericMachineIdentifier::alloc(),
+                        &ns_data,
+                    )
+                }
+                .ok_or_else(|| {
+                    crate::Error::Snapshot(
+                        "invalid VZGenericMachineIdentifier data in snapshot sidecar".into(),
+                    )
+                })?
+            }
+            None => unsafe { VZGenericMachineIdentifier::new() },
+        };
+        let machine_identifier_bytes = unsafe { machine_identifier.dataRepresentation() }.to_vec();
+
+        let platform = unsafe { VZGenericPlatformConfiguration::new() };
+        unsafe {
+            platform.setMachineIdentifier(&machine_identifier);
+            vm_config.setPlatform(&platform);
         }
 
         // 3. Virtio socket device (for host↔guest control channel)
@@ -478,9 +524,14 @@ impl VzBackend {
             vm_config
                 .validateWithError()
                 .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
+            vm_config
+                .validateSaveRestoreSupportWithError()
+                .map_err(|e| {
+                    crate::Error::Backend(format!("VZ save/restore support validation: {}", e))
+                })?;
         }
 
-        Ok(vm_config)
+        Ok((vm_config, machine_identifier_bytes))
     }
 
     /// Extract socket device from a running VM and set up the control channel.
@@ -695,6 +746,7 @@ impl VzBackend {
             cid: self.cid,
             boot_clock_secs: config_info.boot_clock_secs,
             config_hash,
+            machine_identifier: self.machine_identifier.clone(),
         };
         if let Err(e) = meta.save(dir) {
             error!("VzBackend: sidecar save failed: {}", e);
@@ -711,6 +763,7 @@ impl VzBackend {
         self.vm = None;
         self.session_secret = None;
         self.started_config = None;
+        self.machine_identifier = None;
     }
 }
 
@@ -741,8 +794,22 @@ impl VmmBackend for VzBackend {
                         crate::Error::Snapshot("invalid session_secret length in snapshot".into())
                     })?;
 
-                // 2. Build VM configuration (same setup as cold boot)
-                let vm_config = Self::configure_vm(&config, meta.boot_clock_secs)?;
+                // 2. Build VM configuration (same setup as cold boot).
+                //    Reuse the saved machine identifier so Apple's restore
+                //    accepts the reconstructed platform configuration.
+                let saved_machine_identifier =
+                    meta.machine_identifier.as_deref().ok_or_else(|| {
+                        crate::Error::Snapshot(
+                            "snapshot sidecar is missing machine_identifier (pre-fix snapshot); \
+                             recreate the snapshot with a newer voidbox"
+                                .into(),
+                        )
+                    })?;
+                let (vm_config, machine_identifier_bytes) = Self::configure_vm(
+                    &config,
+                    meta.boot_clock_secs,
+                    Some(saved_machine_identifier),
+                )?;
 
                 // 3. Create VM on the VZ queue
                 let vm = unsafe {
@@ -819,6 +886,7 @@ impl VmmBackend for VzBackend {
                     network: meta.network,
                     boot_clock_secs: meta.boot_clock_secs,
                 });
+                self.machine_identifier = Some(machine_identifier_bytes);
                 self.setup_control_channel(session_secret);
 
                 return Ok(());
@@ -842,7 +910,8 @@ impl VmmBackend for VzBackend {
             }
 
             let boot_clock_secs = config::current_epoch_secs();
-            let vm_config = Self::configure_vm(&config, boot_clock_secs)?;
+            let (vm_config, machine_identifier_bytes) =
+                Self::configure_vm(&config, boot_clock_secs, None)?;
 
             // Create and start the VM on a dedicated serial dispatch queue.
             //
@@ -884,6 +953,7 @@ impl VmmBackend for VzBackend {
                 network: config.network,
                 boot_clock_secs,
             });
+            self.machine_identifier = Some(machine_identifier_bytes);
             self.setup_control_channel(config.security.session_secret);
 
             Ok(())
@@ -1122,11 +1192,6 @@ impl VmmBackend for VzBackend {
 
         // Stop the original VM and restart from the saved state. The start
         // path detects `restart_config.snapshot` and takes the restore branch.
-        //
-        // Note: restoreMachineStateFromURL currently fails on VZ with
-        // VZErrorRestore ("invalid argument"); see snapshot_vz_round_trip for
-        // the same symptom. That restore bug is pre-existing and blocks the
-        // full auto-snapshot contract on macOS until it's fixed.
         self.stop().await?;
         self.start(restart_config).await?;
 

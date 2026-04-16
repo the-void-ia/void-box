@@ -47,6 +47,15 @@ pub struct VzSnapshotMeta {
     /// a sidecar was not moved into the wrong slot.
     #[serde(default)]
     pub config_hash: Option<String>,
+    /// `VZGenericMachineIdentifier.dataRepresentation` captured at save time.
+    ///
+    /// Apple's `restoreMachineStateFromURL:` rejects the restore with
+    /// `VZErrorRestore` / "invalid argument" unless the `VZGenericPlatformConfiguration`
+    /// used at restore time carries the same machine identifier that was baked
+    /// into the save file. Snapshots written before this field existed cannot
+    /// be restored and must be recreated.
+    #[serde(default)]
+    pub machine_identifier: Option<Vec<u8>>,
 }
 
 impl VzSnapshotMeta {
