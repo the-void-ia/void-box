@@ -18,14 +18,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+#[path = "common/net.rs"]
+mod test_net;
+
 /// Start the daemon on a random port and return the address.
 fn start_daemon() -> SocketAddr {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let addr = local_addr;
+    let addr = test_net::reserve_localhost_addr();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

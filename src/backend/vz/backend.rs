@@ -776,10 +776,7 @@ impl VmmBackend for VzBackend {
                 config.memory_mb, config.vcpus
             );
 
-            let boot_clock_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let boot_clock_secs = config::current_epoch_secs();
             let vm_config = Self::configure_vm(&config, boot_clock_secs)?;
 
             // Create and start the VM on a dedicated serial dispatch queue.

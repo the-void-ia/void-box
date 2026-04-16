@@ -42,6 +42,13 @@ const LINUX_GUEST_HOST_GATEWAY: &str = "10.0.2.2";
 #[cfg(target_os = "macos")]
 const MACOS_GUEST_HOST_GATEWAY: &str = "192.168.64.1";
 
+fn session_secret_hex(session_secret: &[u8; 32]) -> String {
+    session_secret
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
 /// A single host→guest directory mount.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
@@ -195,6 +202,49 @@ impl BackendConfig {
         } else {
             None
         }
+    }
+}
+
+/// Append guest-visible kernel command line arguments shared by KVM and VZ.
+///
+/// The caller owns the platform-specific prefix (console device, virtio
+/// discovery, rootfs device wiring). This helper appends the common suffix:
+/// session secret, boot clock, optional guest networking flags, mount
+/// descriptors, and OCI rootfs selectors.
+pub(crate) fn append_common_guest_kernel_args(
+    cmdline_parts: &mut Vec<String>,
+    session_secret: &[u8; 32],
+    epoch_secs: u64,
+    network_enabled: bool,
+    include_guest_network_flag: bool,
+    mounts: &[MountConfig],
+    oci_rootfs: Option<&str>,
+    oci_rootfs_dev: Option<&str>,
+) {
+    cmdline_parts.push(format!("voidbox.secret={}", session_secret_hex(session_secret)));
+    cmdline_parts.push(format!("voidbox.clock={}", epoch_secs));
+
+    if network_enabled {
+        if include_guest_network_flag {
+            cmdline_parts.push("voidbox.network=1".to_string());
+        }
+        cmdline_parts.push("ipv6.disable=1".to_string());
+    }
+
+    for (mount_index, mount) in mounts.iter().enumerate() {
+        let mount_mode = if mount.read_only { "ro" } else { "rw" };
+        cmdline_parts.push(format!(
+            "voidbox.mount{}=mount{}:{}:{}",
+            mount_index, mount_index, mount.guest_path, mount_mode
+        ));
+    }
+
+    if let Some(oci_rootfs_path) = oci_rootfs {
+        cmdline_parts.push(format!("voidbox.oci_rootfs={}", oci_rootfs_path));
+    }
+
+    if let Some(oci_rootfs_device) = oci_rootfs_dev {
+        cmdline_parts.push(format!("voidbox.oci_rootfs_dev={}", oci_rootfs_device));
     }
 }
 

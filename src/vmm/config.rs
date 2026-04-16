@@ -268,15 +268,6 @@ impl VoidBoxConfig {
             cmdline.push("rw".to_string());
         }
 
-        // Inject session secret for vsock authentication
-        let secret_hex: String = self
-            .security
-            .session_secret
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
-        cmdline.push(format!("voidbox.secret={}", secret_hex));
-
         // Inject host wall-clock so the guest can set its system time.
         // Without this, the guest starts at epoch (1970) and TLS cert
         // validation fails.
@@ -284,25 +275,16 @@ impl VoidBoxConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        cmdline.push(format!("voidbox.clock={}", epoch_secs));
-
-        // Mount config: tell the guest-agent which 9p tags to mount and where.
-        // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
-        for (i, mount) in self.mounts.iter().enumerate() {
-            let mode = if mount.read_only { "ro" } else { "rw" };
-            cmdline.push(format!(
-                "voidbox.mount{}=mount{}:{}:{}",
-                i, i, mount.guest_path, mode
-            ));
-        }
-
-        // OCI rootfs: tell the guest-agent to pivot_root to the mounted rootfs.
-        if let Some(ref oci_path) = self.oci_rootfs {
-            cmdline.push(format!("voidbox.oci_rootfs={}", oci_path));
-        }
-        if let Some(ref dev) = self.oci_rootfs_dev {
-            cmdline.push(format!("voidbox.oci_rootfs_dev={}", dev));
-        }
+        crate::backend::append_common_guest_kernel_args(
+            &mut cmdline,
+            &self.security.session_secret,
+            epoch_secs,
+            self.network,
+            false,
+            &self.mounts,
+            self.oci_rootfs.as_deref(),
+            self.oci_rootfs_dev.as_deref(),
+        );
 
         // Add extra arguments
         cmdline.extend(self.extra_cmdline.clone());

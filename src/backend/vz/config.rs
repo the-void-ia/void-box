@@ -3,9 +3,9 @@
 //! Translates VoidBox's platform-agnostic configuration into the
 //! Virtualization.framework objects needed to boot a VM.
 
-use crate::backend::BackendConfig;
+use crate::backend::{append_common_guest_kernel_args, BackendConfig};
 
-fn current_epoch_secs() -> u64 {
+pub(crate) fn current_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -33,43 +33,19 @@ pub fn build_kernel_cmdline_with_clock(config: &BackendConfig, epoch_secs: u64) 
         "nokaslr".to_string(),
     ];
 
-    // Inject session secret
-    let secret_hex: String = config
-        .security
-        .session_secret
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    parts.push(format!("voidbox.secret={}", secret_hex));
-
-    // Inject host wall-clock for TLS cert validation
-    parts.push(format!("voidbox.clock={}", epoch_secs));
-
-    // Disable IPv6 if networking is enabled (our guest stack is IPv4 only)
-    // voidbox.network=1: guest-agent uses this to run setup_network() (VZ has no virtio_mmio in cmdline)
-    if config.network {
-        parts.push("voidbox.network=1".to_string());
-        parts.push("ipv6.disable=1".to_string());
-    }
-
     // OCI rootfs: VZ uses virtiofs (not virtio-blk) for OCI rootfs delivery.
     // The host shares the extracted rootfs directory read-only; the guest
     // overlays it with a tmpfs upper layer. See AGENTS.md for details.
-
-    // Mount config: tell the guest-agent which virtiofs tags to mount and where.
-    // Format: voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>
-    for (i, mount) in config.mounts.iter().enumerate() {
-        let mode = if mount.read_only { "ro" } else { "rw" };
-        parts.push(format!(
-            "voidbox.mount{}=mount{}:{}:{}",
-            i, i, mount.guest_path, mode
-        ));
-    }
-
-    // OCI rootfs: tell the guest-agent to pivot_root to the mounted rootfs.
-    if let Some(ref oci_path) = config.oci_rootfs {
-        parts.push(format!("voidbox.oci_rootfs={}", oci_path));
-    }
+    append_common_guest_kernel_args(
+        &mut parts,
+        &config.security.session_secret,
+        epoch_secs,
+        config.network,
+        true,
+        &config.mounts,
+        config.oci_rootfs.as_deref(),
+        None,
+    );
 
     parts.join(" ")
 }

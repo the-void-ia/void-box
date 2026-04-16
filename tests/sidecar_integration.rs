@@ -6,6 +6,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 use void_box::sidecar::{start_sidecar, InboxEntry, InboxSnapshot};
 
+#[path = "common/net.rs"]
+mod test_net;
+
 /// Response data extracted in the blocking thread.
 struct Resp {
     status: u16,
@@ -51,7 +54,7 @@ async fn sidecar_health_endpoint() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -71,7 +74,7 @@ async fn sidecar_inbox_empty_before_load() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -91,7 +94,7 @@ async fn sidecar_context_endpoint() {
         "exec-1",
         "cand-1",
         vec!["cand-2".into(), "cand-3".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -111,7 +114,7 @@ async fn sidecar_signals_returns_501() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -129,7 +132,7 @@ async fn sidecar_post_intent_and_read_inbox_flow() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -184,7 +187,7 @@ async fn sidecar_rejects_oversized_intent() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -223,7 +226,7 @@ async fn sidecar_rejects_excess_intents() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -272,7 +275,7 @@ async fn sidecar_incremental_inbox_query() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -324,7 +327,7 @@ async fn sidecar_batch_intent_submission() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -364,7 +367,7 @@ async fn sidecar_unknown_route_returns_404() {
         "exec-1",
         "cand-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        test_net::localhost_ephemeral_addr(),
     )
     .await
     .unwrap();
@@ -381,12 +384,7 @@ async fn sidecar_unknown_route_returns_404() {
 
 /// Start the daemon on a random port and return the address.
 fn start_daemon() -> SocketAddr {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let addr = local_addr;
+    let addr = test_net::reserve_localhost_addr();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

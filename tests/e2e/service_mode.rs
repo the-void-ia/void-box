@@ -7,6 +7,8 @@
 /// messaging/MCP is active, and that cancel works after publication.
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
+#[path = "../common/net.rs"]
+mod test_net;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -96,10 +98,7 @@ fn wait_for_http_ok(addr: SocketAddr, path: &str, timeout: Duration) {
 }
 
 fn start_daemon(kernel: &std::path::Path, initramfs: &std::path::Path) -> SocketAddr {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let addr = test_net::reserve_localhost_addr();
 
     let kernel = kernel.to_path_buf();
     let initramfs = initramfs.to_path_buf();
