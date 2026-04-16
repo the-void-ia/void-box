@@ -607,7 +607,7 @@ impl VzBackend {
         self.create_snapshot_with_hash(dir, None)
     }
 
-    /// Like [`create_snapshot`], but persists the config hash that produced
+    /// Like [`VzBackend::create_snapshot`], but persists the config hash that produced
     /// this snapshot into the sidecar. Used by auto-snapshot so the sidecar
     /// carries the same identity information KVM's `state.bin` does.
     pub fn create_snapshot_with_hash(&self, dir: &Path, config_hash: Option<String>) -> Result<()> {
