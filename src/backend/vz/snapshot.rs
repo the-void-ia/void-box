@@ -42,6 +42,11 @@ pub struct VzSnapshotMeta {
     pub cid: u32,
     /// Host wall-clock injected into the original boot cmdline.
     pub boot_clock_secs: u64,
+    /// Config hash that produced this snapshot, when known. Mirrors the hash
+    /// encoded in the snapshot directory name and lets tooling validate that
+    /// a sidecar was not moved into the wrong slot.
+    #[serde(default)]
+    pub config_hash: Option<String>,
 }
 
 impl VzSnapshotMeta {

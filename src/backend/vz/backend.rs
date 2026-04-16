@@ -604,6 +604,28 @@ impl VzBackend {
     /// - `vm.vzvmsave` — Apple's opaque save file
     /// - `vz_meta.json` — our sidecar metadata
     pub fn create_snapshot(&self, dir: &Path) -> Result<()> {
+        self.create_snapshot_with_hash(dir, None)
+    }
+
+    /// Like [`create_snapshot`], but persists the config hash that produced
+    /// this snapshot into the sidecar. Used by auto-snapshot so the sidecar
+    /// carries the same identity information KVM's `state.bin` does.
+    pub fn create_snapshot_with_hash(&self, dir: &Path, config_hash: Option<String>) -> Result<()> {
+        if let Err(e) = self.save_state_paused(dir, config_hash) {
+            // Save may have left the VM paused. Resume so the caller's VM
+            // keeps running, and propagate the original error.
+            let _ = self.resume();
+            return Err(e);
+        }
+        self.resume()?;
+        info!("VzBackend: snapshot created at {}", dir.display());
+        Ok(())
+    }
+
+    /// Pause the VM, write Apple's save file and our sidecar, and leave the VM
+    /// paused. Callers are responsible for either resuming the VM or stopping
+    /// it afterwards.
+    fn save_state_paused(&self, dir: &Path, config_hash: Option<String>) -> Result<()> {
         let vm = self
             .vm
             .as_ref()
@@ -621,10 +643,8 @@ impl VzBackend {
         std::fs::create_dir_all(dir)
             .map_err(|e| crate::Error::Snapshot(format!("create snapshot dir: {e}")))?;
 
-        // 1. Pause
         self.pause()?;
 
-        // 2. Save VM state to Apple's opaque file
         let save_path = VzSnapshotMeta::save_file_path(dir);
         let save_url_str = save_path
             .to_str()
@@ -660,15 +680,13 @@ impl VzBackend {
             .map_err(|_| crate::Error::Snapshot("VM save: timed out (120s)".into()))
             .and_then(|r| r.map_err(|e| crate::Error::Snapshot(format!("VM save failed: {e}"))));
 
-        if let Err(e) = &save_result {
-            error!("VzBackend: save failed, resuming VM: {}", e);
-            let _ = self.resume();
-            return Err(save_result.unwrap_err());
+        if let Err(e) = save_result {
+            error!("VzBackend: save failed: {}", e);
+            return Err(e);
         }
 
         info!("VzBackend: VM state saved");
 
-        // 3. Save our sidecar metadata
         let meta = VzSnapshotMeta {
             session_secret: session_secret.to_vec(),
             memory_mb: config_info.memory_mb,
@@ -676,17 +694,13 @@ impl VzBackend {
             network: config_info.network,
             cid: self.cid,
             boot_clock_secs: config_info.boot_clock_secs,
+            config_hash,
         };
         if let Err(e) = meta.save(dir) {
-            error!("VzBackend: sidecar save failed, resuming VM: {}", e);
-            let _ = self.resume();
+            error!("VzBackend: sidecar save failed: {}", e);
             return Err(e);
         }
 
-        // 4. Resume
-        self.resume()?;
-
-        info!("VzBackend: snapshot created at {}", dir.display());
         Ok(())
     }
 
@@ -1078,7 +1092,7 @@ impl VmmBackend for VzBackend {
     async fn create_auto_snapshot(
         &mut self,
         snapshot_dir: &std::path::Path,
-        _config_hash: String,
+        config_hash: String,
     ) -> Result<()> {
         let channel = self
             .control_channel
@@ -1088,14 +1102,37 @@ impl VmmBackend for VzBackend {
             .wait_for_snapshot_ready(std::time::Duration::from_secs(30))
             .await?;
 
-        self.create_snapshot(snapshot_dir)?;
+        // Capture the config to restart from before we mutate `self` via stop.
+        let mut restart_config = self.start_config.clone().ok_or_else(|| {
+            crate::Error::Backend("auto-snapshot: no captured start config to restart from".into())
+        })?;
+        restart_config.snapshot = Some(snapshot_dir.to_path_buf());
+
+        // Save the live VM state + sidecar. create_snapshot_with_hash pauses,
+        // writes the Apple save file + our sidecar, and resumes — leaving the
+        // original VM running until the stop() below.
+        tokio::task::block_in_place(|| {
+            self.create_snapshot_with_hash(snapshot_dir, Some(config_hash.clone()))
+        })?;
         info!(
-            "VzBackend: auto-snapshot saved to {}",
-            snapshot_dir.display()
+            "VzBackend: auto-snapshot saved to {} (hash={})",
+            snapshot_dir.display(),
+            &config_hash[..16.min(config_hash.len())]
         );
-        warn!(
-            "VzBackend: auto-snapshot restore is currently disabled on macOS; \
-             keeping the current VM running after saving the snapshot"
+
+        // Stop the original VM and restart from the saved state. The start
+        // path detects `restart_config.snapshot` and takes the restore branch.
+        //
+        // Note: restoreMachineStateFromURL currently fails on VZ with
+        // VZErrorRestore ("invalid argument"); see snapshot_vz_round_trip for
+        // the same symptom. That restore bug is pre-existing and blocks the
+        // full auto-snapshot contract on macOS until it's fixed.
+        self.stop().await?;
+        self.start(restart_config).await?;
+
+        info!(
+            "VzBackend: auto-snapshot restored, VM running with CID {}",
+            self.cid
         );
         Ok(())
     }

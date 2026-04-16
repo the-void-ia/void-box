@@ -114,7 +114,14 @@ install_busybox() {
     cp "$BUSYBOX" "$OUT_DIR/bin/busybox"
     chmod +x "$OUT_DIR/bin/busybox"
     ln -sf busybox "$OUT_DIR/bin/sh"
-    for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname ip sed grep awk env wget nc udhcpc; do
+    # Superset covering both production images (dhcp, net config) and the
+    # test image's shell-based e2e suites (file ops, text processing).
+    # Symlinks are ~0 cost, so the union is harmless for all callers.
+    for cmd in echo cat tr test base64 uname ls mkdir rm cp mv pwd id hostname \
+               ip ifconfig route sed grep awk env wget nc udhcpc \
+               dd stat chmod wc touch head tail sort uniq \
+               date df du find xargs which basename dirname \
+               readlink realpath sleep; do
       ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
   else

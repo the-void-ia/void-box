@@ -211,6 +211,7 @@ impl BackendConfig {
 /// discovery, rootfs device wiring). This helper appends the common suffix:
 /// session secret, boot clock, optional guest networking flags, mount
 /// descriptors, and OCI rootfs selectors.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_common_guest_kernel_args(
     cmdline_parts: &mut Vec<String>,
     session_secret: &[u8; 32],

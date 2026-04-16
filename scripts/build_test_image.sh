@@ -2,37 +2,37 @@
 set -euo pipefail
 
 # Build a test initramfs for void-box E2E tests.
-# Includes: guest-agent as /init, claudio (mock claude-code) as /usr/local/bin/claude-code.
+#
+# Differs from build_guest_image.sh in one deliberate way: claude-code is
+# replaced by `claudio` — a deterministic mock used by the e2e suites
+# (e2e_telemetry, e2e_skill_pipeline, e2e_mount, e2e_service_mode,
+# e2e_sidecar). Everything else (guest-agent, void-message, void-mcp,
+# busybox, kernel modules) uses the shared helpers in scripts/lib/.
 #
 # Usage:
 #   scripts/build_test_image.sh
 #   OUT_CPIO=/tmp/test-root.cpio.gz scripts/build_test_image.sh
+#   BUSYBOX=/path/to/busybox scripts/build_test_image.sh
 #
-# The resulting initramfs can be used with:
-#   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-#   VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-#   cargo test -- --ignored
-#
-# Supports both x86_64 and aarch64. Auto-detects host architecture.
-# On macOS (Apple Silicon), cross-compiles for aarch64-linux-musl using
-# a musl cross-compiler (brew install filosottile/musl-cross/musl-cross).
-# Handles kernel modules in any compression format (.ko, .ko.xz, .ko.zst).
-# Requires: cpio, gzip, musl target.
+# Requires: cpio, gzip. On macOS also: a musl cross-compiler
+# (brew install filosottile/musl-cross/musl-cross --with-aarch64).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+SCRIPT_DIR="$ROOT_DIR/scripts/lib"
+source "$SCRIPT_DIR/guest_common.sh"
+
 OUT_DIR="${OUT_DIR:-/tmp/void-box-test-rootfs}"
 OUT_CPIO="${OUT_CPIO:-/tmp/void-box-test-rootfs.cpio.gz}"
 
-# Detect host OS and architecture
-HOST_OS=$(uname -s)
-ARCH=$(uname -m)
+# ── Architecture detection ────────────────────────────────────────────────────
 
-# Map macOS arm64 → aarch64
-if [[ "$ARCH" == "arm64" ]]; then
-    ARCH="aarch64"
-fi
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64) HOST_ARCH="aarch64" ;;
+esac
+ARCH="${ARCH:-$HOST_ARCH}"
 
 case "$ARCH" in
   x86_64)  GUEST_TARGET="x86_64-unknown-linux-musl" ;;
@@ -40,158 +40,71 @@ case "$ARCH" in
   *)       echo "[test-image] ERROR: unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# On macOS, set up the musl cross-compiler for building Linux guest binaries
+# ── Platform setup ────────────────────────────────────────────────────────────
+
+HOST_OS="$(uname -s)"
+
 if [[ "$HOST_OS" == "Darwin" ]]; then
-    echo "[test-image] macOS detected — using musl cross-compilation for $GUEST_TARGET"
-    CROSS_GCC="${ARCH}-linux-musl-gcc"
-    CC_VAR_NAME="CC_${GUEST_TARGET//-/_}"
-    export "$CC_VAR_NAME=$CROSS_GCC"
-    export "CARGO_TARGET_$(echo "$GUEST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=$CROSS_GCC"
+  source "$SCRIPT_DIR/guest_macos.sh"
+  setup_cross_linker
+else
+  source "$SCRIPT_DIR/guest_linux.sh"
 fi
 
-# ---- Build guest-agent (static musl) ----
+# ── Build guest binaries ──────────────────────────────────────────────────────
+
 echo "[test-image] Building guest-agent (release, static, target=$GUEST_TARGET)..."
 cargo build --release -p guest-agent --target "$GUEST_TARGET"
 GUEST_AGENT_BIN="target/$GUEST_TARGET/release/guest-agent"
 
-# ---- Build claudio (mock claude-code, static musl) ----
-echo "[test-image] Building claudio (release, static, target=$GUEST_TARGET)..."
+echo "[test-image] Building claudio (mock claude-code, release, static, target=$GUEST_TARGET)..."
 cargo build --release -p claudio --target "$GUEST_TARGET"
 CLAUDIO_BIN="target/$GUEST_TARGET/release/claudio"
 
-# ---- Build void-message (sidecar CLI, static musl) ----
 echo "[test-image] Building void-message (release, static, target=$GUEST_TARGET)..."
 cargo build --release -p void-message --target "$GUEST_TARGET"
 VOID_MESSAGE_BIN="target/$GUEST_TARGET/release/void-message"
 
-# ---- Build void-mcp (MCP bridge, static musl) ----
 echo "[test-image] Building void-mcp (release, static, target=$GUEST_TARGET)..."
 cargo build --release -p void-mcp --target "$GUEST_TARGET"
 VOID_MCP_BIN="target/$GUEST_TARGET/release/void-mcp"
 
-# ---- Assemble rootfs ----
-echo "[test-image] Preparing rootfs at: $OUT_DIR"
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"/{bin,sbin,proc,sys,dev,tmp,usr/local/bin}
+# ── Assemble rootfs ──────────────────────────────────────────────────────────
 
-# Guest-agent IS the init process (PID 1)
-echo "[test-image] Installing guest-agent as /init..."
-cp "$GUEST_AGENT_BIN" "$OUT_DIR/init"
-chmod +x "$OUT_DIR/init"
-cp "$GUEST_AGENT_BIN" "$OUT_DIR/sbin/guest-agent"
+prepare_rootfs
+install_guest_agent "$GUEST_AGENT_BIN"
 
-# Claudio (mock claude-code) replaces real claude-code for deterministic testing
+# Mock claude-code — this is the one deliberate divergence from the
+# production image. claudio gives deterministic output for e2e tests.
 echo "[test-image] Installing claudio as /usr/local/bin/claude-code..."
 cp "$CLAUDIO_BIN" "$OUT_DIR/usr/local/bin/claude-code"
 chmod +x "$OUT_DIR/usr/local/bin/claude-code"
 
-# void-message CLI for sidecar messaging
-echo "[test-image] Installing void-message as /usr/local/bin/void-message..."
+echo "[test-image] Installing void-message CLI at /usr/local/bin/void-message..."
 cp "$VOID_MESSAGE_BIN" "$OUT_DIR/usr/local/bin/void-message"
 chmod +x "$OUT_DIR/usr/local/bin/void-message"
 
-# void-mcp MCP bridge for sidecar messaging
-echo "[test-image] Installing void-mcp as /usr/local/bin/void-mcp..."
+echo "[test-image] Installing void-mcp MCP bridge at /usr/local/bin/void-mcp..."
 cp "$VOID_MCP_BIN" "$OUT_DIR/usr/local/bin/void-mcp"
 chmod +x "$OUT_DIR/usr/local/bin/void-mcp"
 
-# ---- BusyBox for /bin/sh ----
-# Auto-detect a static busybox if BUSYBOX is not explicitly set.
-if [[ -z "${BUSYBOX:-}" ]]; then
-    for candidate in /usr/bin/busybox /bin/busybox /sbin/busybox; do
-        if [[ -x "$candidate" ]] && file "$candidate" | grep -q "statically linked"; then
-            BUSYBOX="$candidate"
-            break
-        fi
-    done
+if [[ "$HOST_OS" == "Darwin" ]]; then
+  ensure_busybox_macos
 fi
+install_busybox
 
-if [[ -n "${BUSYBOX:-}" && -f "$BUSYBOX" ]]; then
-    echo "[test-image] Installing BusyBox at /bin/sh..."
-    cp "$BUSYBOX" "$OUT_DIR/bin/busybox"
-    chmod +x "$OUT_DIR/bin/busybox"
-    ln -sf busybox "$OUT_DIR/bin/sh"
-    for cmd in echo cat env tr test ls mkdir rm cp mv pwd id hostname \
-               dd stat chmod wc touch head tail grep sed awk sort uniq \
-               uname date df du find xargs ip ifconfig route which \
-               basename dirname readlink realpath sleep wget nc; do
-        ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
-    done
+# ── Kernel modules ────────────────────────────────────────────────────────────
+
+if [[ "$HOST_OS" == "Darwin" ]]; then
+  install_kernel_modules_macos
 else
-    echo "[test-image] WARNING: No static busybox found — /bin/sh will not be available"
-    echo "[test-image]   Set BUSYBOX=/path/to/busybox-static to include it"
+  install_kernel_modules_linux
 fi
 
-# ---- Kernel modules (Linux only) ----
-# On macOS the VZ backend uses PCI auto-discovery — no virtio-mmio kernel
-# modules are needed in the initramfs.
-if [[ "$HOST_OS" == "Linux" ]]; then
-    KVER=$(uname -r)
-    MODDIR="/lib/modules/$KVER/kernel"
-    DEST_MODDIR="$OUT_DIR/lib/modules"
-    mkdir -p "$DEST_MODDIR"
+# ── Pack ──────────────────────────────────────────────────────────────────────
 
-    # copy_module: find a kernel module by name (any compression) and decompress it
-    copy_module() {
-        local mod_name="$1"
-        local found=""
+pack_initramfs
 
-        # Search for .ko, .ko.xz, .ko.zst (covers Ubuntu, Fedora, etc.)
-        for ext in ko ko.xz ko.zst; do
-            found=$(find "$MODDIR" -name "${mod_name}.${ext}" 2>/dev/null | head -1)
-            [[ -n "$found" ]] && break
-        done
-
-        if [[ -z "$found" ]]; then
-            echo "  WARNING: ${mod_name} not found under $MODDIR"
-            return
-        fi
-
-        cp "$found" "$DEST_MODDIR/"
-        local base
-        base=$(basename "$found")
-
-        case "$base" in
-            *.ko.xz)
-                xz -d "$DEST_MODDIR/$base"
-                echo "  -> ${base%.xz}"
-                ;;
-            *.ko.zst)
-                zstd -d --rm "$DEST_MODDIR/$base" 2>/dev/null
-                echo "  -> ${base%.zst}"
-                ;;
-            *.ko)
-                echo "  -> $base"
-                ;;
-        esac
-    }
-
-    echo "[test-image] Adding kernel modules (kernel $KVER, arch $ARCH)..."
-    for mod_name in \
-        virtio_mmio \
-        vsock \
-        vmw_vsock_virtio_transport_common \
-        vmw_vsock_virtio_transport \
-        failover \
-        net_failover \
-        virtio_net \
-        netfs \
-        9pnet \
-        9p \
-        9pnet_virtio \
-        overlay \
-        ; do
-        copy_module "$mod_name"
-    done
-else
-    echo "[test-image] Skipping kernel modules (not needed for VZ backend on macOS)"
-fi
-
-# ---- Create initramfs ----
-echo "[test-image] Creating test initramfs at: $OUT_CPIO"
-( cd "$OUT_DIR" && find . | cpio -o -H newc | gzip ) > "$OUT_CPIO"
-
-echo "[test-image] Done. Test initramfs: $OUT_CPIO"
 echo "[test-image] Use with:"
 echo "  VOID_BOX_KERNEL=/boot/vmlinuz-\$(uname -r) \\"
 echo "  VOID_BOX_INITRAMFS=$OUT_CPIO \\"
