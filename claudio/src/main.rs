@@ -347,9 +347,9 @@ fn emit_session(config: &Config, prompt: &str, discovered: &DiscoveredSkills) {
     let num_tools = config.effective_tools(discovered);
     let tool_names = get_tool_names(config, discovered);
     let mut msg_id = 1;
-    let mut tool_id = 1;
 
     for t in 0..num_tools {
+        let tool_id = t + 1;
         let tool_name = &tool_names[t % tool_names.len()];
         let (input_json, output_text) = tool_content(tool_name, t, prompt, discovered);
 
@@ -381,7 +381,6 @@ fn emit_session(config: &Config, prompt: &str, discovered: &DiscoveredSkills) {
         );
         emit_line(&user_event, config.delay_ms);
         msg_id += 1;
-        tool_id += 1;
     }
 
     // --- result event ---
