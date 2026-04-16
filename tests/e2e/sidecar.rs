@@ -59,7 +59,7 @@ fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     Some((kernel, initramfs))
 }
 
-fn build_network_config() -> Option<BackendConfig> {
+fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<BackendConfig> {
     if !backend_available() {
         eprintln!("skipping: VM backend not available");
         return None;
@@ -93,7 +93,7 @@ fn build_network_config() -> Option<BackendConfig> {
         security: BackendSecurityConfig {
             session_secret: secret,
             command_allowlist: vec!["sh".into(), "wget".into(), "cat".into(), "echo".into()],
-            network_deny_list: vec!["169.254.0.0/16".into()],
+            network_deny_list: deny_list,
             max_connections_per_second: 50,
             max_concurrent_connections: 64,
             seccomp: true,
@@ -102,8 +102,24 @@ fn build_network_config() -> Option<BackendConfig> {
     })
 }
 
+fn build_network_config() -> Option<BackendConfig> {
+    build_network_config_with_deny_list(vec!["169.254.0.0/16".into()])
+}
+
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
     let config = build_network_config()?;
+    let mut backend = void_box::backend::create_backend();
+    match backend.start(config).await {
+        Ok(()) => Some(backend),
+        Err(e) => {
+            eprintln!("skipping: backend start failed: {e}");
+            None
+        }
+    }
+}
+
+async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Option<Box<dyn VmmBackend>> {
+    let config = build_network_config_with_deny_list(deny_list)?;
     let mut backend = void_box::backend::create_backend();
     match backend.start(config).await {
         Ok(()) => Some(backend),
@@ -312,7 +328,113 @@ async fn guest_reads_context() {
 }
 
 // ===========================================================================
-// Test 4: Full agent flow — read inbox, reason, emit intent
+// Test 4: Guest cannot reach host gateway when it is deny-listed
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
+async fn guest_cannot_reach_denied_host_gateway() {
+    let gateway_cidr = format!("{}/32", void_box::backend::guest_host_gateway());
+    let backend = match start_backend_with_deny_list(vec![gateway_cidr.clone()]).await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let handle = sidecar::start_sidecar(
+        "run-deny-e2e",
+        "exec-deny-e2e",
+        "c-1",
+        vec![],
+        void_box::backend::guest_accessible_bind_addr(0),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let script = format!(
+        "wget -T 2 -q -O - {}/v1/health >/tmp/deny.out 2>/tmp/deny.err; echo $?",
+        void_box::backend::guest_host_url(port)
+    );
+    let out = guest_sh(&*backend, &script).await;
+    let Some(out) = out else {
+        handle.stop().await;
+        return;
+    };
+
+    assert_eq!(
+        out.exit_code,
+        0,
+        "shell wrapper failed: {}",
+        out.stderr_str()
+    );
+    let wget_exit = out.stdout_str().trim().to_string();
+    assert_ne!(
+        wget_exit, "0",
+        "guest unexpectedly reached deny-listed host gateway {}",
+        gateway_cidr
+    );
+
+    let stderr_out = guest_sh(&*backend, "cat /tmp/deny.err").await;
+    let stderr_text = stderr_out
+        .map(|output| output.stdout_str())
+        .unwrap_or_default();
+    eprintln!(
+        "deny-list blocked guest->host request as expected: exit={} stderr={}",
+        wget_exit,
+        stderr_text.trim()
+    );
+
+    handle.stop().await;
+}
+
+// ===========================================================================
+// Test 5: Unrelated deny-list CIDR does not block guest->host access
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
+async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
+    let backend = match start_backend_with_deny_list(vec!["203.0.113.0/24".into()]).await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let handle = sidecar::start_sidecar(
+        "run-allow-e2e",
+        "exec-allow-e2e",
+        "c-1",
+        vec![],
+        void_box::backend::guest_accessible_bind_addr(0),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let script = format!(
+        "wget -T 2 -q -O - {}/v1/health",
+        void_box::backend::guest_host_url(port)
+    );
+    let out = guest_sh(&*backend, &script).await;
+    let Some(out) = out else {
+        handle.stop().await;
+        return;
+    };
+
+    assert!(
+        out.success(),
+        "guest unexpectedly lost host-gateway access with unrelated deny list: {}",
+        out.stderr_str()
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out.stdout_str()).expect("health response is not valid JSON");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["run_id"], "run-allow-e2e");
+
+    handle.stop().await;
+}
+
+// ===========================================================================
+// Test 6: Full agent flow — read inbox, reason, emit intent
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -403,7 +525,7 @@ async fn guest_full_agent_flow() {
 }
 
 // ===========================================================================
-// Test 5: Skill injection — claudio discovers the provisioned messaging skill
+// Test 7: Skill injection — claudio discovers the provisioned messaging skill
 // ===========================================================================
 
 /// Build a VoidBox with an inline messaging skill and claudio (mock claude-code).
@@ -499,7 +621,7 @@ async fn claudio_discovers_injected_messaging_skill() {
 }
 
 // ===========================================================================
-// Test 6: void-message CLI works from inside the guest VM
+// Test 8: void-message CLI works from inside the guest VM
 // ===========================================================================
 
 /// Boot a real VM and run void-message CLI commands from inside the guest.

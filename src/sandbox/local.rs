@@ -14,6 +14,17 @@ use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::{ObserveConfig, Observer};
 use crate::{Error, ExecOutput, Result};
 
+const DEFAULT_NETWORK_DENY_LIST: &[&str] = &["169.254.0.0/16"];
+const DEFAULT_MAX_CONNECTIONS_PER_SECOND: u32 = 50;
+const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+fn default_network_deny_list() -> Vec<String> {
+    DEFAULT_NETWORK_DENY_LIST
+        .iter()
+        .map(|cidr| (*cidr).to_string())
+        .collect()
+}
+
 /// Local sandbox backed by a real VM.
 pub struct LocalSandbox {
     config: SandboxConfig,
@@ -77,9 +88,9 @@ impl LocalSandbox {
             security: BackendSecurityConfig {
                 session_secret,
                 command_allowlist: Vec::new(), // Set via provisioning
-                network_deny_list: vec!["169.254.0.0/16".to_string()],
-                max_connections_per_second: 50,
-                max_concurrent_connections: 64,
+                network_deny_list: default_network_deny_list(),
+                max_connections_per_second: DEFAULT_MAX_CONNECTIONS_PER_SECOND,
+                max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
                 seccomp: true,
             },
             snapshot: self.config.snapshot.clone(),

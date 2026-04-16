@@ -25,6 +25,7 @@ use std::path::PathBuf;
 mod vm_preflight;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
+use void_box::sidecar;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,6 +48,16 @@ fn backend_available() -> bool {
 }
 
 fn backend_config() -> Option<BackendConfig> {
+    backend_config_with(
+        vec!["169.254.0.0/16".into()],
+        vec!["echo".into(), "sh".into(), "cat".into(), "test".into()],
+    )
+}
+
+fn backend_config_with(
+    network_deny_list: Vec<String>,
+    command_allowlist: Vec<String>,
+) -> Option<BackendConfig> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
     if kernel.as_os_str().is_empty() {
@@ -82,8 +93,8 @@ fn backend_config() -> Option<BackendConfig> {
         env: vec![],
         security: BackendSecurityConfig {
             session_secret: secret,
-            command_allowlist: vec!["echo".into(), "sh".into(), "cat".into(), "test".into()],
-            network_deny_list: vec!["169.254.0.0/16".into()],
+            command_allowlist,
+            network_deny_list,
             max_connections_per_second: 50,
             max_concurrent_connections: 64,
             seccomp: true,
@@ -111,6 +122,35 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
         Ok(()) => Some(backend),
         Err(e) => {
             eprintln!("skipping: backend start failed: {}", e);
+            None
+        }
+    }
+}
+
+async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
+    if !backend_available() {
+        eprintln!("skipping: VM backend not available on this platform");
+        return None;
+    }
+
+    let mut backend = void_box::backend::create_backend();
+    match backend.start(config).await {
+        Ok(()) => Some(backend),
+        Err(e) => {
+            eprintln!("skipping: backend start failed: {}", e);
+            None
+        }
+    }
+}
+
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
+    match backend
+        .exec("sh", &["-c", script], &[], &[], None, Some(30))
+        .await
+    {
+        Ok(out) => Some(out),
+        Err(e) => {
+            eprintln!("guest exec error: {e}");
             None
         }
     }
@@ -325,6 +365,126 @@ async fn conformance_lifecycle() {
         !backend.is_running(),
         "backend should not be running after stop"
     );
+}
+
+// ===========================================================================
+// Conformance: network deny-list parity
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires VM backend + kernel/initramfs artifacts + network"]
+async fn conformance_network_deny_list_blocks_guest_host_gateway() {
+    let config = match backend_config_with(
+        vec![format!("{}/32", void_box::backend::guest_host_gateway())],
+        vec![
+            "echo".into(),
+            "sh".into(),
+            "cat".into(),
+            "test".into(),
+            "wget".into(),
+        ],
+    ) {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    let backend = match create_started_backend_with_config(config).await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let handle = sidecar::start_sidecar(
+        "run-conformance-deny",
+        "exec-conformance-deny",
+        "c-1",
+        vec![],
+        void_box::backend::guest_accessible_bind_addr(0),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let script = format!(
+        "wget -T 2 -q -O - {}/v1/health >/tmp/conformance-deny.out 2>/tmp/conformance-deny.err; echo $?",
+        void_box::backend::guest_host_url(port)
+    );
+    let out = guest_sh(&*backend, &script).await;
+    let Some(out) = out else {
+        handle.stop().await;
+        return;
+    };
+
+    assert_eq!(
+        out.exit_code,
+        0,
+        "shell wrapper failed: {}",
+        out.stderr_str()
+    );
+    assert_ne!(
+        out.stdout_str().trim(),
+        "0",
+        "guest unexpectedly reached deny-listed host gateway"
+    );
+
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires VM backend + kernel/initramfs artifacts + network"]
+async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_access() {
+    let config = match backend_config_with(
+        vec!["203.0.113.0/24".into()],
+        vec![
+            "echo".into(),
+            "sh".into(),
+            "cat".into(),
+            "test".into(),
+            "wget".into(),
+        ],
+    ) {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    let backend = match create_started_backend_with_config(config).await {
+        Some(b) => b,
+        None => return,
+    };
+
+    let handle = sidecar::start_sidecar(
+        "run-conformance-allow",
+        "exec-conformance-allow",
+        "c-1",
+        vec![],
+        void_box::backend::guest_accessible_bind_addr(0),
+    )
+    .await
+    .expect("failed to start sidecar");
+
+    let port = handle.addr().port();
+    let script = format!(
+        "wget -T 2 -q -O - {}/v1/health",
+        void_box::backend::guest_host_url(port)
+    );
+    let out = guest_sh(&*backend, &script).await;
+    let Some(out) = out else {
+        handle.stop().await;
+        return;
+    };
+
+    assert!(out.success(), "wget failed: {}", out.stderr_str());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out.stdout_str()).expect("health response is not valid JSON");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["run_id"], "run-conformance-allow");
+
+    handle.stop().await;
 }
 
 // ===========================================================================

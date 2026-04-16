@@ -16,7 +16,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -67,6 +67,9 @@ const OCI_FAIL_MOUNT_SHARED: u8 = 25;
 static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
 /// Stores the last OCI setup error detail (e.g., mount failure reasons).
 static OCI_SETUP_ERROR_DETAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static NETWORK_DENY_LIST_APPLIED: AtomicBool = AtomicBool::new(false);
+
+const NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
 
 fn oci_status_str(code: u8) -> &'static str {
     match code {
@@ -185,6 +188,53 @@ pub(crate) static RESOURCE_LIMITS: std::sync::OnceLock<ResourceLimits> = std::sy
 
 /// Loaded command allowlist (parsed from /etc/voidbox/allowed_commands.json or empty = allow all).
 static COMMAND_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn apply_network_deny_list() {
+    if NETWORK_DENY_LIST_APPLIED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let deny_list = match std::fs::read_to_string(NETWORK_DENY_LIST_PATH) {
+        Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+            Ok(deny_list) => deny_list,
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to parse network deny list {}: {}",
+                    NETWORK_DENY_LIST_PATH, e
+                ));
+                return;
+            }
+        },
+        Err(_) => {
+            return;
+        }
+    };
+
+    for cidr in deny_list {
+        match Command::new("ip")
+            .args(["route", "add", "blackhole", &cidr])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                kmsg(&format!("Installed deny-list blackhole route for {}", cidr));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                kmsg(&format!(
+                    "WARNING: Failed to install deny-list route for {}: {}",
+                    cidr,
+                    stderr.trim()
+                ));
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to run 'ip route add blackhole {}': {}",
+                    cidr, e
+                ));
+            }
+        }
+    }
+}
 
 /// CPU jiffies snapshot from /proc/stat
 struct CpuJiffies {
@@ -2040,6 +2090,8 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
         let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
         kmsg(&format!("Exec gate passed: oci_status={}", status));
     }
+
+    apply_network_deny_list();
 
     // Check command allowlist before spawning
     if !is_command_allowed(&request.program) {

@@ -221,7 +221,10 @@ pub(crate) fn append_common_guest_kernel_args(
     oci_rootfs: Option<&str>,
     oci_rootfs_dev: Option<&str>,
 ) {
-    cmdline_parts.push(format!("voidbox.secret={}", session_secret_hex(session_secret)));
+    cmdline_parts.push(format!(
+        "voidbox.secret={}",
+        session_secret_hex(session_secret)
+    ));
     cmdline_parts.push(format!("voidbox.clock={}", epoch_secs));
 
     if network_enabled {

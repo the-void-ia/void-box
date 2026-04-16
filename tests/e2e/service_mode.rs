@@ -1,5 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[path = "../common/net.rs"]
+mod test_net;
 /// End-to-end test for `agent.mode: service` lifecycle.
 ///
 /// Exercises the full stack: daemon API -> runtime -> VoidBox -> VM -> guest-agent.
@@ -7,8 +9,6 @@
 /// messaging/MCP is active, and that cancel works after publication.
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
-#[path = "../common/net.rs"]
-mod test_net;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

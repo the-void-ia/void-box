@@ -26,9 +26,9 @@
 //! lists, rate limiting, and connection counting at the host level, VZ NAT does
 //! **not** provide these controls.
 //!
-//! **v1**: The VM boundary itself is the isolation primitive. Network deny lists
-//! from `BackendSecurityConfig` are not enforced on macOS. Guest-side iptables
-//! injection is planned for v2 (requires iptables in the guest rootfs).
+//! **v1**: CIDR deny lists are enforced in-guest via host-provisioned blackhole
+//! routes. Connection rate limiting and concurrent connection counting from
+//! `BackendSecurityConfig` are still not enforced on macOS.
 //!
 //! **v2 (future)**: Inject iptables rules via `exec()` after boot, or use
 //! macOS `pf` rules per VM.
@@ -61,6 +61,31 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
+
+const GUEST_NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
+
+#[async_trait::async_trait]
+trait GuestPolicyWriter: Sync {
+    async fn mkdir_p(&self, path: &str) -> Result<()>;
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+}
+
+async fn provision_network_deny_list_with_writer(
+    writer: &dyn GuestPolicyWriter,
+    deny_list: &[String],
+) -> Result<()> {
+    if deny_list.is_empty() {
+        return Ok(());
+    }
+
+    let deny_list_json = serde_json::to_string_pretty(deny_list).map_err(|e| {
+        crate::Error::Config(format!("failed to serialize network deny list: {}", e))
+    })?;
+    writer.mkdir_p("/etc/voidbox").await?;
+    writer
+        .write_file(GUEST_NETWORK_DENY_LIST_PATH, deny_list_json.as_bytes())
+        .await
+}
 
 fn deterministic_mac_address(session_secret: &[u8; 32]) -> Retained<VZMACAddress> {
     let mut octets = [0u8; 6];
@@ -184,6 +209,23 @@ fn guest_console_sink(config: &BackendConfig) -> Option<Retained<NSFileHandle>> 
 impl Default for VzBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl VzBackend {
+    async fn provision_network_deny_list(&self, deny_list: &[String]) -> Result<()> {
+        provision_network_deny_list_with_writer(self, deny_list).await
+    }
+}
+
+#[async_trait::async_trait]
+impl GuestPolicyWriter for VzBackend {
+    async fn mkdir_p(&self, path: &str) -> Result<()> {
+        VmmBackend::mkdir_p(self, path).await
+    }
+
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+        VmmBackend::write_file(self, path, content).await
     }
 }
 
@@ -775,6 +817,15 @@ impl VmmBackend for VzBackend {
                 "VzBackend: starting VM (memory={}MB, vcpus={})",
                 config.memory_mb, config.vcpus
             );
+            if config.network
+                && (config.security.max_connections_per_second > 0
+                    || config.security.max_concurrent_connections > 0)
+            {
+                warn!(
+                    "VzBackend: macOS VZ NAT does not enforce connection rate/concurrency limits; \
+                     deny-list CIDRs are enforced in-guest only"
+                );
+            }
 
             let boot_clock_secs = config::current_epoch_secs();
             let vm_config = Self::configure_vm(&config, boot_clock_secs)?;
@@ -822,7 +873,12 @@ impl VmmBackend for VzBackend {
             self.setup_control_channel(config.security.session_secret);
 
             Ok(())
-        })
+        })?;
+
+        self.provision_network_deny_list(&config.security.network_deny_list)
+            .await?;
+
+        Ok(())
     }
 
     async fn exec(
@@ -1053,6 +1109,30 @@ impl VmmBackend for VzBackend {
 mod tests {
     use super::*;
     use crate::backend::BackendSecurityConfig;
+    use crate::Result;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakePolicyWriter {
+        mkdir_calls: Mutex<Vec<String>>,
+        write_calls: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GuestPolicyWriter for FakePolicyWriter {
+        async fn mkdir_p(&self, path: &str) -> Result<()> {
+            self.mkdir_calls.lock().unwrap().push(path.to_string());
+            Ok(())
+        }
+
+        async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+            self.write_calls
+                .lock()
+                .unwrap()
+                .push((path.to_string(), content.to_vec()));
+            Ok(())
+        }
+    }
 
     fn test_security_config() -> BackendSecurityConfig {
         BackendSecurityConfig {
@@ -1094,5 +1174,36 @@ mod tests {
     #[test]
     fn guest_console_sink_uses_attachment_for_stderr() {
         assert!(guest_console_sink(&test_config(GuestConsoleSink::Stderr)).is_some());
+    }
+
+    #[tokio::test]
+    async fn provision_network_deny_list_noops_when_empty() {
+        let writer = FakePolicyWriter::default();
+        provision_network_deny_list_with_writer(&writer, &[])
+            .await
+            .unwrap();
+
+        assert!(writer.mkdir_calls.lock().unwrap().is_empty());
+        assert!(writer.write_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provision_network_deny_list_writes_expected_file() {
+        let writer = FakePolicyWriter::default();
+        let deny_list = vec!["192.168.64.1/32".to_string(), "203.0.113.0/24".to_string()];
+        provision_network_deny_list_with_writer(&writer, &deny_list)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writer.mkdir_calls.lock().unwrap().as_slice(),
+            ["/etc/voidbox"]
+        );
+
+        let writes = writer.write_calls.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, GUEST_NETWORK_DENY_LIST_PATH);
+        let written_json: Vec<String> = serde_json::from_slice(&writes[0].1).unwrap();
+        assert_eq!(written_json, deny_list);
     }
 }
