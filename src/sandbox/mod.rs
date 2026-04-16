@@ -362,7 +362,7 @@ impl Sandbox {
         // ClaudeStreamJson: parse stream-json output even on non-zero exit codes —
         // claude-code exits 1 when the task fails but still produces valid stream-json.
         // Codex: parse codex JSONL events; fall back to is_error on non-zero exit.
-        let result = match provider.observer_kind() {
+        let mut result = match provider.observer_kind() {
             crate::llm::ObserverKind::ClaudeStreamJson => {
                 crate::observe::claude::parse_stream_json(&output.stdout)
             }
@@ -411,6 +411,24 @@ impl Sandbox {
                     stdout_preview.trim()
                 }
             )));
+        }
+
+        if provider.observer_kind() == crate::llm::ObserverKind::ClaudeStreamJson
+            && result.is_error
+            && result.error.as_deref().is_none_or(str::is_empty)
+        {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let fallback_error = if !stderr_str.trim().is_empty() {
+                stderr_str.trim().to_string()
+            } else if !result.result_text.trim().is_empty() {
+                result.result_text.trim().to_string()
+            } else {
+                format!(
+                    "{} exited with an unspecified error",
+                    provider.binary_name()
+                )
+            };
+            result.error = Some(fallback_error);
         }
 
         Ok(result)
@@ -547,6 +565,28 @@ impl Sandbox {
                             if stderr_str.trim().is_empty() { "(empty)" } else { stderr_str.trim() },
                             if error_str.trim().is_empty() { "(empty)" } else { error_str.trim() },
                         )));
+                        }
+
+                        if state.is_error && state.error.as_deref().is_none_or(str::is_empty) {
+                            let fallback_error = match &response {
+                                Ok(resp) => {
+                                    let stderr_str = String::from_utf8_lossy(&resp.stderr);
+                                    if !stderr_str.trim().is_empty() {
+                                        stderr_str.trim().to_string()
+                                    } else if !state.result_text.trim().is_empty() {
+                                        state.result_text.trim().to_string()
+                                    } else if let Some(err) = &resp.error {
+                                        err.clone()
+                                    } else {
+                                        format!(
+                                            "{} exited with an unspecified error",
+                                            provider.binary_name()
+                                        )
+                                    }
+                                }
+                                Err(err) => err.to_string(),
+                            };
+                            state.error = Some(fallback_error);
                         }
 
                         Ok(state)

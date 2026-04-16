@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 /// End-to-end test for `agent.mode: service` lifecycle.
 ///
@@ -13,10 +13,32 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
+fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
     Some((PathBuf::from(kernel), PathBuf::from(initramfs)))
+}
+
+fn service_provider_block() -> Option<&'static str> {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return Some(
+            r#"
+llm:
+  provider: claude
+"#,
+        );
+    }
+
+    if void_box::credentials::discover_oauth_credentials().is_ok() {
+        return Some(
+            r#"
+llm:
+  provider: claude-personal
+"#,
+        );
+    }
+
+    None
 }
 
 fn http_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (String, String) {
@@ -113,31 +135,30 @@ fn wait_for_terminal(addr: SocketAddr, run_id: &str, timeout: Duration) -> serde
     panic!("run {} did not become terminal within timeout", run_id);
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + ANTHROPIC_API_KEY"]
+#[ignore = "requires VM backend + kernel/initramfs + Claude auth"]
 async fn e2e_service_mode_output_publication() {
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: KVM not available");
+    if let Err(err) = vm_preflight::require_kvm_usable() {
+        eprintln!("skipping: VM backend not available: {err}");
         return;
     }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
+    if let Err(err) = vm_preflight::require_vsock_usable() {
+        eprintln!("skipping: vsock not available: {err}");
         return;
     }
-    let Some((kernel, initramfs)) = kvm_artifacts() else {
+    let Some((kernel, initramfs)) = vm_artifacts() else {
         eprintln!("skipping: VOID_BOX_KERNEL / VOID_BOX_INITRAMFS not set");
         return;
     };
-    if std::env::var("ANTHROPIC_API_KEY").is_err() {
-        eprintln!("skipping: ANTHROPIC_API_KEY not set");
+    let Some(provider_block) = service_provider_block() else {
+        eprintln!("skipping: neither ANTHROPIC_API_KEY nor claude-personal auth is available");
         return;
-    }
+    };
 
     let tmpdir = tempfile::tempdir().expect("tmpdir");
     let spec_path = tmpdir.path().join("service_test.yaml");
 
-    let spec_yaml = r#"
+    let mut spec_yaml = r#"
 kind: agent
 name: service-mode-e2e
 agent:
@@ -161,7 +182,9 @@ sandbox:
   memory_mb: 3072
   network: true
   mode: auto
-"#;
+"#
+    .to_string();
+    spec_yaml.push_str(provider_block);
 
     std::fs::write(&spec_path, spec_yaml).unwrap();
 

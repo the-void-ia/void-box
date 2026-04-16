@@ -865,7 +865,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
 
     // Start sidecar if messaging is enabled
     if messaging_enabled {
-        let sidecar_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let sidecar_addr = crate::backend::guest_accessible_bind_addr(0);
         match crate::sidecar::start_sidecar(&run_id, &run_id, &run_id, vec![], sidecar_addr).await {
             Ok(handle) => {
                 state
@@ -957,7 +957,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     // Inject sidecar URL as env var for void-message CLI
                     spec.sandbox.env.insert(
                         "VOID_SIDECAR_URL".to_string(),
-                        format!("http://10.0.2.2:{}", port),
+                        crate::backend::guest_host_url(port),
                     );
                     // Inject messaging skill (documents the CLI, not raw HTTP)
                     if let Some(ref mut agent) = spec.agent {
@@ -992,7 +992,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                             let mut mcp_env = std::collections::HashMap::new();
                             mcp_env.insert(
                                 "VOID_SIDECAR_URL".to_string(),
-                                format!("http://10.0.2.2:{}", port),
+                                crate::backend::guest_host_url(port),
                             );
                             agent.skills.push(crate::spec::SkillEntry::Mcp {
                                 command: "void-mcp".to_string(),

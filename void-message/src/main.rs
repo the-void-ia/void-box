@@ -296,15 +296,15 @@ mod tests {
 
     #[test]
     fn parse_host_port_valid() {
-        let (host, port) = parse_host_port("http://10.0.2.2:8090").unwrap();
-        assert_eq!(host, "10.0.2.2");
+        let (host, port) = parse_host_port("http://192.0.2.10:8090").unwrap();
+        assert_eq!(host, "192.0.2.10");
         assert_eq!(port, 8090);
     }
 
     #[test]
     fn parse_host_port_with_trailing_slash() {
-        let (host, port) = parse_host_port("http://10.0.2.2:8090/").unwrap();
-        assert_eq!(host, "10.0.2.2");
+        let (host, port) = parse_host_port("http://192.0.2.10:8090/").unwrap();
+        assert_eq!(host, "192.0.2.10");
         assert_eq!(port, 8090);
     }
 
@@ -317,12 +317,12 @@ mod tests {
 
     #[test]
     fn parse_host_port_missing_scheme() {
-        assert!(parse_host_port("10.0.2.2:8090").is_err());
+        assert!(parse_host_port("192.0.2.10:8090").is_err());
     }
 
     #[test]
     fn parse_host_port_missing_port() {
-        assert!(parse_host_port("http://10.0.2.2").is_err());
+        assert!(parse_host_port("http://192.0.2.10").is_err());
     }
 
     #[test]

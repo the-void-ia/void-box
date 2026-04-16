@@ -11,7 +11,7 @@
 //! in the guest VM can talk to Ollama by simply setting environment variables:
 //!
 //! ```text
-//! ANTHROPIC_BASE_URL=http://10.0.2.2:11434   (SLIRP gateway → host localhost)
+//! ANTHROPIC_BASE_URL=http://<guest-host-gateway>:11434
 //! ANTHROPIC_API_KEY=""                        (must be empty)
 //! ANTHROPIC_AUTH_TOKEN=ollama
 //! ```
@@ -37,11 +37,6 @@
 //! # }
 //! ```
 
-/// The SLIRP gateway IP as seen from the guest VM.
-/// Traffic to this IP is translated to `127.0.0.1` on the host,
-/// allowing the guest to reach host services like Ollama.
-const SLIRP_GATEWAY: &str = "10.0.2.2";
-
 /// The guest binary name for Claude Code and all Claude-compatible
 /// providers (Ollama, LmStudio, Custom, ClaudePersonal). These all route
 /// through the same Bun-built `claude-code` binary via `ANTHROPIC_BASE_URL`.
@@ -64,27 +59,26 @@ pub enum LlmProvider {
     ///
     /// Ollama must be running (`ollama serve`) and the model must be
     /// pulled (`ollama pull <model>`). The guest reaches Ollama through
-    /// the SLIRP gateway IP, which is mapped to `127.0.0.1` on the host.
+    /// the backend-specific host gateway address.
     Ollama {
         /// Model name (e.g. `"qwen3-coder"`, `"llama3.1"`, `"deepseek-coder-v2"`).
         model: String,
         /// Ollama host URL as seen from the guest.
-        /// Default: `http://10.0.2.2:11434` (SLIRP gateway → host localhost).
+        /// Default: `http://<guest-host-gateway>:11434`.
         host: Option<String>,
     },
 
     /// Local LM Studio instance running on the host.
     ///
     /// LM Studio must be running with the local server enabled (default port 1234).
-    /// The guest reaches it through the SLIRP gateway IP (`10.0.2.2`), which is
-    /// mapped to `127.0.0.1` on the host.
+    /// The guest reaches it through the backend-specific host gateway address.
     ///
     /// LM Studio 0.3.x+ exposes an Anthropic-compatible API; no proxy needed.
     LmStudio {
         /// Model identifier as shown in LM Studio (e.g. `"qwen2.5-coder-7b-instruct"`).
         model: String,
         /// LM Studio host URL as seen from the guest.
-        /// Default: `http://10.0.2.2:1234` (SLIRP gateway → host localhost).
+        /// Default: `http://<guest-host-gateway>:1234`.
         host: Option<String>,
     },
 
@@ -404,14 +398,14 @@ impl LlmProvider {
                 vars
             }
             LlmProvider::ClaudePersonal => {
-                // No API key needed — the guest reads OAuth tokens from the
-                // mounted credentials file at $HOME/.claude/.credentials.json.
+                // No API key needed — the runtime stages OAuth credentials and
+                // writes them into the guest at $HOME/.claude/.credentials.json.
                 vec![("HOME".into(), "/home/sandbox".into())]
             }
             LlmProvider::Ollama { host, .. } => {
-                let base_url = host
-                    .clone()
-                    .unwrap_or_else(|| format!("http://{}:11434", SLIRP_GATEWAY));
+                let base_url = host.clone().unwrap_or_else(|| {
+                    format!("http://{}:11434", crate::backend::guest_host_gateway())
+                });
 
                 // Per Ollama docs (https://docs.ollama.com/integrations/claude-code):
                 //   ANTHROPIC_API_KEY must be empty (not a dummy value)
@@ -425,9 +419,9 @@ impl LlmProvider {
                 ]
             }
             LlmProvider::LmStudio { host, .. } => {
-                let base_url = host
-                    .clone()
-                    .unwrap_or_else(|| format!("http://{}:1234", SLIRP_GATEWAY));
+                let base_url = host.clone().unwrap_or_else(|| {
+                    format!("http://{}:1234", crate::backend::guest_host_gateway())
+                });
                 // LM Studio requires a non-empty API key; "lm-studio" is the
                 // conventional placeholder value.
                 vec![
@@ -520,6 +514,10 @@ impl std::fmt::Display for LlmProvider {
 mod tests {
     use super::*;
 
+    fn guest_gateway() -> &'static str {
+        crate::backend::guest_host_gateway()
+    }
+
     #[test]
     fn test_claude_env_vars() {
         // Claude provider always sets HOME, optionally ANTHROPIC_API_KEY
@@ -537,7 +535,7 @@ mod tests {
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
         assert_eq!(
             map.get("ANTHROPIC_BASE_URL").unwrap(),
-            "http://10.0.2.2:11434"
+            &format!("http://{}:11434", guest_gateway())
         );
         // Per Ollama docs: ANTHROPIC_API_KEY must be empty, AUTH_TOKEN is "ollama"
         assert_eq!(map.get("ANTHROPIC_API_KEY").unwrap(), "");
@@ -646,7 +644,7 @@ mod tests {
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
         assert_eq!(
             map.get("ANTHROPIC_BASE_URL").unwrap(),
-            "http://10.0.2.2:1234"
+            &format!("http://{}:1234", guest_gateway())
         );
         assert_eq!(map.get("ANTHROPIC_API_KEY").unwrap(), "lm-studio");
         assert_eq!(map.get("HOME").unwrap(), "/home/sandbox");

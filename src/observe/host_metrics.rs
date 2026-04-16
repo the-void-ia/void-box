@@ -1,8 +1,11 @@
 //! Host Metrics Collector
 //!
 //! Collects daemon-process metrics from the host OS. On Linux, reads
-//! `/proc/self/statm`, `/proc/self/stat`, and `/proc/self/io`. On other
-//! platforms, returns zeros.
+//! `/proc/self/statm`, `/proc/self/stat`, and `/proc/self/io`. On macOS, uses
+//! Mach task APIs for RSS and `getrusage()` for CPU time.
+
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 /// Snapshot of host daemon metrics.
 #[derive(Debug, Clone, Default)]
@@ -19,6 +22,8 @@ pub struct HostSnapshot {
 pub struct HostMetricsCollector {
     #[cfg(target_os = "linux")]
     prev_cpu_ticks: std::sync::Mutex<(u64, u64)>,
+    #[cfg(target_os = "macos")]
+    prev_cpu_sample: std::sync::Mutex<Option<(u64, Instant)>>,
 }
 
 impl HostMetricsCollector {
@@ -26,6 +31,8 @@ impl HostMetricsCollector {
         Self {
             #[cfg(target_os = "linux")]
             prev_cpu_ticks: std::sync::Mutex::new((0, 0)),
+            #[cfg(target_os = "macos")]
+            prev_cpu_sample: std::sync::Mutex::new(None),
         }
     }
 
@@ -35,7 +42,11 @@ impl HostMetricsCollector {
         {
             self.collect_linux()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.collect_macos()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             HostSnapshot::default()
         }
@@ -92,6 +103,37 @@ impl HostMetricsCollector {
 
         Some((delta_proc as f64 / delta_total as f64) * 100.0)
     }
+
+    #[cfg(target_os = "macos")]
+    fn collect_macos(&self) -> HostSnapshot {
+        HostSnapshot {
+            rss_bytes: read_rss_bytes_macos().unwrap_or(0),
+            cpu_percent: self.read_cpu_percent_macos().unwrap_or(0.0),
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_cpu_percent_macos(&self) -> Option<f64> {
+        let cpu_nanos = read_cpu_time_nanos_macos()?;
+        let now = Instant::now();
+        let mut previous = self.prev_cpu_sample.lock().ok()?;
+        let Some((previous_cpu_nanos, previous_instant)) = *previous else {
+            *previous = Some((cpu_nanos, now));
+            return Some(0.0);
+        };
+
+        let elapsed_nanos = now.duration_since(previous_instant).as_nanos() as u64;
+        let delta_cpu_nanos = cpu_nanos.saturating_sub(previous_cpu_nanos);
+        *previous = Some((cpu_nanos, now));
+
+        if elapsed_nanos == 0 {
+            return Some(0.0);
+        }
+
+        Some(((delta_cpu_nanos as f64 / elapsed_nanos as f64) * 100.0).min(100.0))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -117,6 +159,105 @@ fn read_io_bytes() -> Option<(u64, u64)> {
     Some((read_bytes, write_bytes))
 }
 
+#[cfg(target_os = "macos")]
+type IntegerT = libc::c_int;
+#[cfg(target_os = "macos")]
+type MachMsgTypeNumberT = libc::c_uint;
+#[cfg(target_os = "macos")]
+type MachPortNameT = libc::c_uint;
+#[cfg(target_os = "macos")]
+type TaskFlavorT = libc::c_uint;
+
+#[cfg(target_os = "macos")]
+const KERN_SUCCESS: libc::c_int = 0;
+#[cfg(target_os = "macos")]
+const MACH_TASK_BASIC_INFO: TaskFlavorT = 20;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct TimeValue {
+    seconds: IntegerT,
+    microseconds: IntegerT,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTaskBasicInfoData {
+    virtual_size: u64,
+    resident_size: u64,
+    resident_size_max: u64,
+    user_time: TimeValue,
+    system_time: TimeValue,
+    policy: IntegerT,
+    suspend_count: IntegerT,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_task_self() -> MachPortNameT;
+    fn task_info(
+        target_task: MachPortNameT,
+        flavor: TaskFlavorT,
+        task_info_out: *mut IntegerT,
+        task_info_out_count: *mut MachMsgTypeNumberT,
+    ) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn read_rss_bytes_macos() -> Option<u64> {
+    let mut info = MachTaskBasicInfoData {
+        virtual_size: 0,
+        resident_size: 0,
+        resident_size_max: 0,
+        user_time: TimeValue {
+            seconds: 0,
+            microseconds: 0,
+        },
+        system_time: TimeValue {
+            seconds: 0,
+            microseconds: 0,
+        },
+        policy: 0,
+        suspend_count: 0,
+    };
+    let mut count = (std::mem::size_of::<MachTaskBasicInfoData>() / std::mem::size_of::<IntegerT>())
+        as MachMsgTypeNumberT;
+    let result = unsafe {
+        task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            (&mut info as *mut MachTaskBasicInfoData).cast::<IntegerT>(),
+            &mut count,
+        )
+    };
+    if result != KERN_SUCCESS {
+        return None;
+    }
+    Some(info.resident_size)
+}
+
+#[cfg(target_os = "macos")]
+fn read_cpu_time_nanos_macos() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let user_nanos = timeval_to_nanos(usage.ru_utime);
+    let system_nanos = timeval_to_nanos(usage.ru_stime);
+    Some(user_nanos.saturating_add(system_nanos))
+}
+
+#[cfg(target_os = "macos")]
+fn timeval_to_nanos(timeval: libc::timeval) -> u64 {
+    let seconds = u64::try_from(timeval.tv_sec).unwrap_or(0);
+    let micros = u64::try_from(timeval.tv_usec).unwrap_or(0);
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(micros.saturating_mul(1_000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +269,8 @@ mod tests {
         // On Linux CI, we should get non-zero RSS
         #[cfg(target_os = "linux")]
         assert!(snap.rss_bytes > 0, "Expected non-zero RSS on Linux");
-        // On non-Linux, we get zeros (that's fine)
+        #[cfg(target_os = "macos")]
+        assert!(snap.rss_bytes > 0, "Expected non-zero RSS on macOS");
         let _ = snap;
     }
 

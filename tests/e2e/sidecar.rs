@@ -1,7 +1,7 @@
 //! End-to-End sidecar integration tests
 //!
 //! These tests boot a real VM and verify that a guest agent can communicate
-//! with the host-side sidecar via SLIRP networking (10.0.2.2:<port>).
+//! with the host-side sidecar via the backend-specific guest→host gateway.
 //!
 //! ## Prerequisites
 //!
@@ -19,28 +19,30 @@
 //!
 //! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
 
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-#[cfg(target_os = "linux")]
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
-#[cfg(target_os = "linux")]
 use void_box::sidecar;
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
 fn backend_available() -> bool {
-    vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
+    #[cfg(target_os = "linux")]
+    {
+        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
 }
 
-#[cfg(target_os = "linux")]
-fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
+fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
     if kernel.as_os_str().is_empty() {
@@ -57,13 +59,12 @@ fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
     Some((kernel, initramfs))
 }
 
-#[cfg(target_os = "linux")]
 fn build_network_config() -> Option<BackendConfig> {
     if !backend_available() {
         eprintln!("skipping: VM backend not available");
         return None;
     }
-    let (kernel, initramfs) = match kvm_artifacts() {
+    let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
@@ -101,7 +102,6 @@ fn build_network_config() -> Option<BackendConfig> {
     })
 }
 
-#[cfg(target_os = "linux")]
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
     let config = build_network_config()?;
     let mut backend = void_box::backend::create_backend();
@@ -114,7 +114,6 @@ async fn start_backend() -> Option<Box<dyn VmmBackend>> {
     }
 }
 
-#[cfg(target_os = "linux")]
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
     match backend
         .exec("sh", &["-c", script], &[], &[], None, Some(30))
@@ -132,9 +131,8 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::Ex
 // Test 1: Guest reads sidecar health endpoint
 // ===========================================================================
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + network"]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_sidecar_health() {
     let backend = match start_backend().await {
         Some(b) => b,
@@ -147,15 +145,17 @@ async fn guest_reads_sidecar_health() {
         "exec-e2e",
         "c-1",
         vec!["c-2".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
 
     let port = handle.addr().port();
 
-    // Guest fetches /v1/health via SLIRP gateway (10.0.2.2)
-    let script = format!("wget -q -O - http://10.0.2.2:{}/v1/health", port);
+    let script = format!(
+        "wget -q -O - {}/v1/health",
+        void_box::backend::guest_host_url(port)
+    );
     let out = guest_sh(&*backend, &script).await;
     let Some(out) = out else {
         handle.stop().await;
@@ -178,9 +178,8 @@ async fn guest_reads_sidecar_health() {
 // Test 2: Guest reads inbox and posts intent
 // ===========================================================================
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + network"]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_inbox_and_posts_intent() {
     let backend = match start_backend().await {
         Some(b) => b,
@@ -192,7 +191,7 @@ async fn guest_reads_inbox_and_posts_intent() {
         "exec-e2e",
         "c-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
@@ -216,7 +215,10 @@ async fn guest_reads_inbox_and_posts_intent() {
         .await;
 
     // Guest reads inbox
-    let script = format!("wget -q -O - http://10.0.2.2:{}/v1/inbox", port);
+    let script = format!(
+        "wget -q -O - {}/v1/inbox",
+        void_box::backend::guest_host_url(port)
+    );
     let out = guest_sh(&*backend, &script).await;
     let Some(out) = out else {
         handle.stop().await;
@@ -233,8 +235,9 @@ async fn guest_reads_inbox_and_posts_intent() {
     // Guest posts an intent
     let intent_json = r#"{"kind":"signal","audience":"broadcast","payload":{"summary_text":"ack from guest"},"priority":"normal"}"#;
     let script = format!(
-        "wget -q -O - --post-data='{}' --header='Content-Type: application/json' http://10.0.2.2:{}/v1/intents",
-        intent_json, port
+        "wget -q -O - --post-data='{}' --header='Content-Type: application/json' {}/v1/intents",
+        intent_json,
+        void_box::backend::guest_host_url(port),
     );
     let out = guest_sh(&*backend, &script).await;
     let Some(out) = out else {
@@ -267,9 +270,8 @@ async fn guest_reads_inbox_and_posts_intent() {
 // Test 3: Guest reads context endpoint
 // ===========================================================================
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + network"]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_context() {
     let backend = match start_backend().await {
         Some(b) => b,
@@ -281,14 +283,17 @@ async fn guest_reads_context() {
         "exec-e2e",
         "c-3",
         vec!["c-1".into(), "c-2".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
 
     let port = handle.addr().port();
 
-    let script = format!("wget -q -O - http://10.0.2.2:{}/v1/context", port);
+    let script = format!(
+        "wget -q -O - {}/v1/context",
+        void_box::backend::guest_host_url(port)
+    );
     let out = guest_sh(&*backend, &script).await;
     let Some(out) = out else {
         handle.stop().await;
@@ -310,9 +315,8 @@ async fn guest_reads_context() {
 // Test 4: Full agent flow — read inbox, reason, emit intent
 // ===========================================================================
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + network"]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_full_agent_flow() {
     let backend = match start_backend().await {
         Some(b) => b,
@@ -324,7 +328,7 @@ async fn guest_full_agent_flow() {
         "exec-e2e",
         "c-1",
         vec!["c-2".into(), "c-3".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
@@ -359,7 +363,7 @@ async fn guest_full_agent_flow() {
     // This simulates what a generic agent would do
     let script = format!(
         r#"
-        SIDECAR="http://10.0.2.2:{port}"
+        SIDECAR="{sidecar_url}"
 
         # 1. Read context to know who I am
         CTX=$(wget -q -O - "$SIDECAR/v1/context")
@@ -374,7 +378,8 @@ async fn guest_full_agent_flow() {
             --post-data='{{"kind":"evaluation","audience":"leader","payload":{{"summary_text":"approach A looks good"}},"priority":"high"}}' \
             --header='Content-Type: application/json' \
             "$SIDECAR/v1/intents"
-        "#
+        "#,
+        sidecar_url = void_box::backend::guest_host_url(port),
     );
 
     let out = guest_sh(&*backend, &script).await;
@@ -406,22 +411,21 @@ async fn guest_full_agent_flow() {
 /// discovered skills in its output. This test verifies the full provisioning
 /// pipeline: SkillKind::Inline → provision_skills → guest filesystem → claudio
 /// discovery.
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + network"]
+#[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn claudio_discovers_injected_messaging_skill() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
     if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: KVM not available");
+        eprintln!("skipping: VM backend not available");
         return;
     }
     if vm_preflight::require_vsock_usable().is_err() {
         eprintln!("skipping: vsock not available");
         return;
     }
-    let (kernel, initramfs) = match kvm_artifacts() {
+    let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
@@ -439,7 +443,7 @@ async fn claudio_discovers_injected_messaging_skill() {
         "exec-skill-inject",
         "c-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
@@ -501,9 +505,8 @@ async fn claudio_discovers_injected_messaging_skill() {
 /// Boot a real VM and run void-message CLI commands from inside the guest.
 /// Requires the test initramfs to include void-message binary
 /// (rebuild with scripts/build_test_image.sh after adding void-message).
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs with void-message"]
+#[ignore = "requires VM backend + kernel/initramfs with void-message"]
 async fn guest_uses_void_message_cli() {
     let backend = match start_backend().await {
         Some(b) => b,
@@ -515,13 +518,13 @@ async fn guest_uses_void_message_cli() {
         "exec-cli-e2e",
         "c-1",
         vec!["c-2".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
 
     let port = handle.addr().port();
-    let sidecar_url = format!("http://10.0.2.2:{port}");
+    let sidecar_url = void_box::backend::guest_host_url(port);
 
     // Load inbox
     handle
@@ -591,22 +594,21 @@ async fn guest_uses_void_message_cli() {
 
 /// Build a VoidBox with void-mcp registered as an MCP server, run claudio,
 /// verify claudio discovers it in mcp.json and simulates mcp__void-mcp tool calls.
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs with void-mcp"]
+#[ignore = "requires VM backend + kernel/initramfs with void-mcp"]
 async fn claudio_discovers_void_mcp_tools() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
     if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: KVM not available");
+        eprintln!("skipping: VM backend not available");
         return;
     }
     if vm_preflight::require_vsock_usable().is_err() {
         eprintln!("skipping: vsock not available");
         return;
     }
-    let (kernel, initramfs) = match kvm_artifacts() {
+    let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
@@ -624,7 +626,7 @@ async fn claudio_discovers_void_mcp_tools() {
         "exec-mcp-e2e",
         "c-1",
         vec!["c-2".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
@@ -640,7 +642,7 @@ async fn claudio_discovers_void_mcp_tools() {
         .skill(
             Skill::mcp("void-mcp")
                 .description("Collaboration tools")
-                .env("VOID_SIDECAR_URL", format!("http://10.0.2.2:{}", port)),
+                .env("VOID_SIDECAR_URL", void_box::backend::guest_host_url(port)),
         )
         .skill(Skill::agent("claude-code"))
         .prompt("Use your collaboration tools.")

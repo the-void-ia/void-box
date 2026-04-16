@@ -192,6 +192,54 @@ async fn snapshot_vz_round_trip() {
     eprintln!("==============================");
 }
 
+/// Cold-boot a VZ VM, create an auto-snapshot, and verify the restored VM can
+/// still execute commands without manual intervention.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn auto_snapshot_vz_round_trip() {
+    let config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    eprintln!("[vz_auto_snapshot] Booting VM...");
+    let mut backend = VzBackend::new();
+    if let Err(e) = backend.start(config).await {
+        eprintln!("[vz_auto_snapshot] start failed: {e}");
+        return;
+    }
+
+    let output = backend
+        .exec("echo", &["before-auto-snap"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed before auto-snapshot");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout_str().trim(), "before-auto-snap");
+
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    eprintln!(
+        "[vz_auto_snapshot] Creating auto-snapshot at {}...",
+        snap_dir.path().display()
+    );
+    backend
+        .create_auto_snapshot(snap_dir.path(), "vz-auto-snapshot".into())
+        .await
+        .expect("create_auto_snapshot failed");
+    assert!(backend.is_running(), "backend should still be running");
+
+    let output = backend
+        .exec("echo", &["after-auto-snap"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed after auto-snapshot restore");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout_str().trim(), "after-auto-snap");
+
+    backend.stop().await.expect("stop failed");
+}
+
 // ---------------------------------------------------------------------------
 // CLI-level tests: snapshot_store list / delete / exists with VZ snapshots
 // ---------------------------------------------------------------------------

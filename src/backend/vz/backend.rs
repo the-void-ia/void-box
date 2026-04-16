@@ -62,6 +62,21 @@ use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 
+fn deterministic_mac_address(session_secret: &[u8; 32]) -> Retained<VZMACAddress> {
+    let mut octets = [0u8; 6];
+    octets.copy_from_slice(&session_secret[..6]);
+    // Locally administered, unicast MAC address.
+    octets[0] = (octets[0] | 0x02) & 0xfe;
+    let mac_string = format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        octets[0], octets[1], octets[2], octets[3], octets[4], octets[5]
+    );
+    unsafe {
+        VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&mac_string))
+            .expect("deterministic MAC address must be valid")
+    }
+}
+
 /// Wrapper to assert `Send + Sync` for `Retained<VZVirtioSocketDevice>`.
 ///
 /// # Safety
@@ -96,6 +111,8 @@ pub struct VzBackend {
     session_secret: Option<[u8; 32]>,
     /// Snapshot of the BackendConfig used in start() (kept for snapshot sidecar).
     started_config: Option<StartedConfigInfo>,
+    /// Full backend config for restart flows such as auto-snapshot.
+    start_config: Option<BackendConfig>,
 }
 
 /// Subset of BackendConfig we need to persist in the snapshot sidecar.
@@ -103,6 +120,7 @@ struct StartedConfigInfo {
     memory_mb: usize,
     vcpus: usize,
     network: bool,
+    boot_clock_secs: u64,
 }
 
 // Safety: The ObjC `vm` and `socket_device` handles are only mutated in
@@ -245,6 +263,7 @@ impl VzBackend {
             span_context: None,
             session_secret: None,
             started_config: None,
+            start_config: None,
         }
     }
 
@@ -253,7 +272,10 @@ impl VzBackend {
     /// This contains steps 1–7 of the original `start()`: boot loader,
     /// memory/cpu, vsock, networking, serial, virtiofs, and validation.
     /// Both cold-boot and snapshot-restore paths call this.
-    fn configure_vm(config: &BackendConfig) -> Result<Retained<VZVirtualMachineConfiguration>> {
+    fn configure_vm(
+        config: &BackendConfig,
+        boot_clock_secs: u64,
+    ) -> Result<Retained<VZVirtualMachineConfiguration>> {
         // 1. Boot loader
         let kernel_url =
             NSURL::fileURLWithPath(&NSString::from_str(config.kernel.to_str().unwrap_or("")));
@@ -269,7 +291,7 @@ impl VzBackend {
         }
 
         // Set kernel cmdline
-        let cmdline = config::build_kernel_cmdline(config);
+        let cmdline = config::build_kernel_cmdline_with_clock(config, boot_clock_secs);
         unsafe {
             boot_loader.setCommandLine(&NSString::from_str(&cmdline));
         }
@@ -295,8 +317,10 @@ impl VzBackend {
         if config.network {
             let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
             let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
+            let mac_address = deterministic_mac_address(&config.security.session_secret);
             unsafe {
                 net_config.setAttachment(Some(&nat_attachment));
+                net_config.setMACAddress(&mac_address);
             }
             let net_configs: Retained<NSArray<VZNetworkDeviceConfiguration>> =
                 NSArray::arrayWithObject(&net_config);
@@ -609,6 +633,7 @@ impl VzBackend {
             vcpus: config_info.vcpus,
             network: config_info.network,
             cid: self.cid,
+            boot_clock_secs: config_info.boot_clock_secs,
         };
         if let Err(e) = meta.save(dir) {
             error!("VzBackend: sidecar save failed, resuming VM: {}", e);
@@ -622,11 +647,21 @@ impl VzBackend {
         info!("VzBackend: snapshot created at {}", dir.display());
         Ok(())
     }
+
+    fn clear_runtime_state(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.control_channel = None;
+        self.socket_device = None;
+        self.vm = None;
+        self.session_secret = None;
+        self.started_config = None;
+    }
 }
 
 #[async_trait::async_trait]
 impl VmmBackend for VzBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
+        self.start_config = Some(config.clone());
         if let Some(warning) = config.initramfs_memory_warning() {
             warn!("VzBackend: {}", warning);
         }
@@ -651,7 +686,7 @@ impl VmmBackend for VzBackend {
                     })?;
 
                 // 2. Build VM configuration (same setup as cold boot)
-                let vm_config = Self::configure_vm(&config)?;
+                let vm_config = Self::configure_vm(&config, meta.boot_clock_secs)?;
 
                 // 3. Create VM on the VZ queue
                 let vm = unsafe {
@@ -726,6 +761,7 @@ impl VmmBackend for VzBackend {
                     memory_mb: meta.memory_mb,
                     vcpus: meta.vcpus,
                     network: meta.network,
+                    boot_clock_secs: meta.boot_clock_secs,
                 });
                 self.setup_control_channel(session_secret);
 
@@ -740,7 +776,11 @@ impl VmmBackend for VzBackend {
                 config.memory_mb, config.vcpus
             );
 
-            let vm_config = Self::configure_vm(&config)?;
+            let boot_clock_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let vm_config = Self::configure_vm(&config, boot_clock_secs)?;
 
             // Create and start the VM on a dedicated serial dispatch queue.
             //
@@ -780,6 +820,7 @@ impl VmmBackend for VzBackend {
                 memory_mb: config.memory_mb,
                 vcpus: config.vcpus,
                 network: config.network,
+                boot_clock_secs,
             });
             self.setup_control_channel(config.security.session_secret);
 
@@ -969,20 +1010,41 @@ impl VmmBackend for VzBackend {
                 info!("VzBackend: stopping VM");
 
                 let vm_ptr = Retained::as_ptr(vm) as usize;
-                match dispatch_vz_op(&self.vz_queue, vm_ptr, 10, "stop", |vm_ref, handler| {
+                dispatch_vz_op(&self.vz_queue, vm_ptr, 10, "stop", |vm_ref, handler| {
                     unsafe { vm_ref.stopWithCompletionHandler(handler) };
-                }) {
-                    Ok(()) => info!("VzBackend: VM stopped"),
-                    Err(e) => error!("VzBackend: VM stop error: {}", e),
-                }
+                })
+                .inspect_err(|e| error!("VzBackend: VM stop error: {}", e))?;
+                info!("VzBackend: VM stopped");
             }
 
-            self.running.store(false, Ordering::SeqCst);
-            self.control_channel = None;
-            self.socket_device = None;
-            self.vm = None;
+            self.clear_runtime_state();
             Ok(())
         })
+    }
+
+    async fn create_auto_snapshot(
+        &mut self,
+        snapshot_dir: &std::path::Path,
+        _config_hash: String,
+    ) -> Result<()> {
+        let channel = self
+            .control_channel
+            .as_ref()
+            .ok_or_else(|| crate::Error::Guest("no control channel".into()))?;
+        channel
+            .wait_for_snapshot_ready(std::time::Duration::from_secs(30))
+            .await?;
+
+        self.create_snapshot(snapshot_dir)?;
+        info!(
+            "VzBackend: auto-snapshot saved to {}",
+            snapshot_dir.display()
+        );
+        warn!(
+            "VzBackend: auto-snapshot restore is currently disabled on macOS; \
+             keeping the current VM running after saving the snapshot"
+        );
+        Ok(())
     }
 
     fn cid(&self) -> u32 {

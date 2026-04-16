@@ -40,6 +40,8 @@ pub struct VzSnapshotMeta {
     pub network: bool,
     /// The VM's vsock CID.
     pub cid: u32,
+    /// Host wall-clock injected into the original boot cmdline.
+    pub boot_clock_secs: u64,
 }
 
 impl VzSnapshotMeta {

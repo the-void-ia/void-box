@@ -55,6 +55,7 @@ const CLAUDE_HOME: &str = "/workspace/.claude";
 /// MCP config file path. Claude Code reads project-scoped MCP servers from
 /// .mcp.json at the project root.
 const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
+const CLAUDE_ONBOARDING_PATH: &str = "/home/sandbox/.claude.json";
 
 /// Published output from a service agent.
 /// Contains only what agent_box knows: guest execution output.
@@ -137,6 +138,8 @@ struct BoxConfig {
     timeout_secs: Option<u64>,
     /// Agent mode: Task (run-to-completion) or Service (long-running).
     mode: AgentMode,
+    /// Optional staged Claude personal credentials to copy into the guest.
+    claude_credentials_host_path: Option<PathBuf>,
 }
 
 impl Default for BoxConfig {
@@ -158,6 +161,7 @@ impl Default for BoxConfig {
             llm: LlmProvider::default(),
             timeout_secs: None,
             mode: AgentMode::default(),
+            claude_credentials_host_path: None,
         }
     }
 }
@@ -228,6 +232,13 @@ impl VoidBox {
     /// Defaults to `/workspace/output.json`.
     pub fn output_file(mut self, path: impl Into<String>) -> Self {
         self.config.output_file = path.into();
+        self
+    }
+
+    /// Point at a staged host-side Claude credentials directory whose
+    /// `.credentials.json` should be copied into the guest before launch.
+    pub fn claude_credentials_host_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.claude_credentials_host_path = Some(path.into());
         self
     }
 
@@ -425,6 +436,60 @@ impl VoidBox {
     async fn write_skill_file(sandbox: &Sandbox, name: &str, content: &[u8]) -> Result<()> {
         let path = format!("{}/skills/{}.md", CLAUDE_HOME, name);
         sandbox.write_file(&path, content).await?;
+        Ok(())
+    }
+
+    async fn provision_claude_bootstrap(&self, sandbox: &Sandbox) -> Result<()> {
+        if !self.config.llm.supports_claude_settings() {
+            return Ok(());
+        }
+
+        let onboarding = r#"{"hasCompletedOnboarding":true}"#;
+        sandbox
+            .write_file(CLAUDE_ONBOARDING_PATH, onboarding.as_bytes())
+            .await?;
+
+        let settings = serde_json::json!({
+            "skipWebFetchPreflight": true
+        });
+        sandbox
+            .write_file(
+                &format!("{}/settings.json", CLAUDE_HOME),
+                settings.to_string().as_bytes(),
+            )
+            .await?;
+
+        if let Some(ref host_dir) = self.config.claude_credentials_host_path {
+            let creds_path = host_dir.join(".credentials.json");
+            if let Ok(credentials_bytes) = std::fs::read(&creds_path) {
+                sandbox.mkdir_p("/home/sandbox/.claude").await?;
+                sandbox
+                    .write_file(
+                        "/home/sandbox/.claude/.credentials.json",
+                        &credentials_bytes,
+                    )
+                    .await?;
+            }
+        }
+
+        // Ensure the sandbox user (uid 1000) owns ~/.claude and the
+        // onboarding marker.  The guest-agent runs as root so files it
+        // creates are root-owned by default; claude-code runs as uid 1000
+        // and must be able to read credentials and write token refreshes.
+        // Use `sh -c` because standalone `chown` may not exist in minimal
+        // initramfs images — busybox provides it as a shell built-in.
+        let _ = sandbox
+            .exec(
+                "sh",
+                &[
+                    "-c",
+                    "chown -R 1000:1000 /home/sandbox/.claude 2>/dev/null; \
+                     chown 1000:1000 /home/sandbox/.claude.json 2>/dev/null; \
+                     true",
+                ],
+            )
+            .await;
+
         Ok(())
     }
 
@@ -692,18 +757,7 @@ impl VoidBox {
         // Provision skills into the guest
         self.provision_skills(sandbox).await?;
 
-        // Write claude-code settings.  skipWebFetchPreflight avoids the
-        // preflight call to claude.ai/api/web/domain_info which is
-        // unreachable from inside the SLIRP network in many environments.
-        let settings = serde_json::json!({
-            "skipWebFetchPreflight": true
-        });
-        sandbox
-            .write_file(
-                &format!("{}/settings.json", CLAUDE_HOME),
-                settings.to_string().as_bytes(),
-            )
-            .await?;
+        self.provision_claude_bootstrap(sandbox).await?;
 
         let tag = &self.name;
 
@@ -842,13 +896,7 @@ impl VoidBox {
 
         self.provision_skills(sandbox).await?;
 
-        let settings = serde_json::json!({ "skipWebFetchPreflight": true });
-        sandbox
-            .write_file(
-                &format!("{}/settings.json", CLAUDE_HOME),
-                settings.to_string().as_bytes(),
-            )
-            .await?;
+        self.provision_claude_bootstrap(sandbox).await?;
 
         if let Some(data) = input {
             sandbox.write_file("/workspace/input.json", data).await?;
@@ -959,6 +1007,21 @@ impl VoidBox {
                                 res.total_cost_usd,
                                 res.is_error,
                             );
+                            if res.is_error {
+                                if let Some(error_message) = res.error.as_deref() {
+                                    eprintln!(
+                                        "[vm:{}] Service agent error: {}",
+                                        box_name_agent, error_message
+                                    );
+                                }
+                                if !res.result_text.trim().is_empty() {
+                                    eprintln!(
+                                        "[vm:{}] Service agent result preview: {}",
+                                        box_name_agent,
+                                        res.result_text.trim()
+                                    );
+                                }
+                            }
 
                             // Best-effort exit-time publication. Hard timeout so
                             // a dying sandbox cannot block exit_tx forever.

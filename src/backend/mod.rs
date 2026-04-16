@@ -18,6 +18,7 @@ pub mod kvm;
 pub mod vz;
 
 use std::io::{Read, Seek, SeekFrom};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,6 +37,10 @@ use crate::ExecOutput;
 /// places it in guest RAM) and the decompressed tmpfs content coexist during
 /// early-boot extraction, so the caller adds both on top of this constant.
 const INITRAMFS_OVERHEAD_BYTES: u64 = 208 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_GUEST_HOST_GATEWAY: &str = "10.0.2.2";
+#[cfg(target_os = "macos")]
+const MACOS_GUEST_HOST_GATEWAY: &str = "192.168.64.1";
 
 /// A single host→guest directory mount.
 #[derive(Debug, Clone)]
@@ -190,6 +195,46 @@ impl BackendConfig {
         } else {
             None
         }
+    }
+}
+
+/// Host-reachable gateway address as seen from inside the guest VM.
+///
+/// Linux/KVM uses the userspace SLIRP gateway, while macOS/VZ uses the
+/// Virtualization.framework NAT gateway.
+pub fn guest_host_gateway() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        LINUX_GUEST_HOST_GATEWAY
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MACOS_GUEST_HOST_GATEWAY
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "127.0.0.1"
+    }
+}
+
+/// Build a guest-visible HTTP URL to a host-local service.
+pub fn guest_host_url(port: u16) -> String {
+    format!("http://{}:{}", guest_host_gateway(), port)
+}
+
+/// Bind address for host-side services that must be reachable from inside the guest.
+///
+/// On Linux/KVM, SLIRP forwards guest connections to host loopback. On macOS/VZ,
+/// host services must listen on a non-loopback interface to be reachable through
+/// the NAT gateway.
+pub fn guest_accessible_bind_addr(port: u16) -> SocketAddr {
+    #[cfg(target_os = "macos")]
+    {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     }
 }
 

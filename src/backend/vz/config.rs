@@ -5,6 +5,13 @@
 
 use crate::backend::BackendConfig;
 
+fn current_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Build the kernel command line for a VZ-based VM.
 ///
 /// Key differences from KVM:
@@ -12,6 +19,11 @@ use crate::backend::BackendConfig;
 /// - No `virtio_mmio.device=` declarations — VZ uses PCI auto-discovery
 /// - Shared: `voidbox.secret`, `voidbox.clock`, `ipv6.disable=1`
 pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
+    build_kernel_cmdline_with_clock(config, current_epoch_secs())
+}
+
+/// Build the kernel command line for a VZ-based VM with an explicit boot clock.
+pub fn build_kernel_cmdline_with_clock(config: &BackendConfig, epoch_secs: u64) -> String {
     let mut parts = vec![
         "console=hvc0".to_string(),
         "loglevel=0".to_string(),
@@ -31,10 +43,6 @@ pub fn build_kernel_cmdline(config: &BackendConfig) -> String {
     parts.push(format!("voidbox.secret={}", secret_hex));
 
     // Inject host wall-clock for TLS cert validation
-    let epoch_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     parts.push(format!("voidbox.clock={}", epoch_secs));
 
     // Disable IPv6 if networking is enabled (our guest stack is IPv4 only)
@@ -76,6 +84,8 @@ mod tests {
     use super::*;
     use crate::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
     use std::path::PathBuf;
+
+    const TEST_CLOCK_SECS: u64 = 1_700_000_000;
 
     fn test_config() -> BackendConfig {
         BackendConfig {
@@ -132,8 +142,8 @@ mod tests {
     #[test]
     fn cmdline_includes_clock() {
         let config = test_config();
-        let cmdline = build_kernel_cmdline(&config);
-        assert!(cmdline.contains("voidbox.clock="));
+        let cmdline = build_kernel_cmdline_with_clock(&config, TEST_CLOCK_SECS);
+        assert!(cmdline.contains(&format!("voidbox.clock={TEST_CLOCK_SECS}")));
     }
 
     #[test]

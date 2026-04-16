@@ -20,21 +20,16 @@
 //!   ANTHROPIC_API_KEY=sk-... \
 //!   cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
 
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-#[cfg(target_os = "linux")]
 use void_box::agent_box::VoidBox;
-#[cfg(target_os = "linux")]
 use void_box::sidecar;
-#[cfg(target_os = "linux")]
 use void_box::skill::Skill;
 
-#[cfg(target_os = "linux")]
-fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
+fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
     if kernel.as_os_str().is_empty() {
@@ -62,19 +57,18 @@ fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
 /// 3. Claude uses the tools (check sidecar for buffered intents)
 ///
 /// The prompt explicitly asks Claude to use collaboration tools.
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs + ANTHROPIC_API_KEY"]
+#[ignore = "requires VM backend + kernel/initramfs + ANTHROPIC_API_KEY"]
 async fn real_claude_uses_void_mcp_tools() {
     if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: KVM not available");
+        eprintln!("skipping: VM backend not available");
         return;
     }
     if vm_preflight::require_vsock_usable().is_err() {
         eprintln!("skipping: vsock not available");
         return;
     }
-    let (kernel, initramfs) = match kvm_artifacts() {
+    let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
@@ -92,7 +86,7 @@ async fn real_claude_uses_void_mcp_tools() {
         "exec-real-claude",
         "c-1",
         vec!["c-2".into(), "c-3".into()],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
@@ -128,7 +122,7 @@ async fn real_claude_uses_void_mcp_tools() {
         .skill(
             Skill::mcp("void-mcp")
                 .description("Collaboration tools for multi-agent swarm")
-                .env("VOID_SIDECAR_URL", format!("http://10.0.2.2:{}", port)),
+                .env("VOID_SIDECAR_URL", void_box::backend::guest_host_url(port)),
         )
         .skill(Skill::agent("claude-code"))
         .prompt(
@@ -231,21 +225,20 @@ async fn real_claude_uses_void_mcp_tools() {
 
 /// Minimal diagnostic: just check if void-mcp starts and responds
 /// to the MCP handshake from inside the guest VM.
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires KVM + kernel/initramfs"]
+#[ignore = "requires VM backend + kernel/initramfs"]
 async fn diagnostic_void_mcp_starts_in_guest() {
     use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
 
     if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: KVM not available");
+        eprintln!("skipping: VM backend not available");
         return;
     }
     if vm_preflight::require_vsock_usable().is_err() {
         eprintln!("skipping: vsock not available");
         return;
     }
-    let (kernel, initramfs) = match kvm_artifacts() {
+    let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
@@ -259,13 +252,13 @@ async fn diagnostic_void_mcp_starts_in_guest() {
         "exec-diag",
         "c-1",
         vec![],
-        "127.0.0.1:0".parse().unwrap(),
+        void_box::backend::guest_accessible_bind_addr(0),
     )
     .await
     .expect("failed to start sidecar");
 
     let port = handle.addr().port();
-    let sidecar_url = format!("http://10.0.2.2:{port}");
+    let sidecar_url = void_box::backend::guest_host_url(port);
 
     // Boot VM
     let mut secret = [0u8; 32];
