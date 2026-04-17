@@ -425,8 +425,8 @@ fn parse_mount_flag(raw: &str) -> Result<MountConfig, Box<dyn std::error::Error>
 /// Resolves a `--snapshot` argument (or spec-level `sandbox.snapshot`) to an
 /// absolute snapshot directory.
 ///
-/// Thin wrapper over [`snapshot_store::resolve_snapshot_argument`] that turns
-/// the shared resolution result into a CLI-friendly error.
+/// Thin wrapper over [`void_box::snapshot_store::resolve_snapshot_argument`]
+/// that turns the shared resolution result into a CLI-friendly error.
 fn resolve_snapshot_arg(arg: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     match void_box::snapshot_store::resolve_snapshot_argument(arg) {
         void_box::snapshot_store::SnapshotResolution::Hash(p)
