@@ -1018,13 +1018,13 @@ impl VoidBox {
                             );
                             if res.is_error {
                                 if let Some(error_message) = res.error.as_deref() {
-                                    eprintln!(
+                                    error!(
                                         "[vm:{}] Service agent error: {}",
                                         box_name_agent, error_message
                                     );
                                 }
                                 if !res.result_text.trim().is_empty() {
-                                    eprintln!(
+                                    warn!(
                                         "[vm:{}] Service agent result preview: {}",
                                         box_name_agent,
                                         res.result_text.trim()

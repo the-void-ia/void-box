@@ -88,6 +88,16 @@ struct AppendMessageRequest {
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_on_listener(listener).await
+}
+
+/// Serve the daemon on an already-bound listener.
+///
+/// Useful for tests that need to reserve a port before spawning the server:
+/// binding here (rather than reserving a port and re-binding later) closes the
+/// TOCTOU window where another process could claim the port in between.
+pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     let provider = provider_from_env();
     let initial_runs = provider.load_runs().unwrap_or_default();
 
@@ -98,7 +108,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     println!("[void-box] daemon listening on http://{}", addr);
 
     loop {

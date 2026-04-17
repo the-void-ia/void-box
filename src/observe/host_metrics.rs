@@ -132,7 +132,18 @@ impl HostMetricsCollector {
             return Some(0.0);
         }
 
-        Some(((delta_cpu_nanos as f64 / elapsed_nanos as f64) * 100.0).min(100.0))
+        // Normalize against logical CPU count so multi-core usage is reported on
+        // the same 0-100% scale as the Linux path (which divides by total system
+        // ticks). Without this, a process saturating N cores would report N*100%.
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as f64;
+        // task_info reports CPU time at microsecond granularity while
+        // Instant::now() is nanosecond; back-to-back samples with sub-µs elapsed
+        // can yield a ratio >1.0 purely as a measurement artifact. Cap at 100%
+        // (total CPU over total wall-time across all cores is bounded there).
+        let pct = (delta_cpu_nanos as f64 / elapsed_nanos as f64) * 100.0 / logical_cpus;
+        Some(pct.min(100.0))
     }
 }
 

@@ -98,7 +98,8 @@ fn wait_for_http_ok(addr: SocketAddr, path: &str, timeout: Duration) {
 }
 
 fn start_daemon(kernel: &std::path::Path, initramfs: &std::path::Path) -> SocketAddr {
-    let addr = test_net::reserve_localhost_addr();
+    let (addr, listener) = test_net::reserve_localhost_listener();
+    listener.set_nonblocking(true).unwrap();
 
     let kernel = kernel.to_path_buf();
     let initramfs = initramfs.to_path_buf();
@@ -108,7 +109,10 @@ fn start_daemon(kernel: &std::path::Path, initramfs: &std::path::Path) -> Socket
         rt.block_on(async {
             std::env::set_var("VOID_BOX_KERNEL", kernel.to_str().unwrap());
             std::env::set_var("VOID_BOX_INITRAMFS", initramfs.to_str().unwrap());
-            void_box::daemon::serve(addr).await.unwrap();
+            let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            void_box::daemon::serve_on_listener(tokio_listener)
+                .await
+                .unwrap();
         });
     });
 
