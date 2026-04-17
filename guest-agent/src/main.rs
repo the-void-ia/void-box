@@ -354,6 +354,11 @@ fn main() {
     if std::process::id() == 1 {
         if network_enabled_from_cmdline() {
             setup_network();
+            // Install the host-provided network deny list *once* at boot,
+            // before any guest command can run. This closes the window
+            // between network bring-up and the first exec call, and avoids
+            // repeating the (idempotent) work on every exec.
+            apply_network_deny_list();
         } else {
             kmsg("Network disabled by host config; skipping setup_network()");
         }
@@ -2090,8 +2095,6 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
         let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
         kmsg(&format!("Exec gate passed: oci_status={}", status));
     }
-
-    apply_network_deny_list();
 
     // Check command allowlist before spawning
     if !is_command_allowed(&request.program) {

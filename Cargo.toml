@@ -101,6 +101,7 @@ objc2-foundation = { version = "0.3", features = [
 objc2-virtualization = { version = "0.3", features = ["dispatch2", "VZMACAddress"] }
 block2 = "0.6"
 dispatch2 = "0.3"
+mach2 = "0.4"
 
 [dev-dependencies]
 regex-lite = "0.1.9"

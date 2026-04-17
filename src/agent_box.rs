@@ -39,6 +39,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tracing::{debug, error, info, warn};
+
 use crate::llm::LlmProvider;
 use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
@@ -478,7 +480,7 @@ impl VoidBox {
         // and must be able to read credentials and write token refreshes.
         // Use `sh -c` because standalone `chown` may not exist in minimal
         // initramfs images — busybox provides it as a shell built-in.
-        let _ = sandbox
+        if let Err(e) = sandbox
             .exec(
                 "sh",
                 &[
@@ -488,7 +490,14 @@ impl VoidBox {
                      true",
                 ],
             )
-            .await;
+            .await
+        {
+            warn!(
+                "[vm:{}] claude bootstrap chown exec failed: {} — \
+                 claude-code may be unable to read credentials or refresh tokens",
+                self.name, e
+            );
+        }
 
         Ok(())
     }
@@ -1055,7 +1064,7 @@ impl VoidBox {
                                         }
                                     }
                                 } else {
-                                    eprintln!(
+                                    warn!(
                                         "[vm:{}] Service agent: exit-time output read failed or timed out",
                                         box_name_agent
                                     );
@@ -1064,21 +1073,21 @@ impl VoidBox {
 
                             // Signal exit — unconditional, never depends on publication.
                             exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
-                            eprintln!("[vm:{}] Service agent: sending exit", box_name_agent);
+                            info!("[vm:{}] Service agent: sending exit", box_name_agent);
                             let _ = exit_tx.send(ServiceExit::Exited {
                                 success: !res.is_error,
                                 error: res.error,
                             });
                         }
                         Err(e) => {
-                            eprintln!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
+                            error!("[vm:{}] Service agent crashed: {}", box_name_agent, e);
                             exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = exit_tx.send(ServiceExit::Crashed(e.to_string()));
                         }
                     }
                 }
                 _ = stop_rx => {
-                    eprintln!("[vm:{}] Service agent stop requested", box_name_agent);
+                    info!("[vm:{}] Service agent stop requested", box_name_agent);
                     exited_agent.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = exit_tx.send(ServiceExit::Canceled);
                 }
@@ -1099,13 +1108,13 @@ impl VoidBox {
 
                 // Stop if the agent task already exited.
                 if exited_monitor.load(std::sync::atomic::Ordering::SeqCst) {
-                    eprintln!("[vm:{}] Output monitor: agent exited, stopping", tag);
+                    debug!("[vm:{}] Output monitor: agent exited, stopping", tag);
                     return;
                 }
 
                 // Stop if the sender was already consumed by the exit fallback.
                 if output_tx_monitor.lock().await.is_none() {
-                    eprintln!("[vm:{}] Output monitor: already published, stopping", tag);
+                    debug!("[vm:{}] Output monitor: already published, stopping", tag);
                     return;
                 }
 
@@ -1118,12 +1127,12 @@ impl VoidBox {
                 {
                     Ok(Ok(found)) => found,
                     Ok(Err(e)) => {
-                        eprintln!("[vm:{}] Output monitor: file_exists failed: {}", tag, e);
+                        warn!("[vm:{}] Output monitor: file_exists failed: {}", tag, e);
                         probe_failures += 1;
                         false
                     }
                     Err(_) => {
-                        eprintln!("[vm:{}] Output monitor: file_exists timed out", tag);
+                        warn!("[vm:{}] Output monitor: file_exists timed out", tag);
                         probe_failures += 1;
                         false
                     }
@@ -1131,7 +1140,7 @@ impl VoidBox {
 
                 if !exists {
                     if probe_failures >= 10 {
-                        eprintln!(
+                        error!(
                             "[vm:{}] Output monitor: too many probe failures, stopping",
                             tag
                         );
@@ -1149,20 +1158,20 @@ impl VoidBox {
                 {
                     Ok(Ok(data)) if !data.is_empty() => data,
                     Ok(Ok(_)) => {
-                        eprintln!("[vm:{}] Output monitor: file empty, retrying", tag);
+                        debug!("[vm:{}] Output monitor: file empty, retrying", tag);
                         continue;
                     }
                     Ok(Err(e)) => {
-                        eprintln!("[vm:{}] Output monitor: read failed: {}", tag, e);
+                        warn!("[vm:{}] Output monitor: read failed: {}", tag, e);
                         continue;
                     }
                     Err(_) => {
-                        eprintln!("[vm:{}] Output monitor: read timed out", tag);
+                        warn!("[vm:{}] Output monitor: read timed out", tag);
                         continue;
                     }
                 };
 
-                eprintln!(
+                info!(
                     "[vm:{}] Output monitor: publishing output ({} bytes)",
                     tag,
                     data.len()

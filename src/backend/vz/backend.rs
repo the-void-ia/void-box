@@ -62,35 +62,17 @@ use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSData, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 
-const GUEST_NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
-
-#[async_trait::async_trait]
-trait GuestPolicyWriter: Sync {
-    async fn mkdir_p(&self, path: &str) -> Result<()>;
-    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
-}
-
-async fn provision_network_deny_list_with_writer(
-    writer: &dyn GuestPolicyWriter,
-    deny_list: &[String],
-) -> Result<()> {
-    if deny_list.is_empty() {
-        return Ok(());
-    }
-
-    let deny_list_json = serde_json::to_string_pretty(deny_list).map_err(|e| {
-        crate::Error::Config(format!("failed to serialize network deny list: {}", e))
-    })?;
-    writer.mkdir_p("/etc/voidbox").await?;
-    writer
-        .write_file(GUEST_NETWORK_DENY_LIST_PATH, deny_list_json.as_bytes())
-        .await
-}
+use crate::backend::{provision_network_deny_list_with_writer, GuestPolicyWriter};
 
 fn deterministic_mac_address(session_secret: &[u8; 32]) -> Retained<VZMACAddress> {
     let mut octets = [0u8; 6];
     octets.copy_from_slice(&session_secret[..6]);
-    // Locally administered, unicast MAC address.
+    // Force the MAC into the IEEE 802 "locally administered, unicast" range so
+    // it can never collide with a real OUI-assigned vendor MAC:
+    //   - bit 1 of octet 0 (`0x02`, "locally administered") must be SET.
+    //   - bit 0 of octet 0 (`0x01`, "multicast/group") must be CLEARED so the
+    //     frame is treated as unicast.
+    // `(x | 0x02) & 0xfe` applies both transforms in one pass.
     octets[0] = (octets[0] | 0x02) & 0xfe;
     let mac_string = format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -301,6 +283,7 @@ fn sidecar_restore_config(config: BackendConfig, meta: &VzSnapshotMeta) -> Backe
         env,
         security,
         snapshot,
+        enable_snapshots,
     } = config;
 
     if caller_memory_mb != meta.memory_mb {
@@ -341,6 +324,7 @@ fn sidecar_restore_config(config: BackendConfig, meta: &VzSnapshotMeta) -> Backe
         env,
         security,
         snapshot,
+        enable_snapshots,
     }
 }
 
@@ -419,6 +403,7 @@ impl VzBackend {
         config: &BackendConfig,
         boot_clock_secs: u64,
         machine_identifier_data: Option<&[u8]>,
+        validate_save_restore: bool,
     ) -> Result<(Retained<VZVirtualMachineConfiguration>, Vec<u8>)> {
         // 1. Boot loader
         let kernel_url =
@@ -434,7 +419,16 @@ impl VzBackend {
             unsafe { boot_loader.setInitialRamdiskURL(Some(&initrd_url)) };
         }
 
-        // Set kernel cmdline
+        // Set kernel cmdline.
+        //
+        // On the cold-boot path `boot_clock_secs` is the live epoch; on the
+        // restore path it comes from the sidecar so the reconstructed cmdline
+        // matches the one embedded in the save blob byte-for-byte — Apple's
+        // `restoreMachineStateFromURL:` rejects any config drift with an
+        // opaque `VZErrorRestore`.  The guest-agent only reads `voidbox.clock`
+        // once at PID 1 startup, so the restored cmdline's stale epoch is
+        // never consumed again; post-restore clock drift is addressed by
+        // guest-side sync, not by rewriting the cmdline.
         let cmdline = config::build_kernel_cmdline_with_clock(config, boot_clock_secs);
         unsafe {
             boot_loader.setCommandLine(&NSString::from_str(&cmdline));
@@ -607,16 +601,24 @@ impl VzBackend {
             }
         }
 
-        // 7. Validate configuration
+        // 7. Validate configuration.
+        //
+        // `validateSaveRestoreSupportWithError` is skipped on cold boot when
+        // the caller did not opt in to save/restore — some device sets (e.g.
+        // virtiofs shares) cause Apple to reject the config here even though
+        // the VM can run fine for non-snapshot workloads. On the restore path
+        // we always validate, since the whole operation depends on it.
         unsafe {
             vm_config
                 .validateWithError()
                 .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
-            vm_config
-                .validateSaveRestoreSupportWithError()
-                .map_err(|e| {
-                    crate::Error::Backend(format!("VZ save/restore support validation: {}", e))
-                })?;
+            if validate_save_restore {
+                vm_config
+                    .validateSaveRestoreSupportWithError()
+                    .map_err(|e| {
+                        crate::Error::Backend(format!("VZ save/restore support validation: {}", e))
+                    })?;
+            }
         }
 
         Ok((vm_config, machine_identifier_bytes))
@@ -904,6 +906,7 @@ impl VmmBackend for VzBackend {
                     &effective_config,
                     meta.boot_clock_secs,
                     Some(saved_machine_identifier),
+                    true,
                 )?;
 
                 // 3. Create VM on the VZ queue
@@ -1006,7 +1009,7 @@ impl VmmBackend for VzBackend {
 
             let boot_clock_secs = config::current_epoch_secs();
             let (vm_config, machine_identifier_bytes) =
-                Self::configure_vm(&config, boot_clock_secs, None)?;
+                Self::configure_vm(&config, boot_clock_secs, None, config.enable_snapshots)?;
 
             // Create and start the VM on a dedicated serial dispatch queue.
             //
@@ -1273,20 +1276,26 @@ impl VmmBackend for VzBackend {
         })?;
         restart_config.snapshot = Some(snapshot_dir.to_path_buf());
 
-        // Save the live VM state + sidecar. create_snapshot_with_hash pauses,
-        // writes the Apple save file + our sidecar, and resumes — leaving the
-        // original VM running until the stop() below.
-        tokio::task::block_in_place(|| {
-            self.create_snapshot_with_hash(snapshot_dir, Some(config_hash.clone()))
-        })?;
+        // Save the live VM state + sidecar, leaving the VM paused. We skip
+        // the resume step that `create_snapshot_with_hash` normally does —
+        // `stop()` below transitions directly from Paused, so resuming just
+        // to stop again would waste a VZ state transition. If the save
+        // fails, we still resume so the caller's VM keeps running.
+        let save_result = tokio::task::block_in_place(|| {
+            self.save_state_paused(snapshot_dir, Some(config_hash.clone()))
+        });
+        if let Err(e) = save_result {
+            let _ = self.resume();
+            return Err(e);
+        }
         info!(
             "VzBackend: auto-snapshot saved to {} (hash={})",
             snapshot_dir.display(),
             &config_hash[..16.min(config_hash.len())]
         );
 
-        // Stop the original VM and restart from the saved state. The start
-        // path detects `restart_config.snapshot` and takes the restore branch.
+        // Stop from Paused and restart from the saved state. The start path
+        // detects `restart_config.snapshot` and takes the restore branch.
         self.stop().await?;
         self.start(restart_config).await?;
 
@@ -1305,7 +1314,7 @@ impl VmmBackend for VzBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BackendSecurityConfig;
+    use crate::backend::{BackendSecurityConfig, GUEST_NETWORK_DENY_LIST_PATH};
     use crate::Result;
     use std::sync::Mutex;
 
@@ -1360,6 +1369,7 @@ mod tests {
             env: Vec::new(),
             security: test_security_config(),
             snapshot: None,
+            enable_snapshots: false,
         }
     }
 

@@ -329,6 +329,7 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
             seccomp: false,
         },
         snapshot: None,
+        enable_snapshots: false,
     }
 }
 

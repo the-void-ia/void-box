@@ -192,27 +192,30 @@ resolve_codex_binary() {
 
     if [[ ! -f "$cached_bin" ]]; then
       echo "[$log_prefix] Downloading codex v${CODEX_VERSION} (${codex_target})..."
-      local tmp_dir
-      tmp_dir="$(mktemp -d)"
-      trap 'rm -rf "$tmp_dir"' EXIT
-      local tmp_tar="$tmp_dir/codex.tar.gz"
-      if ! curl -fSL --progress-bar -o "$tmp_tar" "$release_url"; then
-        echo "ERROR: Failed to download codex from $release_url" >&2
-        echo "  Check that version $CODEX_VERSION exists for $codex_target." >&2
-        exit 1
-      fi
-      tar -xzf "$tmp_tar" -C "$tmp_dir"
-      local extracted_bin
-      extracted_bin="$(find_extracted_executable "$tmp_dir" || true)"
-      if [[ -z "$extracted_bin" ]]; then
-        echo "ERROR: tarball did not contain an executable codex binary" >&2
-        ls -laR "$tmp_dir" >&2
-        exit 1
-      fi
-      cp "$extracted_bin" "$cached_bin"
-      chmod +x "$cached_bin"
-      trap - EXIT
-      rm -rf "$tmp_dir"
+      # Run the download inside a subshell so the EXIT trap we install for
+      # temp-dir cleanup is scoped to this block and does not overwrite any
+      # trap the caller (build_codex_rootfs.sh, build_agents_rootfs.sh) has
+      # set up for its own staging directory.
+      (
+        set -euo pipefail
+        tmp_dir="$(mktemp -d)"
+        trap 'rm -rf "$tmp_dir"' EXIT
+        tmp_tar="$tmp_dir/codex.tar.gz"
+        if ! curl -fSL --progress-bar -o "$tmp_tar" "$release_url"; then
+          echo "ERROR: Failed to download codex from $release_url" >&2
+          echo "  Check that version $CODEX_VERSION exists for $codex_target." >&2
+          exit 1
+        fi
+        tar -xzf "$tmp_tar" -C "$tmp_dir"
+        extracted_bin="$(find_extracted_executable "$tmp_dir" || true)"
+        if [[ -z "$extracted_bin" ]]; then
+          echo "ERROR: tarball did not contain an executable codex binary" >&2
+          ls -laR "$tmp_dir" >&2
+          exit 1
+        fi
+        cp "$extracted_bin" "$cached_bin"
+        chmod +x "$cached_bin"
+      )
     else
       echo "[$log_prefix] Using cached download: $cached_bin"
     fi

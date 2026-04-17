@@ -94,6 +94,7 @@ impl LocalSandbox {
                 seccomp: true,
             },
             snapshot: self.config.snapshot.clone(),
+            enable_snapshots: self.config.enable_snapshots || self.config.snapshot.is_some(),
         };
 
         // Create platform-appropriate backend

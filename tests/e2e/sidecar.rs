@@ -99,6 +99,7 @@ fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<Backend
             seccomp: true,
         },
         snapshot: None,
+        enable_snapshots: false,
     })
 }
 

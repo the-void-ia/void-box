@@ -73,6 +73,7 @@ fn backend_config() -> Option<BackendConfig> {
             seccomp: false,
         },
         snapshot: None,
+        enable_snapshots: true,
     })
 }
 
@@ -274,11 +275,16 @@ async fn snapshot_vz_restore_overrides_drifting_config() {
     };
     assert!(!save_config.network, "save config must have network=false");
 
+    // Match the other VZ tests: if the runner can't cold-boot a VM at all
+    // (nested virtualization unavailable, missing entitlements, resource
+    // contention), skip cleanly rather than fail the build. The regression
+    // this test exists for lives on the restore path below — if the cold
+    // boot never succeeds, there is nothing to regress against.
     let mut backend = VzBackend::new();
-    backend
-        .start(save_config.clone())
-        .await
-        .expect("cold boot failed");
+    if let Err(e) = backend.start(save_config.clone()).await {
+        eprintln!("[vz_restore_drift] skipping: cold boot failed: {e}");
+        return;
+    }
     backend
         .exec("echo", &["pre"], &[], &[], None, Some(30))
         .await

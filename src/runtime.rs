@@ -1140,34 +1140,33 @@ async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
     })
 }
 
+/// Resolve an opt-in snapshot argument, emitting a CLI-visible warning when
+/// it does not match any known snapshot.  `context` is interpolated into the
+/// warning (e.g. `"Snapshot"` or `"Per-box snapshot"`).
+fn resolve_optional_snapshot(hash: &str, context: &str) -> Option<PathBuf> {
+    if hash.is_empty() {
+        return None;
+    }
+    match crate::snapshot_store::resolve_snapshot_argument(hash) {
+        crate::snapshot_store::SnapshotResolution::Hash(p)
+        | crate::snapshot_store::SnapshotResolution::Literal(p) => Some(p),
+        crate::snapshot_store::SnapshotResolution::NotFound { hash_dir, .. } => {
+            eprintln!(
+                "[void-box] {context} '{hash}' not found (checked {} and literal path)",
+                hash_dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the snapshot path from the spec.
 ///
 /// Returns `Some(path)` only if the spec explicitly declares a snapshot.
 /// No auto-detection, no env var fallback — snapshots are off unless
 /// the user explicitly sets `sandbox.snapshot` in the spec.
 fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
-    let hash = spec.sandbox.snapshot.as_deref()?;
-    if hash.is_empty() {
-        return None;
-    }
-    // Resolve hash prefix to a snapshot directory
-    let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
-    if crate::snapshot_store::snapshot_exists(&dir) {
-        Some(dir)
-    } else {
-        // Treat as a literal path
-        let path = PathBuf::from(hash);
-        if crate::snapshot_store::snapshot_exists(&path) {
-            Some(path)
-        } else {
-            eprintln!(
-                "[void-box] Snapshot '{}' not found (checked {} and literal path)",
-                hash,
-                dir.display()
-            );
-            None
-        }
-    }
+    resolve_optional_snapshot(spec.sandbox.snapshot.as_deref()?, "Snapshot")
 }
 
 /// Resolve per-box snapshot override, falling back to the top-level spec.
@@ -1175,24 +1174,11 @@ fn resolve_box_snapshot(
     box_override: Option<&BoxSandboxOverride>,
     spec: &RunSpec,
 ) -> Option<PathBuf> {
-    // Per-box override takes priority
     if let Some(ov) = box_override {
         if let Some(ref hash) = ov.snapshot {
-            if !hash.is_empty() {
-                let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
-                if crate::snapshot_store::snapshot_exists(&dir) {
-                    return Some(dir);
-                }
-                let path = PathBuf::from(hash);
-                if crate::snapshot_store::snapshot_exists(&path) {
-                    return Some(path);
-                }
-                eprintln!("[void-box] Per-box snapshot '{}' not found", hash);
-                return None;
-            }
+            return resolve_optional_snapshot(hash, "Per-box snapshot");
         }
     }
-    // Fall back to top-level spec
     resolve_snapshot(spec)
 }
 

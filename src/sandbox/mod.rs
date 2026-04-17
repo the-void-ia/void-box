@@ -79,6 +79,13 @@ pub struct SandboxConfig {
     pub env: Vec<(String, String)>,
     /// Path to a snapshot directory to restore from (skips cold boot).
     pub snapshot: Option<PathBuf>,
+    /// Opt-in that the caller plans to save a snapshot later in this run.
+    ///
+    /// Set by CLI `--auto-snapshot` and by builders that intend to invoke
+    /// `create_auto_snapshot`. Forwarded to the backend so VZ (on macOS) can
+    /// validate save/restore support at cold boot instead of deferring a
+    /// cryptic failure to save time.
+    pub enable_snapshots: bool,
 }
 
 impl Default for SandboxConfig {
@@ -100,6 +107,7 @@ impl Default for SandboxConfig {
             oci_rootfs_disk: None,
             env: Vec::new(),
             snapshot: None,
+            enable_snapshots: false,
         }
     }
 }
@@ -117,6 +125,35 @@ enum SandboxInner {
     Local(Box<LocalSandbox>),
     /// Mock sandbox for testing
     Mock(Box<MockSandbox>),
+}
+
+/// Produce a human-readable fallback error message when the agent reported
+/// `is_error=true` but left `error` empty.  Tries, in order: guest stderr,
+/// agent `result_text`, the optional exec-layer error (e.g. from the
+/// streaming `response.error` field), and a default `"<binary> exited with
+/// an unspecified error"` string.  Callers pass whichever signals are
+/// available for their code path.
+fn fallback_error_message(
+    stderr: &str,
+    result_text: &str,
+    response_error: Option<&str>,
+    binary_name: &str,
+) -> String {
+    let trimmed_stderr = stderr.trim();
+    if !trimmed_stderr.is_empty() {
+        return trimmed_stderr.to_string();
+    }
+    let trimmed_result = result_text.trim();
+    if !trimmed_result.is_empty() {
+        return trimmed_result.to_string();
+    }
+    if let Some(err) = response_error {
+        let trimmed = err.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    format!("{} exited with an unspecified error", binary_name)
 }
 
 impl Sandbox {
@@ -418,17 +455,12 @@ impl Sandbox {
             && result.error.as_deref().is_none_or(str::is_empty)
         {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let fallback_error = if !stderr_str.trim().is_empty() {
-                stderr_str.trim().to_string()
-            } else if !result.result_text.trim().is_empty() {
-                result.result_text.trim().to_string()
-            } else {
-                format!(
-                    "{} exited with an unspecified error",
-                    provider.binary_name()
-                )
-            };
-            result.error = Some(fallback_error);
+            result.error = Some(fallback_error_message(
+                &stderr_str,
+                &result.result_text,
+                None,
+                provider.binary_name(),
+            ));
         }
 
         Ok(result)
@@ -571,18 +603,12 @@ impl Sandbox {
                             let fallback_error = match &response {
                                 Ok(resp) => {
                                     let stderr_str = String::from_utf8_lossy(&resp.stderr);
-                                    if !stderr_str.trim().is_empty() {
-                                        stderr_str.trim().to_string()
-                                    } else if !state.result_text.trim().is_empty() {
-                                        state.result_text.trim().to_string()
-                                    } else if let Some(err) = &resp.error {
-                                        err.clone()
-                                    } else {
-                                        format!(
-                                            "{} exited with an unspecified error",
-                                            provider.binary_name()
-                                        )
-                                    }
+                                    fallback_error_message(
+                                        &stderr_str,
+                                        &state.result_text,
+                                        resp.error.as_deref(),
+                                        provider.binary_name(),
+                                    )
                                 }
                                 Err(err) => err.to_string(),
                             };
@@ -858,6 +884,16 @@ impl SandboxBuilder {
     /// Set the snapshot directory to restore from (skips cold boot).
     pub fn snapshot(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.snapshot = Some(path.into());
+        self
+    }
+
+    /// Opt in to saving a snapshot later in this run.
+    ///
+    /// This lets backends that require upfront save/restore capability
+    /// validation (VZ on macOS) run the check at cold boot time instead of
+    /// deferring a cryptic failure to the save call.
+    pub fn enable_snapshots(mut self, enabled: bool) -> Self {
+        self.config.enable_snapshots = enabled;
         self
     }
 

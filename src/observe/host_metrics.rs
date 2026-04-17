@@ -159,81 +159,45 @@ fn read_io_bytes() -> Option<(u64, u64)> {
     Some((read_bytes, write_bytes))
 }
 
-#[cfg(target_os = "macos")]
-type IntegerT = libc::c_int;
-#[cfg(target_os = "macos")]
-type MachMsgTypeNumberT = libc::c_uint;
-#[cfg(target_os = "macos")]
-type MachPortNameT = libc::c_uint;
-#[cfg(target_os = "macos")]
-type TaskFlavorT = libc::c_uint;
-
-#[cfg(target_os = "macos")]
-const KERN_SUCCESS: libc::c_int = 0;
-#[cfg(target_os = "macos")]
-const MACH_TASK_BASIC_INFO: TaskFlavorT = 20;
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct TimeValue {
-    seconds: IntegerT,
-    microseconds: IntegerT,
-}
-
+// Minimal definition of `mach_task_basic_info` — the flavor constant is
+// exported by mach2 but the corresponding struct is not, so we still define
+// it here. Layout follows `<mach/task_info.h>`.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct MachTaskBasicInfoData {
     virtual_size: u64,
     resident_size: u64,
     resident_size_max: u64,
-    user_time: TimeValue,
-    system_time: TimeValue,
-    policy: IntegerT,
-    suspend_count: IntegerT,
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_task_self() -> MachPortNameT;
-    fn task_info(
-        target_task: MachPortNameT,
-        flavor: TaskFlavorT,
-        task_info_out: *mut IntegerT,
-        task_info_out_count: *mut MachMsgTypeNumberT,
-    ) -> libc::c_int;
+    user_time: mach2::time_value::time_value_t,
+    system_time: mach2::time_value::time_value_t,
+    policy: mach2::vm_types::integer_t,
+    suspend_count: mach2::vm_types::integer_t,
 }
 
 #[cfg(target_os = "macos")]
 fn read_rss_bytes_macos() -> Option<u64> {
-    let mut info = MachTaskBasicInfoData {
-        virtual_size: 0,
-        resident_size: 0,
-        resident_size_max: 0,
-        user_time: TimeValue {
-            seconds: 0,
-            microseconds: 0,
-        },
-        system_time: TimeValue {
-            seconds: 0,
-            microseconds: 0,
-        },
-        policy: 0,
-        suspend_count: 0,
-    };
-    let mut count = (std::mem::size_of::<MachTaskBasicInfoData>() / std::mem::size_of::<IntegerT>())
-        as MachMsgTypeNumberT;
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::message::mach_msg_type_number_t;
+    use mach2::task::task_info;
+    use mach2::task_info::MACH_TASK_BASIC_INFO;
+    use mach2::traps::mach_task_self;
+    use mach2::vm_types::integer_t;
+
+    let mut info = std::mem::MaybeUninit::<MachTaskBasicInfoData>::zeroed();
+    let mut count = (std::mem::size_of::<MachTaskBasicInfoData>()
+        / std::mem::size_of::<integer_t>()) as mach_msg_type_number_t;
     let result = unsafe {
         task_info(
             mach_task_self(),
             MACH_TASK_BASIC_INFO,
-            (&mut info as *mut MachTaskBasicInfoData).cast::<IntegerT>(),
+            info.as_mut_ptr().cast::<integer_t>(),
             &mut count,
         )
     };
     if result != KERN_SUCCESS {
         return None;
     }
-    Some(info.resident_size)
+    Some(unsafe { info.assume_init() }.resident_size)
 }
 
 #[cfg(target_os = "macos")]

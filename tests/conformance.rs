@@ -100,6 +100,7 @@ fn backend_config_with(
             seccomp: true,
         },
         snapshot: None,
+        enable_snapshots: false,
     })
 }
 

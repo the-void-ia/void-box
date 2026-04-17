@@ -287,6 +287,7 @@ async fn diagnostic_void_mcp_starts_in_guest() {
             seccomp: true,
         },
         snapshot: None,
+        enable_snapshots: false,
     };
 
     let mut backend = void_box::backend::create_backend();

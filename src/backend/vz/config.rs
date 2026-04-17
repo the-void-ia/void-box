@@ -88,6 +88,7 @@ mod tests {
                 seccomp: false,
             },
             snapshot: None,
+            enable_snapshots: false,
         }
     }
 

@@ -292,3 +292,46 @@ pub fn delete_snapshot(hash_prefix: &str) -> Result<bool> {
 pub fn snapshot_exists(dir: &Path) -> bool {
     dir.join("state.bin").exists() || dir.join("vz_meta.json").exists()
 }
+
+/// Outcome of [`resolve_snapshot_argument`].
+pub enum SnapshotResolution {
+    /// `arg` matched a hash prefix under `~/.void-box/snapshots/`.
+    Hash(PathBuf),
+    /// `arg` was a literal filesystem path with a valid snapshot.
+    Literal(PathBuf),
+    /// Neither interpretation found a valid snapshot.
+    NotFound { hash_dir: PathBuf, literal: PathBuf },
+}
+
+impl SnapshotResolution {
+    /// Return the resolved path, or `None` when no interpretation matched.
+    pub fn path(self) -> Option<PathBuf> {
+        match self {
+            SnapshotResolution::Hash(p) | SnapshotResolution::Literal(p) => Some(p),
+            SnapshotResolution::NotFound { .. } => None,
+        }
+    }
+}
+
+/// Resolve a user-provided snapshot argument (hash prefix or literal path) to
+/// a snapshot directory.
+///
+/// The same rules are applied by `voidbox run`, `voidbox shell`, and
+/// spec-level `sandbox.snapshot` fields so the three agree on what a given
+/// string means:
+///
+/// 1. Try `arg` as a hash prefix under the standard snapshot store
+///    (`~/.void-box/snapshots/<arg>`).
+/// 2. Fall back to treating `arg` as a literal filesystem path.
+/// 3. If neither contains a valid snapshot, return [`SnapshotResolution::NotFound`].
+pub fn resolve_snapshot_argument(arg: &str) -> SnapshotResolution {
+    let hash_dir = snapshot_dir_for_hash(arg);
+    if snapshot_exists(&hash_dir) {
+        return SnapshotResolution::Hash(hash_dir);
+    }
+    let literal = PathBuf::from(arg);
+    if snapshot_exists(&literal) {
+        return SnapshotResolution::Literal(literal);
+    }
+    SnapshotResolution::NotFound { hash_dir, literal }
+}

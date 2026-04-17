@@ -115,6 +115,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let mut auto_snapshot_pending = false;
 
     if opts.auto_snapshot {
+        builder = builder.enable_snapshots(true);
         let config_hash = compute_config_hash(
             Path::new(&kernel),
             initramfs.as_deref().map(Path::new),
@@ -424,26 +425,21 @@ fn parse_mount_flag(raw: &str) -> Result<MountConfig, Box<dyn std::error::Error>
 /// Resolves a `--snapshot` argument (or spec-level `sandbox.snapshot`) to an
 /// absolute snapshot directory.
 ///
-/// Accepts either a hash prefix (checked under the standard snapshot store at
-/// `~/.void-box/snapshots/<hash>`) or a literal filesystem path. Mirrors the
-/// resolution order used by `resolve_snapshot` in `runtime.rs` so that
-/// `voidbox run` and `voidbox shell` agree on how a `--snapshot <arg>` value
-/// is interpreted.
+/// Thin wrapper over [`snapshot_store::resolve_snapshot_argument`] that turns
+/// the shared resolution result into a CLI-friendly error.
 fn resolve_snapshot_arg(arg: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let hash_dir = snapshot_dir_for_hash(arg);
-    if snapshot_exists(&hash_dir) {
-        return Ok(hash_dir);
+    match void_box::snapshot_store::resolve_snapshot_argument(arg) {
+        void_box::snapshot_store::SnapshotResolution::Hash(p)
+        | void_box::snapshot_store::SnapshotResolution::Literal(p) => Ok(p),
+        void_box::snapshot_store::SnapshotResolution::NotFound { hash_dir, literal } => {
+            Err(format!(
+                "snapshot '{arg}' not found (checked {} and literal path '{}')",
+                hash_dir.display(),
+                literal.display()
+            )
+            .into())
+        }
     }
-    let literal = PathBuf::from(arg);
-    if snapshot_exists(&literal) {
-        return Ok(literal);
-    }
-    Err(format!(
-        "snapshot '{arg}' not found (checked {} and literal path '{}')",
-        hash_dir.display(),
-        literal.display()
-    )
-    .into())
 }
 
 /// Parses a `KEY=VALUE` env flag.

@@ -110,6 +110,13 @@ pub struct BackendConfig {
     /// Path to a snapshot directory to restore from (skips cold boot).
     /// If `None`, the VM is cold-booted normally.
     pub snapshot: Option<PathBuf>,
+    /// Opt-in that the caller intends to save a snapshot later in this run.
+    ///
+    /// Backends that require upfront save/restore capability validation (VZ
+    /// on macOS) use this to decide whether to run that check at cold-boot
+    /// time.  Restore path implies it; auto-snapshot callers set it
+    /// explicitly.
+    pub enable_snapshots: bool,
 }
 
 impl BackendConfig {
@@ -148,6 +155,7 @@ impl BackendConfig {
                 seccomp: false,
             },
             snapshot: None,
+            enable_snapshots: false,
         }
     }
 
@@ -307,6 +315,43 @@ pub struct BackendSecurityConfig {
     pub max_concurrent_connections: usize,
     /// Whether to install seccomp-bpf (Linux only, ignored on macOS).
     pub seccomp: bool,
+}
+
+/// Absolute guest path where the network deny list is materialized for
+/// backends that enforce filtering in-guest (VZ on macOS — Apple's NAT has
+/// no host-side filter hook). Linux/KVM enforces deny-list CIDRs in the
+/// host-side SLIRP stack and does not need this file.
+pub const GUEST_NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
+
+/// Minimal host→guest write surface used to materialize policy files in the
+/// guest without going through [`VmmBackend`].
+///
+/// Separated from `VmmBackend` so helpers like
+/// [`provision_network_deny_list_with_writer`] can be exercised from unit
+/// tests against a fake writer, avoiding the cost of booting a real VM.
+#[async_trait::async_trait]
+pub trait GuestPolicyWriter: Sync {
+    async fn mkdir_p(&self, path: &str) -> Result<()>;
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+}
+
+/// Write the network deny list to the guest in JSON form at
+/// [`GUEST_NETWORK_DENY_LIST_PATH`].  No-ops when the deny list is empty.
+pub async fn provision_network_deny_list_with_writer(
+    writer: &dyn GuestPolicyWriter,
+    deny_list: &[String],
+) -> Result<()> {
+    if deny_list.is_empty() {
+        return Ok(());
+    }
+
+    let deny_list_json = serde_json::to_string_pretty(deny_list).map_err(|e| {
+        crate::Error::Config(format!("failed to serialize network deny list: {}", e))
+    })?;
+    writer.mkdir_p("/etc/voidbox").await?;
+    writer
+        .write_file(GUEST_NETWORK_DENY_LIST_PATH, deny_list_json.as_bytes())
+        .await
 }
 
 /// Trait that all VM backends must implement.

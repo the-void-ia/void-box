@@ -127,6 +127,7 @@ fn build_config_with_mount(
             seccomp: true,
         },
         snapshot: None,
+        enable_snapshots: false,
     })
 }
 
