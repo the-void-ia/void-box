@@ -21,6 +21,11 @@ pub enum SnapshotCommand {
         /// Number of vCPUs.
         #[arg(long, default_value = "1")]
         vcpus: usize,
+        /// Enable guest networking in the snapshotted VM. Must match the
+        /// `network` value used at restore time — Apple's VZ rejects any
+        /// device-set drift between save and restore.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        network: bool,
         /// Create a differential snapshot on top of an existing base.
         #[arg(long)]
         diff: bool,
@@ -45,8 +50,9 @@ pub async fn handle(
             initramfs,
             memory,
             vcpus,
+            network,
             diff,
-        } => cmd_snapshot_create(&kernel, initramfs.as_deref(), memory, vcpus, diff).await,
+        } => cmd_snapshot_create(&kernel, initramfs.as_deref(), memory, vcpus, network, diff).await,
         SnapshotCommand::List => cmd_snapshot_list(output, snapshot_dir),
         SnapshotCommand::Delete { hash_prefix } => cmd_snapshot_delete(&hash_prefix, snapshot_dir),
     }
@@ -57,34 +63,62 @@ async fn cmd_snapshot_create(
     initramfs: Option<&Path>,
     memory_mb: usize,
     vcpus: usize,
+    network: bool,
     is_diff: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use void_box::snapshot_store;
 
     let config_hash = snapshot_store::compute_config_hash(kernel, initramfs, memory_mb, vcpus)?;
     eprintln!(
-        "Creating {} snapshot: kernel={}, initramfs={:?}, memory={}MB, vcpus={}",
+        "Creating {} snapshot: kernel={}, initramfs={:?}, memory={}MB, vcpus={}, network={}",
         if is_diff { "diff" } else { "base" },
         kernel.display(),
         initramfs.map(|p| p.display()),
         memory_mb,
-        vcpus
+        vcpus,
+        network,
     );
     eprintln!("Config hash: {}", &config_hash[..16]);
 
     #[cfg(target_os = "linux")]
     {
-        cmd_snapshot_create_linux(kernel, initramfs, memory_mb, vcpus, is_diff, &config_hash).await
+        cmd_snapshot_create_linux(
+            kernel,
+            initramfs,
+            memory_mb,
+            vcpus,
+            network,
+            is_diff,
+            &config_hash,
+        )
+        .await
     }
 
     #[cfg(target_os = "macos")]
     {
-        cmd_snapshot_create_macos(kernel, initramfs, memory_mb, vcpus, is_diff, &config_hash).await
+        cmd_snapshot_create_macos(
+            kernel,
+            initramfs,
+            memory_mb,
+            vcpus,
+            network,
+            is_diff,
+            &config_hash,
+        )
+        .await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (kernel, initramfs, memory_mb, vcpus, is_diff, config_hash);
+        let _ = (
+            kernel,
+            initramfs,
+            memory_mb,
+            vcpus,
+            network,
+            is_diff,
+            config_hash,
+        );
         Err("snapshot create is not supported on this platform".into())
     }
 }
@@ -95,6 +129,7 @@ async fn cmd_snapshot_create_linux(
     initramfs: Option<&Path>,
     memory_mb: usize,
     vcpus: usize,
+    network: bool,
     is_diff: bool,
     config_hash: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -155,7 +190,7 @@ async fn cmd_snapshot_create_linux(
             vcpus,
             cid: vm.cid(),
             vsock_mmio_base: 0xd080_0000,
-            network: VoidBoxConfig::new().network,
+            network,
         };
 
         let snap_dir = vm
@@ -207,6 +242,7 @@ async fn cmd_snapshot_create_linux(
             .kernel(kernel)
             .memory_mb(memory_mb)
             .vcpus(vcpus)
+            .network(network)
             .enable_vsock(true)
             .vsock_backend(void_box::vmm::config::VsockBackendType::Userspace);
         if let Some(initramfs) = initramfs {
@@ -261,6 +297,7 @@ async fn cmd_snapshot_create_macos(
     initramfs: Option<&Path>,
     memory_mb: usize,
     vcpus: usize,
+    network: bool,
     is_diff: bool,
     config_hash: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -284,7 +321,7 @@ async fn cmd_snapshot_create_macos(
         .into());
     }
 
-    let mut config = BackendConfig::minimal(kernel, memory_mb, vcpus);
+    let mut config = BackendConfig::minimal(kernel, memory_mb, vcpus).network(network);
     if let Some(initramfs) = initramfs {
         config = config.initramfs(initramfs);
     }

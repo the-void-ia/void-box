@@ -256,6 +256,94 @@ fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
     out
 }
 
+/// Reconcile a caller-supplied `BackendConfig` with the saved metadata so the
+/// reconstructed VZ configuration matches the save blob device-for-device.
+///
+/// Apple's `restoreMachineStateFromURL:` rejects any drift between the saved
+/// configuration and the one attached to the target VM with a single opaque
+/// `VZErrorRestore` / "invalid argument". In practice this means the caller's
+/// `memory_mb`, `vcpus`, and `network` flag must match what was active at
+/// save time — otherwise users see an unactionable error. The sidecar records
+/// these fields explicitly, so prefer them and warn on any mismatch.
+///
+/// ## Why this destructures exhaustively
+///
+/// The body below pattern-matches every field of `BackendConfig` with no `..`
+/// wildcard. Adding a new field to `BackendConfig` therefore triggers a
+/// compile error here, forcing a decision:
+///
+///   * **Device-affecting** (changes the reconstructed
+///     `VZVirtualMachineConfiguration` — memory, vCPUs, network device,
+///     disks, virtiofs shares, serial console attachment, vsock device,
+///     bootloader, etc.): mirror it in [`VzSnapshotMeta`] and pull the value
+///     from `meta` here. Also add a drift assertion to
+///     `snapshot_vz_restore_overrides_drifting_config`.
+///   * **Runtime-only** (host-side behavior that does not change the device
+///     set — env vars, security policy, snapshot path, etc.): pass the
+///     caller's value through unchanged.
+///
+/// Do not add `..` to this pattern or the compile-time guard is lost.
+fn sidecar_restore_config(config: BackendConfig, meta: &VzSnapshotMeta) -> BackendConfig {
+    let BackendConfig {
+        memory_mb: caller_memory_mb,
+        vcpus: caller_vcpus,
+        network: caller_network,
+        kernel,
+        initramfs,
+        rootfs,
+        enable_vsock,
+        guest_console,
+        shared_dir,
+        mounts,
+        oci_rootfs,
+        oci_rootfs_dev,
+        oci_rootfs_disk,
+        env,
+        security,
+        snapshot,
+    } = config;
+
+    if caller_memory_mb != meta.memory_mb {
+        warn!(
+            "VzBackend: restore overriding memory_mb {} -> {} (from snapshot sidecar)",
+            caller_memory_mb, meta.memory_mb
+        );
+    }
+    if caller_vcpus != meta.vcpus {
+        warn!(
+            "VzBackend: restore overriding vcpus {} -> {} (from snapshot sidecar)",
+            caller_vcpus, meta.vcpus
+        );
+    }
+    if caller_network != meta.network {
+        warn!(
+            "VzBackend: restore overriding network {} -> {} (from snapshot sidecar)",
+            caller_network, meta.network
+        );
+    }
+
+    BackendConfig {
+        // From sidecar — must match the save blob's device set.
+        memory_mb: meta.memory_mb,
+        vcpus: meta.vcpus,
+        network: meta.network,
+        // Pass-through — runtime-only or unchanged-by-default today.
+        kernel,
+        initramfs,
+        rootfs,
+        enable_vsock,
+        guest_console,
+        shared_dir,
+        mounts,
+        oci_rootfs,
+        oci_rootfs_dev,
+        oci_rootfs_disk,
+        env,
+        security,
+        snapshot,
+    }
+}
+
 /// Dispatch a VZ completion-handler operation and wait for the result.
 ///
 /// Shared helper for pause/resume/save/restore — all follow the same
@@ -805,8 +893,15 @@ impl VmmBackend for VzBackend {
                                 .into(),
                         )
                     })?;
+                // Override the caller's memory/vcpus/network with the values
+                // from the sidecar. Apple's restoreMachineStateFromURL: rejects
+                // *any* device-set drift between the save blob and the
+                // reconstructed `VZVirtualMachineConfiguration` with a single
+                // opaque `VZErrorRestore` ("invalid argument"), so diverging
+                // here would surface to users as an unactionable error.
+                let effective_config = sidecar_restore_config(config.clone(), &meta);
                 let (vm_config, machine_identifier_bytes) = Self::configure_vm(
-                    &config,
+                    &effective_config,
                     meta.boot_clock_secs,
                     Some(saved_machine_identifier),
                 )?;

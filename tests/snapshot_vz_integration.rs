@@ -253,6 +253,69 @@ async fn auto_snapshot_vz_round_trip() {
     backend.stop().await.expect("stop failed");
 }
 
+/// Regression for VZ restore device-set drift.
+///
+/// Saves with `network: false`, then restores with a caller `BackendConfig`
+/// whose `network: true`, `memory_mb`, and `vcpus` all differ from the saved
+/// values. The restore path should pull the device-affecting fields from the
+/// sidecar and accept the restore; without the reconciliation helper the
+/// reconstructed `VZVirtualMachineConfiguration` would carry an extra
+/// virtio-net device and Apple would reject with `VZErrorRestore` /
+/// "invalid argument".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn snapshot_vz_restore_overrides_drifting_config() {
+    let save_config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+    assert!(!save_config.network, "save config must have network=false");
+
+    let mut backend = VzBackend::new();
+    backend
+        .start(save_config.clone())
+        .await
+        .expect("cold boot failed");
+    backend
+        .exec("echo", &["pre"], &[], &[], None, Some(30))
+        .await
+        .expect("pre-save exec");
+
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    tokio::task::block_in_place(|| backend.create_snapshot(snap_dir.path()))
+        .expect("create_snapshot");
+    backend.stop().await.expect("stop");
+
+    let meta = VzSnapshotMeta::load(snap_dir.path()).expect("load sidecar");
+    assert!(!meta.network, "sidecar must record network=false");
+
+    // Restore with a config whose device-affecting fields all drift. The
+    // restore branch must override these from the sidecar — otherwise the
+    // reconstructed VZ config would have a virtio-net device that isn't in
+    // the save blob, and Apple would reject with VZErrorRestore.
+    let mut restore_cfg = save_config;
+    restore_cfg.snapshot = Some(snap_dir.path().to_path_buf());
+    restore_cfg.network = true;
+    restore_cfg.memory_mb = meta.memory_mb + 128;
+    restore_cfg.vcpus = meta.vcpus + 1;
+    restore_cfg.security.session_secret = meta.session_secret.as_slice().try_into().unwrap();
+
+    let mut restored = VzBackend::new();
+    restored
+        .start(restore_cfg)
+        .await
+        .expect("restore should succeed after overriding drifting fields");
+    let output = restored
+        .exec("echo", &["post"], &[], &[], None, Some(30))
+        .await
+        .expect("exec on restored VM");
+    assert_eq!(output.stdout_str().trim(), "post");
+    restored.stop().await.expect("stop restored");
+}
+
 // ---------------------------------------------------------------------------
 // CLI-level tests: snapshot_store list / delete / exists with VZ snapshots
 // ---------------------------------------------------------------------------

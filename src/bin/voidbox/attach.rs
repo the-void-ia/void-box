@@ -1,6 +1,6 @@
 //! CLI handlers for `voidbox attach` and `voidbox shell`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::termios::tcgetwinsize;
 use tracing::info;
@@ -132,10 +132,10 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
             );
             auto_snapshot_pending = true;
         }
-    } else if let Some(snapshot_path) = opts.snapshot {
-        builder = builder.snapshot(snapshot_path);
-    } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
-        builder = builder.snapshot(snapshot_path);
+    } else if let Some(snapshot_arg) = opts.snapshot {
+        builder = builder.snapshot(resolve_snapshot_arg(snapshot_arg)?);
+    } else if let Some(ref snapshot_arg) = run_spec.sandbox.snapshot {
+        builder = builder.snapshot(resolve_snapshot_arg(snapshot_arg)?);
     }
 
     for mount_spec in &run_spec.sandbox.mounts {
@@ -419,6 +419,31 @@ fn parse_mount_flag(raw: &str) -> Result<MountConfig, Box<dyn std::error::Error>
         guest_path: parts[1].to_string(),
         read_only,
     })
+}
+
+/// Resolves a `--snapshot` argument (or spec-level `sandbox.snapshot`) to an
+/// absolute snapshot directory.
+///
+/// Accepts either a hash prefix (checked under the standard snapshot store at
+/// `~/.void-box/snapshots/<hash>`) or a literal filesystem path. Mirrors the
+/// resolution order used by `resolve_snapshot` in `runtime.rs` so that
+/// `voidbox run` and `voidbox shell` agree on how a `--snapshot <arg>` value
+/// is interpreted.
+fn resolve_snapshot_arg(arg: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let hash_dir = snapshot_dir_for_hash(arg);
+    if snapshot_exists(&hash_dir) {
+        return Ok(hash_dir);
+    }
+    let literal = PathBuf::from(arg);
+    if snapshot_exists(&literal) {
+        return Ok(literal);
+    }
+    Err(format!(
+        "snapshot '{arg}' not found (checked {} and literal path '{}')",
+        hash_dir.display(),
+        literal.display()
+    )
+    .into())
 }
 
 /// Parses a `KEY=VALUE` env flag.

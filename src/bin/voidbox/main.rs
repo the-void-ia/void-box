@@ -218,8 +218,8 @@ enum Command {
         /// Number of vCPUs.
         #[arg(long, default_value = "2")]
         vcpus: usize,
-        /// Enable guest networking.
-        #[arg(long, default_value = "true")]
+        /// Enable guest networking. Accepts `true` or `false` (e.g. `--network=false`).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         network: bool,
         /// LLM provider override.
         #[arg(long)]
@@ -1118,12 +1118,14 @@ mod cli_parse_tests {
                     initramfs,
                     memory,
                     vcpus,
+                    network,
                     diff,
                 } => {
                     assert_eq!(kernel, PathBuf::from("/boot/vmlinuz"));
                     assert_eq!(initramfs, Some(PathBuf::from("/tmp/init.cpio.gz")));
                     assert_eq!(memory, 256);
                     assert_eq!(vcpus, 2);
+                    assert!(network);
                     assert!(diff);
                 }
                 _ => panic!("expected Create"),
@@ -1140,12 +1142,14 @@ mod cli_parse_tests {
                     initramfs,
                     memory,
                     vcpus,
+                    network,
                     diff,
                 } => {
                     assert_eq!(kernel, PathBuf::from("/k/vmlinux"));
                     assert!(initramfs.is_none());
                     assert_eq!(memory, 512);
                     assert_eq!(vcpus, 1);
+                    assert!(network);
                     assert!(!diff);
                 }
                 _ => panic!("expected Create"),
@@ -1824,6 +1828,7 @@ mod behavior_tests {
             initramfs: None,
             memory: 128,
             vcpus: 1,
+            network: true,
             diff: false,
         };
         let (_tmp, snap_dir) = isolated_snapshot_dir();
@@ -1842,6 +1847,7 @@ mod behavior_tests {
             initramfs: Some(PathBuf::from("/nonexistent/initramfs")),
             memory: 128,
             vcpus: 1,
+            network: true,
             diff: false,
         };
         let (_tmp2, snap_dir) = isolated_snapshot_dir();
