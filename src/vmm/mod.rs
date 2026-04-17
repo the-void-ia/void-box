@@ -1454,8 +1454,11 @@ fn vsock_irq_thread(
 
     let mut events = [epoll_event { events: 0, u64: 0 }; 4];
 
+    // Short timeout so `stop()` reclaims the thread in <=20ms instead of
+    // waiting up to a full epoll interval. A proper eventfd wake-up would
+    // be zero-latency; 20ms is a pragmatic single-line midpoint.
     while running.load(Ordering::Relaxed) {
-        let nfds = unsafe { epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, 200) };
+        let nfds = unsafe { epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, 20) };
         if nfds < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {

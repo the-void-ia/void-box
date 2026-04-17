@@ -37,6 +37,15 @@ use crate::guest::protocol::{
 };
 use crate::{Error, Result};
 
+/// Per-attempt read timeout for the handshake Pong.
+///
+/// The vsock listener in the guest usually binds immediately, long before
+/// `guest-agent`'s dispatcher loop is ready to answer a Ping. A long per-read
+/// timeout here means the first attempt silently eats that slack as idle
+/// wait; shrinking it lets the retry loop probe aggressively and succeed as
+/// soon as the dispatcher is up.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;
 
@@ -133,7 +142,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "exec",
             )?;
 
@@ -195,7 +204,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "exec-streaming",
             )?;
 
@@ -263,7 +272,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "exec-streaming",
             )?;
 
@@ -330,7 +339,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "write-file",
             )?;
 
@@ -373,7 +382,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "mkdir-p",
             )?;
 
@@ -416,7 +425,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "file-stat",
             )?;
 
@@ -459,7 +468,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "read-file",
             )?;
 
@@ -577,7 +586,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                Duration::from_secs(3),
+                HANDSHAKE_READ_TIMEOUT,
                 "snapshot-ready",
             )?;
 
@@ -633,17 +642,24 @@ pub(crate) fn connect_with_handshake_sync(
     handshake_timeout: Duration,
     context: &str,
 ) -> Result<Box<dyn GuestStream>> {
-    // Wait for guest kernel boot once per ControlChannel lifetime.
-    if boot_wait_done
+    // Mark the first attempt for logging / future diagnostics. We used to
+    // block here on a fixed `sleep(4s)` as a worst-case "wait for guest
+    // kernel boot" pad; profiling showed that single sleep was ~85% of
+    // cold-boot wall-clock. Polling connect() on a short interval below
+    // reaches the guest-agent as soon as it binds the vsock port — the
+    // guest is typically ready in 200-800ms.
+    let first_attempt = boot_wait_done
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        std::thread::sleep(Duration::from_secs(4));
-    }
+        .is_ok();
 
-    let mut delay = Duration::from_millis(100);
+    // Initial delay sized for typical guest boot probe cadence (~25ms).
+    // Max cap kept small so a late-booting guest costs at most ~250ms of
+    // over-sleep, not 2s.
+    let mut delay = Duration::from_millis(25);
+    let max_delay = Duration::from_millis(250);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut attempt: u32 = 0;
+    let t_start = Instant::now();
 
     loop {
         if Instant::now() >= deadline {
@@ -669,7 +685,7 @@ pub(crate) fn connect_with_handshake_sync(
                     attempt, e, delay
                 );
                 std::thread::sleep(delay);
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                delay = std::cmp::min(delay * 2, max_delay);
                 continue;
             }
         };
@@ -681,7 +697,7 @@ pub(crate) fn connect_with_handshake_sync(
                 attempt, e
             );
             std::thread::sleep(delay);
-            delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+            delay = std::cmp::min(delay * 2, max_delay);
             continue;
         }
 
@@ -698,7 +714,7 @@ pub(crate) fn connect_with_handshake_sync(
                 attempt
             );
             std::thread::sleep(delay);
-            delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+            delay = std::cmp::min(delay * 2, max_delay);
             continue;
         }
         match Message::read_from_sync(&mut *s) {
@@ -715,8 +731,11 @@ pub(crate) fn connect_with_handshake_sync(
                     0 // legacy guest, no version in Pong
                 };
                 debug!(
-                    "control_channel[{context}]: handshake OK (peer_version={})",
-                    peer_version
+                    "control_channel[{context}]: handshake OK (peer_version={}, cold={}, attempts={}, elapsed={:?})",
+                    peer_version,
+                    first_attempt,
+                    attempt,
+                    t_start.elapsed(),
                 );
                 return Ok(s);
             }
@@ -726,7 +745,7 @@ pub(crate) fn connect_with_handshake_sync(
                     attempt, msg.msg_type
                 );
                 std::thread::sleep(delay);
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                delay = std::cmp::min(delay * 2, max_delay);
             }
             Err(e) => {
                 debug!(
@@ -734,7 +753,7 @@ pub(crate) fn connect_with_handshake_sync(
                     attempt, e
                 );
                 std::thread::sleep(delay);
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
+                delay = std::cmp::min(delay * 2, max_delay);
             }
         }
     }

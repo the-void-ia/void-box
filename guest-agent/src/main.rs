@@ -658,9 +658,11 @@ fn load_kernel_modules() {
         }
     }
 
-    // Give the kernel a moment to probe devices after module loading
-    kmsg("Modules loaded, waiting 1s for device probe...");
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // No blind sleep here: `finit_module(2)` is synchronous — by the time it
+    // returns, the module's init callback has run and the virtio device has
+    // been probed. Subsequent `socket(AF_VSOCK, ...)` will succeed
+    // immediately. A fixed sleep added ~1s to every cold boot for no gain.
+    kmsg("Modules loaded");
 }
 
 fn virtio_mmio_params_from_cmdline() -> String {
