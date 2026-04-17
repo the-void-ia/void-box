@@ -68,6 +68,8 @@ Use these scripts based on purpose:
 - `build_guest_image.sh`: general runtime guest image.
 - `build_test_image.sh`: test/E2E image with deterministic `claudio`.
 - `build_claude_rootfs.sh`: includes native `claude-code`, CA certs, and sandbox user.
+- `build_codex_rootfs.sh`: includes the OpenAI `codex` CLI (musl-static), CA certs, and sandbox user.
+- `build_agents_rootfs.sh`: combined claude + codex flavor produced in one build.
 
 OpenClaw note:
 - `examples/openclaw/openclaw_telegram.yaml` should run with `build_claude_rootfs.sh` output (`target/void-box-rootfs.cpio.gz`).
@@ -75,11 +77,15 @@ OpenClaw note:
 
 ### Guest image script differences
 
-| Script | Primary use | Includes Claude runtime | Kernel module policy |
+| Script | Primary use | Includes agent runtime | Kernel module policy |
 | --- | --- | --- | --- |
-| `scripts/build_guest_image.sh` | Base/initramfs for normal VM runs and OCI-rootfs workflows | Optional (`CLAUDE_CODE_BIN` if provided), otherwise no Claude binary requirement | Host modules by default; downloads modules only when `VOID_BOX_KMOD_VERSION` is set |
+| `scripts/build_guest_image.sh` | Base/initramfs for normal VM runs and OCI-rootfs workflows | Optional (`CLAUDE_CODE_BIN` if provided), otherwise no agent binary requirement | Host modules by default; downloads modules only when `VOID_BOX_KMOD_VERSION` is set |
 | `scripts/build_claude_rootfs.sh` | Production Claude-capable image | Yes (native `claude-code` + `/usr/local/bin/claude` symlink + CA certs + sandbox user) | Local default uses host modules; pinned/downloaded modules only when `VOID_BOX_PINNED_KMODS=1` (or CI) |
-| `scripts/build_test_image.sh` | Deterministic tests | No real Claude; bundles `claudio` mock | Host modules on Linux (test path) |
+| `scripts/build_codex_rootfs.sh` | Production Codex-capable image | Yes (OpenAI `codex` CLI, musl-static, auto-download by `CODEX_VERSION` + CA certs + sandbox user) | Local default uses host modules; pinned/downloaded modules only when `VOID_BOX_PINNED_KMODS=1` (or CI) |
+| `scripts/build_agents_rootfs.sh` | Combined claude + codex production image | Yes (both `claude-code` and `codex` CLI in one initramfs) | Same as the individual agent flavors |
+| `scripts/build_test_image.sh` | Deterministic tests | No real agent; bundles `claudio` mock | Host modules on Linux (test path) |
+
+All agent-flavor scripts (`build_claude_rootfs.sh`, `build_codex_rootfs.sh`, `build_agents_rootfs.sh`) delegate to `scripts/lib/agent_rootfs_common.sh`, which centralizes rootfs staging, sandbox-user/CA-cert provisioning, cpio packaging, and Linux-binary resolution (with auto-download when invoked from an Apple Silicon host).
 
 ### Running Tests
 

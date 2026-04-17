@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `voidbox --log-dir` and `VOIDBOX_LOG_DIR` overrides for file-based runtime logs
 - **Codex CLI as first-class agent peer** — `llm.provider: codex` in YAML specs exec's the bundled OpenAI Codex CLI inside the guest VM with full structured observability
 - `scripts/build_codex_rootfs.sh` — production Codex-capable initramfs with auto-download from GitHub releases (musl-static, no glibc shipping)
-- `scripts/lib/agent_rootfs_common.sh` — shared rootfs helpers (sandbox user, CA certs, finalize) extracted from the Claude flavor for reuse across agent flavors
+- `scripts/build_agents_rootfs.sh` — combined claude+codex flavor produced in a single build
+- `scripts/lib/agent_rootfs_common.sh` — shared rootfs helpers (sandbox user, CA certs, finalize, claude/codex binary resolution + auto-download) extracted from the Claude flavor for reuse across agent flavors
 - `src/observe/codex.rs` — structured stream parser for Codex's `exec --json` JSONL events (tool calls, token counts, error handling)
 - `ObserverKind` enum on `LlmProvider` — typed dispatch replacing the binary-name string comparison for stream observer selection
 - `LlmProvider::Codex` variant with `binary_name()`, `supports_claude_settings()`, `build_exec_args()`, `observer_kind()`, `image_flavor()` methods
@@ -19,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Codex MCP discovery — writes `~/.codex/config.toml` with `[mcp_servers]` streamable-HTTP entries pointing at the existing void-mcp server
 - Per-agent docs at `docs/agents/claude.md` and `docs/agents/codex.md` with `@` discovery imports in AGENTS.md
 - `examples/specs/codex_smoke.yaml` (`kind: agent`) and `examples/specs/codex_workflow_smoke.yaml` (`kind: workflow`)
+- **VZ native snapshot/restore** using Apple's `saveMachineStateToURL:` / `restoreMachineStateFromURL:` APIs (macOS 14+) with a JSON sidecar (`VzSnapshotMeta`) carrying `session_secret`, `memory_mb`, `vcpus`, `network`, `boot_clock_secs`, `config_hash`, and `VZGenericMachineIdentifier.dataRepresentation`
+- VZ restore **device-set drift reconciliation**: when caller-supplied `memory_mb` / `vcpus` / `network` drift from the sidecar's saved values, the saved values are used so Apple's strict configuration-match check does not fail the restore
+- `SandboxBuilder::enable_snapshots(…)` / `SandboxConfig` / `BackendConfig` opt-in plumbing that gates VZ's `validateSaveRestoreSupportWithError` check (cold boots that do not opt in skip the check — some device sets make Apple reject snapshot-capability validation even when the VM itself is healthy)
+- `snapshot_store::resolve_snapshot_argument` returning a `SnapshotResolution` enum (`Hash` / `Literal` / `NotFound`), unifying three duplicate hash-vs-literal resolution paths
 
 ### Changed
 - Rust MSRV bumped to 1.88
@@ -29,14 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Renamed** `StageResult.claude_result` → `agent_result`
 - **Renamed** `e2e_claude_mcp` test → `e2e_agent_mcp` (MCP infrastructure is agent-agnostic)
 - `build_claude_rootfs.sh` refactored to source shared `agent_rootfs_common.sh` helpers
+- `build_claude_rootfs.sh` and `build_codex_rootfs.sh` auto-detect or download the respective Linux binaries when invoked from an Apple Silicon host
 - Claude-specific `--settings` and `--mcp-config` flags gated behind `provider.supports_claude_settings()`
+- **Guest network deny list** is now applied once at guest init (right after `setup_network()`) instead of lazily on the first `exec` — closes the race window between network bring-up and first exec and makes the deny list visible on the serial console at boot
+- **VZ auto-snapshot** uses `save_state_paused` followed by a direct `stop()` from the paused state, avoiding an unnecessary resume/pause round-trip
+- `host_metrics.rs` on macOS now uses the `mach2` crate instead of hand-rolled Mach FFI (`IntegerT`, `TaskFlavorT`, `extern "C"` block)
+- Service-agent and output-monitor progress messages in `agent_box.rs` routed through `tracing` (`info!` / `warn!` / `error!` / `debug!`) instead of `eprintln!`
 
 ### Fixed
 - Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
 - Guest console routing semantics are now consistent across macOS/VZ and Linux/KVM
-
-### Fixed
 - Snapshot restore: capture/restore `IA32_XSS` MSR to prevent XRSTORS #GP on CET-enabled kernels (6.x+)
+- Silent `chown` failure in `provision_claude_bootstrap` now emits a `warn!` with actionable remediation
+- Codex downloader's `EXIT` trap is scoped to a subshell so it cannot clobber the caller's cleanup trap
+- Deterministic MAC-address bit manipulation in `deterministic_mac_address` (`(x | 0x02) & 0xfe`) now carries a bit-level comment explaining the IEEE 802 "locally administered, unicast" transform
 
 ## [0.1.2] - 2026-03-16
 

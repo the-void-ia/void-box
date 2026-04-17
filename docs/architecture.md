@@ -552,6 +552,67 @@ Snapshot cloning shares identical VM state across restored instances:
 - **ASLR**: Clones share guest page table layout. Mitigated by: short-lived tasks, no direct network addressability (SLIRP NAT), command allowlist limiting attack surface
 - **Session isolation**: Restored VMs reuse the snapshot's stored session secret for vsock authentication (the secret is baked into the guest's kernel cmdline in snapshot memory). Per-restore secret rotation would require guest-side support
 
+### macOS / VZ snapshots
+
+The VZ backend uses Apple's native save/restore APIs rather than a custom memory/vCPU capture pipeline. This keeps VoidBox out of the business of serializing Apple's private VM state, but adds a strict constraint: Apple rejects any restore whose `VZVirtualMachineConfiguration` drifts from the one used at save time (platform identifier, device set, memory, vCPUs, kernel cmdline). The sidecar + reconciliation helper exists to cope with that constraint on cold hosts.
+
+#### Save/restore flow
+
+```
+1. Pause VM                          VZVirtualMachine.pause
+2. saveMachineStateToURL:            Apple writes opaque VM state blob
+3. Write vz_meta.json sidecar        VzSnapshotMeta (VoidBox-specific fields)
+4. stop() (from paused)              No resume/pause round-trip for auto-snapshot
+
+Cold restore:
+1. Read vz_meta.json                 Recover VZGenericMachineIdentifier + config
+2. Reconcile with caller config      Override drifting memory/vcpus/network
+3. Build VZVirtualMachineConfiguration using the saved identifier
+4. restoreMachineStateFromURL:       Apple restores opaque state
+5. Resume                            Guest continues execution
+```
+
+#### VzSnapshotMeta sidecar
+
+Alongside Apple's opaque save blob (`vm.vzvmsave`), VoidBox persists `vz_meta.json` containing the fields Apple needs to reconstruct an identical configuration plus the VoidBox-specific continuity bits:
+
+| Field | Purpose |
+|---|---|
+| `session_secret` | Guest-agent auth token baked into kernel cmdline at save time |
+| `memory_mb`, `vcpus`, `network` | Reconciliation targets — override caller config if drifting |
+| `boot_clock_secs` | Wall-clock at save; cmdline must match at restore so post-restore clock sync happens over the control channel, not in the boot args |
+| `config_hash` | Continuity check against the caller's `BackendConfig` |
+| `machine_identifier` | `VZGenericMachineIdentifier.dataRepresentation` — Apple refuses to restore without the original identifier |
+
+#### Storage layout (VZ)
+
+```
+~/.void-box/snapshots/
+  └── <hash-prefix>/
+      ├── vm.vzvmsave          # Apple's opaque save blob (saveMachineStateToURL:)
+      └── vz_meta.json         # VzSnapshotMeta sidecar (JSON)
+```
+
+#### Device-set drift reconciliation
+
+Apple's restore API returns failure as soon as the caller's `VZVirtualMachineConfiguration` differs from the configuration that was active at save time. Most of those fields are user-visible knobs (memory, vCPUs, network), so if the caller supplies a drifting `BackendConfig` we prefer the sidecar values silently rather than surface a validation failure that the caller can't usefully recover from. The reconciliation helper lives in `src/backend/vz/snapshot.rs`; the regression test `snapshot_vz_restore_overrides_drifting_config` guards the contract on real hardware.
+
+#### `enable_snapshots` opt-in
+
+`SandboxBuilder::enable_snapshots(true)` (plumbed through `SandboxConfig` → `BackendConfig`) gates Apple's `validateSaveRestoreSupportWithError` call at cold boot. Some device sets (e.g. virtiofs shares) make Apple reject snapshot capability validation even when the VM runs fine for non-snapshot workloads — cold boots that do not opt in skip the check and keep working.
+
+#### CI limitation
+
+Apple's VZ stack requires access to the bare-metal hypervisor (EL2). GitHub's hosted `macos-14` / `macos-15` arm64 runners themselves run each job inside a VZ guest, so `VZVirtualMachine::validateWithError` fails with "Virtualization is not available on this hardware". The `snapshot_vz_integration` suite uses the skip-on-start-failure pattern to no-op on such runners; real VZ coverage requires a self-hosted bare-metal Mac runner.
+
+#### Key files (VZ)
+
+| File | Role |
+|---|---|
+| `src/backend/vz/snapshot.rs` | `VzSnapshotMeta`, drift reconciliation helper |
+| `src/backend/vz/backend.rs` | `pause()`, `resume()`, `create_snapshot()`, `create_auto_snapshot()`, restore branch of `start()` |
+| `tests/snapshot_vz_integration.rs` | Cold boot → snapshot → restore, auto-snapshot, CLI list/delete, device-set drift |
+
 ## Developer Notes
 
 For contributor setup, lint/test parity commands, and script usage, see
