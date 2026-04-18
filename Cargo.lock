@@ -287,7 +287,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claudio"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "void-box"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "void-box-protocol"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "void-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2941,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "void-message"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2951,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "voidbox-oci"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "reqwest",

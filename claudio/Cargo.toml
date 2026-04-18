@@ -1,6 +1,6 @@
 [package]
 name = "claudio"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Claudio: configurable mock of claude-code CLI for void-box testing and playground"
 publish = false
