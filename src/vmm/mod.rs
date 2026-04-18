@@ -481,7 +481,9 @@ impl MicroVm {
     /// Skips kernel loading, initramfs, boot params, and the 4s boot wait.
     /// Instead: restore memory (COW mmap) → KVM state → vsock → vCPU resume.
     pub async fn from_snapshot(snapshot_dir: &Path) -> Result<Self> {
+        let t_enter = std::time::Instant::now();
         let snap = snapshot::VmSnapshot::load(snapshot_dir)?;
+        let t_load = t_enter.elapsed();
         let mem_path = snapshot::VmSnapshot::memory_path(snapshot_dir);
 
         info!(
@@ -490,7 +492,9 @@ impl MicroVm {
         );
 
         // 1. Create KVM VM (allocates memory, creates irqchip + PIT)
+        let t0 = std::time::Instant::now();
         let vm = Arc::new(kvm::Vm::new(snap.config.memory_mb)?);
+        let t_vm_new = t0.elapsed();
 
         // 2. Restore memory contents
         match snap.snapshot_type {
@@ -521,11 +525,14 @@ impl MicroVm {
                 snapshot::restore_memory(vm.guest_memory(), &mem_path)?;
             }
         }
+        let t_mem = t0.elapsed() - t_vm_new;
 
         // 3. Restore in-kernel interrupt controller + arch state.
+        let t1 = std::time::Instant::now();
         use crate::vmm::arch::{Arch, CurrentArch};
         CurrentArch::restore_irqchip(&vm, &snap.irqchip)?;
         CurrentArch::restore_arch_vm_state(&vm, &snap.arch_state)?;
+        let t_irq = t1.elapsed();
 
         // 4. Serial device (fresh — no state to restore)
         let (serial_tx, serial_rx) = mpsc::channel(4096);
@@ -606,6 +613,7 @@ impl MicroVm {
         };
 
         // 8. Restore vCPUs from snapshot state
+        let t_vcpu_start = std::time::Instant::now();
         cpu::install_vcpu_signal_handler();
         let running = Arc::new(AtomicBool::new(true));
         let mut vcpu_handles = Vec::with_capacity(snap.vcpu_states.len());
@@ -625,7 +633,17 @@ impl MicroVm {
             )?;
             vcpu_handles.push(handle);
         }
+        let t_vcpu = t_vcpu_start.elapsed();
         debug!("Restored {} vCPUs", vcpu_handles.len());
+        debug!(
+            "restore phases: load_state={:?} vm_new={:?} mem={:?} irq={:?} vcpu={:?} total_to_vcpu={:?}",
+            t_load,
+            t_vm_new,
+            t_mem,
+            t_irq,
+            t_vcpu,
+            t_enter.elapsed(),
+        );
 
         // 9. Spawn vsock IRQ handler thread
         let vsock_irq_handle = if let Some(ref vsock_mmio) = mmio_devices.virtio_vsock {

@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let warm_only = args.iter().any(|a| a == "--warm-only");
     let cold_only = args.iter().any(|a| a == "--cold-only");
+    let breakdown = args.iter().any(|a| a == "--breakdown");
     let console_file: Option<PathBuf> = args
         .iter()
         .position(|a| a == "--console-file")
@@ -115,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut warm: Vec<Sample> = Vec::with_capacity(iters);
         for i in 0..iters {
-            let s = bench_restore_once(memory_mb, &snap_path).await?;
+            let s = bench_restore_once(memory_mb, &snap_path, breakdown).await?;
             eprintln!(
                 "warm[{:>2}]: build={:>7.1?} boot={:>7.1?} stop={:>7.1?} total={:>7.1?}",
                 i, s.build, s.boot, s.stop, s.total
@@ -156,6 +157,7 @@ async fn capture_snapshot(
 async fn bench_restore_once(
     memory_mb: usize,
     snap_path: &std::path::Path,
+    breakdown: bool,
 ) -> Result<Sample, Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let sandbox = Sandbox::local()
@@ -166,6 +168,10 @@ async fn bench_restore_once(
         .build()?;
     let t1 = Instant::now();
 
+    // First exec triggers ensure_started() → from_snapshot (sub-ms, see
+    // `void_box::vmm` debug logs) → handshake + exec RTT. Most of the
+    // elapsed time here is the guest kernel resuming from HLT/NOHZ-idle
+    // on the restored vCPU, not host-side work.
     let out = sandbox.exec("sh", &["-c", ":"]).await?;
     if !out.success() {
         return Err(format!(
@@ -176,6 +182,22 @@ async fn bench_restore_once(
         .into());
     }
     let t2 = Instant::now();
+
+    // Optional: a second exec measures steady-state RTT on the
+    // already-awake guest (no handshake retry, no guest reactivation) and
+    // lets us split `first_exec = guest_wake + rtt`.
+    if breakdown {
+        let t_rtt_start = Instant::now();
+        let _ = sandbox.exec("sh", &["-c", ":"]).await?;
+        let t_rtt = t_rtt_start.elapsed();
+        let t_guest_wake = (t2 - t1).saturating_sub(t_rtt);
+        eprintln!(
+            "  ^ warm breakdown: first_exec={:?}  second_exec_rtt={:?}  guest_wake_est={:?}",
+            t2 - t1,
+            t_rtt,
+            t_guest_wake,
+        );
+    }
 
     sandbox.stop().await?;
     let t3 = Instant::now();
