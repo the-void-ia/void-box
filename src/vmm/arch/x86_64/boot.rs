@@ -35,9 +35,20 @@ pub fn load_kernel(
     let mut kernel_file = File::open(kernel_path)
         .map_err(|e| Error::Boot(format!("Failed to open kernel: {}", e)))?;
 
-    // Read setup-header limits before loading.
-    let _init_size = read_bzimage_init_size(&mut kernel_file).unwrap_or(0);
-    let initrd_addr_max = read_bzimage_initrd_addr_max(&mut kernel_file).unwrap_or(u32::MAX);
+    // Read setup-header limits before loading. These fields only exist in
+    // bzImage; a raw vmlinux ELF has unrelated data at those offsets and
+    // returns misleading values (e.g. 0), so skip the read entirely.
+    let is_bz = is_bzimage(&mut kernel_file).unwrap_or(false);
+    let _init_size = if is_bz {
+        read_bzimage_init_size(&mut kernel_file).unwrap_or(0)
+    } else {
+        0
+    };
+    let initrd_addr_max = if is_bz {
+        read_bzimage_initrd_addr_max(&mut kernel_file).unwrap_or(u32::MAX)
+    } else {
+        u32::MAX
+    };
 
     // Detect kernel format and load it
     let (kernel_load_addr, kernel_entry) = load_kernel_image(guest_memory, &mut kernel_file)?;
@@ -183,6 +194,20 @@ fn load_bzimage(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Resul
 
 /// Load ELF format kernel.
 fn load_elf_kernel(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Result<(u64, u64)> {
+    // ELF64 e_entry lives at offset 0x18 (8 bytes LE). Read it before
+    // letting the loader consume the file — the loader rewinds anyway.
+    kernel_file
+        .seek(SeekFrom::Start(0x18))
+        .map_err(|e| Error::Boot(format!("Failed to seek e_entry: {}", e)))?;
+    let mut buf = [0u8; 8];
+    kernel_file
+        .read_exact(&mut buf)
+        .map_err(|e| Error::Boot(format!("Failed to read e_entry: {}", e)))?;
+    let entry_point = u64::from_le_bytes(buf);
+    kernel_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Boot(format!("Failed to rewind kernel file: {}", e)))?;
+
     let kernel_load = ElfLoader::load(
         guest_memory,
         None, // Use default kernel offset
@@ -192,8 +217,6 @@ fn load_elf_kernel(guest_memory: &GuestMemoryMmap, kernel_file: &mut File) -> Re
     .map_err(|e| Error::Boot(format!("Failed to load ELF kernel: {:?}", e)))?;
 
     let load_addr = kernel_load.kernel_load.raw_value();
-    let entry_point = kernel_load.kernel_end;
-
     Ok((load_addr, entry_point))
 }
 
