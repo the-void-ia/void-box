@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Service-agent and output-monitor progress messages in `agent_box.rs` routed through `tracing` (`info!` / `warn!` / `error!` / `debug!`) instead of `eprintln!`
 
 ### Fixed
+- **OCI rootfs mount on macOS/VZ**: `setup_oci_rootfs()` on the non-block-device path now mounts the virtiofs share (parsed from `/proc/cmdline` `voidbox.mount*` entries) before the `is_dir` check, and the in-overlay shared-dir loop skips the same entry to avoid a double mount. Unblocks every `sandbox.image`-based spec on Apple Silicon; previously failed with `OCI_FAIL_ROOTFS_MISSING`. New `OCI_FAIL_LOWER_MOUNT` status code for diagnostic granularity.
+- **Orphan-run reconciliation on daemon restart**: `reconcile_orphan_runs_on_startup()` flips persisted non-terminal runs (`Pending`/`Starting`/`Running`) to `Failed` with `terminal_reason = "daemon_restarted"` and emits a `run.failed` event. Previously these runs were returned from `GET /v1/runs` forever after a kill/restart. Reuses `RunStatus::Failed` to keep the serde wire format stable.
 - Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
 - Guest console routing semantics are now consistent across macOS/VZ and Linux/KVM
 - Snapshot restore: capture/restore `IA32_XSS` MSR to prevent XRSTORS #GP on CET-enabled kernels (6.x+)
