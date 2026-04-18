@@ -44,7 +44,7 @@ use crate::{Error, Result};
 /// timeout here means the first attempt silently eats that slack as idle
 /// wait; shrinking it lets the retry loop probe aggressively and succeed as
 /// soon as the dispatcher is up.
-const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;

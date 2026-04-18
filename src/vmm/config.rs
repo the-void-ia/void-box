@@ -237,6 +237,10 @@ impl VoidBoxConfig {
             "i8042.noaux".to_string(),
             "i8042.nokbd".to_string(),
             "i8042.nopnp".to_string(),
+            // Skip driver initcalls that would otherwise burn ~1.6s of host-kernel
+            // probe timeouts when the guest boots on a distro kernel. Unknown
+            // symbols are silently ignored.
+            "initcall_blacklist=cmos_init,i8042_init".to_string(),
         ];
 
         // Only add nomodules if vsock is NOT enabled (vsock needs modprobe)
