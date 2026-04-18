@@ -1,0 +1,23 @@
+api_version: v1
+kind: workflow
+name: startup-cross-check
+
+# Minimal real-VM workflow used to cross-check the `voidbox-startup-bench`
+# harness numbers against a single `voidbox run` CLI invocation. Does one
+# trivial exec (`sh -c :`), same shape as the harness's per-iteration work,
+# so `perf-agent` on this process reflects the actual user-facing cold
+# startup path through the full CLI → runtime → VM pipeline.
+
+sandbox:
+  memory_mb: 1024
+  vcpus: 1
+  network: false
+
+workflow:
+  steps:
+    - name: noop
+      run:
+        program: sh
+        args: ["-c", ":"]
+
+  output_step: noop
