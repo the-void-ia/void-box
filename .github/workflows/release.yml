@@ -15,11 +15,17 @@ jobs:
   # ── Linux builds (x86_64 + aarch64) ──────────────────────────────────────
   build-linux:
     name: Build Linux (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            nfpm_arch: x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            nfpm_arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -33,17 +39,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools cpio gzip xz-utils zstd
-
-      - name: Install aarch64 cross-linker
-        if: matrix.arch == 'aarch64'
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          # Use the GNU cross-compiler as linker and C compiler for the musl target.
-          # Disable FORTIFY_SOURCE because glibc headers define __memcpy_chk etc.
-          # which don't exist in musl.
-          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
-          echo 'CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
-          echo 'CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE' >> "$GITHUB_ENV"
 
       - name: Download static busybox
         run: |
@@ -70,8 +65,9 @@ jobs:
       - name: Install nfpm
         run: |
           NFPM_VERSION=2.45.1
-          curl -sfL --retry 3 --retry-delay 5 \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+          NFPM_ARCH="${{ matrix.nfpm_arch }}"
+          curl -sfL --retry 5 --retry-delay 10 --retry-all-errors \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz" \
             -o /tmp/nfpm.tar.gz
           tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
 
