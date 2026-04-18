@@ -63,6 +63,7 @@ const OCI_FAIL_PIVOT_ROOT_EPERM: u8 = 22;
 const OCI_FAIL_PIVOT_ROOT_ENOENT: u8 = 23;
 const OCI_FAIL_PIVOT_ROOT: u8 = 24;
 const OCI_FAIL_MOUNT_SHARED: u8 = 25;
+const OCI_FAIL_LOWER_MOUNT: u8 = 26;
 
 static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
 /// Stores the last OCI setup error detail (e.g., mount failure reasons).
@@ -93,6 +94,7 @@ fn oci_status_str(code: u8) -> &'static str {
         OCI_FAIL_PIVOT_ROOT_ENOENT => "pivot-root-enoent",
         OCI_FAIL_PIVOT_ROOT => "pivot-root-failed",
         OCI_FAIL_MOUNT_SHARED => "mount-shared-failed",
+        OCI_FAIL_LOWER_MOUNT => "lower-mount-failed",
         _ => "unknown",
     }
 }
@@ -1234,6 +1236,55 @@ fn setup_oci_rootfs() {
         };
 
         // Legacy mount-based OCI path for virtiofs/9p backends.
+        //
+        // `mount_shared_dirs()` is skipped on boot when OCI rootfs is
+        // configured (to avoid a double-mount of the same virtio device
+        // during the later overlay setup).  Consequently the virtiofs/9p
+        // share that backs the rootfs has NOT been mounted yet — the host
+        // only declared it in the VMM config.  Mount it here so the
+        // subsequent `is_dir`/overlay `lowerdir` steps see real content.
+        //
+        // On macOS/VZ this is the only place the share gets mounted.  On
+        // Linux/KVM this branch is unreachable (the block-device plan is
+        // used instead).
+        let shared_mounts_for_bootstrap = parse_shared_mount_entries_from(&cmdline);
+        if let Some((tag, _, read_only)) = shared_mounts_for_bootstrap
+            .iter()
+            .find(|(_, guest_path, _)| guest_path == &rootfs_path)
+        {
+            if let Err(e) = std::fs::create_dir_all(&rootfs_path) {
+                let msg = format!(
+                    "WARNING: failed to create OCI rootfs mount point {}: {}",
+                    rootfs_path, e
+                );
+                kmsg(&msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_MKDIR, Ordering::Release);
+                return;
+            }
+            if let Err(e) = try_mount_9p_virtiofs(tag, &rootfs_path, *read_only) {
+                let msg = format!(
+                    "WARNING: failed to mount OCI rootfs share '{}' at {}: {}",
+                    tag, rootfs_path, e
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_LOWER_MOUNT, Ordering::Release);
+                return;
+            }
+            kmsg(&format!(
+                "Mounted OCI rootfs share '{}' at {} (pre-overlay bootstrap)",
+                tag, rootfs_path
+            ));
+        } else {
+            kmsg(&format!(
+                "WARNING: no voidbox.mount* entry targets OCI rootfs path {}; \
+                 expecting host to have pre-populated the path",
+                rootfs_path
+            ));
+        }
+
         if !std::path::Path::new(&rootfs_path).is_dir() {
             kmsg(&format!(
                 "WARNING: OCI rootfs {} not found, skipping pivot_root",
@@ -1404,6 +1455,18 @@ fn setup_oci_rootfs() {
         shared_mounts.len()
     ));
     for (tag, guest_path, read_only) in &shared_mounts {
+        // The OCI rootfs share (legacy path-based mode) is already mounted
+        // at `lowerdir` pre-overlay and consumed by overlayfs.  Re-mounting
+        // the same virtio tag inside newroot would be a double-mount
+        // (hangs on some kernels) and the overlay absorbs its contents
+        // regardless, so skip it here.
+        if guest_path == &lowerdir {
+            kmsg(&format!(
+                "Skipping newroot re-mount of OCI rootfs share '{}' at {}",
+                tag, guest_path
+            ));
+            continue;
+        }
         let dst_path = format!("{}{}", newroot, guest_path);
         if let Err(e) = std::fs::create_dir_all(&dst_path) {
             kmsg(&format!(

@@ -99,7 +99,14 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 /// TOCTOU window where another process could claim the port in between.
 pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     let provider = provider_from_env();
-    let initial_runs = provider.load_runs().unwrap_or_default();
+    let mut initial_runs = provider.load_runs().unwrap_or_default();
+
+    // Reconcile orphan runs: any run left in a non-terminal state
+    // (Pending, Starting, Running) in persistent storage cannot resume
+    // after a daemon restart — the owning in-memory task is gone.  Mark
+    // them Failed with a synthetic `run.failed` terminal event so
+    // observers see the transition and the run is no longer a ghost.
+    reconcile_orphan_runs_on_startup(&mut initial_runs, provider.as_ref());
 
     let state = AppState {
         runs: Arc::new(Mutex::new(initial_runs)),
@@ -127,6 +134,57 @@ pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std:
                 debug!(?peer, %e, "daemon connection error");
             }
         });
+    }
+}
+
+/// Mark every non-terminal persisted run as `Failed` with a `run.failed`
+/// terminal event.  Runs in `Pending`, `Starting`, or `Running` at daemon
+/// startup are orphans — their controller task died with the previous
+/// daemon process and will never transition on its own.
+fn reconcile_orphan_runs_on_startup(
+    runs: &mut HashMap<String, RunState>,
+    provider: &dyn PersistenceProvider,
+) {
+    const ORPHAN_REASON: &str = "daemon_restarted";
+    const ORPHAN_MSG: &str = "run orphaned by daemon restart";
+
+    for run in runs.values_mut() {
+        if run.status.is_terminal() {
+            continue;
+        }
+        let prev_status = run.status.clone();
+        let seq = run.events.len() as u64;
+        let ev = event_with_seq(
+            &run.id,
+            "error",
+            "run.failed",
+            format!("{ORPHAN_MSG} (was {prev_status:?})"),
+            seq,
+            run.attempt_id,
+        );
+        run.terminal_event_id = ev.event_id.clone();
+        run.status = RunStatus::Failed;
+        run.error = Some(ORPHAN_MSG.to_string());
+        run.terminal_reason = Some(ORPHAN_REASON.to_string());
+        let ts = now_rfc3339();
+        run.finished_at = Some(ts.clone());
+        run.updated_at = Some(ts);
+        run.active_stage_count = 0;
+        run.active_microvm_count = 0;
+        run.events.push(ev);
+        if let Err(e) = provider.save_run(run) {
+            warn!(
+                run_id = %run.id,
+                error = %e,
+                "failed to persist orphan-run reconciliation"
+            );
+        } else {
+            warn!(
+                run_id = %run.id,
+                from = ?prev_status,
+                "reconciled orphan run to Failed on daemon startup"
+            );
+        }
     }
 }
 
@@ -2513,5 +2571,131 @@ mod tests {
             .skills
             .push(SkillEntry::Simple("agent:claude-code".into()));
         assert!(should_register_void_mcp(&spec));
+    }
+
+    mod orphan_reconciliation {
+        use super::super::*;
+        use crate::persistence::{PersistenceProvider, RunEvent, RunState, RunStatus};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StubProvider {
+            saved: Mutex<HashMap<String, RunState>>,
+        }
+
+        impl PersistenceProvider for StubProvider {
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+
+            fn load_runs(&self) -> crate::Result<HashMap<String, RunState>> {
+                Ok(self.saved.lock().unwrap().clone())
+            }
+
+            fn save_run(&self, run: &RunState) -> crate::Result<()> {
+                self.saved
+                    .lock()
+                    .unwrap()
+                    .insert(run.id.clone(), run.clone());
+                Ok(())
+            }
+
+            fn append_session_message(
+                &self,
+                _session_id: &str,
+                _message: &crate::persistence::SessionMessage,
+            ) -> crate::Result<()> {
+                Ok(())
+            }
+
+            fn load_session_messages(
+                &self,
+                _session_id: &str,
+            ) -> crate::Result<Vec<crate::persistence::SessionMessage>> {
+                Ok(Vec::new())
+            }
+        }
+
+        fn make_run(id: &str, status: RunStatus) -> RunState {
+            RunState {
+                id: id.to_string(),
+                status,
+                file: "spec.yaml".to_string(),
+                report: None,
+                error: None,
+                events: Vec::<RunEvent>::new(),
+                attempt_id: 1,
+                started_at: None,
+                updated_at: None,
+                terminal_reason: None,
+                exit_code: None,
+                active_stage_count: 3,
+                active_microvm_count: 2,
+                policy: None,
+                terminal_event_id: None,
+                finished_at: None,
+                stage_states: None,
+                artifact_publication: None,
+                output_ready: false,
+            }
+        }
+
+        #[test]
+        fn reconciles_running_and_starting_runs_to_failed() {
+            let provider = StubProvider::default();
+            let mut runs = HashMap::new();
+            runs.insert("r-run".to_string(), make_run("r-run", RunStatus::Running));
+            runs.insert(
+                "r-start".to_string(),
+                make_run("r-start", RunStatus::Starting),
+            );
+            runs.insert("r-pend".to_string(), make_run("r-pend", RunStatus::Pending));
+
+            reconcile_orphan_runs_on_startup(&mut runs, &provider);
+
+            for id in ["r-run", "r-start", "r-pend"] {
+                let run = &runs[id];
+                assert_eq!(run.status, RunStatus::Failed, "run {id} status");
+                assert_eq!(run.terminal_reason.as_deref(), Some("daemon_restarted"));
+                assert!(run.terminal_event_id.is_some());
+                assert!(run.finished_at.is_some());
+                assert_eq!(run.active_stage_count, 0);
+                assert_eq!(run.active_microvm_count, 0);
+                assert!(
+                    run.events.iter().any(|e| e.event_type == "run.failed"),
+                    "expected run.failed event for {id}"
+                );
+                // Persisted through provider
+                assert!(provider.saved.lock().unwrap().contains_key(id));
+            }
+        }
+
+        #[test]
+        fn leaves_terminal_runs_untouched() {
+            let provider = StubProvider::default();
+            let mut runs = HashMap::new();
+            for (id, status) in [
+                ("r-ok", RunStatus::Succeeded),
+                ("r-fail", RunStatus::Failed),
+                ("r-cancel", RunStatus::Cancelled),
+            ] {
+                runs.insert(id.to_string(), make_run(id, status));
+            }
+
+            reconcile_orphan_runs_on_startup(&mut runs, &provider);
+
+            assert_eq!(runs["r-ok"].status, RunStatus::Succeeded);
+            assert_eq!(runs["r-fail"].status, RunStatus::Failed);
+            assert_eq!(runs["r-cancel"].status, RunStatus::Cancelled);
+            for id in ["r-ok", "r-fail", "r-cancel"] {
+                assert!(
+                    runs[id].events.is_empty(),
+                    "{id} should not get a new event"
+                );
+                assert!(runs[id].terminal_event_id.is_none());
+            }
+            assert!(provider.saved.lock().unwrap().is_empty());
+        }
     }
 }
