@@ -103,11 +103,16 @@ jobs:
         run: |
           export ARCH=${{ matrix.arch }}
           scripts/download_kernel.sh
-          # Rename to spec-expected names
+          # Rename to spec-expected names. download_kernel.sh on Linux
+          # produces a compressed vmlinuz for both archs; for aarch64 we
+          # additionally extract an uncompressed vmlinux so macOS/VZ
+          # consumers of this release asset can boot it.
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
             cp target/vmlinuz-amd64 target/vmlinuz-x86_64
           else
-            cp target/vmlinux-arm64 target/vmlinux-aarch64
+            chmod +x scripts/extract-vmlinux
+            scripts/extract-vmlinux target/vmlinuz-arm64 > target/vmlinux-aarch64
+            test -s target/vmlinux-aarch64
           fi
 
       - name: Generate SHA-256 checksums
