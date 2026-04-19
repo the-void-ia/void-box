@@ -434,17 +434,37 @@ VoidBox supports three types of VM snapshots for sub-second restore. All snapsho
 
 ### Performance
 
-Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
+Two different latencies matter for snapshot/restore — the **host-side
+snapshot/restore phase** (just the function call) and the **end-to-end
+user-perceived startup** (from `Sandbox::build()` through first exec
+round-trip). The second is what users actually wait for.
+
+**Host-side phase times** — measured on Linux/KVM with 256 MB RAM,
+1 vCPU, userspace virtio-vsock:
 
 | Phase | Time | Notes |
 |---|---|---|
-| Cold boot | ~10 ms | |
 | Base snapshot | ~420 ms | Full 256 MB memory dump |
 | Base restore | ~1.3 ms | COW mmap, lazy page loading |
 | Diff snapshot | ~270 ms | Only dirty pages (~1.5 MB, 0.6% of RAM) |
 | Diff restore | ~3 ms | Base COW mmap + dirty page overlay |
-| **Base speedup** | **~8x** | Cold boot / base restore |
 | **Diff savings** | **99.4%** | Memory file size reduction |
+
+**End-to-end startup (time-to-first-exec)** — measured via
+`voidbox-startup-bench --iters 20 --breakdown` on Fedora 43 / KVM,
+1 GiB RAM, slim kernel (`scripts/build_slim_kernel.sh`) + test rootfs
+(`scripts/build_test_image.sh`):
+
+| Path | p50 | p95 | Notes |
+|---|---|---|---|
+| Cold boot → first exec | **252 ms** | 259 ms | Kernel boot + vsock handshake + one exec RTT |
+| Warm restore → first exec | **138 ms** | 144 ms | `from_snapshot` (sub-ms) + handshake + one exec RTT |
+
+The warm path dwarfs the ~1.3 ms host-side restore because the guest
+kernel resumes from HLT/NOHZ-idle and the host-side vsock handshake
+retry loop converges only as fast as the guest-agent replies to Ping.
+Decomposition of both paths (and the path to sub-100 ms cold) lives
+in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
 
 ### Storage layout
 

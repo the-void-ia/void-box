@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Slim microVM kernel build** (`scripts/build_slim_kernel.sh`) — upstream Linux v6.12.30 LTS + Firecracker `microvm-kernel-ci-{x86_64,aarch64}-6.1.config` base + void-box additions (9p, virtiofs, overlayfs, `VIRTIO_MMIO_CMDLINE_DEVICES`). Ships uncompressed `vmlinux` (~30 MB) unifying artifact shape with macOS/VZ. Disables `CONFIG_MODULE_SIG*` so builds work on OpenSSL 3 hosts (Fedora 40+). `KERNEL_VER` / `FC_COMMIT` / `FC_CONFIG_MAJMIN` env overrides for reproducible builds.
 - `voidbox --log-dir` and `VOIDBOX_LOG_DIR` overrides for file-based runtime logs
 - **Codex CLI as first-class agent peer** — `llm.provider: codex` in YAML specs exec's the bundled OpenAI Codex CLI inside the guest VM with full structured observability
 - `scripts/build_codex_rootfs.sh` — production Codex-capable initramfs with auto-download from GitHub releases (musl-static, no glibc shipping)
@@ -26,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `snapshot_store::resolve_snapshot_argument` returning a `SnapshotResolution` enum (`Hash` / `Literal` / `NotFound`), unifying three duplicate hash-vs-literal resolution paths
 
 ### Changed
+- **Startup latency** — cold-boot p50 cut from ~4.9 s to **252 ms** (−95%) and warm-restore p50 from ~607 ms to **138 ms** (−77%) on KVM. Delivered in three steps: (1) remove three hardcoded blind waits (cold 4.9 s → 3.5 s, warm 607 ms → 433 ms); (2) add `initcall_blacklist=cmos_init,i8042_init` to the default kernel cmdline, skipping host-distro RTC/i8042 probe timeouts (cold 3.5 s → 1.7 s); (3) ship the slim kernel (cold 1.7 s → 252 ms). Backed by `voidbox-startup-bench --iters 20 --breakdown` on Fedora 43 host.
+- `vmm::vsock_irq_thread` epoll timeout tightened 200 ms → 20 ms so `stop()` reclaims the thread within one poll window instead of up to a full interval — drops `stop()` phase from ~230 ms to ~50 ms on both cold and warm paths
 - Rust MSRV bumped to 1.88
 - Interactive `voidbox shell` sessions now route runtime logs to the daily log file and route guest console output away from the active terminal to avoid TUI corruption
 - `voidbox shell` now prefers Claude Personal when personal OAuth credentials are available via the host's cross-platform credential discovery path
@@ -42,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Service-agent and output-monitor progress messages in `agent_box.rs` routed through `tracing` (`info!` / `warn!` / `error!` / `debug!`) instead of `eprintln!`
 
 ### Fixed
+- **Userspace vsock: host→guest writes larger than 4 KiB** (`VsockConnectionMap::queue_host_data`) — the function silently truncated any buffer longer than 4 KiB to a single 4 KiB packet and dropped the rest, so any Message whose wire size exceeded the per-packet cap hung the guest-agent's `read_exact(payload)` indefinitely and the host timed out after 30 s with `Protocol error: IO error: Resource temporarily unavailable`. Loop now produces one Rw packet per 4 KiB chunk, respects peer credit, and buffers the remainder into `conn.tx_buf` + flushes on `peer_fwd_cnt` advance. Small RPCs unchanged. Latent since the userspace backend landed (`f4f14ab`); first user-visible trigger was the 6 KiB `hackernews-api.md` skill file (~21 KiB on the wire after `WriteFile` JSON framing).
+- **x86_64 boot loader: raw `vmlinux` ELF support** (`src/vmm/arch/x86_64/boot.rs`) — `load_elf_kernel` now reads `e_entry` from ELF header offset `0x18` instead of returning `kernel_end` (which was the end of loaded memory, not the entry point), and `read_bzimage_init_size` / `read_bzimage_initrd_addr_max` are gated on `is_bzimage()` so raw ELFs don't read garbage from offsets `0x260` / `0x22c` (which collapsed the initramfs placement window to `0x0` and surfaced as `initramfs too large for placement window end=0x0`)
 - **OCI rootfs mount on macOS/VZ**: `setup_oci_rootfs()` on the non-block-device path now mounts the virtiofs share (parsed from `/proc/cmdline` `voidbox.mount*` entries) before the `is_dir` check, and the in-overlay shared-dir loop skips the same entry to avoid a double mount. Unblocks every `sandbox.image`-based spec on Apple Silicon; previously failed with `OCI_FAIL_ROOTFS_MISSING`. New `OCI_FAIL_LOWER_MOUNT` status code for diagnostic granularity.
 - **Orphan-run reconciliation on daemon restart**: `reconcile_orphan_runs_on_startup()` flips persisted non-terminal runs (`Pending`/`Starting`/`Running`) to `Failed` with `terminal_reason = "daemon_restarted"` and emits a `run.failed` event. Previously these runs were returned from `GET /v1/runs` forever after a kill/restart. Reuses `RunStatus::Failed` to keep the serde wire format stable.
 - Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
