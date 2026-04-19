@@ -46,7 +46,7 @@ case "$ARCH" in
     ;;
 esac
 
-FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/${FC_COMMIT}/resources/guest_configs/microvm-kernel-ci-${MAKE_ARCH}-${FC_CONFIG_MAJMIN}.config"
+FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/${FC_COMMIT}/resources/guest_configs/microvm-kernel-ci-${ARCH}-${FC_CONFIG_MAJMIN}.config"
 OUT_FILE="target/vmlinux-slim-${ARCH}"
 SRC_TARBALL="target/linux-${KERNEL_VER}.tar.xz"
 SRC_DIR="target/linux-${KERNEL_VER}"
