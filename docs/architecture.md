@@ -466,6 +466,31 @@ retry loop converges only as fast as the guest-agent replies to Ping.
 Decomposition of both paths (and the path to sub-100 ms cold) lives
 in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
 
+**Startup evolution on this runtime** — where the 19× cold speedup came from:
+
+| Stage | Cold p50 | Warm p50 | What landed |
+|-------|----------|----------|-------------|
+| Baseline (pre-`feat/perf`) | ~4.9 s | ~607 ms | Blind `sleep(4s)` pre-handshake, blind `sleep(1s)` after module load, 200 ms `epoll_wait` on vsock-irq |
+| After blind-wait removal | 3.5 s | 433 ms | Poll `connect()` directly, drop guest-agent module-load sleep, tighten vsock-irq epoll to 20 ms |
+| After `initcall_blacklist` | 1.7 s | 140 ms | Skip distro-kernel `cmos_init` / `i8042_init` probe timeouts via default kernel cmdline |
+| **After slim kernel** (current) | **252 ms** | **138 ms** | Upstream Linux v6.12.30 + Firecracker microvm config + 9p/virtiofs/overlayfs, uncompressed `vmlinux` |
+
+**Comparison with other microVM runtimes** — approximate published numbers,
+measurement methodology varies (Firecracker's published number is
+"guest init complete", ours is "first exec RTT over vsock"):
+
+| Runtime | Cold boot | Warm restore | Notes |
+|---------|-----------|--------------|-------|
+| Firecracker (AWS) | ~125 ms | <50 ms (snapshot) | Minimal microVM, ~5 years of optimization, purpose-built for Lambda |
+| libkrun (Red Hat) | ~100–150 ms | — | Container-focused, very lean |
+| cloud-hypervisor | ~100–250 ms | 100–200 ms | More features than Firecracker |
+| QEMU microvm | ~300–500 ms | — | Best-case QEMU config |
+| **VoidBox (this branch)** | **252 ms** | **138 ms** | Kernel boot + vsock handshake + first exec RTT |
+
+Competitive for a general-purpose agent runtime; behind Firecracker's
+Lambda-specialized numbers. Paths to narrow the gap further are documented
+in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
+
 ### Storage layout
 
 ```
