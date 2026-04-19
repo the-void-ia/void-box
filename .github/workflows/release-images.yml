@@ -46,7 +46,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools cpio gzip xz-utils zstd file
+          sudo apt-get install -y -qq musl-tools cpio gzip xz-utils zstd file \
+            flex bison bc libssl-dev libelf-dev
 
       - name: Install aarch64 cross-linker
         if: matrix.arch == 'aarch64' && runner.arch == 'X64'
@@ -115,6 +116,25 @@ jobs:
             test -s target/vmlinux-aarch64
           fi
 
+      - name: Cache slim kernel source + Firecracker config
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/linux-6.12.30
+            target/linux-6.12.30.tar.xz
+            target/microvm-kernel-6.1-*.config
+          key: slim-kernel-src-v6.12.30-fc-v1.10.1-${{ matrix.arch }}
+          restore-keys: |
+            slim-kernel-src-v6.12.30-fc-v1.10.1-
+
+      - name: Build slim kernel (uncompressed vmlinux)
+        run: |
+          export ARCH=${{ matrix.arch }}
+          # Free disk before a kernel build (source + build tree ~ 4-5 GB)
+          df -h / | tail -1
+          scripts/build_slim_kernel.sh
+          test -s target/vmlinux-slim-${{ matrix.arch }}
+
       - name: Generate SHA-256 checksums
         run: |
           cd target
@@ -125,8 +145,12 @@ jobs:
             void-box-agents-${{ matrix.arch }}.cpio.gz; do
             sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
           done
-          # Kernel (name varies by arch)
-          for f in $(ls vmlinuz-${{ matrix.arch }} vmlinux-${{ matrix.arch }} 2>/dev/null); do
+          # Distro kernel (name varies by arch) + slim kernel
+          for f in $(ls \
+            vmlinuz-${{ matrix.arch }} \
+            vmlinux-${{ matrix.arch }} \
+            vmlinux-slim-${{ matrix.arch }} \
+            2>/dev/null); do
             sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
           done
 
@@ -148,10 +172,11 @@ jobs:
             void-box-agents-${{ matrix.arch }}.cpio.gz.sha256; do
             gh release upload "$TAG" "$f" --clobber
           done
-          # Upload kernel + checksum
+          # Upload kernels + checksums (distro + slim)
           for f in $(ls \
             vmlinuz-${{ matrix.arch }} vmlinuz-${{ matrix.arch }}.sha256 \
             vmlinux-${{ matrix.arch }} vmlinux-${{ matrix.arch }}.sha256 \
+            vmlinux-slim-${{ matrix.arch }} vmlinux-slim-${{ matrix.arch }}.sha256 \
             2>/dev/null); do
             gh release upload "$TAG" "$f" --clobber
           done
