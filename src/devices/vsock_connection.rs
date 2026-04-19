@@ -374,7 +374,12 @@ impl VsockConnectionMap {
                     (hdr.dst_port, hdr.src_port)
                 };
 
-                if let Some(conn) = self.connections.get_mut(&rw_key) {
+                let had_buffered = {
+                    let Some(conn) = self.connections.get_mut(&rw_key) else {
+                        // Unknown connection — send RST (handled in outer else)
+                        self.queue_rst(hdr);
+                        return true;
+                    };
                     if conn.state == ConnState::Connected && !data.is_empty() {
                         match conn.write_to_host(data) {
                             Ok(n) => {
@@ -393,14 +398,15 @@ impl VsockConnectionMap {
                         }
                     }
                     // Update peer credit info
+                    let had_buf = !conn.tx_buf.is_empty();
                     conn.peer_buf_alloc = hdr.buf_alloc;
                     conn.peer_fwd_cnt = hdr.fwd_cnt;
-                    true
-                } else {
-                    // Unknown connection — send RST
-                    self.queue_rst(hdr);
-                    true
+                    had_buf
+                };
+                if had_buffered {
+                    self.flush_tx_buf(rw_key.0, rw_key.1);
                 }
+                true
             }
             VsockOp::Shutdown => {
                 let sd_key = if self.connections.contains_key(&key) {
@@ -486,38 +492,58 @@ impl VsockConnectionMap {
 
     /// Queue data from a host stream to send to the guest.
     ///
-    /// Call this after reading data from a host UnixStream.
+    /// Call this after reading data from a host UnixStream. Splits the
+    /// payload into virtio-vsock-sized packets (4 KiB each) and respects
+    /// the peer's available credit. If credit is insufficient, the
+    /// remainder is buffered in `conn.tx_buf` for later delivery.
     pub fn queue_host_data(&mut self, guest_port: u32, host_port: u32, data: &[u8]) {
         if data.is_empty() {
             return;
         }
 
         let key = (guest_port, host_port);
-        let conn = match self.connections.get(&key) {
-            Some(c) => c,
-            None => return,
-        };
-
-        // Respect credit: only send up to peer_free bytes
-        let max_send = conn.peer_free() as usize;
-        let send_len = data.len().min(max_send).min(4096); // cap at 4K per packet
-        if send_len == 0 {
+        if !self.connections.contains_key(&key) {
             return;
         }
 
-        let hdr = VsockHeader {
-            src_cid: HOST_CID,
-            dst_cid: self.guest_cid,
-            src_port: host_port,
-            dst_port: guest_port,
-            len: send_len as u32,
-            r#type: 1,
-            op: VsockOp::Rw as u16,
-            flags: 0,
-            buf_alloc: conn.buf_alloc,
-            fwd_cnt: conn.fwd_cnt,
-        };
-        self.rx_queue.push((hdr, data[..send_len].to_vec()));
+        const PACKET_CAP: usize = 4096;
+        let mut offset = 0;
+
+        while offset < data.len() {
+            let conn = match self.connections.get_mut(&key) {
+                Some(c) => c,
+                None => return,
+            };
+            let max_credit = conn.peer_free() as usize;
+            let remaining = data.len() - offset;
+            let send_len = remaining.min(max_credit).min(PACKET_CAP);
+
+            if send_len == 0 {
+                // Out of peer credit; buffer the remainder so it flushes
+                // when the guest updates credit.
+                conn.tx_buf.extend_from_slice(&data[offset..]);
+                return;
+            }
+
+            let buf_alloc = conn.buf_alloc;
+            let fwd_cnt = conn.fwd_cnt;
+
+            let hdr = VsockHeader {
+                src_cid: HOST_CID,
+                dst_cid: self.guest_cid,
+                src_port: host_port,
+                dst_port: guest_port,
+                len: send_len as u32,
+                r#type: 1,
+                op: VsockOp::Rw as u16,
+                flags: 0,
+                buf_alloc,
+                fwd_cnt,
+            };
+            self.rx_queue
+                .push((hdr, data[offset..offset + send_len].to_vec()));
+            offset += send_len;
+        }
     }
 
     /// Take all pending RX packets to inject into the guest.
