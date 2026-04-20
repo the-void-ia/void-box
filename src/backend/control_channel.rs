@@ -37,14 +37,25 @@ use crate::guest::protocol::{
 };
 use crate::{Error, Result};
 
-/// Per-attempt read timeout for the handshake Pong.
+/// Per-attempt read timeout for the handshake Pong on regular RPC paths.
 ///
-/// The vsock listener in the guest usually binds immediately, long before
-/// `guest-agent`'s dispatcher loop is ready to answer a Ping. A long per-read
-/// timeout here means the first attempt silently eats that slack as idle
-/// wait; shrinking it lets the retry loop probe aggressively and succeed as
-/// soon as the dispatcher is up.
-const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
+/// Applies to `exec`, `write_file`, `mkdir_p`, `telemetry_subscribe`, etc.
+/// 150 ms is the longest the fastest retry can take under heavy agent load
+/// (concurrent telemetry + multiple in-flight RPCs) without the userspace
+/// vsock worker churning on broken-pipe reconnects. Lower values (5 ms was
+/// tried) pass the startup bench but flood the agent workload with dropped
+/// connections.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Per-attempt read timeout for the one-shot warmup handshake fired from
+/// [`ControlChannel::warm_handshake`] after `MicroVm::from_snapshot`.
+///
+/// Aggressive 5 ms probes the guest-agent listener the moment it binds,
+/// converging in 0 retries on warm-path restores where the guest is already
+/// up. Safe only for the one-shot warmup because it fires on its own
+/// connection; the regular RPC paths (see `HANDSHAKE_READ_TIMEOUT`) run
+/// concurrently and need more headroom.
+const WARM_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;
@@ -144,7 +155,7 @@ impl ControlChannel {
                 &connector,
                 &session_secret,
                 &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
+                WARM_HANDSHAKE_READ_TIMEOUT,
                 "warm-handshake",
             );
         })
@@ -731,12 +742,14 @@ pub(crate) fn connect_with_handshake_sync(
             continue;
         }
 
-        // Build Ping payload: [secret: 32 bytes][version: 4 bytes LE]
-        let mut ping_payload = session_secret.to_vec();
-        ping_payload.extend_from_slice(&crate::guest::protocol::PROTOCOL_VERSION.to_le_bytes());
+        // Build Ping payload via protocol helper — advertises this host's
+        // feature flags (currently: Lever 7 multiplex capability).
         let ping_msg = Message {
             msg_type: MessageType::Ping,
-            payload: ping_payload,
+            payload: void_box_protocol::build_ping_payload(
+                session_secret,
+                void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX,
+            ),
         };
         if s.write_all(&ping_msg.serialize()).is_err() {
             debug!(
@@ -749,20 +762,17 @@ pub(crate) fn connect_with_handshake_sync(
         }
         match Message::read_from_sync(&mut *s) {
             Ok(msg) if msg.msg_type == MessageType::Pong => {
-                // Parse optional protocol version from Pong payload.
-                let peer_version = if msg.payload.len() >= 4 {
-                    u32::from_le_bytes([
-                        msg.payload[0],
-                        msg.payload[1],
-                        msg.payload[2],
-                        msg.payload[3],
-                    ])
-                } else {
-                    0 // legacy guest, no version in Pong
-                };
+                let (peer_version, peer_flags) =
+                    void_box_protocol::parse_pong_payload(&msg.payload);
+                let peer_supports_multiplex =
+                    peer_flags & void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX != 0;
                 debug!(
-                    "control_channel[{context}]: handshake OK (peer_version={}, cold={}, attempts={}, elapsed={:?})",
+                    "control_channel[{context}]: handshake OK \
+                     (peer_version={}, peer_flags={:#x}, peer_multiplex={}, \
+                      cold={}, attempts={}, elapsed={:?})",
                     peer_version,
+                    peer_flags,
+                    peer_supports_multiplex,
                     first_attempt,
                     attempt,
                     t_start.elapsed(),

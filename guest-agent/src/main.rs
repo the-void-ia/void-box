@@ -2018,29 +2018,37 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 send_response(fd, MessageType::ExecResponse, &response)?;
             }
             MessageType::Ping => match SESSION_SECRET.get() {
-                Some(secret) if payload.len() >= 32 && payload[..32] == secret[..] => {
-                    AUTHENTICATED.with(|a| a.set(true));
-
-                    let peer_version = if payload.len() >= 36 {
-                        u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
-                    } else {
-                        0
+                Some(expected_secret) => {
+                    let Some((peer_secret, peer_version, peer_flags)) =
+                        void_box_protocol::parse_ping_payload(&payload)
+                    else {
+                        eprintln!("Authentication failed: Ping payload shorter than 32 bytes");
+                        return Err("Authentication failed: malformed Ping payload".into());
                     };
 
-                    let version_bytes = void_box_protocol::PROTOCOL_VERSION.to_le_bytes();
-                    send_raw_message(fd, MessageType::Pong, &version_bytes)?;
+                    if peer_secret != &expected_secret[..] {
+                        eprintln!("Authentication failed: invalid secret");
+                        return Err("Authentication failed: invalid session secret".into());
+                    }
+
+                    AUTHENTICATED.with(|a| a.set(true));
+
+                    let peer_supports_multiplex =
+                        peer_flags & void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX != 0;
+
+                    let pong_payload = void_box_protocol::build_pong_payload(
+                        void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX,
+                    );
+                    send_raw_message(fd, MessageType::Pong, &pong_payload)?;
 
                     kmsg(&format!(
-                        "Authenticated (peer_version={}, our_version={})",
+                        "Authenticated (peer_version={}, our_version={}, peer_supports_multiplex={})",
                         peer_version,
-                        void_box_protocol::PROTOCOL_VERSION
+                        void_box_protocol::PROTOCOL_VERSION,
+                        peer_supports_multiplex
                     ));
 
                     trigger_oci_rootfs_setup_async();
-                }
-                Some(_) => {
-                    eprintln!("Authentication failed: invalid secret");
-                    return Err("Authentication failed: invalid session secret".into());
                 }
                 None => {
                     eprintln!("Authentication failed: no secret configured");
