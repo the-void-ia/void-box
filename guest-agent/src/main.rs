@@ -613,6 +613,18 @@ fn init_system() {
 /// Modules are expected in /lib/modules/ as .ko.xz files.
 /// Uses the finit_module(2) syscall which handles compressed modules.
 fn load_kernel_modules() {
+    // Fast path: if `/lib/modules` is missing or empty, the kernel built every
+    // driver we need in-tree (=y). Walking 15 fallback paths + stat'ing
+    // /sys/module/<name> for each one costs nothing interesting, but it's
+    // visible in boot traces and unnecessary noise on slim-kernel guests.
+    let has_modules = std::fs::read_dir("/lib/modules")
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false);
+    if !has_modules {
+        kmsg("Modules loaded (all built-in, no /lib/modules entries)");
+        return;
+    }
+
     let virtio_mmio_params = virtio_mmio_params_from_cmdline();
 
     // Load order matters: dependencies must be loaded first.

@@ -1,6 +1,9 @@
 //! x86_64 KVM setup: irqchip, PIT, clock, memory layout.
 
-use kvm_bindings::{kvm_irqchip, kvm_pit_config, KVM_PIT_SPEAKER_DUMMY};
+use kvm_bindings::{
+    kvm_enable_cap, kvm_irqchip, kvm_pit_config, KVM_CAP_X86_DISABLE_EXITS, KVM_PIT_SPEAKER_DUMMY,
+    KVM_X86_DISABLE_EXITS_HLT, KVM_X86_DISABLE_EXITS_PAUSE,
+};
 use kvm_ioctls::VmFd;
 use tracing::debug;
 
@@ -56,7 +59,12 @@ pub static MEMORY_LAYOUT: MemoryLayout = MemoryLayout {
     mmio_gap_end: Some(layout::MMIO_GAP_END),
 };
 
-/// Create the in-kernel irqchip (PIC + IOAPIC) and PIT.
+/// Creates the in-kernel irqchip, PIT, and requests in-kernel HLT/PAUSE handling.
+///
+/// Enables [`KVM_CAP_X86_DISABLE_EXITS`] with [`KVM_X86_DISABLE_EXITS_HLT`] and
+/// [`KVM_X86_DISABLE_EXITS_PAUSE`] so the guest's `HLT` and `PAUSE` instructions
+/// do not force a vCPU exit to userspace. Cap-not-supported failures are logged
+/// and ignored — the VM still boots, just without the optimisation.
 pub fn setup_vm(vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
     vm_fd.create_irq_chip().map_err(Error::Kvm)?;
     debug!("Created IRQ chip");
@@ -67,6 +75,16 @@ pub fn setup_vm(vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
     };
     vm_fd.create_pit2(pit_config).map_err(Error::Kvm)?;
     debug!("Created PIT");
+
+    let mut disable_exits = kvm_enable_cap {
+        cap: KVM_CAP_X86_DISABLE_EXITS,
+        ..Default::default()
+    };
+    disable_exits.args[0] = u64::from(KVM_X86_DISABLE_EXITS_HLT | KVM_X86_DISABLE_EXITS_PAUSE);
+    match vm_fd.enable_cap(&disable_exits) {
+        Ok(()) => debug!("Enabled KVM_CAP_X86_DISABLE_EXITS (HLT | PAUSE)"),
+        Err(e) => debug!("KVM_CAP_X86_DISABLE_EXITS unavailable: {e}"),
+    }
 
     Ok(())
 }
