@@ -18,6 +18,7 @@
 //! Run with: `cargo bench --bench startup`
 
 use divan::Bencher;
+#[cfg(target_os = "linux")]
 use void_box::VoidBoxConfig;
 use void_box_protocol::{ExecRequest, Message, MessageType, PROTOCOL_VERSION};
 
@@ -117,9 +118,12 @@ fn exec_request_from_json(bencher: Bencher) {
 // VM boot-time host-side compute
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 #[divan::bench]
 fn voidbox_config_kernel_cmdline(bencher: Bencher) {
     // Matches what the startup harness builds: minimal-but-real config.
+    // Linux-only: VoidBoxConfig lives in the KVM backend which is not
+    // compiled on macOS (where VZ is used instead).
     let config = VoidBoxConfig::new()
         .memory_mb(1024)
         .vcpus(1)
