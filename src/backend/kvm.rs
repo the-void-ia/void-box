@@ -172,10 +172,12 @@ impl VmmBackend for KvmBackend {
                 let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
-            self.control_channel = Some(Arc::new(ControlChannel::new_restored(
-                connector,
-                session_secret,
-            )));
+            let channel = Arc::new(ControlChannel::new_restored(connector, session_secret));
+            let channel_for_warmup = Arc::clone(&channel);
+            tokio::spawn(async move {
+                channel_for_warmup.warm_handshake().await;
+            });
+            self.control_channel = Some(channel);
             if let Some(serial_output) = vm.take_serial_output() {
                 self.guest_console_task = Some(spawn_guest_console_task(
                     serial_output,
@@ -477,10 +479,12 @@ impl VmmBackend for KvmBackend {
             let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
-        self.control_channel = Some(Arc::new(ControlChannel::new_restored(
-            connector,
-            session_secret,
-        )));
+        let channel = Arc::new(ControlChannel::new_restored(connector, session_secret));
+        let channel_for_warmup = Arc::clone(&channel);
+        tokio::spawn(async move {
+            channel_for_warmup.warm_handshake().await;
+        });
+        self.control_channel = Some(channel);
         self.cid = restored_vm.cid();
         self.memory_mb = snap.config.memory_mb;
         self.vcpus = snap.config.vcpus;
