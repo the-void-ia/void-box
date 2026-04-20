@@ -121,6 +121,36 @@ impl ControlChannel {
         }
     }
 
+    /// Drives one best-effort Ping/Pong round trip to warm the guest-agent.
+    ///
+    /// After [`MicroVm::from_snapshot`] the guest kernel is in HLT/NOHZ-idle
+    /// and the guest-agent's accept loop is not scheduled. Spawning this
+    /// alongside the vCPU threads forces the first vsock accept, Ping read,
+    /// and Pong write to happen in parallel with the caller's own work, so
+    /// the first real `exec()` finds the retry loop already converged
+    /// (0 retries instead of the 2 × 150 ms seen in profiles).
+    ///
+    /// Failures are swallowed — the channel still works on its own retry
+    /// loop if the warmup races with shutdown.
+    ///
+    /// [`MicroVm::from_snapshot`]: crate::vmm::MicroVm::from_snapshot
+    pub async fn warm_handshake(&self) {
+        let connector = Arc::clone(&self.connector);
+        let session_secret = self.session_secret;
+        let boot_wait_done = Arc::clone(&self.boot_wait_done);
+
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = connect_with_handshake_sync(
+                &connector,
+                &session_secret,
+                &boot_wait_done,
+                HANDSHAKE_READ_TIMEOUT,
+                "warm-handshake",
+            );
+        })
+        .await;
+    }
+
     /// Send an exec request and wait for the response.
     ///
     /// Performs a connect+handshake, sends the request, then reads messages
