@@ -85,13 +85,106 @@ pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 ///
 /// The version is exchanged during the Ping/Pong handshake:
 ///
-/// - **Ping payload**: `[secret: 32 bytes][version: 4 bytes LE]` (36 bytes total)
-/// - **Pong payload**: `[version: 4 bytes LE]` (4 bytes)
+/// - **Ping payload** (v2): `[secret: 32 B][version: 4 B LE][flags: 1 B]` (37 B)
+/// - **Pong payload** (v2): `[version: 4 B LE][flags: 1 B]` (5 B)
 ///
-/// Backward compatibility: old hosts that send a 32-byte Ping (no version)
-/// are treated as version 0. New hosts check `payload.len() >= 36` to detect
-/// the version extension.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Backward compatibility is forward-compatible in both directions because
+/// every extension only appends bytes — old parsers read the prefix they
+/// know about, new parsers check `payload.len()` before reading the
+/// extension:
+///
+/// - v0 hosts sent a 32-byte Ping (no version). Parsers treat `len < 36`
+///   as version 0.
+/// - v1 hosts/guests sent the 4-byte version but no flags. Parsers treat
+///   `len < 37` (Ping) or `len < 5` (Pong) as flags=0.
+/// - v2 adds a flags byte (see [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]).
+///
+/// Use [`build_ping_payload`], [`parse_ping_payload`],
+/// [`build_pong_payload`], and [`parse_pong_payload`] instead of hand-
+/// rolling byte offsets.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Peer supports one long-lived multiplexed control channel per sandbox
+/// (see `docs/superpowers/plans/2026-04-20-startup-milestones-b-c-d.md`
+/// Lever 7). Advertised via `flags` byte in both Ping and Pong. Both
+/// sides must set the bit before the host may use the multiplex path.
+///
+/// Peers that only set version=2 without this flag are treated as
+/// supporting the v2 frame but not multiplex — they still get the
+/// per-RPC reconnect path.
+pub const PROTO_FLAG_SUPPORTS_MULTIPLEX: u8 = 0b0000_0001;
+
+/// Builds a Ping payload with the session secret, protocol version, and
+/// the caller's feature flags.
+///
+/// # Examples
+///
+/// ```
+/// use void_box_protocol::{build_ping_payload, PROTO_FLAG_SUPPORTS_MULTIPLEX};
+///
+/// let secret = [0xABu8; 32];
+/// let payload = build_ping_payload(&secret, PROTO_FLAG_SUPPORTS_MULTIPLEX);
+/// assert_eq!(payload.len(), 37);
+/// ```
+pub fn build_ping_payload(secret: &[u8; 32], flags: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 4 + 1);
+    buf.extend_from_slice(secret);
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    buf.push(flags);
+    buf
+}
+
+/// Parses a Ping payload, returning the session secret, peer's protocol
+/// version, and peer's feature flags.
+///
+/// Returns `None` if the payload is shorter than 32 bytes (no secret).
+/// Older peers may omit the version (returns 0) or flags (returns 0).
+pub fn parse_ping_payload(payload: &[u8]) -> Option<(&[u8; 32], u32, u8)> {
+    if payload.len() < 32 {
+        return None;
+    }
+    let secret: &[u8; 32] = payload[..32].try_into().ok()?;
+    let version = if payload.len() >= 36 {
+        u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
+    } else {
+        0
+    };
+    let flags = if payload.len() >= 37 { payload[36] } else { 0 };
+    Some((secret, version, flags))
+}
+
+/// Builds a Pong payload with the protocol version and the caller's
+/// feature flags.
+///
+/// # Examples
+///
+/// ```
+/// use void_box_protocol::{build_pong_payload, PROTO_FLAG_SUPPORTS_MULTIPLEX};
+///
+/// let payload = build_pong_payload(PROTO_FLAG_SUPPORTS_MULTIPLEX);
+/// assert_eq!(payload.len(), 5);
+/// ```
+pub fn build_pong_payload(flags: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + 1);
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    buf.push(flags);
+    buf
+}
+
+/// Parses a Pong payload, returning the peer's protocol version and
+/// feature flags.
+///
+/// Older peers may send only the 4-byte version (returns flags=0) or
+/// nothing at all (returns version=0, flags=0).
+pub fn parse_pong_payload(payload: &[u8]) -> (u32, u8) {
+    let version = if payload.len() >= 4 {
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+    } else {
+        0
+    };
+    let flags = if payload.len() >= 5 { payload[4] } else { 0 };
+    (version, flags)
+}
 
 // ---------------------------------------------------------------------------
 // MessageType
@@ -980,6 +1073,92 @@ mod tests {
             MessageType::try_from(21u8).unwrap(),
             MessageType::FileStatResponse
         );
+    }
+
+    #[test]
+    fn build_ping_payload_layout() {
+        let secret = [0xABu8; 32];
+        let payload = build_ping_payload(&secret, PROTO_FLAG_SUPPORTS_MULTIPLEX);
+        assert_eq!(payload.len(), 37);
+        assert_eq!(&payload[..32], &secret[..]);
+        assert_eq!(
+            u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]]),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(payload[36], PROTO_FLAG_SUPPORTS_MULTIPLEX);
+    }
+
+    #[test]
+    fn parse_ping_payload_v2_round_trip() {
+        let secret = [0xCDu8; 32];
+        let payload = build_ping_payload(&secret, PROTO_FLAG_SUPPORTS_MULTIPLEX);
+        let (parsed_secret, version, flags) = parse_ping_payload(&payload).unwrap();
+        assert_eq!(parsed_secret, &secret);
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(flags, PROTO_FLAG_SUPPORTS_MULTIPLEX);
+    }
+
+    #[test]
+    fn parse_ping_payload_v1_flags_default_zero() {
+        // v1 peer: 32-byte secret + 4-byte version, no flags byte
+        let secret = [0xEFu8; 32];
+        let mut payload = secret.to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        let (parsed_secret, version, flags) = parse_ping_payload(&payload).unwrap();
+        assert_eq!(parsed_secret, &secret);
+        assert_eq!(version, 1);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_ping_payload_v0_version_default_zero() {
+        // v0 peer: 32-byte secret only
+        let secret = [0x11u8; 32];
+        let (parsed_secret, version, flags) = parse_ping_payload(&secret).unwrap();
+        assert_eq!(parsed_secret, &secret);
+        assert_eq!(version, 0);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_ping_payload_too_short_returns_none() {
+        assert!(parse_ping_payload(&[0u8; 31]).is_none());
+        assert!(parse_ping_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn build_pong_payload_layout() {
+        let payload = build_pong_payload(PROTO_FLAG_SUPPORTS_MULTIPLEX);
+        assert_eq!(payload.len(), 5);
+        assert_eq!(
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(payload[4], PROTO_FLAG_SUPPORTS_MULTIPLEX);
+    }
+
+    #[test]
+    fn parse_pong_payload_v2_round_trip() {
+        let payload = build_pong_payload(PROTO_FLAG_SUPPORTS_MULTIPLEX);
+        let (version, flags) = parse_pong_payload(&payload);
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(flags, PROTO_FLAG_SUPPORTS_MULTIPLEX);
+    }
+
+    #[test]
+    fn parse_pong_payload_v1_flags_default_zero() {
+        // v1 peer: 4-byte version only
+        let payload = 1u32.to_le_bytes().to_vec();
+        let (version, flags) = parse_pong_payload(&payload);
+        assert_eq!(version, 1);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_pong_payload_v0_defaults_zero() {
+        let (version, flags) = parse_pong_payload(&[]);
+        assert_eq!(version, 0);
+        assert_eq!(flags, 0);
     }
 
     #[test]
