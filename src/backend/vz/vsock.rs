@@ -96,4 +96,12 @@ impl GuestStream for VzSocketStream {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
+
+    fn try_clone_box(&self) -> io::Result<Box<dyn GuestStream>> {
+        let dup_fd = unsafe { libc::dup(self.fd) };
+        if dup_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Box::new(VzSocketStream::from_fd(dup_fd)))
+    }
 }

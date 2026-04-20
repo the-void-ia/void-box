@@ -2009,18 +2009,34 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
             continue;
         };
 
+        // Ping is the pre-multiplex handshake: its payload is the session
+        // secret + version + flags with no request_id prefix. Everything
+        // else speaks the multiplex frame: payload = [request_id:4 LE][body].
+        let (request_id, body) = if message_type == MessageType::Ping {
+            (0u32, payload.as_slice())
+        } else if payload.len() < 4 {
+            return Err(format!(
+                "multiplex payload too short for {:?}: {} bytes",
+                message_type,
+                payload.len()
+            ));
+        } else {
+            let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            (id, &payload[4..])
+        };
+
         match message_type {
             MessageType::ExecRequest => {
-                let request: ExecRequest = serde_json::from_slice(&payload)
+                let request: ExecRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse request: {}", e))?;
 
-                let response = execute_command(fd, &request);
-                send_response(fd, MessageType::ExecResponse, &response)?;
+                let response = execute_command(fd, request_id, &request);
+                send_mux_response(fd, MessageType::ExecResponse, request_id, &response)?;
             }
             MessageType::Ping => match SESSION_SECRET.get() {
                 Some(expected_secret) => {
                     let Some((peer_secret, peer_version, peer_flags)) =
-                        void_box_protocol::parse_ping_payload(&payload)
+                        void_box_protocol::parse_ping_payload(body)
                     else {
                         eprintln!("Authentication failed: Ping payload shorter than 32 bytes");
                         return Err("Authentication failed: malformed Ping payload".into());
@@ -2035,6 +2051,15 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
 
                     let peer_supports_multiplex =
                         peer_flags & void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX != 0;
+                    if !peer_supports_multiplex {
+                        eprintln!(
+                            "Authentication failed: peer does not advertise multiplex \
+                             (peer_version={peer_version}, peer_flags={peer_flags:#x})"
+                        );
+                        return Err(
+                            "Authentication failed: peer does not support multiplex framing".into(),
+                        );
+                    }
 
                     let pong_payload = void_box_protocol::build_pong_payload(
                         void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX,
@@ -2063,49 +2088,49 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 return Ok(());
             }
             MessageType::SubscribeTelemetry => {
-                let opts: TelemetrySubscribeRequest = if payload.is_empty() {
+                let opts: TelemetrySubscribeRequest = if body.is_empty() {
                     TelemetrySubscribeRequest::default()
                 } else {
-                    serde_json::from_slice(&payload).unwrap_or_default()
+                    serde_json::from_slice(body).unwrap_or_default()
                 };
                 kmsg(&format!(
                     "Telemetry subscription started (interval={}ms, kernel_threads={})",
                     opts.interval_ms, opts.include_kernel_threads
                 ));
-                telemetry_stream_loop(fd, &opts);
+                telemetry_stream_loop(fd, request_id, &opts);
                 return Ok(());
             }
             MessageType::WriteFile => {
-                let request: WriteFileRequest = serde_json::from_slice(&payload)
+                let request: WriteFileRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse WriteFileRequest: {}", e))?;
                 let response = handle_write_file(&request);
-                send_response(fd, MessageType::WriteFileResponse, &response)?;
+                send_mux_response(fd, MessageType::WriteFileResponse, request_id, &response)?;
             }
             MessageType::MkdirP => {
-                let request: MkdirPRequest = serde_json::from_slice(&payload)
+                let request: MkdirPRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse MkdirPRequest: {}", e))?;
                 let response = handle_mkdir_p(&request);
-                send_response(fd, MessageType::MkdirPResponse, &response)?;
+                send_mux_response(fd, MessageType::MkdirPResponse, request_id, &response)?;
             }
             MessageType::ReadFile => {
-                let request: ReadFileRequest = serde_json::from_slice(&payload)
+                let request: ReadFileRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse ReadFileRequest: {}", e))?;
                 let response = handle_read_file(&request);
-                send_response(fd, MessageType::ReadFileResponse, &response)?;
+                send_mux_response(fd, MessageType::ReadFileResponse, request_id, &response)?;
             }
             MessageType::FileStat => {
-                let request: FileStatRequest = serde_json::from_slice(&payload)
+                let request: FileStatRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse FileStatRequest: {}", e))?;
                 let response = handle_file_stat(&request);
-                send_response(fd, MessageType::FileStatResponse, &response)?;
+                send_mux_response(fd, MessageType::FileStatResponse, request_id, &response)?;
             }
             MessageType::SnapshotReady => {
-                send_raw_message(fd, MessageType::SnapshotReady, &[])?;
+                send_mux_raw(fd, MessageType::SnapshotReady, request_id, &[])?;
             }
             MessageType::PtyOpen => {
-                let request: PtyOpenRequest = serde_json::from_slice(&payload)
+                let request: PtyOpenRequest = serde_json::from_slice(body)
                     .map_err(|e| format!("Failed to parse PtyOpenRequest: {}", e))?;
-                pty::handle_pty_open(fd, &request, is_command_allowed)?;
+                pty::handle_pty_open(fd, request_id, &request, is_command_allowed)?;
                 return Ok(());
             }
             MessageType::PtyData | MessageType::PtyResize | MessageType::PtyClose => {
@@ -2149,7 +2174,10 @@ pub(crate) fn is_command_allowed(program: &str) -> bool {
 
 /// Execute a command, streaming stdout/stderr chunks via ExecOutputChunk
 /// messages, then return the final ExecResponse with full accumulated output.
-fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
+///
+/// Every outgoing frame for this exec carries `request_id` so the host
+/// demultiplexer can route chunks back to the caller's stream receiver.
+fn execute_command(fd: RawFd, request_id: u32, request: &ExecRequest) -> ExecResponse {
     let start = std::time::Instant::now();
     {
         let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
@@ -2415,11 +2443,11 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
 
     let fd_for_stdout = fd_mutex.clone();
     let stdout_handle =
-        std::thread::spawn(move || stream_pipe(fd_for_stdout, stdout_pipe, "stdout"));
+        std::thread::spawn(move || stream_pipe(fd_for_stdout, request_id, stdout_pipe, "stdout"));
 
     let fd_for_stderr = fd_mutex.clone();
     let stderr_handle =
-        std::thread::spawn(move || stream_pipe(fd_for_stderr, stderr_pipe, "stderr"));
+        std::thread::spawn(move || stream_pipe(fd_for_stderr, request_id, stderr_pipe, "stderr"));
 
     // Wait for process to exit
     let exit_code = match child.wait() {
@@ -2490,9 +2518,17 @@ fn execute_command(fd: RawFd, request: &ExecRequest) -> ExecResponse {
     }
 }
 
-/// Read from a pipe and send ExecOutputChunk messages as data arrives.
-/// Returns the full accumulated output for the final ExecResponse.
-fn stream_pipe(fd: Arc<Mutex<RawFd>>, pipe: Option<impl Read>, stream_name: &str) -> Vec<u8> {
+/// Reads from a pipe and sends ExecOutputChunk messages as data arrives.
+///
+/// Returns the full accumulated output for the final ExecResponse so the
+/// host still gets a complete stdout/stderr summary even if a streaming
+/// send transiently fails.
+fn stream_pipe(
+    fd: Arc<Mutex<RawFd>>,
+    request_id: u32,
+    pipe: Option<impl Read>,
+    stream_name: &str,
+) -> Vec<u8> {
     let mut accumulated = Vec::new();
     let mut seq = 0u64;
     let mut buf = [0u8; 4096];
@@ -2508,10 +2544,13 @@ fn stream_pipe(fd: Arc<Mutex<RawFd>>, pipe: Option<impl Read>, stream_name: &str
                         data: buf[..n].to_vec(),
                         seq,
                     };
-                    // Best-effort: if send fails, we still accumulate for the
-                    // final ExecResponse so backward compat is preserved.
                     if let Ok(locked_fd) = fd.lock() {
-                        let _ = send_response(*locked_fd, MessageType::ExecOutputChunk, &chunk);
+                        let _ = send_mux_response(
+                            *locked_fd,
+                            MessageType::ExecOutputChunk,
+                            request_id,
+                            &chunk,
+                        );
                     }
                     seq += 1;
                 }
@@ -2541,20 +2580,38 @@ fn read_exact(fd: RawFd, buf: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Send a response message
-fn send_response<T: Serialize>(
+/// Sends a JSON-serialized response framed with a multiplex request_id prefix.
+///
+/// All post-handshake guest→host messages include the `request_id` the
+/// host allocated for the corresponding request, so the host-side
+/// demultiplexer can route the frame back to its caller.
+fn send_mux_response<T: Serialize>(
     fd: RawFd,
     msg_type: MessageType,
+    request_id: u32,
     payload: &T,
 ) -> Result<(), String> {
     let payload_bytes =
         serde_json::to_vec(payload).map_err(|e| format!("Failed to serialize response: {}", e))?;
+    send_mux_raw(fd, msg_type, request_id, &payload_bytes)
+}
 
-    let length = payload_bytes.len() as u32;
-    let mut msg = Vec::with_capacity(5 + payload_bytes.len());
-    msg.extend_from_slice(&length.to_le_bytes());
+/// Sends a raw-payload response framed with a multiplex request_id prefix.
+///
+/// Prepends the little-endian request_id to the payload bytes so the
+/// host-side demultiplexer can match the response to its pending slot.
+fn send_mux_raw(
+    fd: RawFd,
+    msg_type: MessageType,
+    request_id: u32,
+    body: &[u8],
+) -> Result<(), String> {
+    let payload_len = (4 + body.len()) as u32;
+    let mut msg = Vec::with_capacity(5 + 4 + body.len());
+    msg.extend_from_slice(&payload_len.to_le_bytes());
     msg.push(msg_type as u8);
-    msg.extend_from_slice(&payload_bytes);
+    msg.extend_from_slice(&request_id.to_le_bytes());
+    msg.extend_from_slice(body);
 
     let mut total_written = 0;
     while total_written < msg.len() {
@@ -2570,7 +2627,6 @@ fn send_response<T: Serialize>(
         }
         total_written += n as usize;
     }
-
     Ok(())
 }
 
@@ -2767,8 +2823,11 @@ fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
 // Telemetry: procfs parsing and streaming
 // ---------------------------------------------------------------------------
 
-/// Stream telemetry data to the host until the connection drops.
-fn telemetry_stream_loop(fd: RawFd, opts: &TelemetrySubscribeRequest) {
+/// Streams telemetry data to the host until the connection drops.
+///
+/// All outgoing `TelemetryData` frames carry `request_id` so the host
+/// demultiplexer routes them back to the subscriber's stream receiver.
+fn telemetry_stream_loop(fd: RawFd, request_id: u32, opts: &TelemetrySubscribeRequest) {
     let interval = std::time::Duration::from_millis(opts.interval_ms.max(100)); // floor at 100ms
     let mut seq: u64 = 0;
     let mut prev_cpu = read_cpu_jiffies();
@@ -2802,7 +2861,7 @@ fn telemetry_stream_loop(fd: RawFd, opts: &TelemetrySubscribeRequest) {
             trace_context: None,
         };
 
-        if send_response(fd, MessageType::TelemetryData, &batch).is_err() {
+        if send_mux_response(fd, MessageType::TelemetryData, request_id, &batch).is_err() {
             kmsg("Telemetry subscription ended (write error)");
             return;
         }

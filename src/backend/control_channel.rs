@@ -23,13 +23,13 @@
 use std::io::{self, Read, Write};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-use void_box_protocol::ProtocolError;
-
+use crate::backend::multiplex::{FrameSender, MultiplexChannel, Terminator};
 use crate::guest::protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, Message,
     MessageType, MkdirPRequest, MkdirPResponse, PtyOpenRequest, ReadFileRequest, ReadFileResponse,
@@ -37,25 +37,18 @@ use crate::guest::protocol::{
 };
 use crate::{Error, Result};
 
-/// Per-attempt read timeout for the handshake Pong on regular RPC paths.
+/// Per-attempt read timeout for the handshake Pong.
 ///
-/// Applies to `exec`, `write_file`, `mkdir_p`, `telemetry_subscribe`, etc.
-/// 150 ms is the longest the fastest retry can take under heavy agent load
-/// (concurrent telemetry + multiple in-flight RPCs) without the userspace
-/// vsock worker churning on broken-pipe reconnects. Lower values (5 ms was
-/// tried) pass the startup bench but flood the agent workload with dropped
-/// connections.
-const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
-
-/// Per-attempt read timeout for the one-shot warmup handshake fired from
-/// [`ControlChannel::warm_handshake`] after `MicroVm::from_snapshot`.
-///
-/// Aggressive 5 ms probes the guest-agent listener the moment it binds,
-/// converging in 0 retries on warm-path restores where the guest is already
-/// up. Safe only for the one-shot warmup because it fires on its own
-/// connection; the regular RPC paths (see `HANDSHAKE_READ_TIMEOUT`) run
-/// concurrently and need more headroom.
-const WARM_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
+/// Applies to the single handshake performed when the persistent
+/// multiplex channel is first established (or reconstructed after
+/// death). Because every RPC after that point rides on the same
+/// established channel — no per-RPC reconnect — the old tradeoff
+/// between aggressive 5 ms probes (startup bench win) and relaxed
+/// 150 ms probes (agent-workload correctness) collapses. 5 ms lets
+/// the warm path converge in zero retries when the guest-agent is
+/// already up and still gives the cold path room to retry if it
+/// isn't.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;
@@ -86,11 +79,23 @@ fn resolve_exec_read_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
 /// Both AF_VSOCK sockets (Linux) and VZ socket connections (macOS) expose
 /// raw file descriptors, so this trait is trivially implementable on both.
 pub trait GuestStream: Read + Write + Send {
-    /// Set the read timeout. `None` means blocking (no timeout).
+    /// Sets the read timeout. `None` means blocking (no timeout).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 
     /// Returns the underlying file descriptor for this stream.
     fn as_raw_fd(&self) -> RawFd;
+
+    /// Duplicates the underlying file descriptor and returns a new boxed stream.
+    ///
+    /// The returned stream shares the same underlying socket so read/write
+    /// from either half operate on the same guest connection. This lets the
+    /// multiplex channel put the reader on a dedicated thread while the
+    /// writer is shared across async RPC callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if the `dup(2)` syscall fails.
+    fn try_clone_box(&self) -> io::Result<Box<dyn GuestStream>>;
 }
 
 /// A function that creates a new connection to the guest agent.
@@ -104,6 +109,19 @@ pub type GuestConnector = Arc<dyn Fn() -> Result<Box<dyn GuestStream>> + Send + 
 /// Encapsulates the Ping/Pong handshake, exec requests, file writes,
 /// and telemetry subscriptions. The actual transport is provided by
 /// the `connector` closure.
+///
+/// As of Lever 7b, all RPCs (exec, write_file, mkdir_p, file_stat,
+/// read_file, telemetry, snapshot_ready) route through a single
+/// persistent [`MultiplexChannel`] that is lazily established on first
+/// use. The legacy per-RPC reconnect path has been dropped: guests must
+/// advertise [`PROTO_FLAG_SUPPORTS_MULTIPLEX`] during handshake or the
+/// channel establishment fails.
+///
+/// PTY sessions still open their own dedicated connection (one connection
+/// per interactive shell) but that connection's framing is identical —
+/// every message carries an in-payload request_id.
+///
+/// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]: void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX
 pub struct ControlChannel {
     /// Factory for creating new guest connections.
     connector: GuestConnector,
@@ -111,91 +129,131 @@ pub struct ControlChannel {
     session_secret: [u8; 32],
     /// Whether the initial boot wait has been applied.
     boot_wait_done: Arc<AtomicBool>,
+    /// Lazily-established multiplex channel. Re-established on death.
+    channel: Arc<AsyncMutex<Option<MultiplexChannel>>>,
 }
 
 impl ControlChannel {
-    /// Create a new control channel with the given connector and session secret.
+    /// Creates a new control channel with the given connector and session secret.
     pub fn new(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
         Self {
             connector,
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(false)),
+            channel: Arc::new(AsyncMutex::new(None)),
         }
     }
 
-    /// Create a control channel for a restored VM (skip the boot wait).
+    /// Creates a control channel for a restored VM (skips the boot wait).
     pub fn new_restored(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
         Self {
             connector,
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(true)),
+            channel: Arc::new(AsyncMutex::new(None)),
         }
     }
 
-    /// Drives one best-effort Ping/Pong round trip to warm the guest-agent.
+    /// Sends a one-shot RPC through the multiplex channel and awaits a
+    /// single response, bounded by `timeout`.
     ///
-    /// After [`MicroVm::from_snapshot`] the guest kernel is in HLT/NOHZ-idle
-    /// and the guest-agent's accept loop is not scheduled. Spawning this
-    /// alongside the vCPU threads forces the first vsock accept, Ping read,
-    /// and Pong write to happen in parallel with the caller's own work, so
-    /// the first real `exec()` finds the retry loop already converged
-    /// (0 retries instead of the 2 × 150 ms seen in profiles).
+    /// # Errors
     ///
-    /// Failures are swallowed — the channel still works on its own retry
-    /// loop if the warmup races with shutdown.
+    /// Returns [`Error::Guest`] if the channel cannot be established, if
+    /// the call fails, or if `timeout` elapses before a response arrives.
+    async fn multiplex_call(
+        &self,
+        msg_type: MessageType,
+        body: Vec<u8>,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Result<Message> {
+        let channel = self.get_or_establish_channel().await?;
+        let call = channel.call(msg_type, body);
+        match tokio::time::timeout(timeout, call).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Guest(format!(
+                "multiplex {context} timed out after {timeout:?}"
+            ))),
+        }
+    }
+
+    /// Returns the lazily-established [`MultiplexChannel`], constructing
+    /// or reconstructing it if the current one is absent or dead.
     ///
-    /// [`MicroVm::from_snapshot`]: crate::vmm::MicroVm::from_snapshot
-    pub async fn warm_handshake(&self) {
+    /// # Errors
+    ///
+    /// Returns [`Error::Guest`] if the underlying connect + handshake
+    /// fails, or if the peer does not advertise
+    /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`].
+    ///
+    /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]: void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX
+    async fn get_or_establish_channel(&self) -> Result<MultiplexChannel> {
+        let mut guard = self.channel.lock().await;
+
+        if let Some(channel) = guard.as_ref() {
+            if !channel.is_dead() {
+                return Ok(channel.clone());
+            }
+            debug!("control_channel: multiplex channel dead, reconstructing");
+            *guard = None;
+        }
+
         let connector = Arc::clone(&self.connector);
         let session_secret = self.session_secret;
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
 
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                WARM_HANDSHAKE_READ_TIMEOUT,
-                "warm-handshake",
-            );
-        })
-        .await;
-    }
-
-    /// Send an exec request and wait for the response.
-    ///
-    /// Performs a connect+handshake, sends the request, then reads messages
-    /// in a loop (discarding streaming chunks) until the final ExecResponse.
-    pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let timeout = resolve_exec_read_timeout(request.timeout_secs);
-        let msg_bytes = Message {
-            msg_type: MessageType::ExecRequest,
-            payload: serde_json::to_vec(request)?,
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
+        let channel = tokio::task::spawn_blocking(move || {
+            establish_multiplex_channel(
                 &connector,
                 &session_secret,
                 &boot_wait_done,
                 HANDSHAKE_READ_TIMEOUT,
-                "exec",
-            )?;
+                "multiplex-establish",
+            )
+        })
+        .await
+        .map_err(|e| Error::Guest(format!("multiplex establish task panicked: {e}")))??;
 
-            let _ = stream.set_read_timeout(timeout);
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
+        *guard = Some(channel.clone());
+        Ok(channel)
+    }
 
-            debug!("control_channel: sent ExecRequest, waiting for ExecResponse");
+    /// Eagerly establishes the persistent multiplex channel.
+    ///
+    /// After [`MicroVm::from_snapshot`] the guest kernel is in HLT/NOHZ-idle
+    /// and the guest-agent's accept loop is not yet scheduled. Running this
+    /// alongside the vCPU threads drives the vsock accept, Ping/Pong, and
+    /// reader-thread startup in parallel with the caller's work, so the
+    /// first real RPC finds the multiplex channel already live and its
+    /// retry loop already converged.
+    ///
+    /// Failures are swallowed; the first RPC will re-attempt establishment.
+    ///
+    /// [`MicroVm::from_snapshot`]: crate::vmm::MicroVm::from_snapshot
+    pub async fn warm_handshake(&self) {
+        let _ = self.get_or_establish_channel().await;
+    }
 
-            loop {
-                let msg = Message::read_from_sync(&mut *stream)?;
+    /// Sends an exec request and waits for the response.
+    ///
+    /// Routes through the persistent multiplex channel: allocates a fresh
+    /// request_id, submits the request, and drains output chunks until the
+    /// terminal `ExecResponse` frame arrives.
+    pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
+        let body = serde_json::to_vec(request)?;
+        let timeout = resolve_exec_read_timeout(request.timeout_secs);
+        let channel = self.get_or_establish_channel().await?;
+        let mut rx = channel
+            .call_stream(
+                MessageType::ExecRequest,
+                body,
+                Terminator::OnMessageType(MessageType::ExecResponse),
+            )
+            .await?;
+
+        let drain = async {
+            while let Some(msg) = rx.recv().await {
                 match msg.msg_type {
                     MessageType::ExecOutputChunk => continue,
                     MessageType::ExecResponse => {
@@ -214,52 +272,36 @@ impl ControlChannel {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("exec task panicked: {e}")))?
+            Err(Error::Guest(
+                "exec stream closed without ExecResponse".into(),
+            ))
+        };
+
+        apply_exec_timeout(timeout, drain).await
     }
 
-    /// Send an exec request and stream output chunks as they arrive.
+    /// Sends an exec request and streams output chunks as they arrive via callback.
     pub async fn send_exec_request_streaming<F>(
         &self,
         request: &ExecRequest,
-        on_chunk: F,
+        mut on_chunk: F,
     ) -> Result<ExecResponse>
     where
         F: FnMut(ExecOutputChunk) + Send + 'static,
     {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
+        let body = serde_json::to_vec(request)?;
         let timeout = resolve_exec_read_timeout(request.timeout_secs);
-        let msg_bytes = Message {
-            msg_type: MessageType::ExecRequest,
-            payload: serde_json::to_vec(request)?,
-        }
-        .serialize();
+        let channel = self.get_or_establish_channel().await?;
+        let mut rx = channel
+            .call_stream(
+                MessageType::ExecRequest,
+                body,
+                Terminator::OnMessageType(MessageType::ExecResponse),
+            )
+            .await?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut on_chunk = on_chunk;
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "exec-streaming",
-            )?;
-
-            let _ = stream.set_read_timeout(timeout);
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
-
-            debug!(
-                "control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse"
-            );
-
-            loop {
-                let msg = Message::read_from_sync(&mut *stream)?;
+        let drain = async {
+            while let Some(msg) = rx.recv().await {
                 match msg.msg_type {
                     MessageType::ExecOutputChunk => {
                         match serde_json::from_slice::<ExecOutputChunk>(&msg.payload) {
@@ -284,55 +326,38 @@ impl ControlChannel {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("streaming exec task panicked: {e}")))?
+            Err(Error::Guest(
+                "exec streaming channel closed without ExecResponse".into(),
+            ))
+        };
+
+        apply_exec_timeout(timeout, drain).await
     }
 
-    /// Async-friendly streaming exec: chunks are sent via the mpsc channel.
-    ///
-    /// Connects, sends the request, then reads output in a blocking task.
+    /// Sends an exec request and streams output chunks via an async mpsc sender.
     pub async fn send_exec_request_streaming_async(
         &self,
         request: &ExecRequest,
         chunk_tx: tokio::sync::mpsc::Sender<ExecOutputChunk>,
     ) -> Result<ExecResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
+        let body = serde_json::to_vec(request)?;
         let timeout = resolve_exec_read_timeout(request.timeout_secs);
-        let msg_bytes = Message {
-            msg_type: MessageType::ExecRequest,
-            payload: serde_json::to_vec(request)?,
-        }
-        .serialize();
+        let channel = self.get_or_establish_channel().await?;
+        let mut rx = channel
+            .call_stream(
+                MessageType::ExecRequest,
+                body,
+                Terminator::OnMessageType(MessageType::ExecResponse),
+            )
+            .await?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "exec-streaming",
-            )?;
-
-            let _ = stream.set_read_timeout(timeout);
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
-
-            debug!(
-                "control_channel: sent ExecRequest (streaming), waiting for chunks + ExecResponse"
-            );
-
-            loop {
-                let msg = Message::read_from_sync(&mut *stream)?;
+        let drain = async {
+            while let Some(msg) = rx.recv().await {
                 match msg.msg_type {
                     MessageType::ExecOutputChunk => {
                         match serde_json::from_slice::<ExecOutputChunk>(&msg.payload) {
                             Ok(chunk) => {
-                                let _ = chunk_tx.blocking_send(chunk);
+                                let _ = chunk_tx.send(chunk).await;
                             }
                             Err(e) => warn!(
                                 "Malformed ExecOutputChunk ({}B payload): {}",
@@ -354,301 +379,140 @@ impl ControlChannel {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("streaming task panicked: {e}")))?
+            Err(Error::Guest(
+                "exec streaming channel closed without ExecResponse".into(),
+            ))
+        };
+
+        apply_exec_timeout(timeout, drain).await
     }
 
-    /// Write a file to the guest filesystem using the native WriteFile protocol.
+    /// Writes a file to the guest filesystem using the native WriteFile protocol.
     pub async fn send_write_file(&self, path: &str, content: &[u8]) -> Result<WriteFileResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let msg_bytes = Message {
-            msg_type: MessageType::WriteFile,
-            payload: serde_json::to_vec(&WriteFileRequest {
-                path: path.to_string(),
-                content: content.to_vec(),
-                create_parents: true,
-            })?,
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "write-file",
-            )?;
-
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send WriteFile: {}", e)))?;
-
-            let response_msg = Message::read_from_sync(&mut *stream)?;
-            if response_msg.msg_type != MessageType::WriteFileResponse {
-                return Err(Error::Guest(format!(
-                    "Unexpected response type for WriteFile: {:?}",
-                    response_msg.msg_type
-                )));
-            }
-
-            let response: WriteFileResponse = serde_json::from_slice(&response_msg.payload)?;
-            Ok(response)
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("write_file task panicked: {e}")))?
+        let body = serde_json::to_vec(&WriteFileRequest {
+            path: path.to_string(),
+            content: content.to_vec(),
+            create_parents: true,
+        })?;
+        let msg = self
+            .multiplex_call(
+                MessageType::WriteFile,
+                body,
+                Duration::from_secs(30),
+                "WriteFile",
+            )
+            .await?;
+        ensure_response_type(&msg, MessageType::WriteFileResponse, "WriteFile")?;
+        Ok(serde_json::from_slice(&msg.payload)?)
     }
 
-    /// Create directories in the guest filesystem (mkdir -p).
+    /// Creates directories in the guest filesystem (mkdir -p).
     pub async fn send_mkdir_p(&self, path: &str) -> Result<MkdirPResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let msg_bytes = Message {
-            msg_type: MessageType::MkdirP,
-            payload: serde_json::to_vec(&MkdirPRequest {
-                path: path.to_string(),
-            })?,
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "mkdir-p",
-            )?;
-
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send MkdirP: {}", e)))?;
-
-            let response_msg = Message::read_from_sync(&mut *stream)?;
-            if response_msg.msg_type != MessageType::MkdirPResponse {
-                return Err(Error::Guest(format!(
-                    "Unexpected response type for MkdirP: {:?}",
-                    response_msg.msg_type
-                )));
-            }
-
-            let response: MkdirPResponse = serde_json::from_slice(&response_msg.payload)?;
-            Ok(response)
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("mkdir_p task panicked: {e}")))?
+        let body = serde_json::to_vec(&MkdirPRequest {
+            path: path.to_string(),
+        })?;
+        let msg = self
+            .multiplex_call(MessageType::MkdirP, body, Duration::from_secs(10), "MkdirP")
+            .await?;
+        ensure_response_type(&msg, MessageType::MkdirPResponse, "MkdirP")?;
+        Ok(serde_json::from_slice(&msg.payload)?)
     }
 
     /// Checks if a file exists in the guest filesystem.
     pub async fn send_file_stat(&self, path: &str) -> Result<FileStatResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let msg_bytes = Message {
-            msg_type: MessageType::FileStat,
-            payload: serde_json::to_vec(&FileStatRequest {
-                path: path.to_string(),
-            })?,
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "file-stat",
-            )?;
-
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send FileStat: {e}")))?;
-
-            let response_msg = Message::read_from_sync(&mut *stream)?;
-            if response_msg.msg_type != MessageType::FileStatResponse {
-                return Err(Error::Guest(format!(
-                    "Unexpected response type for FileStat: {:?}",
-                    response_msg.msg_type
-                )));
-            }
-
-            let response: FileStatResponse = serde_json::from_slice(&response_msg.payload)?;
-            Ok(response)
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("file_stat task panicked: {e}")))?
+        let body = serde_json::to_vec(&FileStatRequest {
+            path: path.to_string(),
+        })?;
+        let msg = self
+            .multiplex_call(
+                MessageType::FileStat,
+                body,
+                Duration::from_secs(10),
+                "FileStat",
+            )
+            .await?;
+        ensure_response_type(&msg, MessageType::FileStatResponse, "FileStat")?;
+        Ok(serde_json::from_slice(&msg.payload)?)
     }
 
     /// Reads a file from the guest filesystem.
     pub async fn send_read_file(&self, path: &str) -> Result<ReadFileResponse> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let msg_bytes = Message {
-            msg_type: MessageType::ReadFile,
-            payload: serde_json::to_vec(&ReadFileRequest {
-                path: path.to_string(),
-            })?,
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "read-file",
-            )?;
-
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send ReadFile: {e}")))?;
-
-            let response_msg = Message::read_from_sync(&mut *stream)?;
-            if response_msg.msg_type != MessageType::ReadFileResponse {
-                return Err(Error::Guest(format!(
-                    "Unexpected response type for ReadFile: {:?}",
-                    response_msg.msg_type
-                )));
-            }
-
-            let response: ReadFileResponse = serde_json::from_slice(&response_msg.payload)?;
-            Ok(response)
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("read_file task panicked: {e}")))?
+        let body = serde_json::to_vec(&ReadFileRequest {
+            path: path.to_string(),
+        })?;
+        let msg = self
+            .multiplex_call(
+                MessageType::ReadFile,
+                body,
+                Duration::from_secs(30),
+                "ReadFile",
+            )
+            .await?;
+        ensure_response_type(&msg, MessageType::ReadFileResponse, "ReadFile")?;
+        Ok(serde_json::from_slice(&msg.payload)?)
     }
 
-    /// Open a persistent telemetry subscription to the guest agent.
+    /// Opens a persistent telemetry subscription through the multiplex channel.
+    ///
+    /// Allocates a request_id for the subscription, sends
+    /// `SubscribeTelemetry`, and runs a background task that forwards
+    /// every [`TelemetryBatch`] frame to `on_batch` until the channel
+    /// dies or the subscription is cancelled by a channel-lifetime end.
     pub async fn subscribe_telemetry<F>(
         &self,
         opts: &TelemetrySubscribeRequest,
-        on_batch: F,
+        mut on_batch: F,
     ) -> Result<()>
     where
         F: FnMut(TelemetryBatch) + Send + 'static,
     {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let sub_bytes = Message {
-            msg_type: MessageType::SubscribeTelemetry,
-            payload: serde_json::to_vec(opts).unwrap_or_default(),
-        }
-        .serialize();
+        let body = serde_json::to_vec(opts).unwrap_or_default();
         let interval_ms = opts.interval_ms;
+        let channel = self.get_or_establish_channel().await?;
+        let mut rx = channel
+            .call_stream(
+                MessageType::SubscribeTelemetry,
+                body,
+                Terminator::ChannelLifetime,
+            )
+            .await?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut on_batch = on_batch;
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                Duration::from_secs(5),
-                "telemetry-subscribe",
-            )?;
+        info!("Telemetry subscription active (interval={}ms)", interval_ms);
 
-            stream
-                .write_all(&sub_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send SubscribeTelemetry: {}", e)))?;
-
-            info!("Telemetry subscription active (interval={}ms)", interval_ms);
-
-            let read_timeout_ms = interval_ms.max(1000) * 5;
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
-
-            loop {
-                let msg = match Message::read_from_sync(&mut *stream) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        // Timeouts and connection resets are expected when the
-                        // VM shuts down or the subscription interval elapses.
-                        if is_expected_stream_end(&e) {
-                            info!("Telemetry subscription ended: {}", e);
-                        } else {
-                            warn!("Telemetry subscription ended unexpectedly: {}", e);
-                        }
-                        return Ok(());
-                    }
-                };
-
-                if msg.msg_type != MessageType::TelemetryData {
-                    warn!(
-                        "Unexpected message type in telemetry stream: {:?}",
-                        msg.msg_type
-                    );
-                    continue;
-                }
-
-                match serde_json::from_slice::<TelemetryBatch>(&msg.payload) {
-                    Ok(batch) => on_batch(batch),
-                    Err(e) => {
-                        warn!("Failed to parse TelemetryBatch: {}", e);
-                    }
-                }
+        while let Some(msg) = rx.recv().await {
+            if msg.msg_type != MessageType::TelemetryData {
+                warn!(
+                    "Unexpected message type in telemetry stream: {:?}",
+                    msg.msg_type
+                );
+                continue;
             }
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("telemetry task panicked: {e}")))?
+            match serde_json::from_slice::<TelemetryBatch>(&msg.payload) {
+                Ok(batch) => on_batch(batch),
+                Err(e) => warn!("Failed to parse TelemetryBatch: {}", e),
+            }
+        }
+
+        info!("Telemetry subscription ended");
+        Ok(())
     }
 
-    /// Wait for the guest to signal snapshot readiness.
+    /// Waits for the guest to signal snapshot readiness.
     ///
-    /// Connects and sends a `SnapshotReady` message, then waits for the
-    /// guest to reply with `SnapshotReady`. Returns `Ok(())` on success.
+    /// Sends a `SnapshotReady` message through the multiplex channel and
+    /// waits for the guest to echo it back.
     pub async fn wait_for_snapshot_ready(&self, timeout: Duration) -> Result<()> {
-        let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
-        let boot_wait_done = Arc::clone(&self.boot_wait_done);
-
-        let msg_bytes = Message {
-            msg_type: MessageType::SnapshotReady,
-            payload: Vec::new(),
-        }
-        .serialize();
-
-        tokio::task::spawn_blocking(move || {
-            let mut stream = connect_with_handshake_sync(
-                &connector,
-                &session_secret,
-                &boot_wait_done,
-                HANDSHAKE_READ_TIMEOUT,
-                "snapshot-ready",
-            )?;
-
-            let _ = stream.set_read_timeout(Some(timeout));
-            stream
-                .write_all(&msg_bytes)
-                .map_err(|e| Error::Guest(format!("Failed to send SnapshotReady: {}", e)))?;
-
-            let response_msg = Message::read_from_sync(&mut *stream)?;
-            if response_msg.msg_type != MessageType::SnapshotReady {
-                return Err(Error::Guest(format!(
-                    "Unexpected response for SnapshotReady: {:?}",
-                    response_msg.msg_type
-                )));
-            }
-
-            debug!("control_channel: guest confirmed SnapshotReady");
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Guest(format!("snapshot_ready task panicked: {e}")))?
+        let msg = self
+            .multiplex_call(
+                MessageType::SnapshotReady,
+                Vec::new(),
+                timeout,
+                "SnapshotReady",
+            )
+            .await?;
+        ensure_response_type(&msg, MessageType::SnapshotReady, "SnapshotReady")?;
+        debug!("control_channel: guest confirmed SnapshotReady");
+        Ok(())
     }
 
     /// Opens a PTY session on the guest, returning a [`super::pty_session::PtySession`] that owns the connection.
@@ -799,23 +663,131 @@ pub(crate) fn connect_with_handshake_sync(
     }
 }
 
-/// Check whether a protocol error represents an expected stream termination.
+/// Connects, handshakes, verifies multiplex support, and returns a ready
+/// [`MultiplexChannel`].
 ///
-/// Timeouts, connection resets, and EOF are normal when the VM shuts down
-/// or a long-lived subscription outlives the guest. Anything else (e.g.
-/// protocol parse errors) is unexpected and should be logged at `warn`.
-fn is_expected_stream_end(err: &ProtocolError) -> bool {
-    match err {
-        ProtocolError::Io(io_err) => matches!(
-            io_err.kind(),
-            std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::UnexpectedEof
-        ),
-        // InvalidMessage with "end of stream" is a clean EOF.
-        ProtocolError::InvalidMessage(msg) => msg.contains("end of stream"),
-        _ => false,
+/// The returned channel owns one dedicated reader thread demultiplexing
+/// incoming frames by request_id. The writer half is a Mutex-guarded
+/// [`Box<dyn GuestStream>`] shared across concurrent RPC callers.
+///
+/// # Errors
+///
+/// Returns [`Error::Guest`] if the connect or handshake retry loop
+/// exhausts its deadline, if the peer advertises an older protocol
+/// that does not support multiplex, or if the `dup(2)` syscall used to
+/// split read/write halves fails.
+pub(crate) fn establish_multiplex_channel(
+    connector: &GuestConnector,
+    session_secret: &[u8; 32],
+    boot_wait_done: &AtomicBool,
+    handshake_timeout: Duration,
+    context: &str,
+) -> Result<MultiplexChannel> {
+    let stream = connect_with_handshake_sync(
+        connector,
+        session_secret,
+        boot_wait_done,
+        handshake_timeout,
+        context,
+    )?;
+    upgrade_stream_to_multiplex(stream, context)
+}
+
+/// Upgrades an already-handshaken [`GuestStream`] into a [`MultiplexChannel`].
+///
+/// Duplicates the file descriptor so the reader thread and the shared
+/// writer each own a distinct fd backed by the same kernel socket.
+fn upgrade_stream_to_multiplex(
+    writer_stream: Box<dyn GuestStream>,
+    context: &str,
+) -> Result<MultiplexChannel> {
+    let reader_stream = writer_stream.try_clone_box().map_err(|e| {
+        Error::Guest(format!(
+            "control_channel[{context}]: failed to dup stream fd for reader: {e}"
+        ))
+    })?;
+
+    reader_stream.set_read_timeout(None).map_err(|e| {
+        Error::Guest(format!(
+            "control_channel[{context}]: failed to clear read timeout on reader fd: {e}"
+        ))
+    })?;
+
+    let reader: Box<dyn Read + Send> = Box::new(GuestStreamReader {
+        inner: reader_stream,
+    });
+    let sender: Arc<dyn FrameSender> = Arc::new(StreamFrameSender {
+        stream: StdMutex::new(writer_stream),
+    });
+
+    Ok(MultiplexChannel::new(reader, sender))
+}
+
+/// Adapts a [`Box<dyn GuestStream>`] into [`Box<dyn Read + Send>`] for the
+/// multiplex reader thread.
+struct GuestStreamReader {
+    inner: Box<dyn GuestStream>,
+}
+
+impl Read for GuestStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
     }
+}
+
+/// Production [`FrameSender`] wrapping a [`GuestStream`] writer half.
+///
+/// Holds a [`std::sync::Mutex`] over the boxed stream so concurrent
+/// RPC callers never interleave their frame bytes on the wire. The
+/// mutex is only held for the duration of one `write_all`, which is
+/// bounded by the size of the frame — telemetry and RPC payloads are
+/// typically < 64 KiB, so contention is minimal.
+struct StreamFrameSender {
+    stream: StdMutex<Box<dyn GuestStream>>,
+}
+
+impl FrameSender for StreamFrameSender {
+    fn send(&self, frame: &[u8]) -> Result<()> {
+        let mut guard = self
+            .stream
+            .lock()
+            .map_err(|_| Error::Guest("multiplex sender stream poisoned".into()))?;
+        guard
+            .write_all(frame)
+            .map_err(|e| Error::Guest(format!("frame send failed: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Applies an optional deadline to an async drain future.
+///
+/// Matches the previous blocking-stream semantics: `None` means wait
+/// forever (service mode / long-running LLM exec); `Some(d)` bounds the
+/// wall-clock wait and surfaces a clear error on expiry.
+async fn apply_exec_timeout<Fut>(timeout: Option<Duration>, fut: Fut) -> Result<ExecResponse>
+where
+    Fut: std::future::Future<Output = Result<ExecResponse>>,
+{
+    match timeout {
+        Some(deadline) => match tokio::time::timeout(deadline, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Guest(format!("exec timed out after {deadline:?}"))),
+        },
+        None => fut.await,
+    }
+}
+
+/// Verifies that a multiplex response matches the expected [`MessageType`].
+///
+/// # Errors
+///
+/// Returns [`Error::Guest`] if `msg.msg_type != expected`.
+fn ensure_response_type(msg: &Message, expected: MessageType, context: &'static str) -> Result<()> {
+    if msg.msg_type == expected {
+        return Ok(());
+    }
+    Err(Error::Guest(format!(
+        "Unexpected response type for {context}: {:?}",
+        msg.msg_type
+    )))
 }

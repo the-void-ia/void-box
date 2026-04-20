@@ -611,7 +611,25 @@ impl VsockStream {
         Ok(Self { fd })
     }
 
-    /// Set read timeout (e.g. for handshake). Pass `None` for blocking.
+    /// Duplicates the underlying file descriptor and returns a new [`VsockStream`].
+    ///
+    /// Both handles refer to the same underlying kernel socket, so reads
+    /// and writes from different threads operate on the same connection
+    /// without interfering. Used by the multiplex channel to split
+    /// reader/writer halves across threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] if the `dup(2)` syscall fails.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        let dup_fd = unsafe { libc::dup(self.fd) };
+        if dup_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd: dup_fd })
+    }
+
+    /// Sets the read timeout (e.g. for handshake). Pass `None` for blocking.
     pub fn set_read_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
         let tv = match duration {
             None => libc::timeval {

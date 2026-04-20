@@ -59,6 +59,7 @@ fn release_session() {
 /// Returns `Err` if sending a response message over the vsock fd fails.
 pub fn handle_pty_open(
     fd: RawFd,
+    request_id: u32,
     request: &PtyOpenRequest,
     allowlist_check: fn(&str) -> bool,
 ) -> Result<(), String> {
@@ -71,7 +72,7 @@ pub fn handle_pty_open(
                 request.program
             )),
         };
-        send_json_message(fd, MessageType::PtyOpened, &resp)?;
+        send_json_message(fd, MessageType::PtyOpened, request_id, &resp)?;
         return Ok(());
     }
 
@@ -81,11 +82,11 @@ pub fn handle_pty_open(
             success: false,
             error: Some(format!("max PTY sessions ({}) reached", MAX_PTY_SESSIONS)),
         };
-        send_json_message(fd, MessageType::PtyOpened, &resp)?;
+        send_json_message(fd, MessageType::PtyOpened, request_id, &resp)?;
         return Ok(());
     }
 
-    let result = run_pty_session(fd, request);
+    let result = run_pty_session(fd, request_id, request);
 
     release_session();
 
@@ -93,7 +94,7 @@ pub fn handle_pty_open(
 }
 
 /// Forks a child process under a PTY and runs the bidirectional I/O loop.
-fn run_pty_session(fd: RawFd, request: &PtyOpenRequest) -> Result<(), String> {
+fn run_pty_session(fd: RawFd, request_id: u32, request: &PtyOpenRequest) -> Result<(), String> {
     let mut master_fd: libc::c_int = -1;
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     ws.ws_col = request.cols;
@@ -108,7 +109,7 @@ fn run_pty_session(fd: RawFd, request: &PtyOpenRequest) -> Result<(), String> {
             success: false,
             error: Some(format!("forkpty failed: {}", err)),
         };
-        send_json_message(fd, MessageType::PtyOpened, &resp)?;
+        send_json_message(fd, MessageType::PtyOpened, request_id, &resp)?;
         return Ok(());
     }
 
@@ -125,9 +126,9 @@ fn run_pty_session(fd: RawFd, request: &PtyOpenRequest) -> Result<(), String> {
         success: true,
         error: None,
     };
-    send_json_message(fd, MessageType::PtyOpened, &resp)?;
+    send_json_message(fd, MessageType::PtyOpened, request_id, &resp)?;
 
-    pty_io_loop(fd, master_fd, pid);
+    pty_io_loop(fd, request_id, master_fd, pid);
 
     unsafe {
         libc::close(master_fd);
@@ -229,15 +230,15 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
 /// A reader thread handles vsock-to-master forwarding (PtyData, PtyResize,
 /// PtyClose). The current thread handles master-to-vsock forwarding and
 /// child reaping.
-fn pty_io_loop(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) {
+fn pty_io_loop(vsock_fd: RawFd, request_id: u32, master_fd: RawFd, child_pid: libc::pid_t) {
     let reader_handle = std::thread::spawn(move || {
         pty_reader_thread(vsock_fd, master_fd, child_pid);
     });
 
-    let exit_code = pty_writer_loop(vsock_fd, master_fd, child_pid);
+    let exit_code = pty_writer_loop(vsock_fd, request_id, master_fd, child_pid);
 
     let resp = PtyClosedResponse { exit_code };
-    let _ = send_json_message(vsock_fd, MessageType::PtyClosed, &resp);
+    let _ = send_json_message(vsock_fd, MessageType::PtyClosed, request_id, &resp);
 
     kmsg(&format!(
         "PTY: session ended pid={} exit_code={}",
@@ -249,7 +250,12 @@ fn pty_io_loop(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) {
 
 /// Reads from the PTY master fd and sends PtyData messages to the host.
 /// On EOF, waits for the child to exit and returns the exit code.
-fn pty_writer_loop(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) -> i32 {
+fn pty_writer_loop(
+    vsock_fd: RawFd,
+    request_id: u32,
+    master_fd: RawFd,
+    child_pid: libc::pid_t,
+) -> i32 {
     let mut buf = [0u8; PTY_READ_BUF_SIZE];
 
     loop {
@@ -260,7 +266,7 @@ fn pty_writer_loop(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) ->
         }
 
         let data = &buf[..n as usize];
-        if send_pty_data(vsock_fd, data).is_err() {
+        if send_pty_data(vsock_fd, request_id, data).is_err() {
             break;
         }
     }
@@ -303,14 +309,23 @@ fn pty_reader_thread(vsock_fd: RawFd, master_fd: RawFd, child_pid: libc::pid_t) 
             continue;
         };
 
+        // Every post-handshake frame carries a 4-byte request_id prefix
+        // on its payload. PTY's reader ignores the id (the session was
+        // established under one id) but must strip it before interpreting
+        // the body.
+        if payload.len() < 4 {
+            continue;
+        }
+        let body = &payload[4..];
+
         match message_type {
             MessageType::PtyData => {
-                if write_all_raw(master_fd, &payload).is_err() {
+                if write_all_raw(master_fd, body).is_err() {
                     return;
                 }
             }
             MessageType::PtyResize => {
-                if let Ok(resize) = serde_json::from_slice::<PtyResizeRequest>(&payload) {
+                if let Ok(resize) = serde_json::from_slice::<PtyResizeRequest>(body) {
                     let ws = libc::winsize {
                         ws_col: resize.cols,
                         ws_row: resize.rows,
@@ -374,28 +389,31 @@ fn reap_child(child_pid: libc::pid_t) -> i32 {
     }
 }
 
-/// Sends a PtyData message with raw bytes (not JSON-encoded).
-fn send_pty_data(fd: RawFd, data: &[u8]) -> Result<(), io::Error> {
-    let length = data.len() as u32;
-    let mut frame = Vec::with_capacity(HEADER_SIZE + data.len());
+/// Sends a PtyData message with raw bytes, prefixed by the session request_id.
+fn send_pty_data(fd: RawFd, request_id: u32, data: &[u8]) -> Result<(), io::Error> {
+    let length = (4 + data.len()) as u32;
+    let mut frame = Vec::with_capacity(HEADER_SIZE + 4 + data.len());
     frame.extend_from_slice(&length.to_le_bytes());
     frame.push(MessageType::PtyData as u8);
+    frame.extend_from_slice(&request_id.to_le_bytes());
     frame.extend_from_slice(data);
     write_all_raw(fd, &frame)
 }
 
-/// Sends a JSON-serialized message over the fd.
+/// Sends a JSON-serialized message with a multiplex request_id prefix.
 fn send_json_message<T: serde::Serialize>(
     fd: RawFd,
     msg_type: MessageType,
+    request_id: u32,
     payload: &T,
 ) -> Result<(), String> {
     let payload_bytes =
         serde_json::to_vec(payload).map_err(|e| format!("Failed to serialize: {}", e))?;
-    let length = payload_bytes.len() as u32;
-    let mut frame = Vec::with_capacity(HEADER_SIZE + payload_bytes.len());
+    let length = (4 + payload_bytes.len()) as u32;
+    let mut frame = Vec::with_capacity(HEADER_SIZE + 4 + payload_bytes.len());
     frame.extend_from_slice(&length.to_le_bytes());
     frame.push(msg_type as u8);
+    frame.extend_from_slice(&request_id.to_le_bytes());
     frame.extend_from_slice(&payload_bytes);
     write_all_raw(fd, &frame).map_err(|e| format!("Failed to write message: {}", e))
 }
