@@ -33,6 +33,11 @@ impl GuestStream for VsockStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         std::os::unix::io::AsRawFd::as_raw_fd(self)
     }
+
+    fn try_clone_box(&self) -> std::io::Result<Box<dyn GuestStream>> {
+        let cloned = VsockStream::try_clone(self)?;
+        Ok(Box::new(cloned))
+    }
 }
 
 /// KVM-based VM backend for Linux.
