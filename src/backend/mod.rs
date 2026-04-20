@@ -9,6 +9,7 @@
 //! - **macOS**: `VzBackend` — Apple Virtualization.framework
 
 pub mod control_channel;
+pub mod multiplex;
 pub mod pty_session;
 
 #[cfg(target_os = "linux")]
