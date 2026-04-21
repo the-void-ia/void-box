@@ -1,9 +1,9 @@
 //! Long-lived multiplexed control channel for host↔guest RPCs.
 //!
-//! Lever 7b of the startup plan. Replaces the per-RPC
-//! `connect_with_handshake_sync` pattern with one persistent connection
-//! per sandbox over which every request, response, and stream is
-//! multiplexed by a 4-byte `request_id` prefix on each payload.
+//! Replaces the per-RPC `connect_with_handshake_sync` pattern with one
+//! persistent connection per sandbox over which every request,
+//! response, and stream is multiplexed by a 4-byte `request_id` prefix
+//! on each payload.
 //!
 //! ## Wire Format
 //!
