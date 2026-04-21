@@ -150,8 +150,7 @@ echo "[slim-kernel] Applying void-box additions to config..."
     scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
     scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
-    # Lever 1: trim boot-path kernel features we never use.
-    # Target ~40–80 ms cold-boot reduction (initcalls + image size).
+    # Trim boot-path kernel features the guest never uses.
     #
     # Note on debug info: Firecracker's microvm base config ships
     # `CONFIG_DEBUG_INFO_NONE=y` — no DWARF, no BTF in the guest kernel
