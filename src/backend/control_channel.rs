@@ -131,16 +131,16 @@ pub type GuestConnector = Arc<dyn Fn() -> Result<Box<dyn GuestStream>> + Send + 
 /// and telemetry subscriptions. The actual transport is provided by
 /// the `connector` closure.
 ///
-/// As of Lever 7b, all RPCs (exec, write_file, mkdir_p, file_stat,
-/// read_file, telemetry, snapshot_ready) route through a single
-/// persistent [`MultiplexChannel`] that is lazily established on first
-/// use. The legacy per-RPC reconnect path has been dropped: guests must
-/// advertise [`PROTO_FLAG_SUPPORTS_MULTIPLEX`] during handshake or the
-/// channel establishment fails.
+/// All RPCs — `exec`, `write_file`, `mkdir_p`, `file_stat`, `read_file`,
+/// `telemetry`, `snapshot_ready` — route through a single persistent
+/// [`MultiplexChannel`] that is lazily established on first use and
+/// reconstructed if it dies. The guest must advertise
+/// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`] during the handshake or channel
+/// establishment fails.
 ///
-/// PTY sessions still open their own dedicated connection (one connection
-/// per interactive shell) but that connection's framing is identical —
-/// every message carries an in-payload request_id.
+/// PTY sessions open their own dedicated connection (one connection per
+/// interactive shell) but that connection's framing is identical: every
+/// message carries an in-payload request_id.
 ///
 /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]: void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX
 pub struct ControlChannel {
@@ -639,7 +639,7 @@ pub(crate) fn connect_with_handshake_sync(
         }
 
         // Build Ping payload via protocol helper — advertises this host's
-        // feature flags (currently: Lever 7 multiplex capability).
+        // feature flags (multiplex capability).
         let ping_msg = Message {
             msg_type: MessageType::Ping,
             payload: void_box_protocol::build_ping_payload(

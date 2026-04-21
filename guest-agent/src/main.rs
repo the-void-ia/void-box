@@ -70,6 +70,18 @@ static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
 static OCI_SETUP_ERROR_DETAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static NETWORK_DENY_LIST_APPLIED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes writes to the host vsock fd so concurrent writers never
+/// interleave bytes on the wire.
+///
+/// The multiplex control channel carries telemetry streams, exec
+/// output chunks, and RPC responses on a single connection, all
+/// written from different threads. `libc::write` on a stream socket is
+/// only guaranteed atomic up to the kernel's internal buffer slot; a
+/// frame that takes multiple syscalls (partial writes, or writes
+/// larger than the atomic boundary) could otherwise interleave with
+/// another thread's frame and corrupt the wire.
+static CONN_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
 
 fn oci_status_str(code: u8) -> &'static str {
@@ -2097,8 +2109,17 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                     "Telemetry subscription started (interval={}ms, kernel_threads={})",
                     opts.interval_ms, opts.include_kernel_threads
                 ));
-                telemetry_stream_loop(fd, request_id, &opts);
-                return Ok(());
+                // Telemetry runs for the lifetime of the connection.
+                // Running it inline would monopolize this handler thread
+                // and block every other RPC on the shared multiplex
+                // connection. Spawning it as a background thread lets the
+                // handler keep dispatching; [`CONN_WRITE_LOCK`] serializes
+                // writes between this thread and the handler.
+                let handler_fd = fd;
+                std::thread::Builder::new()
+                    .name("telemetry".into())
+                    .spawn(move || telemetry_stream_loop(handler_fd, request_id, &opts))
+                    .map_err(|e| format!("spawn telemetry thread: {e}"))?;
             }
             MessageType::WriteFile => {
                 let request: WriteFileRequest = serde_json::from_slice(body)
@@ -2613,21 +2634,7 @@ fn send_mux_raw(
     msg.extend_from_slice(&request_id.to_le_bytes());
     msg.extend_from_slice(body);
 
-    let mut total_written = 0;
-    while total_written < msg.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                msg[total_written..].as_ptr() as *const libc::c_void,
-                msg.len() - total_written,
-            )
-        };
-        if n <= 0 {
-            return Err("Write failed".into());
-        }
-        total_written += n as usize;
-    }
-    Ok(())
+    write_framed(fd, &msg)
 }
 
 /// Send a raw (non-JSON) message to the host over the vsock fd.
@@ -2641,6 +2648,21 @@ fn send_raw_message(fd: RawFd, msg_type: MessageType, payload: &[u8]) -> Result<
     msg.extend_from_slice(&length.to_le_bytes());
     msg.push(msg_type as u8);
     msg.extend_from_slice(payload);
+
+    write_framed(fd, &msg)
+}
+
+/// Writes a fully framed message to the host vsock fd under
+/// [`CONN_WRITE_LOCK`].
+///
+/// # Errors
+///
+/// Returns [`String`] if the write lock is poisoned or if the
+/// underlying `libc::write` returns a non-positive value.
+fn write_framed(fd: RawFd, msg: &[u8]) -> Result<(), String> {
+    let _guard = CONN_WRITE_LOCK
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
 
     let mut total_written = 0;
     while total_written < msg.len() {
