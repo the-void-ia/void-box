@@ -198,6 +198,45 @@ Re-run `conformance`, `oci_integration`, `e2e_mount`,
 7c: bench (expect ~82 ms warm), HN agent (expect no broken-pipe
 flood), openclaw_telegram (expect smoke_message posts).
 
+### Implementation status (2026-04-20)
+
+| Sub-milestone | Status | Evidence |
+|---------------|--------|----------|
+| 7a: protocol bump + multiplex capability | landed | commit `eb2a7eb`, 9 new `void-box-protocol` unit tests |
+| 7b: persistent channel + demuxer         | landed | commits `c2f5ef9` (Phase A module), `0866bd8` (Phase B wiring) |
+| 7c: remove retry-timeout tuning knob     | absorbed into 7b | split into `HANDSHAKE_READ_TIMEOUT=5 ms` initial + exponential ramp to `MAX_HANDSHAKE_READ_TIMEOUT=150 ms`; the dual-constant tradeoff from Milestone A is gone |
+
+Validation (local Fedora 43 / KVM):
+
+- `cargo test --workspace --all-features` — no regressions
+- `cargo test --test persistent_channel -- --ignored` — 2/2 pass (16 serial and 16 concurrent execs on one `Sandbox`, demuxer verified under contention)
+- `cargo test --test conformance -- --ignored` — 9/12 pass; the 3 failures (`conformance_exec_timeout`, `conformance_write_file`, `conformance_mkdir_p`) pre-date Lever 7 (see known issue below)
+- `voidbox-startup-bench --iters 10 --breakdown` — warm p50 = 84 ms, matching the Milestone A best (82 ms) that was only achievable with the 5 ms timeout that broke HN. 7b makes it durable. Second exec RTT ≈ 0.8 ms — the persistent channel eliminates the per-RPC handshake.
+
+### Known guest-agent limitation (follow-up)
+
+The guest-agent's `execute_command` spawns a watchdog thread per call
+that sleeps `timeout_secs` (default 30 s) and is **not joined**. Under
+the per-RPC reconnect design that Lever 7 replaced, each connection's
+handler thread exited after one exec and these watchdogs aged out.
+With one persistent connection, the watchdogs accumulate on the same
+thread, and around exec 28 the guest-agent stalls under the
+test-image's 1 vCPU configuration. The `persistent_channel_*`
+integration tests cap at 16 execs to stay below this ceiling.
+
+Fix candidates:
+
+- Join the watchdog on successful `child.wait()` by signalling it
+  early via a `Condvar` instead of `thread::sleep`.
+- Detach the watchdog so its stack is reclaimed at `thread::sleep`
+  return instead of at handler exit.
+- Move watchdog into a single long-lived timer wheel so it's O(1)
+  per request instead of O(1) thread per request.
+
+Not a Lever 7 regression per se — the per-RPC reconnect design
+masked it — but Lever 7 is what exposes it in concurrent / long-lived
+sandboxes.
+
 ### Why this is ordering change #1
 
 Without Lever 7, we're forced to choose between bench-speed and

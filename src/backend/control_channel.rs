@@ -37,18 +37,29 @@ use crate::guest::protocol::{
 };
 use crate::{Error, Result};
 
-/// Per-attempt read timeout for the handshake Pong.
+/// Initial per-attempt read timeout for the handshake Pong.
 ///
-/// Applies to the single handshake performed when the persistent
-/// multiplex channel is first established (or reconstructed after
-/// death). Because every RPC after that point rides on the same
-/// established channel — no per-RPC reconnect — the old tradeoff
-/// between aggressive 5 ms probes (startup bench win) and relaxed
-/// 150 ms probes (agent-workload correctness) collapses. 5 ms lets
-/// the warm path converge in zero retries when the guest-agent is
-/// already up and still gives the cold path room to retry if it
-/// isn't.
+/// The handshake runs exactly once per sandbox — on first RPC or when
+/// the multiplex channel is reconstructed after death. Because there
+/// is no per-RPC reconnect, the old 5 ms / 150 ms tradeoff collapses
+/// into a single one-shot cost.
+///
+/// We still want the warm path (guest-agent already bound) to converge
+/// in zero retries and the cold path (guest booting, first Ping takes
+/// longer than the first Pong read) to succeed without 30 seconds of
+/// backoff. Starting at 5 ms and doubling up to
+/// [`MAX_HANDSHAKE_READ_TIMEOUT`] on each retry gives both: warm
+/// finishes on attempt 1 with a 5 ms probe, cold converges within a
+/// handful of attempts as the timeout grows.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Upper bound for the exponential per-attempt handshake read timeout.
+///
+/// 150 ms is the ceiling validated against agent workloads in the
+/// Milestone A plan (see 2026-04-20-startup-milestones-b-c-d.md) — long
+/// enough to absorb the userspace vsock worker's queueing under cold
+/// boot, short enough that the handshake loop exits quickly.
+const MAX_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;
@@ -565,6 +576,7 @@ pub(crate) fn connect_with_handshake_sync(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut attempt: u32 = 0;
     let t_start = Instant::now();
+    let mut attempt_timeout = handshake_timeout;
 
     loop {
         if Instant::now() >= deadline {
@@ -596,7 +608,7 @@ pub(crate) fn connect_with_handshake_sync(
         };
 
         // Handshake: Ping -> Pong
-        if let Err(e) = s.set_read_timeout(Some(handshake_timeout)) {
+        if let Err(e) = s.set_read_timeout(Some(attempt_timeout)) {
             debug!(
                 "control_channel[{context}]: attempt {} set_read_timeout failed: {}",
                 attempt, e
@@ -653,11 +665,13 @@ pub(crate) fn connect_with_handshake_sync(
             }
             Err(e) => {
                 debug!(
-                    "control_channel[{context}]: attempt {} handshake read failed: {}",
-                    attempt, e
+                    "control_channel[{context}]: attempt {} handshake read failed: {} \
+                     (timeout={:?})",
+                    attempt, e, attempt_timeout
                 );
                 std::thread::sleep(delay);
                 delay = std::cmp::min(delay * 2, max_delay);
+                attempt_timeout = std::cmp::min(attempt_timeout * 2, MAX_HANDSHAKE_READ_TIMEOUT);
             }
         }
     }

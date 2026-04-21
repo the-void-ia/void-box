@@ -383,6 +383,10 @@ fn dispatch_frame(
     request_id: u32,
     body: Vec<u8>,
 ) {
+    debug!(
+        "multiplex: dispatch msg_type={msg_type:?} request_id={request_id} body_len={}",
+        body.len()
+    );
     let mut guard = match pending.lock() {
         Ok(g) => g,
         Err(_) => {
