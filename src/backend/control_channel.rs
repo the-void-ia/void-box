@@ -53,16 +53,6 @@ use crate::{Error, Result};
 /// handful of attempts as the timeout grows.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
-/// Cold-boot wait applied once per [`ControlChannel`] before the first
-/// connect attempt.
-///
-/// Older host-side code slept 4 seconds unconditionally; profiling
-/// showed most guests are ready in 200–800 ms, so 250 ms matches the
-/// common case while still giving the kernel vhost-vsock driver time
-/// to see the guest's virtio-vsock device come up. Restored channels
-/// skip this wait entirely because the guest-agent is already live.
-const BOOT_WAIT: Duration = Duration::from_millis(250);
-
 /// Upper bound for the exponential per-attempt handshake read timeout.
 ///
 /// 150 ms is the ceiling validated against agent workloads in the
@@ -150,17 +140,43 @@ pub struct ControlChannel {
     session_secret: [u8; 32],
     /// Whether the initial boot wait has been applied.
     boot_wait_done: Arc<AtomicBool>,
+    /// Cold-boot wait applied once before the first connect attempt.
+    ///
+    /// Set to a non-zero value for the kernel vhost-vsock backend,
+    /// whose `libc::connect` corners the driver when fired before the
+    /// guest's virtio-vsock device is up. The userspace vsock backend
+    /// buffers connects behind its worker and uses [`Duration::ZERO`].
+    boot_wait: Duration,
     /// Lazily-established multiplex channel. Re-established on death.
     channel: Arc<AsyncMutex<Option<MultiplexChannel>>>,
 }
 
 impl ControlChannel {
-    /// Creates a new control channel with the given connector and session secret.
+    /// Creates a control channel that skips the cold-boot wait.
+    ///
+    /// Equivalent to [`Self::with_boot_wait`] with `boot_wait =
+    /// Duration::ZERO`. Appropriate for userspace-vsock connectors
+    /// where connect is buffered against guest readiness.
     pub fn new(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
+        Self::with_boot_wait(connector, session_secret, Duration::ZERO)
+    }
+
+    /// Creates a control channel that pads the first connect attempt
+    /// with `boot_wait`.
+    ///
+    /// Intended for connectors backed by the kernel vhost-vsock
+    /// driver so the guest's virtio-vsock device has time to come up
+    /// before the host's first `libc::connect` reaches the driver.
+    pub fn with_boot_wait(
+        connector: GuestConnector,
+        session_secret: [u8; 32],
+        boot_wait: Duration,
+    ) -> Self {
         Self {
             connector,
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(false)),
+            boot_wait,
             channel: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -171,6 +187,7 @@ impl ControlChannel {
             connector,
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(true)),
+            boot_wait: Duration::ZERO,
             channel: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -223,12 +240,14 @@ impl ControlChannel {
         let connector = Arc::clone(&self.connector);
         let session_secret = self.session_secret;
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
+        let boot_wait = self.boot_wait;
 
         let channel = tokio::task::spawn_blocking(move || {
             establish_multiplex_channel(
                 &connector,
                 &session_secret,
                 &boot_wait_done,
+                boot_wait,
                 HANDSHAKE_READ_TIMEOUT,
                 "multiplex-establish",
             )
@@ -565,6 +584,7 @@ pub(crate) fn connect_with_handshake_sync(
     connector: &GuestConnector,
     session_secret: &[u8; 32],
     boot_wait_done: &AtomicBool,
+    boot_wait: Duration,
     handshake_timeout: Duration,
     context: &str,
 ) -> Result<Box<dyn GuestStream>> {
@@ -578,14 +598,12 @@ pub(crate) fn connect_with_handshake_sync(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
 
-    // Cold boot: give the guest kernel a head start before we hammer
-    // the vsock. Host-side AF_VSOCK connect goes through the kernel
-    // vhost-vsock driver, which RSTs or corners itself when the guest's
-    // virtio-vsock device isn't fully initialized. The userspace
-    // backend buffers connects behind its worker thread and doesn't
-    // suffer, but we take the common path for both.
-    if first_attempt {
-        std::thread::sleep(BOOT_WAIT);
+    // Callers who know their connector cannot tolerate rapid retries
+    // against a still-booting guest (currently the kernel vhost-vsock
+    // backend) pass a non-zero `boot_wait` to pad the first attempt.
+    // Userspace backends pass `Duration::ZERO` and skip this entirely.
+    if first_attempt && boot_wait > Duration::ZERO {
+        std::thread::sleep(boot_wait);
     }
 
     // Initial delay sized for typical guest boot probe cadence (~25ms).
@@ -714,6 +732,7 @@ pub(crate) fn establish_multiplex_channel(
     connector: &GuestConnector,
     session_secret: &[u8; 32],
     boot_wait_done: &AtomicBool,
+    boot_wait: Duration,
     handshake_timeout: Duration,
     context: &str,
 ) -> Result<MultiplexChannel> {
@@ -721,6 +740,7 @@ pub(crate) fn establish_multiplex_channel(
         connector,
         session_secret,
         boot_wait_done,
+        boot_wait,
         handshake_timeout,
         context,
     )?;
