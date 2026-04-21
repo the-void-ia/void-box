@@ -25,11 +25,10 @@ use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, 
 
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
 ///
-/// Kept below the guest-agent's per-connection exec ceiling (see
-/// [`SERIAL_EXEC_COUNT`] docs) so this test targets the demultiplexer
-/// rather than the pre-existing watchdog-thread leak. 16 parallel
-/// calls exercise the writer-mutex under contention and verify each
-/// response is routed to the correct `request_id` slot.
+/// Capped at 16 while the userspace vsock backend's flow-control bug
+/// around long-lived multiplex connections is being investigated
+/// separately; 16 parallel calls still exercise writer-mutex
+/// contention and request_id demultiplexing without tripping it.
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
 fn backend_available() -> bool {
@@ -115,34 +114,18 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
     }
 }
 
-/// Fires [`SERIAL_EXEC_COUNT`] exec calls serially against the same backend.
+/// Number of serial `exec` calls fired through the persistent channel.
 ///
-/// Verifies that the persistent multiplex channel survives a long run
-/// of RPCs without leaking request_ids, deadlocking the writer mutex,
-/// or the reader thread silently dying.
-///
-/// # Known limitation
-///
-/// The guest-agent's dispatch loop is single-threaded per connection:
-/// each `exec` spawns a `watchdog` thread that sleeps the full
-/// `timeout_secs` without being joined. Under Lever 7 those orphan
-/// threads accumulate on one connection whereas the old per-RPC design
-/// hid them by tearing down the connection after every call. With the
-/// test-image 1 vCPU VM and the default 30 s exec timeout, the guest
-/// stalls somewhere after ~20 exec cycles. Capping this test at 16
-/// serial calls verifies the multiplex path without tripping the
-/// pre-existing guest-agent resource limit. Fixing the watchdog leak
-/// is tracked as a follow-up.
+/// Capped at 16 because the userspace vsock backend currently has a
+/// flow-control issue that stalls long-lived multiplex connections
+/// around 24 sequential RPCs (see `virtio_vsock_userspace` — tracked
+/// for a separate fix). 16 sequential calls verify the multiplex path
+/// without tripping it.
 const SERIAL_EXEC_COUNT: usize = 16;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn persistent_channel_serial_exec_many() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
-
     let Some(backend) = create_started_backend().await else {
         return;
     };
@@ -195,7 +178,7 @@ async fn persistent_channel_concurrent_exec() {
             let expected = format!("req-{index}");
             let script = format!("echo {expected}");
             let output = backend
-                .exec("sh", &["-c", &script], &[], &[], None, Some(60))
+                .exec("sh", &["-c", &script], &[], &[], None, Some(30))
                 .await
                 .expect("exec should succeed");
             (index, expected, output)
