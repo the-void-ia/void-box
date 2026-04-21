@@ -454,10 +454,19 @@ impl MicroVm {
 
         // Build the persistent multiplex control channel over the
         // vsock connector. Lazy: first RPC triggers the handshake.
+        // The kernel vhost-vsock backend RSTs rapid connect attempts
+        // before the guest's virtio-vsock device is live; give it a
+        // 250 ms head start. The userspace backend buffers connects
+        // behind its worker thread and needs no padding.
+        let boot_wait = match config.vsock_backend {
+            config::VsockBackendType::Vhost => std::time::Duration::from_millis(250),
+            config::VsockBackendType::Userspace => std::time::Duration::ZERO,
+        };
         let control_channel = vsock.as_ref().map(|device| {
-            Arc::new(crate::backend::control_channel::ControlChannel::new(
+            Arc::new(ControlChannel::with_boot_wait(
                 device.connector(),
                 *device.session_secret(),
+                boot_wait,
             ))
         });
         let control_channel_clone = control_channel.clone();

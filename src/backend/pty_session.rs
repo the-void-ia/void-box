@@ -131,10 +131,14 @@ impl PtySession {
         boot_wait_done: &std::sync::atomic::AtomicBool,
         request: &PtyOpenRequest,
     ) -> Result<Self> {
+        // PTY sessions open after the main control channel has already
+        // taken the boot hit, so we pass `Duration::ZERO` here and
+        // lean on the handshake retry loop to pick up the listener.
         let mut stream = connect_with_handshake_sync(
             connector,
             session_secret,
             boot_wait_done,
+            Duration::ZERO,
             Duration::from_secs(3),
             "pty-open",
         )?;
