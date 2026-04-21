@@ -2420,38 +2420,52 @@ fn execute_command(fd: RawFd, request_id: u32, request: &ExecRequest) -> ExecRes
         }
     }
 
-    // Spawn a watchdog thread that will SIGKILL the child's process group
-    // if it exceeds the timeout. The child PID is captured before we move
-    // ownership to the wait logic.
+    // Spawn a watchdog thread that SIGKILLs the child's process group
+    // when `timeout_secs` elapses. The watchdog shares a condition
+    // variable with the main handler: when the child exits normally,
+    // the handler notifies the condvar so the watchdog wakes up early
+    // and we can `join` it. Without this the watchdog would sleep the
+    // full timeout and leak its OS thread until the VM shuts down.
     let child_pid = child.id() as i32;
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog_handle = if let Some(timeout_secs) = request.timeout_secs {
-        if timeout_secs == 0 {
-            None // Service mode: no timeout
-        } else {
-            let timed_out_flag = timed_out.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("watchdog".into())
-                    .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-                        eprintln!(
-                            "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
-                            timeout_secs, child_pid
-                        );
-                        timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        // Kill the entire process group (negative PID)
-                        unsafe {
-                            libc::kill(-child_pid, libc::SIGKILL);
-                            // Also kill the specific process in case setpgid wasn't called
-                            libc::kill(child_pid, libc::SIGKILL);
-                        }
-                    })
-                    .ok(),
-            )
+    let watchdog_wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let watchdog_handle = match request.timeout_secs {
+        None | Some(0) => None,
+        Some(timeout_secs) => {
+            let timed_out_flag = Arc::clone(&timed_out);
+            let wake = Arc::clone(&watchdog_wake);
+            std::thread::Builder::new()
+                .name("watchdog".into())
+                .spawn(move || {
+                    let (lock, cvar) = &*wake;
+                    let Ok(guard) = lock.lock() else {
+                        return;
+                    };
+                    let (guard, wait_result) = cvar
+                        .wait_timeout_while(
+                            guard,
+                            std::time::Duration::from_secs(timeout_secs),
+                            |done| !*done,
+                        )
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *guard {
+                        return;
+                    }
+                    if !wait_result.timed_out() {
+                        return;
+                    }
+                    eprintln!(
+                        "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
+                        timeout_secs, child_pid
+                    );
+                    timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    unsafe {
+                        libc::kill(-child_pid, libc::SIGKILL);
+                        libc::kill(child_pid, libc::SIGKILL);
+                    }
+                })
+                .ok()
         }
-    } else {
-        None
     };
 
     // Take stdout/stderr pipes for streaming
@@ -2505,9 +2519,19 @@ fn execute_command(fd: RawFd, request_id: u32, request: &ExecRequest) -> ExecRes
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    // The watchdog thread is a daemon -- it will exit when the process dies.
-    // We don't join it because it may still be sleeping.
-    let _ = watchdog_handle;
+    // Wake the watchdog early so it exits without blocking for the full
+    // timeout, then join it so the OS thread is reaped. Under the
+    // persistent control channel this matters: leaked watchdog threads
+    // were accumulating on every exec and stalling the guest dispatch
+    // loop after ~20 sequential calls.
+    if let Some(handle) = watchdog_handle {
+        let (lock, cvar) = &*watchdog_wake;
+        if let Ok(mut done) = lock.lock() {
+            *done = true;
+            cvar.notify_all();
+        }
+        let _ = handle.join();
+    }
 
     let was_timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
 
