@@ -109,6 +109,11 @@ jobs:
           # Skill-install + MCP exec path (exercises unified ControlChannel)
           cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
+          # PTY happy-path regression guard (only the stable test; the
+          # other two in e2e_pty are flaky pending PTY-master lifetime
+          # root-cause).
+          cargo test --test e2e_pty pty_nonzero_exit_code -- --ignored --test-threads=1
+
       - name: Run snapshot integration tests
         env:
           VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
