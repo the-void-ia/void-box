@@ -27,8 +27,8 @@ use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, 
 ///
 /// Capped at 16 while the userspace vsock backend's flow-control bug
 /// around long-lived multiplex connections is being investigated
-/// separately; 16 parallel calls still exercise writer-mutex
-/// contention and request_id demultiplexing without tripping it.
+/// separately (see
+/// `docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md`).
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
 fn backend_available() -> bool {
@@ -116,11 +116,7 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
 
 /// Number of serial `exec` calls fired through the persistent channel.
 ///
-/// Capped at 16 because the userspace vsock backend currently has a
-/// flow-control issue that stalls long-lived multiplex connections
-/// around 24 sequential RPCs (see `virtio_vsock_userspace` — tracked
-/// for a separate fix). 16 sequential calls verify the multiplex path
-/// without tripping it.
+/// Capped at 16 for the same reason as [`CONCURRENT_EXEC_COUNT`].
 const SERIAL_EXEC_COUNT: usize = 16;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

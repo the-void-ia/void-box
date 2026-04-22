@@ -469,6 +469,17 @@ impl MicroVm {
                 boot_wait,
             ))
         });
+
+        // Eagerly fire the handshake in parallel with the rest of
+        // `new`'s work so the first RPC finds the channel already live.
+        // Failures are swallowed; the first real RPC re-attempts.
+        if let Some(channel) = control_channel.as_ref() {
+            let warm = Arc::clone(channel);
+            tokio::spawn(async move {
+                warm.warm_handshake().await;
+            });
+        }
+
         let control_channel_clone = control_channel.clone();
 
         // Start VM event loop
