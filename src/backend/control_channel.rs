@@ -53,6 +53,16 @@ use crate::{Error, Result};
 /// handful of attempts as the timeout grows.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// Cold-boot wait applied once per [`ControlChannel`] before the first
+/// connect attempt.
+///
+/// Older host-side code slept 4 seconds unconditionally; profiling
+/// showed most guests are ready in 200–800 ms, so 250 ms matches the
+/// common case while still giving the kernel vhost-vsock driver time
+/// to see the guest's virtio-vsock device come up. Restored channels
+/// skip this wait entirely because the guest-agent is already live.
+const BOOT_WAIT: Duration = Duration::from_millis(250);
+
 /// Upper bound for the exponential per-attempt handshake read timeout.
 ///
 /// 150 ms is the ceiling validated against agent workloads in the
@@ -567,6 +577,16 @@ pub(crate) fn connect_with_handshake_sync(
     let first_attempt = boot_wait_done
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
+
+    // Cold boot: give the guest kernel a head start before we hammer
+    // the vsock. Host-side AF_VSOCK connect goes through the kernel
+    // vhost-vsock driver, which RSTs or corners itself when the guest's
+    // virtio-vsock device isn't fully initialized. The userspace
+    // backend buffers connects behind its worker thread and doesn't
+    // suffer, but we take the common path for both.
+    if first_attempt {
+        std::thread::sleep(BOOT_WAIT);
+    }
 
     // Initial delay sized for typical guest boot probe cadence (~25ms).
     // Max cap kept small so a late-booting guest costs at most ~250ms of
