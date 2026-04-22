@@ -103,6 +103,12 @@ jobs:
           # Run mount integration tests
           cargo test --test e2e_mount -- --ignored --test-threads=1
 
+          # Persistent multiplex control channel regression guard
+          cargo test --test persistent_channel -- --ignored --test-threads=1
+
+          # Skill-install + MCP exec path (exercises unified ControlChannel)
+          cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+
       - name: Run snapshot integration tests
         env:
           VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
