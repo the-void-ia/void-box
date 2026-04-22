@@ -200,17 +200,27 @@ impl VmmBackend for KvmBackend {
 
         // Normal cold-boot path.
         //
-        // Use the Userspace vsock backend so the device state can be cleanly
-        // captured by snapshot() and restored by from_snapshot() (which
-        // always restores into VirtioVsockUserspace).  Vhost-vsock state is
-        // not snapshot-compatible.
+        // The vsock backend is chosen based on whether the caller intends to
+        // snapshot this VM later. Userspace vsock is required for snapshot
+        // compatibility (from_snapshot always restores into
+        // VirtioVsockUserspace), but has a flow-control limitation that can
+        // stall multi-RPC boot sequences (see
+        // docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md).
+        // Cold-boot-only runs use Vhost-vsock, which is the fast, stable
+        // default.
+        let needs_userspace_vsock = config.enable_snapshots || config.snapshot.is_some();
+        let vsock_backend = if needs_userspace_vsock {
+            VsockBackendType::Userspace
+        } else {
+            VsockBackendType::Vhost
+        };
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .kernel(&config.kernel)
             .network(config.network)
             .enable_vsock(config.enable_vsock)
-            .vsock_backend(VsockBackendType::Userspace);
+            .vsock_backend(vsock_backend);
 
         if let Some(ref initramfs) = config.initramfs {
             vm_config = vm_config.initramfs(initramfs);
@@ -245,18 +255,10 @@ impl VmmBackend for KvmBackend {
         self.vcpus = config.vcpus;
         self.network = config.network;
 
-        // Build the control channel with the Userspace Unix-socket connector
-        // (matches the Userspace vsock backend chosen above for snapshot
-        // compatibility).
         let session_secret = config.security.session_secret;
-        let socket_path = vm
-            .vsock_socket_path()
-            .expect("Userspace vsock backend must have socket path")
-            .to_path_buf();
-        let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
-            let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
-            Ok(Box::new(stream))
-        });
+        let connector = vm
+            .vsock_connector()
+            .expect("vsock device must be present when enable_vsock is true");
         let channel = Arc::new(ControlChannel::new(connector, session_secret));
         let channel_for_warmup = Arc::clone(&channel);
         tokio::spawn(async move {

@@ -1289,6 +1289,16 @@ impl MicroVm {
         self.vsock_socket_path.as_deref()
     }
 
+    /// Returns a [`GuestConnector`] for the configured vsock backend.
+    ///
+    /// Hides whether the VM uses Vhost-vsock (AF_VSOCK) or userspace vsock
+    /// (AF_UNIX) behind a single connector abstraction.
+    ///
+    /// [`GuestConnector`]: crate::backend::control_channel::GuestConnector
+    pub fn vsock_connector(&self) -> Option<crate::backend::control_channel::GuestConnector> {
+        self.vsock.as_ref().map(|v| v.connector())
+    }
+
     /// Check if the VM is currently running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
