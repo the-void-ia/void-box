@@ -175,10 +175,10 @@ pub fn list_snapshots() -> Result<Vec<SnapshotInfo>> {
 
 /// Load snapshot info from a KVM snapshot directory.
 ///
-/// On macOS, `state.bin` uses `bincode`-serialized `VmSnapshot` which depends
-/// on KVM types only available on Linux. We still handle the directory-based
-/// metadata (hash from dirname) but skip deserializing the state file itself
-/// on non-Linux platforms.
+/// On macOS, `state.bin` holds a `postcard`-serialized `VmSnapshot` which
+/// depends on KVM types only available on Linux. We still handle the
+/// directory-based metadata (hash from dirname) but skip deserializing the
+/// state file itself on non-Linux platforms.
 fn load_kvm_snapshot_info(dir: &Path) -> Option<SnapshotInfo> {
     #[cfg(target_os = "linux")]
     {

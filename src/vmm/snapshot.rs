@@ -18,7 +18,13 @@ use crate::vmm::arch;
 use crate::{Error, Result};
 
 /// Snapshot format version for forward compatibility.
-pub const SNAPSHOT_VERSION: u32 = 3;
+///
+/// Bumped to 4 when `bincode` (unmaintained, RUSTSEC-2025-0141) was swapped
+/// for `postcard`. The new wire format — varint-encoded integers, different
+/// option/enum encoding — is not compatible with pre-v4 snapshots. Old
+/// `state.bin` files fail to decode before the version check ever runs;
+/// delete `~/.void-box/snapshots/` to recover.
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 // Re-export cross-platform snapshot utilities from `snapshot_store`.
 pub use crate::snapshot_store::{
@@ -129,7 +135,7 @@ impl VmSnapshot {
         fs::create_dir_all(dir).map_err(|e| {
             Error::Snapshot(format!("create snapshot dir {}: {}", dir.display(), e))
         })?;
-        let state_bytes = bincode::serialize(self)
+        let state_bytes = postcard::to_allocvec(self)
             .map_err(|e| Error::Snapshot(format!("serialize state: {}", e)))?;
         fs::write(dir.join("state.bin"), &state_bytes)?;
         info!(
@@ -145,7 +151,7 @@ impl VmSnapshot {
         let state_path = dir.join("state.bin");
         let state_bytes = fs::read(&state_path)
             .map_err(|e| Error::Snapshot(format!("read {}: {}", state_path.display(), e)))?;
-        let snapshot: VmSnapshot = bincode::deserialize(&state_bytes)
+        let snapshot: VmSnapshot = postcard::from_bytes(&state_bytes)
             .map_err(|e| Error::Snapshot(format!("deserialize state: {}", e)))?;
         if snapshot.version != SNAPSHOT_VERSION {
             return Err(Error::Snapshot(format!(
@@ -295,7 +301,7 @@ pub fn dump_memory_diff(
     };
 
     let mut file = fs::File::create(path)?;
-    let header_bytes = bincode::serialize(&header)
+    let header_bytes = postcard::to_allocvec(&header)
         .map_err(|e| Error::Snapshot(format!("serialize diff header: {}", e)))?;
     file.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
     file.write_all(&header_bytes)?;
@@ -417,7 +423,7 @@ fn read_diff_header(file: &mut fs::File) -> Result<DiffMemoryHeader> {
     file.read_exact(&mut header_bytes)
         .map_err(|e| Error::Snapshot(format!("read diff header: {}", e)))?;
 
-    bincode::deserialize(&header_bytes)
+    postcard::from_bytes(&header_bytes)
         .map_err(|e| Error::Snapshot(format!("deserialize diff header: {}", e)))
 }
 
@@ -609,8 +615,8 @@ mod tests {
     fn test_snapshot_type_serde_roundtrip() {
         let types = vec![SnapshotType::Base, SnapshotType::Diff];
         for t in types {
-            let bytes = bincode::serialize(&t).unwrap();
-            let restored: SnapshotType = bincode::deserialize(&bytes).unwrap();
+            let bytes = postcard::to_allocvec(&t).unwrap();
+            let restored: SnapshotType = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(t, restored);
         }
     }
@@ -636,8 +642,8 @@ mod tests {
             timer_regs: vec![(0x3000, 100)],
             mp_state: Some(0),
         };
-        let bytes = bincode::serialize(&state).unwrap();
-        let restored: arch::VcpuState = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&state).unwrap();
+        let restored: arch::VcpuState = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(state.mp_state, restored.mp_state);
     }
 
@@ -753,8 +759,8 @@ mod tests {
             session_secret: vec![0xAA; 32],
             net_state: None,
         };
-        let bytes = bincode::serialize(&snap).unwrap();
-        let restored: VmSnapshot = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let restored: VmSnapshot = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(restored.version, SNAPSHOT_VERSION);
         assert_eq!(restored.config_hash, "abc123");
         assert_eq!(restored.vcpu_states.len(), 1);
@@ -767,8 +773,8 @@ mod tests {
             total_memory_size: 256 * 1024 * 1024,
             dirty_page_indices: vec![0, 5, 10, 100, 1000],
         };
-        let bytes = bincode::serialize(&header).unwrap();
-        let restored: DiffMemoryHeader = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&header).unwrap();
+        let restored: DiffMemoryHeader = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(restored.total_memory_size, header.total_memory_size);
         assert_eq!(restored.dirty_page_indices, header.dirty_page_indices);
     }
