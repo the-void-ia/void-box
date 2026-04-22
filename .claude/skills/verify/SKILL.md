@@ -43,11 +43,14 @@ Note: Integration and E2E tests (conformance, snapshot, e2e_*) require `VOID_BOX
 cargo audit --deny warnings
 ```
 
-**5. Startup bench regression gate** (Linux only, required before push)
+**5. Startup bench regression gate** (required before push; thresholds differ by host)
 
-Guards against regressions in the subsecond startup path. Fail if cold
-p50 > 400 ms or warm p50 > 200 ms on this host with the slim kernel +
-test rootfs.
+Guards against regressions in the subsecond startup path. Thresholds are
+host-specific because Linux/KVM and macOS/VZ have different floors —
+VZ cold time is dominated by Hypervisor.framework setup, not kernel init,
+so the slim kernel helps much less on macOS.
+
+On Linux (fail if cold p50 > 400 ms or warm p50 > 200 ms):
 
 ```
 cargo build --release --bin voidbox-startup-bench
@@ -57,11 +60,33 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
   tee target/tmp/verify_bench.log | grep -E "^(cold|warm)\.total"
 ```
 
-- If `vmlinux-slim-x86_64` is missing, run `scripts/build_slim_kernel.sh`
-  first (10 min cold; cached thereafter).
+On macOS/arm64 — M-series (fail if cold p50 > 2.2 s or warm p50 > 320 ms).
+Thresholds are provisional, derived from a single n=10 baseline; re-measure
+at n=20 on the target host before treating them as hard gates. Intel
+Mac / VZ has no baseline yet; skip this step or measure locally first.
+Use `cargo run` so the `.cargo/config.toml` runner codesigns the bench
+binary automatically — direct invocation of `target/release/...`
+skips the runner and fails with a `com.apple.security.virtualization`
+entitlement error:
+
+```
+export VOID_BOX_KERNEL=$PWD/target/vmlinux-slim-aarch64
+export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
+cargo run --release --bin voidbox-startup-bench -- --iters 20 --breakdown 2>&1 | \
+  tee target/tmp/verify_bench.log | grep -E "^(cold|warm)\.total"
+```
+
+- If `vmlinux-slim-<arch>` is missing, run `scripts/build_slim_kernel.sh`
+  first (10 min cold; cached thereafter). On macOS the script
+  auto-re-execs inside an `ubuntu:24.04` container — requires Docker
+  Desktop running.
 - If the test rootfs is missing, run `scripts/build_test_image.sh`.
-- Reference numbers (Fedora 43 KVM, slim kernel, post-rebase on main):
-  cold p50 **≈ 252 ms / p95 ≈ 260 ms**, warm p50 **≈ 138 ms / p95 ≈ 144 ms**.
+- Reference numbers:
+  - Fedora 43 / KVM / slim x86_64: cold p50 **≈ 252 ms / p95 ≈ 260 ms**,
+    warm p50 **≈ 138 ms / p95 ≈ 144 ms**.
+  - M-series / VZ / slim aarch64: cold p50 **≈ 1.9 s**, warm p50 **≈ 282 ms**
+    (n=10 baseline; re-measure at n=20 and tune thresholds when you have a
+    stable sample).
 - If the bench hangs or produces EAGAIN within 30 s, skip to
   `superpowers:systematic-debugging` — do not push until diagnosed.
 

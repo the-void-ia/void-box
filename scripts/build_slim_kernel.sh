@@ -34,9 +34,84 @@ set -euo pipefail
 #   KERNEL_VER=6.12.30 scripts/build_slim_kernel.sh
 #   KERNEL_VER=6.1.80 FC_CONFIG_MAJMIN=6.1 scripts/build_slim_kernel.sh
 #   ARCH=aarch64 scripts/build_slim_kernel.sh
+#
+# macOS hosts: the Linux kernel can't be built natively, so the script
+# dispatches a copy of itself into an ubuntu:24.04 container (requires
+# Docker Desktop running). Build happens on the container's overlayfs
+# — bind mounts aren't used for the source tree because Docker
+# Desktop's VirtioFS races with tar's directory-rename metadata during
+# kernel source extraction. Only the final `vmlinux-slim-<arch>`
+# artifact is copied back to `target/`.
+#
+# Override `UBUNTU_IMAGE` to pin a specific digest for reproducibility
+# (e.g. `UBUNTU_IMAGE=ubuntu:24.04@sha256:...`). Default is the plain
+# tag, which is acceptable drift for a local builder image but not
+# fully reproducible.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+build_slim_kernel_in_docker() {
+    local platform="$1"
+    local image="${UBUNTU_IMAGE:-ubuntu:24.04}"
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "[slim-kernel] ERROR: docker CLI not found. Install Docker Desktop." >&2
+        exit 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        echo "[slim-kernel] ERROR: Docker daemon not reachable. Start Docker Desktop." >&2
+        exit 1
+    fi
+    echo "[slim-kernel] macOS host: dispatching build into ${image} (${platform})"
+    mkdir -p "$ROOT_DIR/target"
+    docker run --rm \
+        --platform "$platform" \
+        -v "$ROOT_DIR/scripts:/src/scripts:ro" \
+        -v "$ROOT_DIR/target:/host-target" \
+        -e "ARCH=${ARCH:-}" \
+        -e "KERNEL_VER=${KERNEL_VER:-}" \
+        -e "FC_COMMIT=${FC_COMMIT:-}" \
+        -e "FC_CONFIG_MAJMIN=${FC_CONFIG_MAJMIN:-}" \
+        "$image" bash -euo pipefail -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+                build-essential flex bison bc libssl-dev libelf-dev \
+                cpio curl xz-utils ca-certificates
+            mkdir -p /work/scripts /work/target
+            cp -r /src/scripts/. /work/scripts/
+            cd /work
+            scripts/build_slim_kernel.sh
+            cp -v target/vmlinux-slim-* /host-target/
+        '
+}
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Normalize arch to the tokens the main script uses below, then map to
+    # the docker/OCI platform tuple. Doing it here (before the Linux-only
+    # section runs) lets us short-circuit on the host cache without
+    # paying Docker startup.
+    _host_arch="${ARCH:-$(uname -m)}"
+    case "$_host_arch" in
+        aarch64|arm64) _host_arch=aarch64; _platform=linux/arm64 ;;
+        x86_64|amd64)  _host_arch=x86_64;  _platform=linux/amd64 ;;
+        *)
+            echo "[slim-kernel] ERROR: unsupported architecture: $_host_arch" >&2
+            exit 1
+            ;;
+    esac
+    _out_host="$ROOT_DIR/target/vmlinux-slim-${_host_arch}"
+    if [[ -f "$_out_host" ]]; then
+        echo "[slim-kernel] Cached slim kernel: $_out_host ($(du -h "$_out_host" | cut -f1))"
+        echo "[slim-kernel] To rebuild, remove it: rm $_out_host"
+        echo ""
+        echo "[slim-kernel] Use with:"
+        echo "  VOID_BOX_KERNEL=$_out_host"
+        exit 0
+    fi
+    build_slim_kernel_in_docker "$_platform"
+    exit $?
+fi
 
 KERNEL_VER="${KERNEL_VER:-6.12.30}"
 KERNEL_MAJMIN="${KERNEL_VER%.*}"                 # e.g. 6.12
@@ -141,6 +216,15 @@ echo "[slim-kernel] Applying void-box additions to config..."
     # devices (vsock, net, 9p, OCI rootfs) via `virtio_mmio.device=...` args.
     # Firecracker's config leaves this off because they use virtio-pci.
     scripts/config --enable CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES
+    # Apple Virtualization.framework (macOS) exposes all virtio devices over
+    # PCI on arm64 — Firecracker's config has `# CONFIG_PCI is not set`, so
+    # without these the kernel boots on VZ but enumerates zero devices and
+    # the control channel never comes up. No-op on x86_64 (always has PCI).
+    scripts/config --enable CONFIG_PCI
+    scripts/config --enable CONFIG_PCI_HOST_GENERIC
+    scripts/config --enable CONFIG_PCI_HOST_COMMON
+    scripts/config --enable CONFIG_VIRTIO_PCI
+    scripts/config --enable CONFIG_VIRTIO_PCI_LEGACY
     # Drop module signing — we only build built-in modules and the
     # openssl/engine.h dependency breaks on OpenSSL 3 (Fedora 40+).
     scripts/config --disable CONFIG_MODULE_SIG

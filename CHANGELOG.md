@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Slim microVM kernel build** (`scripts/build_slim_kernel.sh`) — upstream Linux v6.12.30 LTS + Firecracker `microvm-kernel-ci-{x86_64,aarch64}-6.1.config` base + void-box additions (9p, virtiofs, overlayfs, `VIRTIO_MMIO_CMDLINE_DEVICES`). Ships uncompressed `vmlinux` (~30 MB) unifying artifact shape with macOS/VZ. Disables `CONFIG_MODULE_SIG*` so builds work on OpenSSL 3 hosts (Fedora 40+). `KERNEL_VER` / `FC_COMMIT` / `FC_CONFIG_MAJMIN` env overrides for reproducible builds.
+- **macOS slim-kernel cross-build** — `scripts/build_slim_kernel.sh` now dispatches into an `ubuntu:24.04` container on Darwin hosts (`--platform` pinned from host arch, host-side cache check skips Docker on re-runs). `UBUNTU_IMAGE` env var lets callers pin a digest for reproducibility. Enables `CONFIG_PCI{,_HOST_GENERIC,_HOST_COMMON}` + `CONFIG_VIRTIO_PCI{,_LEGACY}` so the slim kernel boots on Apple Virtualization.framework (which uses virtio-PCI on arm64, unlike Firecracker's virtio-MMIO).
 - `voidbox --log-dir` and `VOIDBOX_LOG_DIR` overrides for file-based runtime logs
 - **Codex CLI as first-class agent peer** — `llm.provider: codex` in YAML specs exec's the bundled OpenAI Codex CLI inside the guest VM with full structured observability
 - `scripts/build_codex_rootfs.sh` — production Codex-capable initramfs with auto-download from GitHub releases (musl-static, no glibc shipping)
