@@ -30,7 +30,7 @@ mod pty_tests {
         Ok(sandbox)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_open_and_immediate_exit() {
         if let Some(reason) = skip_reason() {
@@ -60,7 +60,7 @@ mod pty_tests {
         let _ = sandbox.stop().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_command_not_allowed() {
         if let Some(reason) = skip_reason() {
@@ -90,7 +90,7 @@ mod pty_tests {
         let _ = sandbox.stop().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_nonzero_exit_code() {
         if let Some(reason) = skip_reason() {
