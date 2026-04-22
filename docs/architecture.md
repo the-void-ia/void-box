@@ -496,7 +496,7 @@ in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
 ```
 ~/.void-box/snapshots/
   └── <hash-prefix>/        # first 16 chars of config hash
-      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
+      ├── state.bin          # postcard: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
       ├── memory.mem         # full memory dump (base)
       └── memory.diff        # dirty pages only (diff snapshots)
 ```

@@ -61,7 +61,7 @@ rustix = { version = "1", features = ["event", "fs", "termios"] }
 signal-hook = "0.3"
 byteorder = "1"
 sha2 = "0.10"
-indicatif = "0.17"
+indicatif = "0.18"
 tempfile = "3"
 
 # --- Linux-only dependencies ---
@@ -82,7 +82,7 @@ event-manager = "0.4"
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
 
 # Binary serialization for VM snapshot state
-bincode = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # Device Tree Blob generation for aarch64 boot
 vm-fdt = "0.3"
