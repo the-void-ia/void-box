@@ -463,8 +463,6 @@ round-trip). The second is what users actually wait for.
 The warm path dwarfs the ~1.3 ms host-side restore because the guest
 kernel resumes from HLT/NOHZ-idle and the host-side vsock handshake
 retry loop converges only as fast as the guest-agent replies to Ping.
-Decomposition of both paths (and the path to sub-100 ms cold) lives
-in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
 
 **Startup evolution on this runtime** — where the 19× cold speedup came from:
 
@@ -488,8 +486,9 @@ measurement methodology varies (Firecracker's published number is
 | **VoidBox (this branch)** | **252 ms** | **138 ms** | Kernel boot + vsock handshake + first exec RTT |
 
 Competitive for a general-purpose agent runtime; behind Firecracker's
-Lambda-specialized numbers. Paths to narrow the gap further are documented
-in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
+Lambda-specialized numbers. Further gains depend on PVH direct-kernel
+boot (skips `linux-loader` parsing) and smaller-still guest kernel
+configs.
 
 ### Storage layout
 

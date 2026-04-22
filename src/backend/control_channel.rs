@@ -55,8 +55,7 @@ const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Upper bound for the exponential per-attempt handshake read timeout.
 ///
-/// 150 ms is the ceiling validated against agent workloads in the
-/// Milestone A plan (see 2026-04-20-startup-milestones-b-c-d.md) — long
+/// 150 ms is the ceiling validated against agent workloads — long
 /// enough to absorb the userspace vsock worker's queueing under cold
 /// boot, short enough that the handshake loop exits quickly.
 const MAX_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(150);
