@@ -9,15 +9,10 @@
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use tracing::debug;
 
-use crate::guest::protocol::{
-    ExecOutputChunk, ExecRequest, ExecResponse, Message, MessageType, MkdirPRequest,
-    MkdirPResponse, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest, WriteFileResponse,
-};
 use crate::{Error, Result};
 
 /// vsock port used by the guest agent
@@ -33,12 +28,14 @@ pub const VMADDR_CID_HOST: u32 = 2;
 /// Does not open /dev/vhost-vsock; the VirtioVsockMmio device is the single
 /// vhost-vsock backend for this VM's CID.
 pub struct VsockDevice {
-    /// Context ID for this VM (guest CID; host uses CID 2)
+    /// Context ID for this VM (guest CID; host uses CID 2).
     cid: u32,
-    /// Tracks whether the cold-boot wait has already been applied.
-    boot_wait_done: AtomicBool,
     /// 32-byte session secret for vsock authentication.
-    /// Sent as the Ping payload; guest validates against its cmdline secret.
+    ///
+    /// Sent as the Ping payload by [`ControlChannel`]; the guest-agent
+    /// validates it against the secret in its kernel cmdline.
+    ///
+    /// [`ControlChannel`]: crate::backend::control_channel::ControlChannel
     session_secret: [u8; 32],
     /// When set, connect via AF_UNIX instead of AF_VSOCK (userspace backend).
     unix_socket_path: Option<PathBuf>,
@@ -66,33 +63,12 @@ impl VsockDevice {
 
         Ok(Self {
             cid,
-            boot_wait_done: AtomicBool::new(false),
             session_secret,
             unix_socket_path: None,
         })
     }
 
-    /// Create a vsock device for a restored VM (skip boot wait).
-    pub fn restored(cid: u32, session_secret: [u8; 32]) -> Result<Self> {
-        if cid < 3 {
-            return Err(Error::Config(format!(
-                "Invalid CID {}: must be >= 3 (0-2 reserved)",
-                cid
-            )));
-        }
-        debug!(
-            "Creating restored vsock device with CID {} (boot wait skipped)",
-            cid
-        );
-        Ok(Self {
-            cid,
-            boot_wait_done: AtomicBool::new(true), // skip boot wait
-            session_secret,
-            unix_socket_path: None,
-        })
-    }
-
-    /// Create a vsock device that connects via AF_UNIX (userspace backend).
+    /// Creates a vsock device that connects via AF_UNIX (userspace backend).
     pub fn with_unix_socket(
         cid: u32,
         session_secret: [u8; 32],
@@ -111,32 +87,6 @@ impl VsockDevice {
         );
         Ok(Self {
             cid,
-            boot_wait_done: AtomicBool::new(false),
-            session_secret,
-            unix_socket_path: Some(socket_path),
-        })
-    }
-
-    /// Create a restored vsock device that connects via AF_UNIX (userspace backend).
-    pub fn restored_with_unix_socket(
-        cid: u32,
-        session_secret: [u8; 32],
-        socket_path: PathBuf,
-    ) -> Result<Self> {
-        if cid < 3 {
-            return Err(Error::Config(format!(
-                "Invalid CID {}: must be >= 3 (0-2 reserved)",
-                cid
-            )));
-        }
-        debug!(
-            "Creating restored vsock device with CID {} (AF_UNIX: {}, boot wait skipped)",
-            cid,
-            socket_path.display()
-        );
-        Ok(Self {
-            cid,
-            boot_wait_done: AtomicBool::new(true),
             session_secret,
             unix_socket_path: Some(socket_path),
         })
@@ -152,366 +102,26 @@ impl VsockDevice {
         &self.session_secret
     }
 
-    /// Send an exec request to the guest agent and wait for response.
+    /// Returns a [`GuestConnector`] that opens a fresh vsock connection
+    /// to the guest-agent port on every call.
     ///
-    /// Uses a connect handshake: after connect, send Ping and wait for Pong
-    /// before sending the first request. This confirms the guest agent is ready
-    /// and avoids sending ExecRequest before the guest is in the read loop.
-    pub async fn send_exec_request(&self, request: &ExecRequest) -> Result<ExecResponse> {
-        let mut stream = self
-            .connect_with_handshake(Duration::from_secs(3), "exec")
-            .await?;
-
-        // Set the read timeout for the response.
-        // Use the per-request timeout if provided, otherwise default to 20 minutes.
-        // LLM inference (especially with local models via Ollama on CPU) can take
-        // 10+ minutes per turn for complex prompts with tool definitions.
-        // timeout_secs == Some(0) means service mode: wait forever (no timeout).
-        if request.timeout_secs == Some(0) {
-            let _ = stream.set_read_timeout(None); // Service mode: wait forever
-        } else {
-            let timeout = request
-                .timeout_secs
-                .filter(|&s| s > 0)
-                .map(Duration::from_secs)
-                .unwrap_or(Duration::from_secs(1200));
-            let _ = stream.set_read_timeout(Some(timeout));
-        }
-
-        // Serialize and send request
-        let message = Message {
-            msg_type: MessageType::ExecRequest,
-            payload: serde_json::to_vec(request)?,
-        };
-
-        let msg_bytes = message.serialize();
-        stream
-            .write_all(&msg_bytes)
-            .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
-
-        debug!("vsock: sent ExecRequest, waiting for ExecResponse");
-        // Read messages in a loop, discarding streaming ExecOutputChunk
-        // messages until we get the final ExecResponse. The guest-agent
-        // always streams stdout/stderr chunks during execution.
-        loop {
-            let msg = Message::read_from_sync(&mut stream)?;
-            match msg.msg_type {
-                MessageType::ExecOutputChunk => {
-                    // Discard streaming chunks in non-streaming mode
-                    continue;
-                }
-                MessageType::ExecResponse => {
-                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    debug!(
-                        "vsock: ExecResponse received exit_code={}",
-                        response.exit_code
-                    );
-                    return Ok(response);
-                }
-                other => {
-                    return Err(Error::Guest(format!(
-                        "Unexpected response type: {:?}",
-                        other
-                    )));
-                }
-            }
-        }
-    }
-
-    /// Send an exec request and stream output chunks as they arrive.
+    /// The connector is what [`ControlChannel`] needs to establish its
+    /// persistent multiplex channel: one call at first RPC (or on
+    /// reconnect after death), and once on each PTY session.
     ///
-    /// Calls `on_chunk` for each `ExecOutputChunk` the guest sends before the
-    /// final `ExecResponse`. The final response still contains full accumulated
-    /// stdout/stderr for backward compatibility.
-    pub async fn send_exec_request_streaming<F>(
-        &self,
-        request: &ExecRequest,
-        mut on_chunk: F,
-    ) -> Result<ExecResponse>
-    where
-        F: FnMut(ExecOutputChunk),
-    {
-        let mut stream = self
-            .connect_with_handshake(Duration::from_secs(3), "exec-streaming")
-            .await?;
-
-        // timeout_secs == Some(0) means service mode: wait forever (no timeout).
-        if request.timeout_secs == Some(0) {
-            let _ = stream.set_read_timeout(None); // Service mode: wait forever
-        } else {
-            let timeout = request
-                .timeout_secs
-                .filter(|&s| s > 0)
-                .map(Duration::from_secs)
-                .unwrap_or(Duration::from_secs(1200));
-            let _ = stream.set_read_timeout(Some(timeout));
-        }
-
-        let message = Message {
-            msg_type: MessageType::ExecRequest,
-            payload: serde_json::to_vec(request)?,
-        };
-
-        let msg_bytes = message.serialize();
-        stream
-            .write_all(&msg_bytes)
-            .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
-
-        debug!("vsock: sent ExecRequest (streaming), waiting for chunks + ExecResponse");
-
-        // Read messages in a loop until we get the final ExecResponse
-        loop {
-            let msg = Message::read_from_sync(&mut stream)?;
-            match msg.msg_type {
-                MessageType::ExecOutputChunk => {
-                    if let Ok(chunk) = serde_json::from_slice::<ExecOutputChunk>(&msg.payload) {
-                        on_chunk(chunk);
-                    }
-                }
-                MessageType::ExecResponse => {
-                    let response: ExecResponse = serde_json::from_slice(&msg.payload)?;
-                    debug!(
-                        "vsock: ExecResponse received (streaming) exit_code={}",
-                        response.exit_code
-                    );
-                    return Ok(response);
-                }
-                other => {
-                    warn!("Unexpected message type during streaming exec: {:?}", other);
-                }
-            }
-        }
+    /// [`ControlChannel`]: crate::backend::control_channel::ControlChannel
+    /// [`GuestConnector`]: crate::backend::control_channel::GuestConnector
+    pub fn connector(
+        self: &std::sync::Arc<Self>,
+    ) -> crate::backend::control_channel::GuestConnector {
+        let device = std::sync::Arc::clone(self);
+        std::sync::Arc::new(move || {
+            let stream = device.connect_to_guest(GUEST_AGENT_PORT)?;
+            Ok(Box::new(stream) as Box<dyn crate::backend::control_channel::GuestStream>)
+        })
     }
 
-    /// Write a file to the guest filesystem using the native WriteFile protocol.
-    ///
-    /// This sends a WriteFile message directly to the guest-agent, which writes
-    /// the file in Rust without needing `sh`, `echo`, or `base64`. Parent
-    /// directories are created automatically. The write runs as root in the
-    /// guest (appropriate for host-initiated provisioning like skill files).
-    pub async fn send_write_file(&self, path: &str, content: &[u8]) -> Result<WriteFileResponse> {
-        let request = WriteFileRequest {
-            path: path.to_string(),
-            content: content.to_vec(),
-            create_parents: true,
-        };
-
-        let mut stream = self
-            .connect_with_handshake(Duration::from_secs(3), "write-file")
-            .await?;
-
-        // Set generous read timeout
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-
-        let message = Message {
-            msg_type: MessageType::WriteFile,
-            payload: serde_json::to_vec(&request)?,
-        };
-        stream
-            .write_all(&message.serialize())
-            .map_err(|e| Error::Guest(format!("Failed to send WriteFile: {}", e)))?;
-
-        let response_msg = Message::read_from_sync(&mut stream)?;
-        if response_msg.msg_type != MessageType::WriteFileResponse {
-            return Err(Error::Guest(format!(
-                "Unexpected response type for WriteFile: {:?}",
-                response_msg.msg_type
-            )));
-        }
-
-        let response: WriteFileResponse = serde_json::from_slice(&response_msg.payload)?;
-        Ok(response)
-    }
-
-    /// Create directories in the guest filesystem (mkdir -p).
-    pub async fn send_mkdir_p(&self, path: &str) -> Result<MkdirPResponse> {
-        let request = MkdirPRequest {
-            path: path.to_string(),
-        };
-
-        let mut stream = self
-            .connect_with_handshake(Duration::from_secs(3), "mkdir-p")
-            .await?;
-
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-
-        let message = Message {
-            msg_type: MessageType::MkdirP,
-            payload: serde_json::to_vec(&request)?,
-        };
-        stream
-            .write_all(&message.serialize())
-            .map_err(|e| Error::Guest(format!("Failed to send MkdirP: {}", e)))?;
-
-        let response_msg = Message::read_from_sync(&mut stream)?;
-        if response_msg.msg_type != MessageType::MkdirPResponse {
-            return Err(Error::Guest(format!(
-                "Unexpected response type for MkdirP: {:?}",
-                response_msg.msg_type
-            )));
-        }
-
-        let response: MkdirPResponse = serde_json::from_slice(&response_msg.payload)?;
-        Ok(response)
-    }
-
-    /// Connect to the guest agent and perform a Ping/Pong handshake.
-    /// Shared helper for all request flows.
-    async fn connect_with_handshake(
-        &self,
-        handshake_timeout: Duration,
-        context: &str,
-    ) -> Result<VsockStream> {
-        // Wait for guest kernel boot once per VsockDevice lifetime.
-        // Later calls rely on retry/backoff without paying a fixed delay.
-        if self
-            .boot_wait_done
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            tokio::time::sleep(Duration::from_secs(4)).await;
-        }
-
-        let mut delay = Duration::from_millis(100);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut attempt: u32 = 0;
-
-        loop {
-            if Instant::now() >= deadline {
-                warn!(
-                    "vsock[{context}]: deadline reached after {} connect/handshake attempts",
-                    attempt
-                );
-                return Err(Error::Guest(
-                    "vsock: deadline reached (connect or handshake)".into(),
-                ));
-            }
-
-            attempt += 1;
-
-            let mut s = match self.connect_to_guest(GUEST_AGENT_PORT) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    debug!(
-                        "vsock[{context}]: attempt {} connect failed: {}",
-                        attempt, e
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                    continue;
-                }
-            };
-
-            // Handshake: Ping -> Pong
-            if let Err(e) = s.set_read_timeout(Some(handshake_timeout)) {
-                debug!(
-                    "vsock[{context}]: attempt {} set_read_timeout failed: {}",
-                    attempt, e
-                );
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-            // Ping payload carries the 32-byte session secret for authentication.
-            // The guest-agent validates this against the secret from /proc/cmdline.
-            let ping_msg = Message {
-                msg_type: MessageType::Ping,
-                payload: self.session_secret.to_vec(),
-            };
-            if s.write_all(&ping_msg.serialize()).is_err() {
-                debug!("vsock[{context}]: attempt {} failed to send Ping", attempt);
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                continue;
-            }
-            match Message::read_from_sync(&mut s) {
-                Ok(msg) if msg.msg_type == MessageType::Pong => {
-                    return Ok(s);
-                }
-                Ok(msg) => {
-                    debug!(
-                        "vsock[{context}]: attempt {} unexpected msg: {:?}",
-                        attempt, msg.msg_type
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                }
-                Err(e) => {
-                    debug!(
-                        "vsock[{context}]: attempt {} handshake failed: {}",
-                        attempt, e
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(2));
-                }
-            }
-        }
-    }
-
-    /// Open a persistent telemetry subscription to the guest agent.
-    ///
-    /// Connects to the guest, performs a Ping/Pong handshake, sends a
-    /// SubscribeTelemetry message with the given options, then reads
-    /// TelemetryData messages in a loop, calling `on_batch` for each one.
-    /// Returns when the connection drops.
-    pub async fn subscribe_telemetry<F>(
-        &self,
-        opts: &TelemetrySubscribeRequest,
-        mut on_batch: F,
-    ) -> Result<()>
-    where
-        F: FnMut(TelemetryBatch) + Send + 'static,
-    {
-        let mut stream = self
-            .connect_with_handshake(Duration::from_secs(5), "telemetry-subscribe")
-            .await?;
-
-        // Send SubscribeTelemetry with subscription options
-        let sub_msg = Message {
-            msg_type: MessageType::SubscribeTelemetry,
-            payload: serde_json::to_vec(opts).unwrap_or_default(),
-        };
-        stream
-            .write_all(&sub_msg.serialize())
-            .map_err(|e| Error::Guest(format!("Failed to send SubscribeTelemetry: {}", e)))?;
-
-        info!(
-            "Telemetry subscription active (cid={}, interval={}ms)",
-            self.cid, opts.interval_ms
-        );
-
-        // Set read timeout with headroom above the collection interval
-        let read_timeout_ms = opts.interval_ms.max(1000) * 5;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(read_timeout_ms)));
-
-        // Read TelemetryData messages in a loop
-        loop {
-            let msg = match Message::read_from_sync(&mut stream) {
-                Ok(m) => m,
-                Err(e) => {
-                    info!("Telemetry subscription ended: {}", e);
-                    return Ok(());
-                }
-            };
-
-            if msg.msg_type != MessageType::TelemetryData {
-                warn!(
-                    "Unexpected message type in telemetry stream: {:?}",
-                    msg.msg_type
-                );
-                continue;
-            }
-
-            match serde_json::from_slice::<TelemetryBatch>(&msg.payload) {
-                Ok(batch) => on_batch(batch),
-                Err(e) => {
-                    warn!("Failed to parse TelemetryBatch: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Connect to a port on the guest.
+    /// Connects to a port on the guest.
     ///
     /// Uses AF_VSOCK by default. When `unix_socket_path` is set (userspace
     /// backend), connects via AF_UNIX and sends the port as a 4-byte LE header.
