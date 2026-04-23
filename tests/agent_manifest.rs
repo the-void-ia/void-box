@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -228,11 +229,182 @@ fn resolve_claude_fails_if_manifest_missing() {
     );
 }
 
+#[test]
+fn parser_strips_inline_trailing_comments() {
+    let scratch = tempfile_path("r-b5c1-inline-comment.toml");
+    fs::write(
+        &scratch,
+        r#"[claude-code.linux.x86_64]
+version = "9.9.9" # annotated for CVE-2099-0000
+url = "https://example.com/{version}/bin" # stable URL
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+    )
+    .unwrap();
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_path() {{ printf '%s\n' "{}"; }}
+        agent_manifest_require claude-code linux x86_64
+        "#,
+        scratch.display()
+    );
+    let out = run_bash(&script);
+    assert!(out.status.success(), "stderr={}", stderr(&out));
+    let out_stdout = stdout(&out);
+    let lines: Vec<&str> = out_stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "9.9.9",
+            "https://example.com/{version}/bin",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+    );
+    let _ = fs::remove_file(&scratch);
+}
+
+#[test]
+fn parser_rejects_single_quoted_values() {
+    let scratch = tempfile_path("r-b5c1-singlequoted.toml");
+    fs::write(
+        &scratch,
+        "[claude-code.linux.x86_64]\nversion = '1.0.0'\nurl = \"x\"\nsha256 = \"y\"\n",
+    )
+    .unwrap();
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_path() {{ printf '%s\n' "{}"; }}
+        agent_manifest_require claude-code linux x86_64
+        "#,
+        scratch.display()
+    );
+    let out = run_bash(&script);
+    assert!(
+        !out.status.success(),
+        "parser must reject single-quoted value"
+    );
+    assert!(
+        stderr(&out).contains("single-quoted values are not accepted"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = fs::remove_file(&scratch);
+}
+
+#[test]
+fn parser_rejects_trailing_junk_after_value() {
+    let scratch = tempfile_path("r-b5c1-trailing-junk.toml");
+    fs::write(
+        &scratch,
+        "[claude-code.linux.x86_64]\nversion = \"1.0.0\" unexpected\nurl = \"x\"\nsha256 = \"y\"\n",
+    )
+    .unwrap();
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_path() {{ printf '%s\n' "{}"; }}
+        agent_manifest_require claude-code linux x86_64
+        "#,
+        scratch.display()
+    );
+    let out = run_bash(&script);
+    assert!(!out.status.success(), "parser must reject trailing junk");
+    assert!(
+        stderr(&out).contains("unexpected content after quoted value"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = fs::remove_file(&scratch);
+}
+
+#[test]
+fn claude_ambiguous_env_combo_is_rejected() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        CLAUDE_BIN=/usr/bin/true CLAUDE_CODE_VERSION=9.9.9 CLAUDE_CODE_SHA256=deadbeef \
+            resolve_claude_binary r-b5c1-test
+        "#,
+    );
+    assert!(
+        !out.status.success(),
+        "setting both CLAUDE_BIN and CLAUDE_CODE_VERSION must be refused"
+    );
+    assert!(
+        stderr(&out).contains("ambiguous resolution"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn codex_ambiguous_env_combo_is_rejected() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        CODEX_BIN=/usr/bin/true CODEX_VERSION=9.9.9 CODEX_SHA256=deadbeef \
+            resolve_codex_binary r-b5c1-test
+        "#,
+    );
+    assert!(
+        !out.status.success(),
+        "setting both CODEX_BIN and CODEX_VERSION must be refused"
+    );
+    assert!(
+        stderr(&out).contains("ambiguous resolution"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn override_drift_from_manifest_warns() {
+    // Override CLAUDE_CODE_VERSION to something the manifest does not pin.
+    // The resolver will still fail at fetch-time (the URL probably 404s, or
+    // the SHA won't match), but before it fails it must print the drift
+    // warning — and we must NOT see "R-B5c.1 forbids unverified overrides"
+    // because the SHA env var IS set.
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=true
+        # Stub the fetcher so we don't hit the network. Return 1 like a
+        # verification failure so the function returns nonzero normally.
+        _agent_fetch_and_verify() { return 1; }
+        CLAUDE_CODE_VERSION=0.0.0-dev-override \
+        CLAUDE_CODE_SHA256=deadbeef \
+            resolve_claude_binary r-b5c1-test
+        "#,
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("differs from manifest pin"),
+        "stderr should warn on drift but didn't: {err}"
+    );
+    assert!(
+        !err.contains("R-B5c.1 forbids unverified overrides"),
+        "stderr must not complain about missing SHA when SHA is set: {err}"
+    );
+}
+
 fn tempfile_path(name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir: PathBuf = std::env::temp_dir();
     dir.join(format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
+        seq,
         Path::new(name).display()
     ))
 }

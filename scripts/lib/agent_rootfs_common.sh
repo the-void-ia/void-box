@@ -47,11 +47,20 @@ resolve_claude_binary() {
   CLAUDE_BIN="${CLAUDE_BIN:-}"
   CLAUDE_BUILD_PROVENANCE=""
 
+  # Ambiguity guard: CLAUDE_BIN and CLAUDE_CODE_VERSION both claim ownership
+  # of the resolution. Refuse rather than silently preferring one.
+  if [[ -n "$CLAUDE_BIN" && -n "${CLAUDE_CODE_VERSION:-}" ]]; then
+    echo "ERROR: CLAUDE_BIN and CLAUDE_CODE_VERSION are both set — ambiguous resolution." >&2
+    echo "  Unset one: CLAUDE_BIN picks a local file (non-production) and" >&2
+    echo "  CLAUDE_CODE_VERSION+CLAUDE_CODE_SHA256 picks a verified download." >&2
+    return 1
+  fi
+
   local claude_platform
   case "$GUEST_ARCH" in
     x86_64)  claude_platform="linux-x64" ;;
     aarch64) claude_platform="linux-arm64" ;;
-    *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; exit 1 ;;
+    *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; return 1 ;;
   esac
 
   # 1. CLAUDE_BIN env var → explicit local-dev path.
@@ -87,16 +96,24 @@ resolve_claude_binary() {
       echo "  R-B5c.1 forbids unverified overrides." >&2
       echo "  Supply the SHA-256 of the artifact you want the build to trust:" >&2
       echo "    CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION CLAUDE_CODE_SHA256=<hex> $0" >&2
-      exit 1
+      return 1
     fi
 
-    local manifest_url_template
-    manifest_url_template="$(agent_manifest_require claude-code linux "$GUEST_ARCH" | sed -n '2p')"
+    local manifest_entry pinned_version manifest_url_template
+    manifest_entry="$(agent_manifest_require claude-code linux "$GUEST_ARCH")" || return 1
+    pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
+    manifest_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
+    if [[ "$CLAUDE_CODE_VERSION" != "$pinned_version" ]]; then
+      # The override version is re-templated through the manifest's URL
+      # pattern. If upstream changes the URL shape between pins, the
+      # override will 404 — make that possibility visible up front.
+      echo "[$log_prefix] WARN: CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION differs from manifest pin $pinned_version — reusing manifest URL template, which may be stale for the override version." >&2
+    fi
     local download_url="${manifest_url_template//\{version\}/$CLAUDE_CODE_VERSION}"
     local download_dir="$ROOT_DIR/target/claude-download"
     mkdir -p "$download_dir"
     CLAUDE_BIN="$download_dir/claude-${CLAUDE_CODE_VERSION}-${claude_platform}"
-    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$CLAUDE_CODE_SHA256" || exit 1
+    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$CLAUDE_CODE_SHA256" || return 1
     chmod +x "$CLAUDE_BIN"
     CLAUDE_BUILD_PROVENANCE="override"
   fi
@@ -104,7 +121,7 @@ resolve_claude_binary() {
   # 4. Manifest default: no env-var override, no local binary.
   if [[ -z "$CLAUDE_BIN" ]]; then
     local manifest_entry
-    manifest_entry="$(agent_manifest_require claude-code linux "$GUEST_ARCH")" || exit 1
+    manifest_entry="$(agent_manifest_require claude-code linux "$GUEST_ARCH")" || return 1
     local pinned_version pinned_url_template pinned_sha
     pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
     pinned_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
@@ -113,7 +130,7 @@ resolve_claude_binary() {
     local download_dir="$ROOT_DIR/target/claude-download"
     mkdir -p "$download_dir"
     CLAUDE_BIN="$download_dir/claude-${pinned_version}-${claude_platform}"
-    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$pinned_sha" || exit 1
+    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$pinned_sha" || return 1
     chmod +x "$CLAUDE_BIN"
     CLAUDE_CODE_VERSION="$pinned_version"
     CLAUDE_BUILD_PROVENANCE="manifest"
@@ -122,7 +139,7 @@ resolve_claude_binary() {
   if ! file -L "$CLAUDE_BIN" | grep -q "ELF.*executable"; then
     echo "ERROR: $CLAUDE_BIN is not a native Linux ELF binary." >&2
     echo "  file: $(file -L "$CLAUDE_BIN")" >&2
-    exit 1
+    return 1
   fi
 
   local claude_size
@@ -152,11 +169,18 @@ resolve_codex_binary() {
   CODEX_BIN="${CODEX_BIN:-}"
   CODEX_BUILD_PROVENANCE=""
 
+  if [[ -n "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
+    echo "ERROR: CODEX_BIN and CODEX_VERSION are both set — ambiguous resolution." >&2
+    echo "  Unset one: CODEX_BIN picks a local file (non-production) and" >&2
+    echo "  CODEX_VERSION+CODEX_SHA256 picks a verified download." >&2
+    return 1
+  fi
+
   local codex_target
   case "$GUEST_ARCH" in
     x86_64)  codex_target="x86_64-unknown-linux-musl" ;;
     aarch64) codex_target="aarch64-unknown-linux-musl" ;;
-    *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; exit 1 ;;
+    *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; return 1 ;;
   esac
 
   # 1. CODEX_BIN env var → explicit local-dev path.
@@ -188,26 +212,31 @@ resolve_codex_binary() {
       echo "  R-B5c.1 forbids unverified overrides." >&2
       echo "  Supply the SHA-256 of the downloaded tarball you want the build to trust:" >&2
       echo "    CODEX_VERSION=$CODEX_VERSION CODEX_SHA256=<hex> $0" >&2
-      exit 1
+      return 1
     fi
 
-    local manifest_url_template
-    manifest_url_template="$(agent_manifest_require codex linux "$GUEST_ARCH" | sed -n '2p')"
+    local manifest_entry pinned_version manifest_url_template
+    manifest_entry="$(agent_manifest_require codex linux "$GUEST_ARCH")" || return 1
+    pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
+    manifest_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
+    if [[ "$CODEX_VERSION" != "$pinned_version" ]]; then
+      echo "[$log_prefix] WARN: CODEX_VERSION=$CODEX_VERSION differs from manifest pin $pinned_version — reusing manifest URL template, which may be stale for the override version." >&2
+    fi
     local download_url="${manifest_url_template//\{version\}/$CODEX_VERSION}"
-    _codex_fetch_verify_extract "$log_prefix" "$CODEX_VERSION" "$codex_target" "$download_url" "$CODEX_SHA256" || exit 1
+    _codex_fetch_verify_extract "$log_prefix" "$CODEX_VERSION" "$codex_target" "$download_url" "$CODEX_SHA256" || return 1
     CODEX_BUILD_PROVENANCE="override"
   fi
 
   # 4. Manifest default.
   if [[ -z "$CODEX_BIN" ]]; then
     local manifest_entry
-    manifest_entry="$(agent_manifest_require codex linux "$GUEST_ARCH")" || exit 1
+    manifest_entry="$(agent_manifest_require codex linux "$GUEST_ARCH")" || return 1
     local pinned_version pinned_url_template pinned_sha
     pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
     pinned_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
     pinned_sha="$(printf '%s\n' "$manifest_entry" | sed -n '3p')"
     local download_url="${pinned_url_template//\{version\}/$pinned_version}"
-    _codex_fetch_verify_extract "$log_prefix" "$pinned_version" "$codex_target" "$download_url" "$pinned_sha" || exit 1
+    _codex_fetch_verify_extract "$log_prefix" "$pinned_version" "$codex_target" "$download_url" "$pinned_sha" || return 1
     CODEX_VERSION="$pinned_version"
     CODEX_BUILD_PROVENANCE="manifest"
   fi
@@ -215,7 +244,7 @@ resolve_codex_binary() {
   if ! file -L "$CODEX_BIN" | grep -q "ELF.*executable"; then
     echo "ERROR: $CODEX_BIN is not a native Linux ELF binary." >&2
     echo "  file: $(file -L "$CODEX_BIN")" >&2
-    exit 1
+    return 1
   fi
 
   local codex_size
@@ -245,7 +274,7 @@ _codex_fetch_verify_extract() {
       tmp_dir="$(mktemp -d)"
       trap 'rm -rf "$tmp_dir"' EXIT
       tar -xzf "$cached_tar" -C "$tmp_dir"
-      extracted_bin="$(find_extracted_executable "$tmp_dir" || true)"
+      extracted_bin="$(find_extracted_executable "$tmp_dir" codex || true)"
       if [[ -z "$extracted_bin" ]]; then
         echo "ERROR: tarball did not contain an executable codex binary" >&2
         ls -laR "$tmp_dir" >&2
@@ -318,16 +347,24 @@ GROUP
 # ── Download artifact helpers ────────────────────────────────────────────────
 
 # Fetch `url` to `dest` (idempotent: skip if the file already matches the
-# expected SHA-256), then verify. Deletes a mismatching file on failure so
-# retries don't keep a poisoned copy in the cache.
+# expected SHA-256), then verify.
+#
+# Atomicity: the fresh download is written to a sibling `.tmp.$$` file,
+# verified *there*, and only then renamed into place. A concurrent builder
+# cannot observe a half-written or unverified `dest`. A mismatching cached
+# file (from a prior run whose manifest hash has since changed) is deleted
+# and refetched. Poisoned cache files never persist past a verification
+# failure.
 _agent_fetch_and_verify() {
   local log_prefix="$1"
   local url="$2"
   local dest="$3"
   local expected_sha="$4"
+  local label
+  label="$(basename "$dest")"
 
   if [[ -f "$dest" ]]; then
-    if agent_manifest_verify "$dest" "$expected_sha" "$(basename "$dest")" >/dev/null 2>&1; then
+    if agent_manifest_verify "$dest" "$expected_sha" "$label" >/dev/null 2>&1; then
       echo "[$log_prefix] Using cached (verified) download: $dest"
       return 0
     fi
@@ -335,25 +372,46 @@ _agent_fetch_and_verify() {
     rm -f "$dest"
   fi
 
+  local staging="${dest}.tmp.$$"
   echo "[$log_prefix] Downloading $url"
-  if ! curl -fSL --progress-bar -o "$dest" "$url"; then
+  if ! curl -fSL --progress-bar -o "$staging" "$url"; then
     echo "ERROR: download failed: $url" >&2
-    rm -f "$dest"
+    rm -f "$staging"
     return 1
   fi
 
-  if ! agent_manifest_verify "$dest" "$expected_sha" "$(basename "$dest")"; then
-    rm -f "$dest"
+  if ! agent_manifest_verify "$staging" "$expected_sha" "$label"; then
+    rm -f "$staging"
     return 1
   fi
-  echo "[$log_prefix] Verified SHA-256 for $(basename "$dest")"
+
+  if ! mv -f "$staging" "$dest"; then
+    echo "ERROR: failed to atomically install $dest" >&2
+    rm -f "$staging"
+    return 1
+  fi
+  echo "[$log_prefix] Verified SHA-256 for $label"
   return 0
 }
 
 find_extracted_executable() {
   local search_dir="$1"
+  local preferred_name="${2:-}"
   local candidate
 
+  # Pass 1: a matching bare-name binary, if the caller named one.
+  if [[ -n "$preferred_name" ]]; then
+    while IFS= read -r candidate; do
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < <(find "$search_dir" -type f -name "$preferred_name" | LC_ALL=C sort)
+  fi
+
+  # Pass 2: first executable we find, sorted for determinism. `find` path
+  # ordering is filesystem-defined; LC_ALL=C sort pins the choice so two runs
+  # on the same tarball always pick the same binary.
   while IFS= read -r candidate; do
     if [[ -x "$candidate" ]]; then
       printf '%s\n' "$candidate"
@@ -363,7 +421,8 @@ find_extracted_executable() {
     find "$search_dir" -type f \
       ! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.tar' \
       ! -name '*.zst' ! -name '*.sigstore' ! -name '*.sig' \
-      ! -name '*.sha256' ! -name '*.txt'
+      ! -name '*.sha256' ! -name '*.txt' \
+      | LC_ALL=C sort
   )
 
   return 1

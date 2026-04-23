@@ -49,18 +49,56 @@ agent_manifest_require() {
     return 1
   fi
 
-  # awk extractor. Finds the exact `[section]` header, then reads key = "value"
-  # lines until the next header or EOF. Emits `version\nurl\nsha256\n` in a
-  # stable order regardless of field order in the file.
+  # awk extractor. The manifest schema this parser accepts is intentionally
+  # narrow:
+  #   - `[a.b.c]` section headers (one per tuple)
+  #   - `key = "value"` lines — values MUST use double quotes
+  #   - `#` line comments and trailing `# …` comments after a closed value
+  # Anything else (single-quoted strings, multi-line arrays, nested tables,
+  # `=` inside the value itself) is rejected with a clear error. This keeps
+  # the surface small and makes silent mis-parses impossible in practice.
+  # Emits `version\nurl\nsha256\n` in a stable order regardless of field
+  # order in the file.
   local extracted
   extracted="$(
-    awk -v want="$section" '
-      function strip(s) {
+    awk -v want="$section" -v section="$section" '
+      function strip_space(s) {
         sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
-        gsub(/^"|"$/, "", s)
         return s
       }
+      # Unquote a double-quoted TOML scalar and strip any `# trailing comment`.
+      # Rejects single-quoted scalars (the schema mandates double quotes) and
+      # anything with an un-matched quote pair.
+      function unquote(raw,    s) {
+        s = strip_space(raw)
+        if (s ~ /^'"'"'/) {
+          print "ERROR: single-quoted values are not accepted (use double quotes): " raw > "/dev/stderr"
+          bad = 1; return ""
+        }
+        if (s !~ /^".*"/) {
+          print "ERROR: value is not a quoted TOML string: " raw > "/dev/stderr"
+          bad = 1; return ""
+        }
+        # Peel the leading quote, then everything up to the next unescaped
+        # quote. Whatever follows is treated as an optional trailing comment
+        # and must start with whitespace + `#` or be empty.
+        s = substr(s, 2)
+        closing = index(s, "\"")
+        if (closing == 0) {
+          print "ERROR: unterminated quoted value: " raw > "/dev/stderr"
+          bad = 1; return ""
+        }
+        value = substr(s, 1, closing - 1)
+        tail = substr(s, closing + 1)
+        tail = strip_space(tail)
+        if (tail != "" && substr(tail, 1, 1) != "#") {
+          print "ERROR: unexpected content after quoted value: " raw > "/dev/stderr"
+          bad = 1; return ""
+        }
+        return value
+      }
       /^[[:space:]]*#/ { next }
+      /^[[:space:]]*$/ { next }
       /^[[:space:]]*\[/ {
         header = $0
         sub(/^[[:space:]]*\[[[:space:]]*/, "", header)
@@ -70,23 +108,29 @@ agent_manifest_require() {
       }
       in_section && /=/ {
         key = $0
-        sub(/=.*/, "", key); key = strip(key)
+        sub(/=.*/, "", key); key = strip_space(key)
         val = $0
-        sub(/^[^=]*=/, "", val); val = strip(val)
+        sub(/^[^=]*=/, "", val)
+        val = unquote(val)
+        if (bad) exit 2
         if (key == "version") version = val
         else if (key == "url") url = val
         else if (key == "sha256") sha = val
       }
       END {
-        if (version == "" || url == "" || sha == "") exit 1
+        if (bad) exit 2
+        if (version == "" || url == "" || sha == "") {
+          print "ERROR: section [" section "] missing one of version/url/sha256" > "/dev/stderr"
+          exit 1
+        }
         print version
         print url
         print sha
       }
     ' "$manifest_file"
   )" || {
-    echo "ERROR: manifest entry [$section] missing or incomplete in $manifest_file" >&2
-    echo "  Expected keys: version, url, sha256." >&2
+    echo "ERROR: manifest entry [$section] missing or unparseable in $manifest_file" >&2
+    echo "  Expected keys: version, url, sha256 (all double-quoted)." >&2
     return 1
   }
 
