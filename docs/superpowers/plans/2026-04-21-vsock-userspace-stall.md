@@ -166,19 +166,30 @@ waiting for bytes that never arrive. The guest is the black box.
 
 ## Remaining hypotheses (guest-side)
 
-### G1. `/proc/cmdline` read stalls under repeated access
+### G1. `/proc/cmdline` read stalls under repeated access — RULED OUT 2026-04-23
 
-`oci_rootfs_requested()` calls `std::fs::read_to_string("/proc/cmdline")`
-**per exec**. The Rust path does `open` → `read_to_end` (growing
-Vec) → `close`. On a minimal guest running as PID 1, something about
-repeated opens of a proc file might stall under pressure.
+`oci_rootfs_requested()` was calling `std::fs::read_to_string("/proc/cmdline")`
+**per exec**. Hypothesis: repeated `open → read → close` on a procfs
+file under tight PID-1 pressure stalls.
 
-**To check:**
-1. Cache the `oci_rootfs_requested()` result in a `OnceCell<bool>` —
-   kernel cmdline doesn't change after boot.
-2. Repro with the cache in place. If stall still happens, rule out.
+**Experiment (branch `experiment/guest-stall-g1-cache`):** wrap the
+result in `OnceLock<bool>` so subsequent calls return a cached value
+without touching procfs.
 
-This is the cheapest thing to try first.
+```rust
+fn oci_rootfs_requested() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| { /* read & parse once */ })
+}
+```
+
+**Result:** `persistent_channel_serial_exec_many` with
+`SERIAL_EXEC_COUNT = 100` still stalls at iter ~21 (previously ~28 —
+within noise). `/proc/cmdline` churn is not the cause.
+
+The cache is still a strict correctness/perf improvement (immutable
+file, eliminates ~2 syscalls per exec) and is worth keeping
+independently, but it does not fix the stall.
 
 ### G2. Memory allocation churn in PID 1
 

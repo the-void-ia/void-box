@@ -112,12 +112,16 @@ fn oci_status_str(code: u8) -> &'static str {
 }
 
 fn oci_rootfs_requested() -> bool {
-    std::fs::read_to_string("/proc/cmdline")
-        .ok()
-        .map(|cmdline| {
-            cmdline.contains("voidbox.oci_rootfs_dev=") || cmdline.contains("voidbox.oci_rootfs=")
-        })
-        .unwrap_or(false)
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::fs::read_to_string("/proc/cmdline")
+            .ok()
+            .map(|cmdline| {
+                cmdline.contains("voidbox.oci_rootfs_dev=")
+                    || cmdline.contains("voidbox.oci_rootfs=")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn trigger_oci_rootfs_setup_async() {
