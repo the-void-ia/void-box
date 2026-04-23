@@ -255,11 +255,15 @@ impl VmmBackend for KvmBackend {
         self.vcpus = config.vcpus;
         self.network = config.network;
 
-        let session_secret = config.security.session_secret;
-        let connector = vm
-            .vsock_connector()
-            .expect("vsock device must be present when enable_vsock is true");
-        let channel = Arc::new(ControlChannel::new(connector, session_secret));
+        // Reuse the ControlChannel MicroVm::new already built and warmed.
+        // Creating a second one here spawns a second multiplex-reader thread
+        // on the same vsock stream; the two readers race for every frame and
+        // responses get routed to a pending-table whose waiter has already
+        // given up, causing hard-to-debug RPC stalls under burst load.
+        let channel = vm
+            .control_channel()
+            .expect("MicroVm must build a control channel when enable_vsock is true")
+            .clone();
         let channel_for_warmup = Arc::clone(&channel);
         tokio::spawn(async move {
             channel_for_warmup.warm_handshake().await;

@@ -1299,6 +1299,17 @@ impl MicroVm {
         self.vsock.as_ref().map(|v| v.connector())
     }
 
+    /// Returns the warm `ControlChannel` built during `new`.
+    ///
+    /// `MicroVm::new` creates a single control channel with the right
+    /// boot-wait for the configured vsock backend and eagerly warms its
+    /// handshake. Backends should reuse this channel rather than build a
+    /// second one — otherwise two multiplex readers end up racing for
+    /// frames on the same vsock stream.
+    pub fn control_channel(&self) -> Option<&Arc<ControlChannel>> {
+        self.control_channel.as_ref()
+    }
+
     /// Check if the VM is currently running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
