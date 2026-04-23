@@ -260,7 +260,7 @@ impl ControlChannel {
 
     /// Eagerly establishes the persistent multiplex channel.
     ///
-    /// After [`MicroVm::from_snapshot`] the guest kernel is in HLT/NOHZ-idle
+    /// After `MicroVm::from_snapshot` the guest kernel is in HLT/NOHZ-idle
     /// and the guest-agent's accept loop is not yet scheduled. Running this
     /// alongside the vCPU threads drives the vsock accept, Ping/Pong, and
     /// reader-thread startup in parallel with the caller's work, so the
@@ -268,8 +268,6 @@ impl ControlChannel {
     /// retry loop already converged.
     ///
     /// Failures are swallowed; the first RPC will re-attempt establishment.
-    ///
-    /// [`MicroVm::from_snapshot`]: crate::vmm::MicroVm::from_snapshot
     pub async fn warm_handshake(&self) {
         let _ = self.get_or_establish_channel().await;
     }
