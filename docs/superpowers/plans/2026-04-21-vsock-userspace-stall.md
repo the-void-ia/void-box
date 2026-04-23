@@ -164,6 +164,46 @@ waiting for bytes that never arrive. The guest is the black box.
 
 ---
 
+## 2026-04-23 update: NEW evidence contradicts "guest-side"
+
+`perf stat -e kvm:kvm_exit,kvm:kvm_entry -a -I 1000` during the stall:
+
+```
+t=16–28:  ~1344 kvm_exit/s  (steady guest activity)
+t=29:     303  kvm_exit/s   (sudden drop)
+t=30+:    0    kvm_exit/s   (vCPU threads not entering guest mode)
+```
+
+**The vCPU threads stop calling `KVM_RUN` entirely during the stall.**
+This is impossible if the guest is simply "stuck waiting" — an HLT'd
+guest still exits on timer IRQ (→ kvm_exit). Zero exits + zero entries
+means the host-side `vcpu_run_loop` is blocked before re-entering
+guest mode. The stall is **host-side, not guest-side**.
+
+This invalidates the framing of earlier hypotheses G1–G4 below. The
+kmsg-based "Exec start → Exec gate passed" localization was almost
+certainly showing where the *host side* stops processing kvm_exits
+that it previously serviced — not a true guest-side hang.
+
+**New top-priority hypothesis — H5: vcpu_run_loop deadlock on
+VsockConnectionMap Mutex.**
+
+The userspace virtio-vsock backend holds `Arc<Mutex<VsockConnectionMap>>`.
+Both vCPU MMIO handlers (`process_tx`, `process_rx`) and the worker
+thread (`worker_thread` poll loop) compete for it. If the worker is
+mid-loop with the mutex held while doing a blocking AF_UNIX read, and
+the multiplex-reader thread is blocked on `libc::read(vsock_fd)`
+(which depends on process_rx running to get the data delivered),
+we're stuck.
+
+**Next step:** gstack the voidbox process during the stall. Thread
+names to check: `vcpu-0`, `vcpu-1`, `vsock-userspace`, `vsock-irq`,
+`multiplex-reader`. If any two threads are both stuck on the same
+Mutex (one holding, one waiting), that's the culprit. G1–G4 below
+kept for historical reference but are NOT the root cause.
+
+---
+
 ## Remaining hypotheses (guest-side)
 
 ### G1. `/proc/cmdline` read stalls under repeated access — RULED OUT 2026-04-23

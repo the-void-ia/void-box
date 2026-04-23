@@ -285,6 +285,102 @@ pub(crate) fn kmsg(msg: &str) {
     }
 }
 
+/// Monotonic counter incremented by every dispatch-loop iteration.
+///
+/// Consumed by [`spawn_stall_watchdog`] to detect when the main dispatch
+/// thread has stopped making progress.
+static DISPATCH_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Spawns a background watchdog that dumps every guest-agent thread's
+/// kernel stack to `/dev/kmsg` once the dispatch loop has stalled for
+/// `threshold_secs` seconds.
+///
+/// Writes `/proc/<tid>/comm` and `/proc/<tid>/stack` for every `task`
+/// under `/proc/self/task/`, then stops. The dump itself is idempotent
+/// within one stall (guard flag).
+fn spawn_stall_watchdog(threshold_secs: u64) {
+    std::thread::Builder::new()
+        .name("stall-watchdog".into())
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+            // Wait for dispatch to actually start before arming. Guest-agent
+            // boot runs external commands (ip, modprobe, …) whose internal
+            // Command::output poll() would otherwise trip the watchdog.
+            while DISPATCH_PROGRESS.load(Ordering::Relaxed) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            kmsg("STALL_WATCHDOG: armed");
+            let mut last_seen = DISPATCH_PROGRESS.load(Ordering::Relaxed);
+            let mut last_change = std::time::Instant::now();
+            let mut dumped = false;
+            let mut hb_last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let now = DISPATCH_PROGRESS.load(Ordering::Relaxed);
+                if hb_last.elapsed().as_secs() >= 2 {
+                    kmsg(&format!(
+                        "STALL_WATCHDOG: hb progress={} since_change={}ms",
+                        now,
+                        last_change.elapsed().as_millis()
+                    ));
+                    hb_last = std::time::Instant::now();
+                }
+                if now != last_seen {
+                    last_seen = now;
+                    last_change = std::time::Instant::now();
+                    dumped = false;
+                    continue;
+                }
+                if !dumped && last_change.elapsed().as_secs() >= threshold_secs {
+                    dumped = true;
+                    dump_all_task_stacks(now);
+                }
+            }
+        })
+        .expect("spawn stall-watchdog");
+}
+
+/// Dumps `/proc/<tid>/comm` + `/proc/<tid>/stack` for every thread of the
+/// current process directly to `/dev/console` (bypassing the rate-limited
+/// kernel printk path that kmsg uses). Called by the watchdog on stall.
+fn dump_all_task_stacks(progress: u64) {
+    use std::io::Write;
+    let mut console = match std::fs::OpenOptions::new().write(true).open("/dev/console") {
+        Ok(f) => f,
+        Err(e) => {
+            kmsg(&format!("STALL_WATCHDOG: open /dev/console: {}", e));
+            return;
+        }
+    };
+    let _ = writeln!(
+        console,
+        "\nSTALL_WATCHDOG: dispatch stalled at progress={}, dumping task stacks",
+        progress
+    );
+    let task_dir = "/proc/self/task";
+    let entries = match std::fs::read_dir(task_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = writeln!(console, "STALL_WATCHDOG: read_dir({}): {}", task_dir, e);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let tid = entry.file_name();
+        let tid = tid.to_string_lossy();
+        let comm =
+            std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid)).unwrap_or_default();
+        let stack =
+            std::fs::read_to_string(format!("/proc/self/task/{}/stack", tid)).unwrap_or_default();
+        let _ = writeln!(console, "STALL_WATCHDOG tid={} comm={}", tid, comm.trim());
+        for line in stack.lines() {
+            let _ = writeln!(console, "STALL_WATCHDOG tid={} stack: {}", tid, line);
+        }
+    }
+    let _ = writeln!(console, "STALL_WATCHDOG: dump complete");
+    let _ = console.flush();
+}
+
 /// Parse the session secret from `/proc/cmdline` (`voidbox.secret=HEX`).
 fn parse_session_secret() -> Option<[u8; 32]> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
@@ -345,6 +441,11 @@ fn sync_clock_from_cmdline() {
 
 fn main() {
     kmsg("void-box guest agent starting...");
+
+    // Dump /proc/*/stack to /dev/kmsg if the dispatch loop stalls for >5s.
+    // Fires once per stall (idempotent). Lets us see exactly which syscall
+    // PID 1 is parked in without flooding serial during normal operation.
+    spawn_stall_watchdog(5);
 
     // Initialize the system if we're PID 1
     if std::process::id() == 1 {
@@ -1982,6 +2083,7 @@ fn create_vsock_listener(port: u32) -> RawFd {
 /// or a terminal message (Shutdown) is received.
 fn handle_connection(fd: RawFd) -> Result<(), String> {
     loop {
+        DISPATCH_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Read message header (4 bytes length + 1 byte type)
         let mut header = [0u8; 5];
         match read_exact(fd, &mut header) {
