@@ -30,11 +30,12 @@ jobs:
       # ---- KVM setup ----
       - name: Enable KVM access
         run: |
-          # Make /dev/kvm accessible to the runner user
+          # Make /dev/kvm and /dev/vhost-vsock accessible to the runner user.
+          # Without chmod on /dev/vhost-vsock the vsock-preflight silently
+          # skips every KVM e2e test — masking real failures.
           sudo chmod a+rw /dev/kvm
-          # Load vhost-vsock module (needed for host<->guest vsock)
           sudo modprobe vhost_vsock || true
-          # Verify
+          sudo chmod a+rw /dev/vhost-vsock 2>/dev/null || true
           ls -la /dev/kvm
           ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present (may be built-in)"
 
