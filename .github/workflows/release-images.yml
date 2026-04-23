@@ -180,3 +180,57 @@ jobs:
             2>/dev/null); do
             gh release upload "$TAG" "$f" --clobber
           done
+
+  # R-B5c.1: publish the pinned vendored-agent hashes as release metadata so a
+  # downstream consumer of a given release has the version+hash record without
+  # cloning the repo. Matches R-B5b.1's pattern (same RELEASE_DIGESTS.json).
+  publish-release-digests:
+    name: Publish RELEASE_DIGESTS.json
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Build RELEASE_DIGESTS.json from manifest.toml
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, pathlib, re, sys
+          manifest = pathlib.Path("scripts/agents/manifest.toml").read_text()
+          section_pat = re.compile(
+              r"\[([\w\-\.]+)\]\n((?:(?!\[).*\n)*)",
+              re.MULTILINE,
+          )
+          kv_pat = re.compile(r'^([a-zA-Z0-9_]+)\s*=\s*"(.+)"\s*$', re.MULTILINE)
+          agents: dict = {}
+          for header, body in section_pat.findall(manifest):
+              parts = header.split(".")
+              if len(parts) != 3:
+                  continue
+              agent, platform, arch = parts
+              fields = dict(kv_pat.findall(body))
+              if not {"version", "url", "sha256"}.issubset(fields):
+                  continue
+              agents.setdefault(agent, {}).setdefault(platform, {})[arch] = {
+                  "version": fields["version"],
+                  "url": fields["url"],
+                  "sha256": fields["sha256"],
+              }
+          out = {
+              "schema": 1,
+              "agents": agents,
+          }
+          pathlib.Path("RELEASE_DIGESTS.json").write_text(
+              json.dumps(out, indent=2, sort_keys=True) + "\n"
+          )
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload RELEASE_DIGESTS.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          gh release upload "$TAG" RELEASE_DIGESTS.json --clobber

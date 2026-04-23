@@ -1,0 +1,220 @@
+name: Bump Agent Manifest
+
+# R-B5c.1: weekly upstream poll for vendored agent binaries. Discovers the
+# latest claude-code and codex versions, computes their SHA-256s, and opens
+# one PR per (agent, platform, arch) tuple so a human reviews the version +
+# hash pair before it lands in scripts/agents/manifest.toml.
+#
+# The job does not merge or push beyond the bump branch — review is manual.
+
+on:
+  schedule:
+    # Mondays at 09:00 UTC.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: "Limit to one agent (claude-code, codex, or empty for both)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    name: Discover (${{ matrix.agent }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [claude-code, codex]
+        arch: [x86_64, aarch64]
+    steps:
+      - name: Skip if input.agent narrows the matrix
+        if: ${{ inputs.agent != '' && inputs.agent != matrix.agent }}
+        run: |
+          echo "skipping: input.agent=${{ inputs.agent }} != matrix.agent=${{ matrix.agent }}"
+          exit 0
+
+      - uses: actions/checkout@v4
+
+      - name: Read current pinned entry
+        id: pinned
+        run: |
+          set -euo pipefail
+          source scripts/lib/agent_manifest.sh
+          entry="$(agent_manifest_require "${{ matrix.agent }}" linux "${{ matrix.arch }}")"
+          pinned_version="$(printf '%s\n' "$entry" | sed -n '1p')"
+          pinned_url_template="$(printf '%s\n' "$entry" | sed -n '2p')"
+          pinned_sha="$(printf '%s\n' "$entry" | sed -n '3p')"
+          {
+            echo "pinned_version=$pinned_version"
+            echo "pinned_url_template=$pinned_url_template"
+            echo "pinned_sha=$pinned_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Discover latest upstream version
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.agent }}" in
+            claude-code)
+              # The install.sh that Anthropic publishes at claude.ai/install.sh
+              # fetches this plain-text endpoint for the latest version.
+              latest="$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)"
+              ;;
+            codex)
+              # Latest codex release tag is `rust-v<version>`.
+              latest_tag="$(gh release list \
+                              --repo openai/codex \
+                              --exclude-drafts \
+                              --exclude-pre-releases \
+                              --limit 20 \
+                              --json tagName \
+                              --jq '.[].tagName' \
+                              | grep -E '^rust-v' \
+                              | head -1)"
+              latest="${latest_tag#rust-v}"
+              ;;
+          esac
+          if [[ -z "$latest" ]]; then
+            echo "ERROR: failed to discover latest version for ${{ matrix.agent }}" >&2
+            exit 1
+          fi
+          echo "latest_version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Short-circuit if up to date
+        id: gate
+        run: |
+          if [[ "${{ steps.pinned.outputs.pinned_version }}" == "${{ steps.latest.outputs.latest_version }}" ]]; then
+            echo "Already pinned to ${{ steps.latest.outputs.latest_version }} — no PR needed."
+            echo "needs_bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and hash the candidate artifact
+        if: steps.gate.outputs.needs_bump == 'true'
+        id: hash
+        run: |
+          set -euo pipefail
+          version="${{ steps.latest.outputs.latest_version }}"
+          url_template="${{ steps.pinned.outputs.pinned_url_template }}"
+          url="${url_template//\{version\}/$version}"
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          echo "Fetching $url"
+          curl -fSL --retry 3 --retry-delay 5 -o "$tmp" "$url"
+          observed="$(sha256sum "$tmp" | awk '{print $1}')"
+          echo "observed_sha=$observed" >> "$GITHUB_OUTPUT"
+          echo "resolved_url=$url" >> "$GITHUB_OUTPUT"
+
+          # Defense in depth for claude-code: cross-check against the
+          # manifest.json that Anthropic publishes. If they disagree, abort —
+          # something is wrong with either CDN and a human should investigate.
+          if [[ "${{ matrix.agent }}" == "claude-code" ]]; then
+            case "${{ matrix.arch }}" in
+              x86_64)  plat="linux-x64" ;;
+              aarch64) plat="linux-arm64" ;;
+            esac
+            manifest_url="https://downloads.claude.ai/claude-code-releases/$version/manifest.json"
+            advertised="$(curl -fsSL "$manifest_url" | python3 -c \
+              "import json,sys; d=json.load(sys.stdin); print(d['platforms']['$plat']['checksum'])")"
+            if [[ "$advertised" != "$observed" ]]; then
+              echo "ERROR: Anthropic manifest.json checksum ($advertised) disagrees with GCS download ($observed)" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Patch manifest.toml with new version + hash
+        if: steps.gate.outputs.needs_bump == 'true'
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, re, pathlib
+          agent = os.environ["AGENT"]
+          arch = os.environ["ARCH"]
+          new_version = os.environ["NEW_VERSION"]
+          new_sha = os.environ["NEW_SHA"]
+          manifest = pathlib.Path("scripts/agents/manifest.toml")
+          text = manifest.read_text()
+          section = f"[{agent}.linux.{arch}]"
+          # Match the table header and the keys that follow until the next
+          # table or end-of-file. Only rewrite version + sha256 fields.
+          pattern = re.compile(
+              re.escape(section) + r"\n((?:.*\n)*?)(?=\[|\Z)",
+              re.MULTILINE,
+          )
+          m = pattern.search(text)
+          if not m:
+              raise SystemExit(f"section {section} not found")
+          body = m.group(1)
+          body = re.sub(
+              r'version\s*=\s*"[^"]*"',
+              f'version = "{new_version}"',
+              body,
+          )
+          body = re.sub(
+              r'sha256\s*=\s*"[^"]*"',
+              f'sha256 = "{new_sha}"',
+              body,
+          )
+          text = text[: m.start(1)] + body + text[m.end(1):]
+          manifest.write_text(text)
+          PY
+        env:
+          AGENT: ${{ matrix.agent }}
+          ARCH: ${{ matrix.arch }}
+          NEW_VERSION: ${{ steps.latest.outputs.latest_version }}
+          NEW_SHA: ${{ steps.hash.outputs.observed_sha }}
+
+      - name: Open PR
+        if: steps.gate.outputs.needs_bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          agent="${{ matrix.agent }}"
+          arch="${{ matrix.arch }}"
+          version="${{ steps.latest.outputs.latest_version }}"
+          sha="${{ steps.hash.outputs.observed_sha }}"
+          url="${{ steps.hash.outputs.resolved_url }}"
+          prev="${{ steps.pinned.outputs.pinned_version }}"
+
+          # Branch name: extend the requirement's `bump-agents/<agent>-<version>`
+          # pattern with `<arch>` so two arches bumping to the same version
+          # don't collide.
+          branch="bump-agents/${agent}-${arch}-${version}"
+          git config user.name "voidbox-bump-agents[bot]"
+          git config user.email "voidbox-bump-agents@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add scripts/agents/manifest.toml
+          git commit -m "chore(agents): bump ${agent} ${arch} ${prev} -> ${version}"
+          git push --force-with-lease origin "$branch"
+
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          Automated R-B5c.1 bump for \`${agent}\` (\`linux/${arch}\`).
+
+          | field | value |
+          | --- | --- |
+          | previous version | \`${prev}\` |
+          | new version | \`${version}\` |
+          | artifact url | ${url} |
+          | sha256 (computed by CI) | \`${sha}\` |
+
+          CI downloaded the artifact from the URL above and recorded the
+          SHA-256 shown here. Please cross-check the version/hash pair before
+          merging — that review is the human gate required by R-B5c.1.
+          EOF
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore(agents): bump ${agent} ${arch} to ${version}" \
+            --body-file "$body_file"

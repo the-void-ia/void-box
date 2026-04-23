@@ -1,0 +1,32 @@
+# Pinned upstream agent binaries (R-B5c.1).
+#
+# One table per (agent, platform, arch) tuple. The build scripts fetch `url`,
+# verify the download against `sha256`, and fail loudly on mismatch. `{version}`
+# in the URL is substituted with the table's `version` field at fetch time.
+#
+# Hash target: the artifact as it lands on disk after curl. For claude-code
+# that is the raw Linux ELF binary; for codex it is the gzipped tarball from
+# GitHub Releases (the script then extracts the binary).
+#
+# Changes to this file require PR review. The weekly
+# `.github/workflows/bump-agents.yml` job opens one PR per bumped tuple.
+
+[claude-code.linux.x86_64]
+version = "2.1.53"
+url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-x64/claude"
+sha256 = "debf286f2a5e974a50f102a034a2dfb5df8cf4ac54f7f4136260b5f900385757"
+
+[claude-code.linux.aarch64]
+version = "2.1.53"
+url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-arm64/claude"
+sha256 = "fba4d70283aea66df7d50fd6cf33cec0fbcb0bf7959abe284f8a5a5672ed5e33"
+
+[codex.linux.x86_64]
+version = "0.118.0"
+url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-x86_64-unknown-linux-musl.tar.gz"
+sha256 = "e707ea65d7bbbc46a04afe731bf3c14a5b77522100cebf8bb93cffb95cf4610b"
+
+[codex.linux.aarch64]
+version = "0.118.0"
+url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-aarch64-unknown-linux-musl.tar.gz"
+sha256 = "29bc741268b6d17ddd148b8c2c2108e8b3a0eef914b07922491348144e667e09"

@@ -1,0 +1,238 @@
+//! Tests for the R-B5c.1 agent-binary pinning manifest.
+//!
+//! These exercise the shell helpers in `scripts/lib/agent_manifest.sh` and the
+//! R-B5c.1 guards in `scripts/lib/agent_rootfs_common.sh` (no VM required).
+//! We drive bash as a subprocess and assert on stderr/exit-code behavior, so
+//! the threat model claim ("build fails loudly on mismatch / missing
+//! manifest / unverified override") is tested end-to-end, not just by
+//! inspection.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn run_bash(script: &str) -> Output {
+    Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to spawn bash")
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn manifest_pins_expected_tuples() {
+    let manifest = repo_root().join("scripts/agents/manifest.toml");
+    let body = fs::read_to_string(&manifest).expect("manifest must exist in tree");
+    for tuple in [
+        "[claude-code.linux.x86_64]",
+        "[claude-code.linux.aarch64]",
+        "[codex.linux.x86_64]",
+        "[codex.linux.aarch64]",
+    ] {
+        assert!(
+            body.contains(tuple),
+            "manifest missing required tuple: {tuple}"
+        );
+    }
+}
+
+#[test]
+fn manifest_reader_extracts_fields_in_stable_order() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_require claude-code linux x86_64
+        "#,
+    );
+    assert!(out.status.success(), "stderr={}", stderr(&out));
+    let out_stdout = stdout(&out);
+    let lines: Vec<&str> = out_stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 lines, got {:?}", lines);
+    assert!(!lines[0].is_empty(), "version empty");
+    assert!(
+        lines[1].starts_with("https://"),
+        "url not https: {}",
+        lines[1]
+    );
+    assert_eq!(
+        lines[2].len(),
+        64,
+        "sha256 should be 64 hex chars, got: {}",
+        lines[2]
+    );
+}
+
+#[test]
+fn manifest_reader_fails_on_missing_entry() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_require claude-code windows x86_64
+        "#,
+    );
+    assert!(!out.status.success(), "expected failure for unknown tuple");
+    assert!(
+        stderr(&out).contains("manifest entry [claude-code.windows.x86_64] missing"),
+        "stderr did not name the missing tuple: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn manifest_reader_fails_on_missing_file() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        # Shadow the path resolver so the helper looks at a nonexistent file.
+        agent_manifest_path() { printf '%s\n' "/tmp/does-not-exist-$$-manifest.toml"; }
+        agent_manifest_require claude-code linux x86_64
+        "#,
+    );
+    assert!(
+        !out.status.success(),
+        "expected failure when manifest is missing"
+    );
+    assert!(
+        stderr(&out).contains("manifest not found"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn manifest_verify_rejects_wrong_hash() {
+    // Write a file whose real SHA-256 differs from the expected hash below.
+    let tmp = tempfile_path("r-b5c1-sha-mismatch.bin");
+    fs::write(&tmp, b"payload").unwrap();
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_verify "{}" deadbeef label
+        "#,
+        tmp.display()
+    );
+    let out = run_bash(&script);
+    assert!(!out.status.success(), "verify should have rejected");
+    let err = stderr(&out);
+    assert!(err.contains("SHA-256 mismatch"), "stderr: {err}");
+    assert!(err.contains("expected: deadbeef"), "stderr: {err}");
+    let _ = fs::remove_file(&tmp);
+}
+
+#[test]
+fn manifest_verify_accepts_matching_hash() {
+    let tmp = tempfile_path("r-b5c1-sha-match.bin");
+    fs::write(&tmp, b"hello world").unwrap();
+    // sha256("hello world") — computed once, stable.
+    let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_verify "{}" {} label
+        "#,
+        tmp.display(),
+        expected
+    );
+    let out = run_bash(&script);
+    assert!(
+        out.status.success(),
+        "expected verify to succeed, stderr={}",
+        stderr(&out)
+    );
+    let _ = fs::remove_file(&tmp);
+}
+
+#[test]
+fn claude_override_without_sha_is_rejected() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        CLAUDE_CODE_VERSION=99.99.99 resolve_claude_binary r-b5c1-test
+        "#,
+    );
+    assert!(
+        !out.status.success(),
+        "resolve_claude_binary must fail when the override has no SHA"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("CLAUDE_CODE_VERSION=99.99.99 is set without a matching CLAUDE_CODE_SHA256"),
+        "stderr did not name the missing SHA env: {err}"
+    );
+    assert!(
+        err.contains("R-B5c.1 forbids unverified overrides"),
+        "stderr did not cite R-B5c.1: {err}"
+    );
+}
+
+#[test]
+fn codex_override_without_sha_is_rejected() {
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        CODEX_VERSION=99.99.99 resolve_codex_binary r-b5c1-test
+        "#,
+    );
+    assert!(
+        !out.status.success(),
+        "resolve_codex_binary must fail when the override has no SHA"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("CODEX_VERSION=99.99.99 is set without a matching CODEX_SHA256"),
+        "stderr did not name the missing SHA env: {err}"
+    );
+    assert!(
+        err.contains("R-B5c.1 forbids unverified overrides"),
+        "stderr did not cite R-B5c.1: {err}"
+    );
+}
+
+#[test]
+fn resolve_claude_fails_if_manifest_missing() {
+    // Resolver must not silently fall back to an unpinned download.
+    let out = run_bash(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=true
+        agent_manifest_path() { printf '%s\n' "/tmp/does-not-exist-$$-manifest.toml"; }
+        resolve_claude_binary r-b5c1-test
+        "#,
+    );
+    assert!(!out.status.success(), "must fail when manifest is absent");
+    assert!(
+        stderr(&out).contains("manifest not found"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+fn tempfile_path(name: &str) -> PathBuf {
+    let dir: PathBuf = std::env::temp_dir();
+    dir.join(format!(
+        "{}-{}",
+        std::process::id(),
+        Path::new(name).display()
+    ))
+}

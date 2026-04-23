@@ -3,6 +3,12 @@
 # Sourced by build_<agent>_rootfs.sh — not meant to be run directly.
 # Caller owns `set -euo pipefail`.
 
+# Load the pinned-manifest reader (R-B5c.1). This is the only source of truth
+# for `version`/`url`/`sha256` tuples consumed by the resolve_* helpers below.
+_agent_rootfs_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./agent_manifest.sh
+source "$_agent_rootfs_common_dir/agent_manifest.sh"
+
 # ── Architecture & cross-build detection ────────────────────────────────────
 # Sets: GUEST_ARCH, IS_CROSS_BUILD
 
@@ -21,24 +27,26 @@ detect_guest_arch() {
 }
 
 # ── Claude binary resolution ───────────────────────────────────────────────
-# Locates or downloads a Linux ELF claude-code binary.
+# Locates or downloads a Linux ELF claude-code binary, with SHA-256 pinning
+# per R-B5c.1.
 #
-# Reads: CLAUDE_BIN, CLAUDE_CODE_VERSION (env vars, both optional)
+# Reads: CLAUDE_BIN, CLAUDE_CODE_VERSION, CLAUDE_CODE_SHA256 (all optional)
 # Requires: GUEST_ARCH, IS_CROSS_BUILD (call detect_guest_arch first)
-# Sets: CLAUDE_BIN (absolute path to the resolved binary)
+# Sets: CLAUDE_BIN (absolute path to the resolved binary),
+#       CLAUDE_BUILD_PROVENANCE (one of: manifest, override, local-path)
 #
 # Discovery chain:
-#   1. CLAUDE_BIN env var (explicit path)
-#   2. Local PATH (~/.local/bin/claude or `which claude`) — Linux only, ELF-checked
-#   3. macOS auto-detect: run local `claude --version`, set CLAUDE_CODE_VERSION
-#   4. CLAUDE_CODE_VERSION → download Linux build from GCS
-#   5. Validate exists + is ELF
+#   1. CLAUDE_BIN env var → local dev path; **non-production** (no verify)
+#   2. PATH (Linux only) → local dev path; **non-production** (no verify)
+#   3. CLAUDE_CODE_VERSION → explicit override; CLAUDE_CODE_SHA256 is required
+#      so developers supply the hash they are asking the build to trust
+#   4. Default → pull version+url+sha256 from scripts/agents/manifest.toml
 
 resolve_claude_binary() {
   local log_prefix="${1:-agent-rootfs}"
   CLAUDE_BIN="${CLAUDE_BIN:-}"
+  CLAUDE_BUILD_PROVENANCE=""
 
-  # Map guest arch to claude-code download platform string.
   local claude_platform
   case "$GUEST_ARCH" in
     x86_64)  claude_platform="linux-x64" ;;
@@ -46,7 +54,13 @@ resolve_claude_binary() {
     *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; exit 1 ;;
   esac
 
-  # 1. Try locally installed binary (Linux only — macOS has Mach-O).
+  # 1. CLAUDE_BIN env var → explicit local-dev path.
+  if [[ -n "$CLAUDE_BIN" ]]; then
+    CLAUDE_BUILD_PROVENANCE="local-path"
+    echo "[$log_prefix] WARN: using CLAUDE_BIN=$CLAUDE_BIN without SHA-256 verification — non-production image" >&2
+  fi
+
+  # 2. PATH (Linux only, no env-var override in play).
   if [[ -z "$CLAUDE_BIN" && -z "${CLAUDE_CODE_VERSION:-}" && "$IS_CROSS_BUILD" == "false" ]]; then
     local candidate
     for candidate in \
@@ -56,96 +70,88 @@ resolve_claude_binary() {
       if [[ -n "$candidate" && -f "$candidate" ]] \
          && file -L "$candidate" 2>/dev/null | grep -q "ELF.*executable"; then
         CLAUDE_BIN="$(readlink -f "$candidate")"
+        CLAUDE_BUILD_PROVENANCE="local-path"
+        echo "[$log_prefix] WARN: using local PATH claude ($CLAUDE_BIN) without SHA-256 verification — non-production image" >&2
         break
       fi
     done
   fi
 
-  # 2. macOS auto-detect: derive CLAUDE_CODE_VERSION from local install.
-  if [[ -z "$CLAUDE_BIN" && -z "${CLAUDE_CODE_VERSION:-}" && "$IS_CROSS_BUILD" == "true" ]]; then
-    local local_claude
-    local_claude="$(command -v claude 2>/dev/null || true)"
-    if [[ -n "$local_claude" ]]; then
-      local detected_ver
-      detected_ver="$("$local_claude" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-      if [[ -n "$detected_ver" ]]; then
-        echo "[$log_prefix] macOS detected — will download Linux build of claude-code v${detected_ver}"
-        CLAUDE_CODE_VERSION="$detected_ver"
-      fi
-    fi
-  fi
-
-  # 3. Download via CLAUDE_CODE_VERSION.
+  # 3. CLAUDE_CODE_VERSION override path: must be accompanied by a matching
+  #    CLAUDE_CODE_SHA256. This is the R-B5c.1 guard: no silent unverified
+  #    fetch. The URL template still comes from the manifest so an override
+  #    can't silently point at an attacker-controlled origin.
   if [[ -z "$CLAUDE_BIN" && -n "${CLAUDE_CODE_VERSION:-}" ]]; then
-    local gcs_base="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
-    local download_url="$gcs_base/$CLAUDE_CODE_VERSION/$claude_platform/claude"
+    if [[ -z "${CLAUDE_CODE_SHA256:-}" ]]; then
+      echo "ERROR: CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION is set without a matching CLAUDE_CODE_SHA256." >&2
+      echo "  R-B5c.1 forbids unverified overrides." >&2
+      echo "  Supply the SHA-256 of the artifact you want the build to trust:" >&2
+      echo "    CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION CLAUDE_CODE_SHA256=<hex> $0" >&2
+      exit 1
+    fi
+
+    local manifest_url_template
+    manifest_url_template="$(agent_manifest_require claude-code linux "$GUEST_ARCH" | sed -n '2p')"
+    local download_url="${manifest_url_template//\{version\}/$CLAUDE_CODE_VERSION}"
     local download_dir="$ROOT_DIR/target/claude-download"
     mkdir -p "$download_dir"
     CLAUDE_BIN="$download_dir/claude-${CLAUDE_CODE_VERSION}-${claude_platform}"
-
-    if [[ ! -f "$CLAUDE_BIN" ]]; then
-      echo "[$log_prefix] Downloading claude-code v${CLAUDE_CODE_VERSION} (${claude_platform})..."
-      if ! curl -fSL --progress-bar -o "$CLAUDE_BIN" "$download_url"; then
-        echo "ERROR: Failed to download claude-code from $download_url" >&2
-        echo "  Check that version $CLAUDE_CODE_VERSION exists for $claude_platform." >&2
-        rm -f "$CLAUDE_BIN"
-        exit 1
-      fi
-      chmod +x "$CLAUDE_BIN"
-    else
-      echo "[$log_prefix] Using cached download: $CLAUDE_BIN"
-    fi
+    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$CLAUDE_CODE_SHA256" || exit 1
+    chmod +x "$CLAUDE_BIN"
+    CLAUDE_BUILD_PROVENANCE="override"
   fi
 
-  # 4. Validate presence.
-  if [[ -z "$CLAUDE_BIN" || ! -f "$CLAUDE_BIN" ]]; then
-    echo "ERROR: Native claude binary not found." >&2
-    echo "" >&2
-    echo "Options:" >&2
-    echo "  1. Install claude:  curl -fsSL https://claude.ai/install.sh | sh" >&2
-    echo "     (on macOS, the Linux binary will be auto-downloaded)" >&2
-    echo "  2. Set CLAUDE_BIN=/path/to/linux/claude (must be a Linux ELF binary)" >&2
-    echo "  3. Set CLAUDE_CODE_VERSION=2.1.45 for automatic download" >&2
-    exit 1
+  # 4. Manifest default: no env-var override, no local binary.
+  if [[ -z "$CLAUDE_BIN" ]]; then
+    local manifest_entry
+    manifest_entry="$(agent_manifest_require claude-code linux "$GUEST_ARCH")" || exit 1
+    local pinned_version pinned_url_template pinned_sha
+    pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
+    pinned_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
+    pinned_sha="$(printf '%s\n' "$manifest_entry" | sed -n '3p')"
+    local download_url="${pinned_url_template//\{version\}/$pinned_version}"
+    local download_dir="$ROOT_DIR/target/claude-download"
+    mkdir -p "$download_dir"
+    CLAUDE_BIN="$download_dir/claude-${pinned_version}-${claude_platform}"
+    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$pinned_sha" || exit 1
+    chmod +x "$CLAUDE_BIN"
+    CLAUDE_CODE_VERSION="$pinned_version"
+    CLAUDE_BUILD_PROVENANCE="manifest"
   fi
 
-  # 5. Validate it's a Linux ELF binary.
   if ! file -L "$CLAUDE_BIN" | grep -q "ELF.*executable"; then
     echo "ERROR: $CLAUDE_BIN is not a native Linux ELF binary." >&2
     echo "  file: $(file -L "$CLAUDE_BIN")" >&2
-    if [[ "$IS_CROSS_BUILD" == "true" ]]; then
-      echo "  On macOS, set CLAUDE_CODE_VERSION to download the Linux build:" >&2
-      echo "    CLAUDE_CODE_VERSION=2.0.76 $0" >&2
-    else
-      echo "  Make sure you have the native claude-code binary (not the npm wrapper)." >&2
-    fi
     exit 1
   fi
 
   local claude_size
   claude_size="$(du -sh "$CLAUDE_BIN" | awk '{print $1}')"
-  echo "[$log_prefix] Claude binary: $CLAUDE_BIN ($claude_size)"
+  echo "[$log_prefix] Claude binary: $CLAUDE_BIN ($claude_size) [provenance=${CLAUDE_BUILD_PROVENANCE}]"
 }
 
 # ── Codex binary resolution ───────────────────────────────────────────────
-# Locates or downloads a Linux ELF codex binary.
+# Locates or downloads a Linux ELF codex binary, with SHA-256 pinning per
+# R-B5c.1. The pinned sha256 is computed against the *tarball* as it lands on
+# disk (the downloaded blob), not against the extracted binary.
 #
-# Reads: CODEX_BIN, CODEX_VERSION (env vars, both optional)
+# Reads: CODEX_BIN, CODEX_VERSION, CODEX_SHA256 (all optional)
 # Requires: GUEST_ARCH, IS_CROSS_BUILD (call detect_guest_arch first)
-# Sets: CODEX_BIN (absolute path to the resolved binary)
+# Sets: CODEX_BIN (absolute path to the resolved binary),
+#       CODEX_BUILD_PROVENANCE (one of: manifest, override, local-path)
 #
 # Discovery chain:
-#   1. CODEX_BIN env var (explicit path)
-#   2. Local PATH (`which codex`) — Linux only, ELF-checked, warns on non-ELF
-#   3. macOS auto-detect: run local `codex --version`, set CODEX_VERSION
-#   4. CODEX_VERSION → download from GitHub releases
-#   5. Validate exists + is ELF
+#   1. CODEX_BIN env var → local dev path; **non-production** (no verify)
+#   2. PATH (Linux only) → local dev path; **non-production** (no verify)
+#   3. CODEX_VERSION → explicit override; CODEX_SHA256 is required so
+#      developers supply the hash they are asking the build to trust
+#   4. Default → pull version+url+sha256 from scripts/agents/manifest.toml
 
 resolve_codex_binary() {
   local log_prefix="${1:-agent-rootfs}"
   CODEX_BIN="${CODEX_BIN:-}"
+  CODEX_BUILD_PROVENANCE=""
 
-  # Map guest arch to codex GitHub release asset suffix.
   local codex_target
   case "$GUEST_ARCH" in
     x86_64)  codex_target="x86_64-unknown-linux-musl" ;;
@@ -153,100 +159,104 @@ resolve_codex_binary() {
     *)       echo "ERROR: unsupported guest architecture: $GUEST_ARCH" >&2; exit 1 ;;
   esac
 
-  # 1. Try locally installed binary (Linux only — macOS has Mach-O).
-  # An explicit CODEX_VERSION takes priority so the user always gets the
-  # requested build even if a stale/wrapper `codex` is on PATH.
+  # 1. CODEX_BIN env var → explicit local-dev path.
+  if [[ -n "$CODEX_BIN" ]]; then
+    CODEX_BUILD_PROVENANCE="local-path"
+    echo "[$log_prefix] WARN: using CODEX_BIN=$CODEX_BIN without SHA-256 verification — non-production image" >&2
+  fi
+
+  # 2. PATH (Linux only, no env-var override in play).
   if [[ -z "$CODEX_BIN" && -z "${CODEX_VERSION:-}" && "$IS_CROSS_BUILD" == "false" ]]; then
     local local_codex
     local_codex="$(command -v codex 2>/dev/null || true)"
     if [[ -n "$local_codex" && -f "$local_codex" ]]; then
       if file -L "$local_codex" 2>/dev/null | grep -q "ELF.*executable"; then
         CODEX_BIN="$(readlink -f "$local_codex")"
+        CODEX_BUILD_PROVENANCE="local-path"
+        echo "[$log_prefix] WARN: using local PATH codex ($CODEX_BIN) without SHA-256 verification — non-production image" >&2
       else
-        echo "[$log_prefix] PATH has a non-ELF codex ($local_codex) — skipping; set CODEX_VERSION to download a native build." >&2
+        echo "[$log_prefix] PATH has a non-ELF codex ($local_codex) — skipping; set CODEX_VERSION + CODEX_SHA256 to download a native build." >&2
       fi
     fi
   fi
 
-  # 2. macOS auto-detect: derive CODEX_VERSION from local install.
-  if [[ -z "$CODEX_BIN" && -z "${CODEX_VERSION:-}" && "$IS_CROSS_BUILD" == "true" ]]; then
-    local local_codex
-    local_codex="$(command -v codex 2>/dev/null || true)"
-    if [[ -n "$local_codex" ]]; then
-      # Extract bare version number (e.g. "0.120.0" from "codex-cli 0.120.0")
-      local detected_ver
-      detected_ver="$("$local_codex" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-      if [[ -n "$detected_ver" ]]; then
-        echo "[$log_prefix] macOS detected — will download Linux build of codex v${detected_ver}"
-        CODEX_VERSION="$detected_ver"
-      fi
-    fi
-  fi
-
-  # 3. Download via CODEX_VERSION.
+  # 3. CODEX_VERSION override path: must be accompanied by a matching
+  #    CODEX_SHA256 (R-B5c.1 — no silent unverified fetch).
   if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
-    local release_url="https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-${codex_target}.tar.gz"
-    local download_dir="$ROOT_DIR/target/codex-download"
-    mkdir -p "$download_dir"
-    local cached_bin="$download_dir/codex-${CODEX_VERSION}-${codex_target}"
-
-    if [[ ! -f "$cached_bin" ]]; then
-      echo "[$log_prefix] Downloading codex v${CODEX_VERSION} (${codex_target})..."
-      # Run the download inside a subshell so the EXIT trap we install for
-      # temp-dir cleanup is scoped to this block and does not overwrite any
-      # trap the caller (build_codex_rootfs.sh, build_agents_rootfs.sh) has
-      # set up for its own staging directory.
-      (
-        set -euo pipefail
-        tmp_dir="$(mktemp -d)"
-        trap 'rm -rf "$tmp_dir"' EXIT
-        tmp_tar="$tmp_dir/codex.tar.gz"
-        if ! curl -fSL --progress-bar -o "$tmp_tar" "$release_url"; then
-          echo "ERROR: Failed to download codex from $release_url" >&2
-          echo "  Check that version $CODEX_VERSION exists for $codex_target." >&2
-          exit 1
-        fi
-        tar -xzf "$tmp_tar" -C "$tmp_dir"
-        extracted_bin="$(find_extracted_executable "$tmp_dir" || true)"
-        if [[ -z "$extracted_bin" ]]; then
-          echo "ERROR: tarball did not contain an executable codex binary" >&2
-          ls -laR "$tmp_dir" >&2
-          exit 1
-        fi
-        cp "$extracted_bin" "$cached_bin"
-        chmod +x "$cached_bin"
-      )
-    else
-      echo "[$log_prefix] Using cached download: $cached_bin"
+    if [[ -z "${CODEX_SHA256:-}" ]]; then
+      echo "ERROR: CODEX_VERSION=$CODEX_VERSION is set without a matching CODEX_SHA256." >&2
+      echo "  R-B5c.1 forbids unverified overrides." >&2
+      echo "  Supply the SHA-256 of the downloaded tarball you want the build to trust:" >&2
+      echo "    CODEX_VERSION=$CODEX_VERSION CODEX_SHA256=<hex> $0" >&2
+      exit 1
     fi
-    CODEX_BIN="$cached_bin"
+
+    local manifest_url_template
+    manifest_url_template="$(agent_manifest_require codex linux "$GUEST_ARCH" | sed -n '2p')"
+    local download_url="${manifest_url_template//\{version\}/$CODEX_VERSION}"
+    _codex_fetch_verify_extract "$log_prefix" "$CODEX_VERSION" "$codex_target" "$download_url" "$CODEX_SHA256" || exit 1
+    CODEX_BUILD_PROVENANCE="override"
   fi
 
-  # 4. Validate presence.
-  if [[ -z "$CODEX_BIN" || ! -f "$CODEX_BIN" ]]; then
-    echo "ERROR: codex binary not found." >&2
-    echo "" >&2
-    echo "Options:" >&2
-    echo "  1. Install codex on your PATH (Linux host only; macOS Mach-O binaries cannot run in the Linux guest)" >&2
-    echo "  2. Set CODEX_BIN=/path/to/linux/codex (must be a Linux ELF binary)" >&2
-    echo "  3. Set CODEX_VERSION=0.118.0 for automatic download" >&2
-    exit 1
+  # 4. Manifest default.
+  if [[ -z "$CODEX_BIN" ]]; then
+    local manifest_entry
+    manifest_entry="$(agent_manifest_require codex linux "$GUEST_ARCH")" || exit 1
+    local pinned_version pinned_url_template pinned_sha
+    pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
+    pinned_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
+    pinned_sha="$(printf '%s\n' "$manifest_entry" | sed -n '3p')"
+    local download_url="${pinned_url_template//\{version\}/$pinned_version}"
+    _codex_fetch_verify_extract "$log_prefix" "$pinned_version" "$codex_target" "$download_url" "$pinned_sha" || exit 1
+    CODEX_VERSION="$pinned_version"
+    CODEX_BUILD_PROVENANCE="manifest"
   fi
 
-  # 5. Validate it's a Linux ELF binary.
   if ! file -L "$CODEX_BIN" | grep -q "ELF.*executable"; then
     echo "ERROR: $CODEX_BIN is not a native Linux ELF binary." >&2
     echo "  file: $(file -L "$CODEX_BIN")" >&2
-    if [[ "$IS_CROSS_BUILD" == "true" ]]; then
-      echo "  On macOS, set CODEX_VERSION to download the Linux build:" >&2
-      echo "    CODEX_VERSION=0.118.0 $0" >&2
-    fi
     exit 1
   fi
 
   local codex_size
   codex_size="$(du -sh "$CODEX_BIN" | awk '{print $1}')"
-  echo "[$log_prefix] Codex binary: $CODEX_BIN ($codex_size)"
+  echo "[$log_prefix] Codex binary: $CODEX_BIN ($codex_size) [provenance=${CODEX_BUILD_PROVENANCE}]"
+}
+
+# Internal: download the codex tarball, verify its SHA-256, extract the
+# binary, and set CODEX_BIN to the cached extracted path.
+_codex_fetch_verify_extract() {
+  local log_prefix="$1"
+  local version="$2"
+  local target="$3"
+  local url="$4"
+  local expected_sha="$5"
+
+  local download_dir="$ROOT_DIR/target/codex-download"
+  mkdir -p "$download_dir"
+  local cached_tar="$download_dir/codex-${version}-${target}.tar.gz"
+  local cached_bin="$download_dir/codex-${version}-${target}"
+
+  _agent_fetch_and_verify "$log_prefix" "$url" "$cached_tar" "$expected_sha" || return 1
+
+  if [[ ! -x "$cached_bin" ]]; then
+    (
+      set -euo pipefail
+      tmp_dir="$(mktemp -d)"
+      trap 'rm -rf "$tmp_dir"' EXIT
+      tar -xzf "$cached_tar" -C "$tmp_dir"
+      extracted_bin="$(find_extracted_executable "$tmp_dir" || true)"
+      if [[ -z "$extracted_bin" ]]; then
+        echo "ERROR: tarball did not contain an executable codex binary" >&2
+        ls -laR "$tmp_dir" >&2
+        exit 1
+      fi
+      cp "$extracted_bin" "$cached_bin"
+      chmod +x "$cached_bin"
+    ) || return 1
+  fi
+
+  CODEX_BIN="$cached_bin"
 }
 
 # ── Busybox setup ───────────────────────────────────────────────────────────
@@ -306,6 +316,39 @@ GROUP
 }
 
 # ── Download artifact helpers ────────────────────────────────────────────────
+
+# Fetch `url` to `dest` (idempotent: skip if the file already matches the
+# expected SHA-256), then verify. Deletes a mismatching file on failure so
+# retries don't keep a poisoned copy in the cache.
+_agent_fetch_and_verify() {
+  local log_prefix="$1"
+  local url="$2"
+  local dest="$3"
+  local expected_sha="$4"
+
+  if [[ -f "$dest" ]]; then
+    if agent_manifest_verify "$dest" "$expected_sha" "$(basename "$dest")" >/dev/null 2>&1; then
+      echo "[$log_prefix] Using cached (verified) download: $dest"
+      return 0
+    fi
+    echo "[$log_prefix] Cached download failed verification, refetching: $dest" >&2
+    rm -f "$dest"
+  fi
+
+  echo "[$log_prefix] Downloading $url"
+  if ! curl -fSL --progress-bar -o "$dest" "$url"; then
+    echo "ERROR: download failed: $url" >&2
+    rm -f "$dest"
+    return 1
+  fi
+
+  if ! agent_manifest_verify "$dest" "$expected_sha" "$(basename "$dest")"; then
+    rm -f "$dest"
+    return 1
+  fi
+  echo "[$log_prefix] Verified SHA-256 for $(basename "$dest")"
+  return 0
+}
 
 find_extracted_executable() {
   local search_dir="$1"
