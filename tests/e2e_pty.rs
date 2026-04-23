@@ -3,12 +3,22 @@
 //! Requires KVM, `VOID_BOX_KERNEL`, and `VOID_BOX_INITRAMFS` (test image
 //! with BusyBox for `/bin/sh`).
 
+#[path = "common/vm_preflight.rs"]
+mod vm_preflight;
+
 #[cfg(target_os = "linux")]
 mod pty_tests {
+    use super::vm_preflight;
     use void_box::sandbox::Sandbox;
     use void_box_protocol::PtyOpenRequest;
 
     fn skip_reason() -> Option<String> {
+        if let Err(err) = vm_preflight::require_kvm_usable() {
+            return Some(err);
+        }
+        if let Err(err) = vm_preflight::require_vsock_usable() {
+            return Some(err);
+        }
         if std::env::var("VOID_BOX_KERNEL").is_err() {
             return Some("VOID_BOX_KERNEL not set".into());
         }
