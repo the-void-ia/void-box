@@ -375,28 +375,32 @@ _agent_fetch_and_verify() {
   # `mktemp` gives us a unique sibling even if two runs under the same
   # parent shell race (bash `$$` is the parent PID, so `.tmp.$$` would
   # collide). `--tmpdir`-free usage is portable across macOS and Linux.
+  # We considered a `trap 'rm -f "$staging"' RETURN` for belt-and-
+  # suspenders cleanup but removed it: bash's RETURN trap is
+  # shell-global, not function-scoped, so it would fire on every
+  # subsequent function return and blow up under `set -u` once
+  # `$staging` leaves scope. Explicit cleanup on each return path is
+  # both simpler and side-effect-free. A SIGKILL still orphans the
+  # staging sibling; that residue lives under `target/` and is cleaned
+  # by a normal rebuild.
   local staging
   staging="$(mktemp "${dest}.tmp.XXXXXX")"
-  # Belt-and-suspenders: RETURN fires on every exit from this function
-  # (success, any `return 1`, stray non-zero bubbling). After a successful
-  # `mv`, `$staging` no longer exists and `rm -f` is a no-op. A SIGKILL of
-  # the whole shell still orphans the staging file (no trap fires) — that
-  # residue lives inside `target/` and is cleaned by `cargo clean` / a
-  # normal build rebuild.
-  trap 'rm -f "$staging" 2>/dev/null || true' RETURN
 
   echo "[$log_prefix] Downloading $url"
   if ! curl -fSL --progress-bar -o "$staging" "$url"; then
     echo "ERROR: download failed: $url" >&2
+    rm -f "$staging"
     return 1
   fi
 
   if ! agent_manifest_verify "$staging" "$expected_sha" "$label"; then
+    rm -f "$staging"
     return 1
   fi
 
   if ! mv -f "$staging" "$dest"; then
     echo "ERROR: failed to atomically install $dest" >&2
+    rm -f "$staging"
     return 1
   fi
   echo "[$log_prefix] Verified SHA-256 for $label"
