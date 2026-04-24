@@ -61,7 +61,7 @@ agent_manifest_require() {
   # order in the file.
   local extracted
   extracted="$(
-    awk -v want="$section" -v section="$section" '
+    awk -v section="$section" '
       function strip_space(s) {
         sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
         return s
@@ -69,7 +69,12 @@ agent_manifest_require() {
       # Unquote a double-quoted TOML scalar and strip any `# trailing comment`.
       # Rejects single-quoted scalars (the schema mandates double quotes) and
       # anything with an un-matched quote pair.
-      function unquote(raw,    s) {
+      # The manifest schema forbids `"` inside any value (versions, URLs, and
+      # SHA-256s never contain one), so we take the first `"` after the
+      # opening quote as the terminator without tracking backslash escapes.
+      # If a future key ever needs embedded quotes, this routine must grow
+      # an escape scanner.
+      function unquote(raw,    s, closing, value, tail) {
         s = strip_space(raw)
         if (s ~ /^'"'"'/) {
           print "ERROR: single-quoted values are not accepted (use double quotes): " raw > "/dev/stderr"
@@ -79,9 +84,6 @@ agent_manifest_require() {
           print "ERROR: value is not a quoted TOML string: " raw > "/dev/stderr"
           bad = 1; return ""
         }
-        # Peel the leading quote, then everything up to the next unescaped
-        # quote. Whatever follows is treated as an optional trailing comment
-        # and must start with whitespace + `#` or be empty.
         s = substr(s, 2)
         closing = index(s, "\"")
         if (closing == 0) {
@@ -103,7 +105,7 @@ agent_manifest_require() {
         header = $0
         sub(/^[[:space:]]*\[[[:space:]]*/, "", header)
         sub(/[[:space:]]*\].*$/, "", header)
-        in_section = (header == want) ? 1 : 0
+        in_section = (header == section) ? 1 : 0
         next
       }
       in_section && /=/ {

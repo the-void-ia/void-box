@@ -397,6 +397,43 @@ fn override_drift_from_manifest_warns() {
     );
 }
 
+#[test]
+fn find_extracted_executable_prefers_named_binary() {
+    // A tarball extraction often contains multiple executables (e.g.
+    // `codex` + `codex-migrate` + a README script). Deterministic
+    // selection under `LC_ALL=C sort` is fine but the explicit-name path
+    // is stronger: pass `codex` and it should win even if another
+    // sortable-first file exists alongside.
+    let dir = tempfile_path("r-b5c1-find");
+    fs::create_dir_all(&dir).unwrap();
+    let decoy = dir.join("aaa-decoy");
+    let target = dir.join("codex");
+    fs::write(&decoy, b"#!/bin/sh\n").unwrap();
+    fs::write(&target, b"#!/bin/sh\n").unwrap();
+    // Both need the exec bit for the helper to consider them.
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = format!(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        find_extracted_executable "{}" codex
+        "#,
+        dir.display()
+    );
+    let out = run_bash(&script);
+    assert!(out.status.success(), "stderr={}", stderr(&out));
+    let picked = stdout(&out).trim().to_string();
+    assert_eq!(
+        picked,
+        target.to_string_lossy(),
+        "preferred name should win over lexicographically earlier decoy"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn tempfile_path(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);

@@ -21,7 +21,7 @@ be added without renaming existing ones.
   "schema": 1,
 
   // R-B5c.1 — vendored agent binaries. One entry per
-  // (agent, platform, arch) tuple; the values are copied verbatim from
+  // (agent, platform, arch) tuple; values are copied verbatim from
   // scripts/agents/manifest.toml at release time.
   "agents": {
     "<agent>": {           // e.g. "claude-code", "codex"
@@ -34,15 +34,20 @@ be added without renaming existing ones.
       }
     }
   }
-
-  // Reserved for R-B5b.1:
-  //   "kernels":   { ... }   // slim + distro kernel digests
-  //   "initramfs": { ... }   // per-flavor initramfs digests
-  // The publisher (`.github/workflows/release-images.yml`) will populate
-  // these from the same release-time inputs; consumers should tolerate
-  // their absence in schema v1 releases.
 }
 ```
+
+### Reserved keys (for R-B5b.1)
+
+R-B5b.1 will extend the schema with sibling top-level keys for the
+release-built kernel and initramfs artifacts:
+
+- `"kernels"`    — slim + distro kernel digests
+- `"initramfs"`  — per-flavor initramfs digests
+
+The publisher (`.github/workflows/release-images.yml`) will populate
+these from the same release-time inputs. Schema-v1 releases omit them;
+consumers MUST tolerate their absence.
 
 ## Producer
 

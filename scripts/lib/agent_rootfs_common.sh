@@ -372,7 +372,11 @@ _agent_fetch_and_verify() {
     rm -f "$dest"
   fi
 
-  local staging="${dest}.tmp.$$"
+  # `mktemp` gives us a unique sibling even if two runs under the same
+  # parent shell race (bash `$$` is the parent PID, so `.tmp.$$` would
+  # collide). `--tmpdir`-free usage is portable across macOS and Linux.
+  local staging
+  staging="$(mktemp "${dest}.tmp.XXXXXX")"
   echo "[$log_prefix] Downloading $url"
   if ! curl -fSL --progress-bar -o "$staging" "$url"; then
     echo "ERROR: download failed: $url" >&2
