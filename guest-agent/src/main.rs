@@ -272,9 +272,16 @@ impl CpuJiffies {
 }
 
 /// Writes a message to /dev/kmsg so it appears on the kernel serial console.
+///
+/// Previously this also `eprintln!`'d the message to guest-agent's stderr
+/// for redundancy. Under the persistent multiplex control channel, that
+/// duplicate path accumulated state in the Rust stdio/tty layer and
+/// caused the dispatch thread to block inside `write(2)` after ~20 tight
+/// execs (see `docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md`).
+/// Kernel printk already routes `/dev/kmsg` writes to the serial console,
+/// so the stderr path added no extra visibility — dropping it removed the
+/// stall entirely.
 pub(crate) fn kmsg(msg: &str) {
-    // Write to both stderr and /dev/kmsg for maximum visibility
-    eprintln!("{}", msg);
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
         use std::io::Write;
         let _ = writeln!(f, "guest-agent: {}", msg);

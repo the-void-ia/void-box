@@ -24,11 +24,6 @@ mod vm_preflight;
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
-///
-/// Capped at 16 while the userspace vsock backend's flow-control bug
-/// around long-lived multiplex connections is being investigated
-/// separately (see
-/// `docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md`).
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
 fn backend_available() -> bool {
@@ -116,8 +111,10 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
 
 /// Number of serial `exec` calls fired through the persistent channel.
 ///
-/// Capped at 16 for the same reason as [`CONCURRENT_EXEC_COUNT`].
-const SERIAL_EXEC_COUNT: usize = 16;
+/// This exercises the previously failing tight-loop path that stalled after
+/// ~20 execs when guest-agent duplicated `kmsg()` to both stderr and
+/// `/dev/kmsg`.
+const SERIAL_EXEC_COUNT: usize = 100;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]

@@ -1008,6 +1008,49 @@ That production image is for real Claude/OpenClaw runtime paths.
 
 ## Known issues
 
+### Guest-agent `kmsg()` must write to `/dev/kmsg` only — never also to stderr
+
+**Symptom:** On the userspace-vsock backend, `persistent_channel`
+(and any tight-loop RPC pattern) stalls somewhere between iter 20
+and iter 28, with the guest thread stuck at
+`pv_native_safe_halt` and the host's `multiplex-reader` blocked on
+`libc::read(vsock_fd)`. See
+`docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md` for the
+full investigation.
+
+**Root cause (2 days of wrong turns to get here):** `guest-agent`'s
+`kmsg()` used to write the same message twice — once via
+`eprintln!` (stderr → `/dev/console` via the n_tty line discipline)
+and once via `/dev/kmsg` (kernel printk ring buffer → serial
+console). The stderr path goes through `tty_write` →
+`wait_event_interruptible(write_room > 0)`. Under the persistent
+multiplex channel, many `kmsg()` calls execute back-to-back on one
+thread; the n_tty `write_room` work queue eventually gets starved,
+the next `write(2)` on stderr blocks, the guest kernel goes idle,
+and the host times out. The `/dev/kmsg` path does **not** block
+(kernel printk has a drop-based rate-limiter and a separate work
+queue), which is why dropping the `eprintln!` call removed the
+stall.
+
+**Rule.** Do not have `kmsg()` (or any hot-path log helper) dual-write
+to both stderr and `/dev/kmsg`. `/dev/kmsg` alone is sufficient to
+surface the message on the serial console, and does not have the
+tty-layer backpressure path that can deadlock PID 1 under sustained
+load. If you need a second destination (file, host-side sink),
+route it through a path that cannot block PID 1 on tty write_room.
+
+**Debugging tip for "stall around iter N" patterns:**
+
+1. Sample the guest RIP via `KVM_GET_REGS` from gdb attached to the
+   VMM process. If every sample lands in `pv_native_safe_halt`
+   (symbol in the guest vmlinux), the guest is **idle**, not
+   spinning. Look for a syscall inside a hot-path helper that
+   blocked — not a spin-loop.
+2. Iteration count at stall scales with the amount of logging per
+   iter. Halving the number of log calls per iter should roughly
+   double the stall iter. If it does, the bug is in the logging
+   path, not in the RPC plumbing.
+
 ### Vsock control channel timeout with large initramfs or missing `ip`
 
 **Symptom:** `control_channel: deadline reached (connect or handshake)` — the

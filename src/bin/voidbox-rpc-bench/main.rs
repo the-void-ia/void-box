@@ -42,10 +42,8 @@ use void_box::sandbox::Sandbox;
 
 /// Default sample count per sequential phase.
 ///
-/// Capped at 8 because the current guest-agent dispatch loop leaks one
-/// watchdog thread per `exec` call; beyond ~16 sequential calls on one
-/// connection the guest stalls. Override with `--seq-iters N` once that
-/// leak is fixed.
+/// Kept small so the default bench stays fast; raise with `--seq-iters N`
+/// when you want longer regression sweeps against one warm VM.
 const DEFAULT_SEQ_ITERS: usize = 8;
 
 /// Default concurrent exec fan-out.
