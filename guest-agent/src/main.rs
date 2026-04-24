@@ -273,14 +273,13 @@ impl CpuJiffies {
 
 /// Writes a message to /dev/kmsg so it appears on the kernel serial console.
 ///
-/// Previously this also `eprintln!`'d the message to guest-agent's stderr
-/// for redundancy. Under the persistent multiplex control channel, that
-/// duplicate path accumulated state in the Rust stdio/tty layer and
-/// caused the dispatch thread to block inside `write(2)` after ~20 tight
-/// execs (see `docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md`).
-/// Kernel printk already routes `/dev/kmsg` writes to the serial console,
-/// so the stderr path added no extra visibility — dropping it removed the
-/// stall entirely.
+/// Must **not** also `eprintln!` — the stderr path goes through the guest
+/// kernel's n_tty line discipline, which blocks on `write_room` under
+/// sustained logging from a single thread and can wedge PID 1. Kernel
+/// printk already flushes `/dev/kmsg` writes to the serial console, so
+/// the stderr path adds no visibility, only load. See
+/// `docs/war-histories.md` — "The eprintln! tty-backpressure stall"
+/// for the full story.
 pub(crate) fn kmsg(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
         use std::io::Write;

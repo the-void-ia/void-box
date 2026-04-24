@@ -203,11 +203,9 @@ impl VmmBackend for KvmBackend {
         // The vsock backend is chosen based on whether the caller intends to
         // snapshot this VM later. Userspace vsock is required for snapshot
         // compatibility (from_snapshot always restores into
-        // VirtioVsockUserspace), but has a flow-control limitation that can
-        // stall multi-RPC boot sequences (see
-        // docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md).
-        // Cold-boot-only runs use Vhost-vsock, which is the fast, stable
-        // default.
+        // VirtioVsockUserspace). Cold-boot-only runs use Vhost-vsock for
+        // lower per-RPC latency (in-kernel IRQ injection, no eventfd
+        // bridge thread).
         let needs_userspace_vsock = config.enable_snapshots || config.snapshot.is_some();
         let vsock_backend = if needs_userspace_vsock {
             VsockBackendType::Userspace

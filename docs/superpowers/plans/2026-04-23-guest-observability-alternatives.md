@@ -2,9 +2,9 @@
 
 **Status:** Design approved 2026-04-23; implementation pending.
 **Motivation:** The userspace-vsock stall investigation
-(`docs/superpowers/plans/2026-04-21-vsock-userspace-stall.md`) took
-two days in part because VoidBox has no first-class way to profile
-guest code while it's running. Host-side `perf kvm` hit multiple
+(`docs/war-histories.md` — "The eprintln! tty-backpressure stall")
+took two days in part because VoidBox has no first-class way to
+profile guest code while it's running. Host-side `perf kvm` hit multiple
 dead ends on our Fedora + AMD + slim-kernel combination. This spec
 lays out what to ship to make the *next* "why is the guest
 stuck/slow?" investigation a minutes-long rather than days-long
