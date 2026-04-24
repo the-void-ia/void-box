@@ -102,16 +102,20 @@ jobs:
           plan_file="${RUNNER_TEMP:-/tmp}/bump-plan-${agent}.json"
 
           # Start with an empty plan — "has_bumps=true" only fires if at
-          # least one arch successfully computed a new hash.
-          python3 -c 'import json; print(json.dumps({"agent":"","target":"","bumps":[]}))' > "$plan_file"
-          python3 -c "
+          # least one arch successfully computed a new hash. All mutations
+          # of the plan go through env-var-fed `python3 <<'PY'` heredocs
+          # rather than `python3 -c "..."` so a future value containing a
+          # quote cannot inject into the Python source.
+          PLAN_FILE="$plan_file" AGENT="$agent" TARGET="$latest" python3 <<'PY'
           import json, os
-          p = '$plan_file'
-          with open(p) as f: d = json.load(f)
-          d['agent'] = '$agent'
-          d['target'] = '$latest'
-          with open(p, 'w') as f: json.dump(d, f)
-          "
+          path = os.environ["PLAN_FILE"]
+          with open(path, "w") as f:
+              json.dump({
+                  "agent": os.environ["AGENT"],
+                  "target": os.environ["TARGET"],
+                  "bumps": [],
+              }, f)
+          PY
 
           for arch in x86_64 aarch64; do
             entry="$(agent_manifest_require "$agent" linux "$arch")"
@@ -125,9 +129,12 @@ jobs:
 
             url="${url_template//\{version\}/$latest}"
             tmp="$(mktemp)"
-            # Any download or cross-check failure for this arch is a
-            # skip-with-warning, not a job failure. The other arch still
-            # gets a chance to bump, and next Monday will retry the lagger.
+            # A failed download here is a skip-with-warning, not a job
+            # failure: the other arch still gets a chance to bump, and
+            # next Monday will retry the lagger. A *structural* surprise
+            # (unexpected JSON shape from Anthropic) is treated separately
+            # as a hard error below — we never want to silently degrade
+            # cross-check coverage.
             echo "[$agent:$arch] fetching $url"
             if ! curl -fSL --retry 3 --retry-delay 5 -o "$tmp" "$url"; then
               echo "::warning::[$agent:$arch] upstream artifact not available at $url — skipping this arch"
@@ -151,11 +158,44 @@ jobs:
                 x86_64)  plat="linux-x64" ;;
                 aarch64) plat="linux-arm64" ;;
               esac
-              advertised="$(curl -fsSL \
-                "https://downloads.claude.ai/claude-code-releases/$latest/manifest.json" \
-                | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['platforms']['$plat']['checksum'])" || true)"
-              if [[ -z "$advertised" ]]; then
-                echo "::warning::[$agent:$arch] Anthropic manifest.json lacks a checksum for $plat at version $latest — skipping this arch"
+              manifest_url="https://downloads.claude.ai/claude-code-releases/$latest/manifest.json"
+              manifest_json="$(mktemp)"
+              if ! curl -fsSL -o "$manifest_json" "$manifest_url"; then
+                # Network failure is transient — retry next week.
+                echo "::warning::[$agent:$arch] Anthropic manifest.json unavailable at $manifest_url — skipping this arch"
+                rm -f "$manifest_json"
+                continue
+              fi
+
+              # Structural failure (key renamed, schema change) is NOT
+              # transient and must not silently degrade the cross-check.
+              # The heredoc extractor exits with code 2 for a missing key;
+              # we convert that to a hard job error, while exit 1 (generic)
+              # or successful extraction follow their own paths.
+              #
+              # All inputs go through env vars: `python3 <<EOF arg` does
+              # NOT pass `arg` as sys.argv[1] — it treats it as the script
+              # filename and silently ignores the heredoc.
+              set +e
+              advertised="$(PLAT="$plat" MANIFEST_JSON="$manifest_json" python3 <<'PY'
+          import json, os, sys
+          d = json.load(open(os.environ["MANIFEST_JSON"]))
+          try:
+              print(d["platforms"][os.environ["PLAT"]]["checksum"])
+          except KeyError as e:
+              sys.stderr.write(f"missing key: {e!r}\n")
+              sys.exit(2)
+          PY
+          )"
+              rc=$?
+              set -e
+              rm -f "$manifest_json"
+
+              if [[ "$rc" -eq 2 ]]; then
+                echo "::error::[$agent:$arch] Anthropic manifest.json schema surprise for $plat at version $latest — structural key missing. Investigate before the next run; do not treat as transient."
+                exit 1
+              elif [[ "$rc" -ne 0 ]]; then
+                echo "::warning::[$agent:$arch] manifest.json extraction failed (rc=$rc) — skipping this arch"
                 continue
               fi
               if [[ "$advertised" != "$observed" ]]; then
@@ -165,21 +205,25 @@ jobs:
             fi
 
             # Append this arch to the plan.
-            python3 -c "
-            import json
-            p = '$plan_file'
-            with open(p) as f: d = json.load(f)
-            d['bumps'].append({
-                'arch': '$arch',
-                'prev': '$pinned_version',
-                'url': '$url',
-                'sha256': '$observed',
-            })
-            with open(p, 'w') as f: json.dump(d, f)
-            "
+            PLAN_FILE="$plan_file" ARCH="$arch" PREV="$pinned_version" \
+              URL="$url" SHA="$observed" python3 <<'PY'
+          import json, os
+          path = os.environ["PLAN_FILE"]
+          with open(path) as f:
+              plan = json.load(f)
+          plan["bumps"].append({
+              "arch": os.environ["ARCH"],
+              "prev": os.environ["PREV"],
+              "url": os.environ["URL"],
+              "sha256": os.environ["SHA"],
+          })
+          with open(path, "w") as f:
+              json.dump(plan, f)
+          PY
           done
 
-          count="$(python3 -c "import json; print(len(json.load(open('$plan_file'))['bumps']))")"
+          count="$(PLAN_FILE="$plan_file" python3 -c \
+            'import json, os; print(len(json.load(open(os.environ["PLAN_FILE"]))["bumps"]))')"
           echo "plan_file=$plan_file" >> "$GITHUB_OUTPUT"
           if [[ "$count" -eq 0 ]]; then
             echo "has_bumps=false" >> "$GITHUB_OUTPUT"
@@ -242,6 +286,18 @@ jobs:
           git config user.email "voidbox-bump-agents@users.noreply.github.com"
           git checkout -b "$branch"
           git add scripts/agents/manifest.toml
+          # `git diff --cached --quiet` exits 0 when there are no staged
+          # changes. Corner case: a previous weekly run already bumped this
+          # same (agent, version) pair *and the PR was merged*. The plan
+          # short-circuit at `has_bumps` will almost always catch that
+          # first, but a race — upstream advertises the new version,
+          # prior PR merges in the same window — could still reach here
+          # with nothing to commit. Exit cleanly rather than failing on an
+          # empty `git commit`.
+          if git diff --cached --quiet; then
+            echo "[$agent] manifest already matches ${version} — prior PR already merged, nothing to push."
+            exit 0
+          fi
           git commit -m "chore(agents): bump ${agent} to ${version}"
 
           # Plain push for a fresh branch. If a previous run of this job

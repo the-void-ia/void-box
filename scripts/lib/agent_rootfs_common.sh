@@ -377,21 +377,26 @@ _agent_fetch_and_verify() {
   # collide). `--tmpdir`-free usage is portable across macOS and Linux.
   local staging
   staging="$(mktemp "${dest}.tmp.XXXXXX")"
+  # Belt-and-suspenders: RETURN fires on every exit from this function
+  # (success, any `return 1`, stray non-zero bubbling). After a successful
+  # `mv`, `$staging` no longer exists and `rm -f` is a no-op. A SIGKILL of
+  # the whole shell still orphans the staging file (no trap fires) — that
+  # residue lives inside `target/` and is cleaned by `cargo clean` / a
+  # normal build rebuild.
+  trap 'rm -f "$staging" 2>/dev/null || true' RETURN
+
   echo "[$log_prefix] Downloading $url"
   if ! curl -fSL --progress-bar -o "$staging" "$url"; then
     echo "ERROR: download failed: $url" >&2
-    rm -f "$staging"
     return 1
   fi
 
   if ! agent_manifest_verify "$staging" "$expected_sha" "$label"; then
-    rm -f "$staging"
     return 1
   fi
 
   if ! mv -f "$staging" "$dest"; then
     echo "ERROR: failed to atomically install $dest" >&2
-    rm -f "$staging"
     return 1
   fi
   echo "[$log_prefix] Verified SHA-256 for $label"

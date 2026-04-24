@@ -398,20 +398,21 @@ fn override_drift_from_manifest_warns() {
 }
 
 #[test]
-fn find_extracted_executable_prefers_named_binary() {
-    // A tarball extraction often contains multiple executables (e.g.
-    // `codex` + `codex-migrate` + a README script). Deterministic
-    // selection under `LC_ALL=C sort` is fine but the explicit-name path
-    // is stronger: pass `codex` and it should win even if another
-    // sortable-first file exists alongside.
-    let dir = tempfile_path("r-b5c1-find");
+fn find_extracted_executable_prefers_named_binary_over_sort_earlier_decoy() {
+    // Regression guard: a tarball extraction may contain a
+    // lexicographically-earlier executable that is NOT the binary we
+    // want (e.g. `aaa-uninstall`). Without a preferred name, the
+    // sort-deterministic fallback (Pass 2) would pick the decoy. With a
+    // preferred name, Pass 1 must filter to the name and win. A
+    // regression where Pass 1 silently falls through to Pass 2 would
+    // flip this test to returning the decoy.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile_path("r-b5c1-find-pref");
     fs::create_dir_all(&dir).unwrap();
     let decoy = dir.join("aaa-decoy");
     let target = dir.join("codex");
     fs::write(&decoy, b"#!/bin/sh\n").unwrap();
     fs::write(&target, b"#!/bin/sh\n").unwrap();
-    // Both need the exec bit for the helper to consider them.
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -428,7 +429,44 @@ fn find_extracted_executable_prefers_named_binary() {
     assert_eq!(
         picked,
         target.to_string_lossy(),
-        "preferred name should win over lexicographically earlier decoy"
+        "preferred name must win over lexicographically earlier non-matching decoy"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_extracted_executable_is_deterministic_without_preferred_name() {
+    // Without a preferred name, the helper must pick the lexicographically
+    // first executable under LC_ALL=C sort. This pins the behavior so a
+    // future refactor that relies on `find`'s raw (filesystem-defined)
+    // order fails in CI rather than silently choosing different binaries
+    // on different runners.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile_path("r-b5c1-find-sort");
+    fs::create_dir_all(&dir).unwrap();
+    // `alpha` sorts before `zeta` under LC_ALL=C.
+    let first = dir.join("alpha");
+    let second = dir.join("zeta");
+    fs::write(&first, b"#!/bin/sh\n").unwrap();
+    fs::write(&second, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = format!(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        find_extracted_executable "{}"
+        "#,
+        dir.display()
+    );
+    let out = run_bash(&script);
+    assert!(out.status.success(), "stderr={}", stderr(&out));
+    let picked = stdout(&out).trim().to_string();
+    assert_eq!(
+        picked,
+        first.to_string_lossy(),
+        "no-preferred-name fallback must pick the LC_ALL=C sort-first executable"
     );
 
     let _ = fs::remove_dir_all(&dir);
