@@ -374,19 +374,6 @@ expose the existing ControlChannel-backed profiler over
 `http://localhost:6060/debug/pprof/profile` as well.
 `go tool pprof -http` then works without a CLI shim.
 
-### Extended stall-watchdog with `/proc/*/stat` R-state
-enumeration
-
-The stall-investigation watchdog in `guest-agent/src/main.rs`
-(`dump_all_task_stacks`, commit `764535a`) currently dumps only
-the guest-agent process's thread stacks. A follow-up change
-walks `/proc/*/stat` and dumps any process in state `R` with its
-kernel stack and current syscall — useful for the specific case
-of "guest-agent is sleeping but something else in the guest is
-burning CPU". Code was prototyped during the stall investigation
-and is ~40 lines; will land as a separate small commit
-independent of this spec.
-
 ### Profile-on-stall auto-trigger
 
 Tie the existing stall watchdog to `voidbox profile`: when the
@@ -532,10 +519,7 @@ is constant points at a cumulative-state bug in
 `guest-agent/src/main.rs::dump_all_task_stacks` (commit
 `764535a`) dumps every thread's kernel stack to `/dev/console`
 when `DISPATCH_PROGRESS` stops advancing for N seconds. Useful
-when the stall is PID-1-internal. The planned R-state
-enumeration extension (see Future work) expands it to dump
-every process on the system when the stall is outside
-guest-agent.
+when the stall is PID-1-internal.
 
 ---
 
