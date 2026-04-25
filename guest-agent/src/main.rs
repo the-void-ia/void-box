@@ -2067,16 +2067,20 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
 
                     AUTHENTICATED.with(|a| a.set(true));
 
+                    // Multiplex framing is required since protocol v2 — every
+                    // post-handshake frame carries a request_id prefix that
+                    // pre-multiplex peers cannot decode, so accepting a peer
+                    // without PROTO_FLAG_SUPPORTS_MULTIPLEX would corrupt every
+                    // subsequent frame. Reject at handshake.
                     let peer_supports_multiplex =
                         peer_flags & void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX != 0;
                     if !peer_supports_multiplex {
-                        eprintln!(
-                            "Authentication failed: peer does not advertise multiplex \
-                             (peer_version={peer_version}, peer_flags={peer_flags:#x})"
-                        );
-                        return Err(
-                            "Authentication failed: peer does not support multiplex framing".into(),
-                        );
+                        kmsg(&format!(
+                            "Protocol error: peer does not advertise PROTO_FLAG_SUPPORTS_MULTIPLEX (peer_version={peer_version}, peer_flags={peer_flags:#x}); minimum protocol version required is v2"
+                        ));
+                        return Err(format!(
+                            "Protocol error: peer does not advertise PROTO_FLAG_SUPPORTS_MULTIPLEX (peer_version={peer_version}, peer_flags={peer_flags:#x}); minimum protocol version required is v2"
+                        ));
                     }
 
                     let pong_payload = void_box_protocol::build_pong_payload(

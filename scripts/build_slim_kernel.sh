@@ -275,11 +275,11 @@ echo "[slim-kernel] Applying void-box additions to config..."
     scripts/config --disable CONFIG_INPUT_MISC
 
     # Filesystems we never mount in the guest. Our guest uses ext4
-    # (OCI block lowerdir) + tmpfs + overlayfs + 9p/virtiofs.
+    # (OCI block lowerdir) + tmpfs + overlayfs + 9p/virtiofs, so keep
+    # ext4's journaling dependency chain (JBD2) intact.
     scripts/config --disable CONFIG_BTRFS_FS
     scripts/config --disable CONFIG_XFS_FS
     scripts/config --disable CONFIG_F2FS_FS
-    scripts/config --disable CONFIG_JBD2
     scripts/config --disable CONFIG_REISERFS_FS
     scripts/config --disable CONFIG_NFS_FS
     scripts/config --disable CONFIG_NFSD

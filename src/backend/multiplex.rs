@@ -100,8 +100,10 @@ pub trait FrameSender: Send + Sync {
 /// Handle to the persistent multiplexed control channel.
 ///
 /// Clones share the same underlying reader thread and pending-slot
-/// table. Dropping the final handle signals the reader thread to
-/// exit on its next cycle.
+/// table. Dropping the final handle releases this shared state, but
+/// does not by itself shut down the reader thread; the reader exits
+/// only when the underlying connection is closed or a read error
+/// occurs.
 #[derive(Clone)]
 pub struct MultiplexChannel {
     inner: Arc<Inner>,

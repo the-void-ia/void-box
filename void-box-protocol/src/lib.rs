@@ -106,12 +106,16 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Peer supports one long-lived multiplexed control channel per sandbox
 /// (see `docs/superpowers/plans/2026-04-20-startup-milestones-b-c-d.md`
-/// Lever 7). Advertised via `flags` byte in both Ping and Pong. Both
-/// sides must set the bit before the host may use the multiplex path.
+/// Lever 7). Advertised via `flags` byte in both Ping and Pong.
 ///
-/// Peers that only set version=2 without this flag are treated as
-/// supporting the v2 frame but not multiplex — they still get the
-/// per-RPC reconnect path.
+/// **Required since protocol v2.** Every post-handshake frame carries
+/// a 4-byte `request_id` prefix that pre-multiplex peers cannot decode,
+/// so accepting a peer without this flag would corrupt every
+/// subsequent frame. Guest-agent and host-side `ControlChannel` both
+/// hard-reject at handshake when the peer's flag byte does not have
+/// this bit set. The flag exists only as an explicit feature negotiation
+/// point so future versions can layer additional capabilities under
+/// the same Ping/Pong format.
 pub const PROTO_FLAG_SUPPORTS_MULTIPLEX: u8 = 0b0000_0001;
 
 /// Builds a Ping payload with the session secret, protocol version, and
