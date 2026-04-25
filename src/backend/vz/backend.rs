@@ -986,6 +986,12 @@ impl VmmBackend for VzBackend {
                 });
                 self.machine_identifier = Some(machine_identifier_bytes);
                 self.setup_control_channel(session_secret);
+                if let Some(ref channel) = self.control_channel {
+                    let channel_for_warmup = Arc::clone(channel);
+                    tokio::spawn(async move {
+                        channel_for_warmup.warm_handshake().await;
+                    });
+                }
 
                 return Ok(());
             }

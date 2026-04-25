@@ -96,57 +96,95 @@ where applicable. Key platform differences:
 
 ## Control channel I/O model
 
-The control channel (`src/backend/control_channel.rs`) uses **synchronous I/O**
-(`std::io::Read`/`Write`) for all guest communication, wrapped in
-`tokio::task::spawn_blocking` so that blocking syscalls never stall the tokio
-async runtime.
+VoidBox uses **one persistent, multiplexed vsock connection per
+sandbox** for every host↔guest RPC (exec, write_file, mkdir_p,
+telemetry, pty, snapshot). The connection is established lazily on
+the first RPC, reused for everything after that, and reconstructed if
+the reader thread dies. Earlier versions used a per-RPC
+connect-handshake-close cycle; that is gone.
 
-### Why not fully async (`AsyncRead`/`AsyncWrite`)?
+### Multiplex design
+
+After the `Ping` / `Pong` handshake negotiates
+`PROTO_FLAG_SUPPORTS_MULTIPLEX` on both sides, every subsequent frame
+carries `[request_id: 4 B LE][body...]` as its payload. The `Message`
+frame layout is unchanged — the `request_id` is an in-payload
+prefix. Helpers in `src/backend/multiplex.rs` (`build_frame`,
+`decode_payload`) centralize the layout so callers never hand-roll
+offsets.
+
+Dispatch per RPC:
+
+1. Caller allocates a fresh `request_id` via an `AtomicU32` counter.
+2. Caller registers a dispatch slot (oneshot or stream) keyed on
+   that id.
+3. Caller writes the framed request through a shared `FrameSender`
+   behind a `Mutex` (serializes writes across concurrent RPCs).
+4. Caller awaits the matching response on its slot channel.
+
+One dedicated reader thread per channel owns the read half of the
+stream, demultiplexes each incoming frame by its `request_id`, and
+delivers the message to the registered slot. When the reader detects
+end-of-stream or a fatal protocol error, it marks the channel dead,
+fails every still-pending slot, and exits. The next RPC reconstructs
+the channel.
+
+### Synchronous I/O wrapped in `spawn_blocking`
+
+All guest communication uses **synchronous I/O**
+(`std::io::Read`/`Write`) wrapped in `tokio::task::spawn_blocking` so
+that blocking syscalls never stall the tokio async runtime.
+
+Why not fully async (`AsyncRead`/`AsyncWrite`)?
 
 1. **The VZ connector is fundamentally callback-based.**
-   `VZVirtioSocketDevice.connectToPort:completionHandler:` dispatches onto a GCD
-   serial queue and fires an ObjC completion handler.  There is no fd to poll
-   until *after* the callback delivers one.  A bridge channel between GCD and
-   tokio is required regardless.
-
-2. **`AsyncFd` on raw vsock fds is fragile.**
-   The fd comes from `dup(connection.fileDescriptor())` inside a GCD callback,
-   outside tokio's control.  `AsyncFd` requires `O_NONBLOCK`, which changes
-   read/write semantics and demands `WouldBlock` handling.  The current blocking
-   fds with `SO_RCVTIMEO` for timeouts are simpler and correct.
-
-3. **Cancellation safety.**
-   With async reads, `tokio::time::timeout` cancels the future mid-read.  If
-   cancellation happens between a header read and a payload read, the stream is
-   left in an inconsistent state.  Avoiding this requires a cancel-safe framing
+   `VZVirtioSocketDevice.connectToPort:completionHandler:` dispatches
+   onto a GCD serial queue and fires an ObjC completion handler.
+   There is no fd to poll until *after* the callback delivers one. A
+   bridge channel between GCD and tokio is required regardless.
+2. **`AsyncFd` on raw vsock fds is fragile.** The fd comes from
+   `dup(connection.fileDescriptor())` inside a GCD callback, outside
+   tokio's control. `AsyncFd` requires `O_NONBLOCK`, which changes
+   read/write semantics and demands `WouldBlock` handling. Blocking
+   fds with `SO_RCVTIMEO` are simpler and correct.
+3. **Cancellation safety.** With async reads, `tokio::time::timeout`
+   cancels the future mid-read. If cancellation happens between a
+   header read and a payload read, the stream is left in an
+   inconsistent state. Avoiding this requires a cancel-safe framing
    layer — added complexity for no practical gain.
+4. **Concurrency is low per channel.** A single VM has one control
+   channel. Even with concurrent exec calls, the blocking thread
+   pool (up to 512 threads, dynamic scaling) handles the workload
+   comfortably. The async advantage doesn't apply.
 
-4. **Concurrency is low.**
-   A single VM has one control channel.  Even with concurrent exec calls, the
-   blocking thread pool (up to 512 threads, dynamic scaling) handles the workload
-   comfortably.  The async advantage (thousands of connections on few threads)
-   doesn't apply.
+### RPC pattern
 
-### Pattern
+Every public `async fn` on `ControlChannel` follows the same shape:
 
-Every public `async fn` on `ControlChannel` follows the same structure:
+1. **Serialize** the outgoing message on the caller's async task
+   (cheap, non-blocking).
+2. **Clone** the `Arc` fields (`connector`, `boot_wait_done`) and
+   copy `session_secret`.
+3. **`spawn_blocking`**: allocate `request_id` → register dispatch
+   slot → write framed request → await slot.
 
-1. **Serialize** the outgoing message on the caller's async task (cheap, non-blocking).
-2. **Clone** the `Arc` fields (`connector`, `boot_wait_done`) and copy `session_secret`.
-3. **`spawn_blocking`**: connect → handshake → send → read loop — all synchronous.
-
-The handshake function (`connect_with_handshake_sync`) is a regular `fn` that
-uses `std::thread::sleep` for backoff.  It is never called from an async context
-directly.
+Handshake (`connect_with_handshake_sync`) is a regular `fn` using
+`std::thread::sleep` for backoff. It runs once per channel lifetime
+and is never called from an async context directly.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `src/backend/control_channel.rs` | `ControlChannel`, `GuestStream` trait, `connect_with_handshake_sync` |
+| `src/backend/control_channel.rs` | `ControlChannel`, `GuestStream` trait, `multiplex_call`, lazy channel construction |
+| `src/backend/multiplex.rs` | `MultiplexChannel`, `FrameSender`, `Terminator`, reader thread, `build_frame` / `decode_payload` |
 | `src/backend/kvm.rs` | AF_VSOCK connector, `GuestStream` impl for `VsockStream` |
 | `src/backend/vz/backend.rs` | VZ GCD-based connector (`build_connector`) |
 | `src/backend/vz/vsock.rs` | `VzSocketStream` — `GuestStream` impl over dup'd fd |
+| `guest-agent/src/main.rs` | Guest-side `handle_connection` loop — reads frame, parses `request_id`, dispatches |
+
+Guest-side logging must go through `/dev/kmsg`, not `eprintln!` —
+see `docs/war-histories.md` for why.
 
 ## OCI root switch internals
 

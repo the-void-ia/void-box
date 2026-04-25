@@ -25,6 +25,15 @@ use crate::guest::protocol::{
 use crate::{Error, Result};
 
 use super::control_channel::{connect_with_handshake_sync, GuestConnector};
+use super::multiplex::{build_frame, decode_payload};
+
+/// Fixed multiplex request_id for PTY sessions.
+///
+/// A PTY owns its entire connection, so there is no concurrent RPC to
+/// multiplex against. Every outgoing and incoming frame on this
+/// connection reuses this one id, which keeps the wire layout uniform
+/// with the RPC channel.
+const PTY_REQUEST_ID: u32 = 1;
 
 /// Poll timeout for the interactive PTY relay loop.
 ///
@@ -122,19 +131,23 @@ impl PtySession {
         boot_wait_done: &std::sync::atomic::AtomicBool,
         request: &PtyOpenRequest,
     ) -> Result<Self> {
+        // PTY sessions open after the main control channel has already
+        // taken the boot hit, so we pass `Duration::ZERO` here and
+        // lean on the handshake retry loop to pick up the listener.
         let mut stream = connect_with_handshake_sync(
             connector,
             session_secret,
             boot_wait_done,
+            Duration::ZERO,
             Duration::from_secs(3),
             "pty-open",
         )?;
 
-        let msg_bytes = Message {
-            msg_type: MessageType::PtyOpen,
-            payload: serde_json::to_vec(request)?,
-        }
-        .serialize();
+        let msg_bytes = build_frame(
+            MessageType::PtyOpen,
+            PTY_REQUEST_ID,
+            &serde_json::to_vec(request)?,
+        );
 
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         stream
@@ -151,7 +164,13 @@ impl PtySession {
             )));
         }
 
-        let response: PtyOpenedResponse = serde_json::from_slice(&response_msg.payload)?;
+        let Some((_id, response_body)) = decode_payload(&response_msg.payload) else {
+            return Err(Error::Guest(
+                "PtyOpened payload too short for multiplex request_id".into(),
+            ));
+        };
+
+        let response: PtyOpenedResponse = serde_json::from_slice(response_body)?;
         if !response.success {
             return Err(Error::Guest(format!(
                 "guest refused PtyOpen: {}",
@@ -227,21 +246,20 @@ impl PtySession {
                 match classify_stdin_read_result(read(borrow_fd(stdin_fd), &mut stdin_buf)) {
                     Ok(StdinReadAction::Retry) => continue,
                     Ok(StdinReadAction::Data(bytes_read)) => {
-                        let data_msg = Message {
-                            msg_type: MessageType::PtyData,
-                            payload: stdin_buf[..bytes_read].to_vec(),
-                        };
-                        write_all_fd(vsock_fd, &data_msg.serialize())
+                        let data_frame = build_frame(
+                            MessageType::PtyData,
+                            PTY_REQUEST_ID,
+                            &stdin_buf[..bytes_read],
+                        );
+                        write_all_fd(vsock_fd, &data_frame)
                             .map_err(|e| Error::Guest(format!("failed to send PtyData: {e}")))?;
                     }
                     Ok(StdinReadAction::Eof) => {
                         stdin_closed = true;
                         if !close_sent {
-                            let close_msg = Message {
-                                msg_type: MessageType::PtyClose,
-                                payload: Vec::new(),
-                            };
-                            write_all_fd(vsock_fd, &close_msg.serialize()).map_err(|e| {
+                            let close_frame =
+                                build_frame(MessageType::PtyClose, PTY_REQUEST_ID, &[]);
+                            write_all_fd(vsock_fd, &close_frame).map_err(|e| {
                                 Error::Guest(format!("failed to send PtyClose: {e}"))
                             })?;
                             close_sent = true;
@@ -262,15 +280,22 @@ impl PtySession {
                     Ok(incoming_msg) => incoming_msg,
                     Err(e) => return Err(Error::Guest(format!("pty read error: {e}"))),
                 };
+                let Some((_id, body)) = decode_payload(&incoming_msg.payload) else {
+                    debug!(
+                        "pty_session: dropping short payload for {:?}",
+                        incoming_msg.msg_type
+                    );
+                    continue;
+                };
+
                 match incoming_msg.msg_type {
                     MessageType::PtyData => {
-                        let _ = stdout.write_all(&incoming_msg.payload);
+                        let _ = stdout.write_all(body);
                         let _ = stdout.flush();
                     }
                     MessageType::PtyClosed => {
-                        let closed_response: PtyClosedResponse =
-                            serde_json::from_slice(&incoming_msg.payload)
-                                .unwrap_or(PtyClosedResponse { exit_code: -1 });
+                        let closed_response: PtyClosedResponse = serde_json::from_slice(body)
+                            .unwrap_or(PtyClosedResponse { exit_code: -1 });
                         debug!(
                             "pty_session: finished with exit_code={}",
                             closed_response.exit_code
@@ -335,12 +360,10 @@ fn terminal_size(tty_fd: RawFd) -> Result<(u16, u16)> {
 
 fn send_resize(stream_fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
     let resize = PtyResizeRequest { cols, rows };
-    let msg = Message {
-        msg_type: MessageType::PtyResize,
-        payload: serde_json::to_vec(&resize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-    };
-    write_all_fd(stream_fd, &msg.serialize())
+    let body =
+        serde_json::to_vec(&resize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let frame = build_frame(MessageType::PtyResize, PTY_REQUEST_ID, &body);
+    write_all_fd(stream_fd, &frame)
 }
 
 fn write_all_fd(stream_fd: RawFd, buf: &[u8]) -> io::Result<()> {

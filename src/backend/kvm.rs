@@ -33,6 +33,11 @@ impl GuestStream for VsockStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         std::os::unix::io::AsRawFd::as_raw_fd(self)
     }
+
+    fn try_clone_box(&self) -> std::io::Result<Box<dyn GuestStream>> {
+        let cloned = VsockStream::try_clone(self)?;
+        Ok(Box::new(cloned))
+    }
 }
 
 /// KVM-based VM backend for Linux.
@@ -172,10 +177,12 @@ impl VmmBackend for KvmBackend {
                 let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
                 Ok(Box::new(stream))
             });
-            self.control_channel = Some(Arc::new(ControlChannel::new_restored(
-                connector,
-                session_secret,
-            )));
+            let channel = Arc::new(ControlChannel::new_restored(connector, session_secret));
+            let channel_for_warmup = Arc::clone(&channel);
+            tokio::spawn(async move {
+                channel_for_warmup.warm_handshake().await;
+            });
+            self.control_channel = Some(channel);
             if let Some(serial_output) = vm.take_serial_output() {
                 self.guest_console_task = Some(spawn_guest_console_task(
                     serial_output,
@@ -193,17 +200,25 @@ impl VmmBackend for KvmBackend {
 
         // Normal cold-boot path.
         //
-        // Use the Userspace vsock backend so the device state can be cleanly
-        // captured by snapshot() and restored by from_snapshot() (which
-        // always restores into VirtioVsockUserspace).  Vhost-vsock state is
-        // not snapshot-compatible.
+        // The vsock backend is chosen based on whether the caller intends to
+        // snapshot this VM later. Userspace vsock is required for snapshot
+        // compatibility (from_snapshot always restores into
+        // VirtioVsockUserspace). Cold-boot-only runs use Vhost-vsock for
+        // lower per-RPC latency (in-kernel IRQ injection, no eventfd
+        // bridge thread).
+        let needs_userspace_vsock = config.enable_snapshots || config.snapshot.is_some();
+        let vsock_backend = if needs_userspace_vsock {
+            VsockBackendType::Userspace
+        } else {
+            VsockBackendType::Vhost
+        };
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .kernel(&config.kernel)
             .network(config.network)
             .enable_vsock(config.enable_vsock)
-            .vsock_backend(VsockBackendType::Userspace);
+            .vsock_backend(vsock_backend);
 
         if let Some(ref initramfs) = config.initramfs {
             vm_config = vm_config.initramfs(initramfs);
@@ -238,19 +253,16 @@ impl VmmBackend for KvmBackend {
         self.vcpus = config.vcpus;
         self.network = config.network;
 
-        // Build the control channel with the Userspace Unix-socket connector
-        // (matches the Userspace vsock backend chosen above for snapshot
-        // compatibility).
         let session_secret = config.security.session_secret;
-        let socket_path = vm
-            .vsock_socket_path()
-            .expect("Userspace vsock backend must have socket path")
-            .to_path_buf();
-        let connector = Arc::new(move || -> Result<Box<dyn GuestStream>> {
-            let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
-            Ok(Box::new(stream))
+        let connector = vm
+            .vsock_connector()
+            .expect("vsock device must be present when enable_vsock is true");
+        let channel = Arc::new(ControlChannel::new(connector, session_secret));
+        let channel_for_warmup = Arc::clone(&channel);
+        tokio::spawn(async move {
+            channel_for_warmup.warm_handshake().await;
         });
-        self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+        self.control_channel = Some(channel);
         if let Some(serial_output) = vm.take_serial_output() {
             self.guest_console_task = Some(spawn_guest_console_task(
                 serial_output,
@@ -477,10 +489,12 @@ impl VmmBackend for KvmBackend {
             let stream = VsockStream::connect_unix(&socket_path, GUEST_AGENT_PORT)?;
             Ok(Box::new(stream))
         });
-        self.control_channel = Some(Arc::new(ControlChannel::new_restored(
-            connector,
-            session_secret,
-        )));
+        let channel = Arc::new(ControlChannel::new_restored(connector, session_secret));
+        let channel_for_warmup = Arc::clone(&channel);
+        tokio::spawn(async move {
+            channel_for_warmup.warm_handshake().await;
+        });
+        self.control_channel = Some(channel);
         self.cid = restored_vm.cid();
         self.memory_mb = snap.config.memory_mb;
         self.vcpus = snap.config.vcpus;

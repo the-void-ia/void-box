@@ -359,6 +359,63 @@ for entry in entries {
 }
 ```
 
+## Logging: Never `println!` / `eprintln!` in Library or Service Code
+
+Use `tracing::{trace, debug, info, warn, error}!` for all runtime
+output in library crates, long-running services (daemons, guest-agent,
+backends), and anything that runs in production. `println!` and
+`eprintln!` are acceptable **only** in:
+
+- Test code (`#[cfg(test)]`, `tests/*.rs`, examples).
+- The top-level CLI `main.rs` user-facing output (prompts, usage,
+  final results). Even there, prefer `tracing` when structured
+  logging is meaningful.
+
+```rust
+// DO (library / service code)
+use tracing::{debug, info, warn};
+
+fn handle_request(req: Request) {
+    info!(request_id = req.id, "handling request");
+    if req.is_stale() {
+        warn!(request_id = req.id, "stale request, rejecting");
+        return;
+    }
+    debug!(?req, "request details");
+}
+
+// DON'T (library / service code)
+fn handle_request(req: Request) {
+    println!("handling request {}", req.id);
+    if req.is_stale() {
+        eprintln!("stale request {}", req.id);
+        return;
+    }
+    eprintln!("request details: {req:?}");
+}
+```
+
+Why this rule is absolute in service code:
+
+1. `println!` / `eprintln!` write to `stdout` / `stderr`. In a
+   long-running service those fds may be pointed at a serial tty
+   (guest-agent is PID 1 with stderr → `/dev/console`), a pipe to
+   another process, or a file. Each of those paths has its own
+   backpressure semantics. `eprintln!` inside a hot-path helper
+   wedged PID 1 for two days of investigation — see
+   `docs/war-histories.md` — "The eprintln! tty-backpressure stall".
+2. `tracing` integrates with the project's `LogConfig` /
+   `StructuredLogger` pipeline, gets trace-context propagation for
+   free, and is filterable via `RUST_LOG` / `VOIDBOX_LOG_LEVEL`
+   without a rebuild.
+3. `tracing` output can be routed to any sink (file, stderr,
+   ringbuffer, OTLP) without touching call sites. `println!` can't.
+
+If you genuinely need to write to a specific fd (not "log, please
+route somewhere"), use `writeln!(io::stderr().lock(), ...)` /
+`writeln!(io::stdout().lock(), ...)` with an explicit lock so the
+intent is obvious and the lint doesn't catch it.
+
 ## Code Navigation: Always Use rust-analyzer LSP
 
 When searching or navigating Rust code, always use the LSP tool with rust-analyzer operations:

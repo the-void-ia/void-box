@@ -233,6 +233,61 @@ echo "[slim-kernel] Applying void-box additions to config..."
     scripts/config --disable CONFIG_SYSTEM_REVOCATION_LIST
     scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
     scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+
+    # Trim boot-path kernel features the guest never uses.
+    #
+    # Note on debug info: Firecracker's microvm base config ships
+    # `CONFIG_DEBUG_INFO_NONE=y` — no DWARF, no BTF in the guest kernel
+    # ELF. We leave that as-is. Host-side profiling of the `voidbox`
+    # process is unaffected (perf-agent resolves Rust release symbols
+    # from the voidbox binary itself, not the guest kernel). We only
+    # lose the ability to profile *inside* the guest kernel, which we
+    # don't do — smaller image and faster ELF load are worth more to
+    # us than `perf` on guest-kernel symbols.
+
+    # Audit: no auditd in our guest. Trims initcalls and syscall hooks.
+    scripts/config --disable CONFIG_AUDIT
+    scripts/config --disable CONFIG_AUDITSYSCALL
+    scripts/config --disable CONFIG_AUDIT_WATCH
+    scripts/config --disable CONFIG_AUDIT_TREE
+
+    # Hardware RNG drivers: keep CONFIG_RANDOM_TRUST_CPU so RDRAND seeds
+    # the pool; drop the virtio_rng / intel_rng / amd_rng / etc. probes
+    # that would otherwise hang briefly at boot on missing hardware.
+    scripts/config --disable CONFIG_HW_RANDOM
+    scripts/config --disable CONFIG_HW_RANDOM_VIRTIO
+    scripts/config --disable CONFIG_HW_RANDOM_INTEL
+    scripts/config --disable CONFIG_HW_RANDOM_AMD
+    scripts/config --enable CONFIG_RANDOM_TRUST_CPU
+
+    # No audio, no video, no USB, no non-virtio input in a microVM.
+    # Firecracker's base config already drops most of these, but a few
+    # survive via `olddefconfig` when the kernel version moves forward.
+    scripts/config --disable CONFIG_SOUND
+    scripts/config --disable CONFIG_SND
+    scripts/config --disable CONFIG_DRM
+    scripts/config --disable CONFIG_DRM_VIRTIO_GPU
+    scripts/config --disable CONFIG_USB
+    scripts/config --disable CONFIG_USB_SUPPORT
+    scripts/config --disable CONFIG_INPUT_JOYDEV
+    scripts/config --disable CONFIG_INPUT_TABLET
+    scripts/config --disable CONFIG_INPUT_TOUCHSCREEN
+    scripts/config --disable CONFIG_INPUT_MISC
+
+    # Filesystems we never mount in the guest. Our guest uses ext4
+    # (OCI block lowerdir) + tmpfs + overlayfs + 9p/virtiofs, so keep
+    # ext4's journaling dependency chain (JBD2) intact.
+    scripts/config --disable CONFIG_BTRFS_FS
+    scripts/config --disable CONFIG_XFS_FS
+    scripts/config --disable CONFIG_F2FS_FS
+    scripts/config --disable CONFIG_REISERFS_FS
+    scripts/config --disable CONFIG_NFS_FS
+    scripts/config --disable CONFIG_NFSD
+
+    # SysRq is a debug convenience. No host reaches the guest's serial
+    # console interactively in production.
+    scripts/config --disable CONFIG_MAGIC_SYSRQ
+
     # olddefconfig fills in any new symbols introduced since the Firecracker
     # config was written (older config vs newer kernel tree).
     make ARCH="$MAKE_ARCH" olddefconfig >/dev/null

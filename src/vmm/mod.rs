@@ -45,6 +45,90 @@ use self::config::VoidBoxConfig;
 use self::cpu::VcpuHandle;
 use self::kvm::Vm;
 
+use crate::backend::control_channel::ControlChannel;
+
+/// Dispatches one [`VmCommand`] through the persistent [`ControlChannel`].
+///
+/// Factored out of the event loop so both `new` and `from_snapshot`
+/// share one implementation.
+async fn dispatch_vm_command(
+    cmd: VmCommand,
+    channel: Option<&Arc<ControlChannel>>,
+    running: &Arc<AtomicBool>,
+) {
+    let Some(channel) = channel else {
+        match cmd {
+            VmCommand::Exec { response_tx, .. } => {
+                let _ = response_tx.send(Err(Error::Guest("vsock not enabled".into())));
+            }
+            VmCommand::ExecStreaming { response_tx, .. } => {
+                let _ = response_tx.send(Err(Error::Guest("vsock not enabled".into())));
+            }
+            VmCommand::WriteFile { response_tx, .. } => {
+                let _ = response_tx.send(Err(Error::Guest("vsock not enabled".into())));
+            }
+            VmCommand::MkdirP { response_tx, .. } => {
+                let _ = response_tx.send(Err(Error::Guest("vsock not enabled".into())));
+            }
+            VmCommand::SubscribeTelemetry { .. } => {}
+            VmCommand::Stop => running.store(false, Ordering::SeqCst),
+        }
+        return;
+    };
+
+    match cmd {
+        VmCommand::Exec {
+            request,
+            response_tx,
+        } => {
+            let result = channel.send_exec_request(&request).await;
+            let _ = response_tx.send(result);
+        }
+        VmCommand::ExecStreaming {
+            request,
+            response_tx,
+            chunk_tx,
+        } => {
+            let result = channel
+                .send_exec_request_streaming(&request, move |chunk| {
+                    let _ = chunk_tx.try_send(chunk);
+                })
+                .await;
+            let _ = response_tx.send(result);
+        }
+        VmCommand::WriteFile {
+            request,
+            response_tx,
+        } => {
+            let result = channel
+                .send_write_file(&request.path, &request.content)
+                .await;
+            let _ = response_tx.send(result);
+        }
+        VmCommand::MkdirP {
+            request,
+            response_tx,
+        } => {
+            let result = channel.send_mkdir_p(&request.path).await;
+            let _ = response_tx.send(result);
+        }
+        VmCommand::SubscribeTelemetry { aggregator, opts } => {
+            let channel = Arc::clone(channel);
+            tokio::spawn(async move {
+                let subscription = channel
+                    .subscribe_telemetry(&opts, move |batch| {
+                        aggregator.ingest(&batch);
+                    })
+                    .await;
+                if let Err(e) = subscription {
+                    tracing::warn!("Telemetry subscription ended: {}", e);
+                }
+            });
+        }
+        VmCommand::Stop => running.store(false, Ordering::SeqCst),
+    }
+}
+
 /// Main MicroVm instance representing a running micro-VM
 pub struct MicroVm {
     /// The underlying KVM VM
@@ -58,9 +142,21 @@ pub struct MicroVm {
     serial_output: Option<mpsc::Receiver<u8>>,
     /// Context ID for vsock communication
     cid: u32,
-    /// Vsock device for guest communication
+    /// Vsock device — connector factory for [`ControlChannel`].
+    ///
+    /// Kept around for snapshot capture (session secret accessor) and
+    /// because [`PtySession::open`] still builds its own connector for
+    /// one-off interactive connections.
     #[allow(dead_code)]
     vsock: Option<Arc<VsockDevice>>,
+    /// Persistent multiplex control channel shared by every RPC.
+    ///
+    /// Lazily establishes a single connection to the guest-agent on
+    /// first RPC and reconstructs it if the reader thread dies.
+    /// Retained so the channel outlives the event loop in case a
+    /// direct call site outside the command dispatch needs it.
+    #[allow(dead_code)]
+    control_channel: Option<Arc<crate::backend::control_channel::ControlChannel>>,
     /// virtio-vsock MMIO device (kept for snapshot state capture)
     #[allow(dead_code)]
     virtio_vsock_mmio: Option<Arc<Mutex<dyn VsockMmioDevice>>>,
@@ -356,9 +452,38 @@ impl MicroVm {
         // Create command channel
         let (command_tx, mut command_rx) = mpsc::channel::<VmCommand>(32);
 
+        // Build the persistent multiplex control channel over the
+        // vsock connector. Lazy: first RPC triggers the handshake.
+        // The kernel vhost-vsock backend RSTs rapid connect attempts
+        // before the guest's virtio-vsock device is live; give it a
+        // 250 ms head start. The userspace backend buffers connects
+        // behind its worker thread and needs no padding.
+        let boot_wait = match config.vsock_backend {
+            config::VsockBackendType::Vhost => std::time::Duration::from_millis(250),
+            config::VsockBackendType::Userspace => std::time::Duration::ZERO,
+        };
+        let control_channel = vsock.as_ref().map(|device| {
+            Arc::new(ControlChannel::with_boot_wait(
+                device.connector(),
+                *device.session_secret(),
+                boot_wait,
+            ))
+        });
+
+        // Eagerly fire the handshake in parallel with the rest of
+        // `new`'s work so the first RPC finds the channel already live.
+        // Failures are swallowed; the first real RPC re-attempts.
+        if let Some(channel) = control_channel.as_ref() {
+            let warm = Arc::clone(channel);
+            tokio::spawn(async move {
+                warm.warm_handshake().await;
+            });
+        }
+
+        let control_channel_clone = control_channel.clone();
+
         // Start VM event loop
         let running_clone = running.clone();
-        let vsock_clone = vsock.clone();
         let enable_seccomp = config.security.seccomp;
         let event_loop_handle = std::thread::spawn(move || {
             // Install seccomp-BPF filter after all setup is done.
@@ -373,7 +498,8 @@ impl MicroVm {
                 }
             }
 
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime");
@@ -382,59 +508,7 @@ impl MicroVm {
                 while running_clone.load(Ordering::SeqCst) {
                     tokio::select! {
                         Some(cmd) = command_rx.recv() => {
-                            match cmd {
-                                VmCommand::Exec { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_exec_request(&request).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::ExecStreaming { request, response_tx, chunk_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_exec_request_streaming(&request, |chunk| {
-                                            let _ = chunk_tx.try_send(chunk);
-                                        }).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::WriteFile { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_write_file(&request.path, &request.content).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::MkdirP { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_mkdir_p(&request.path).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::SubscribeTelemetry { aggregator, opts } => {
-                                    if let Some(ref vsock) = vsock_clone {
-                                        let vsock = vsock.clone();
-                                        let agg = aggregator.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = vsock.subscribe_telemetry(&opts, move |batch| {
-                                                agg.ingest(&batch);
-                                            }).await {
-                                                tracing::warn!("Telemetry subscription ended: {}", e);
-                                            }
-                                        });
-                                    }
-                                }
-                                VmCommand::Stop => {
-                                    running_clone.store(false, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
+                            dispatch_vm_command(cmd, control_channel_clone.as_ref(), &running_clone).await;
                         }
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                             // Periodic tick for housekeeping
@@ -464,6 +538,7 @@ impl MicroVm {
             serial_output: Some(serial_rx),
             cid,
             vsock,
+            control_channel,
             virtio_vsock_mmio: mmio_devices.virtio_vsock,
             virtio_net: mmio_devices.virtio_net,
             command_tx,
@@ -559,7 +634,7 @@ impl MicroVm {
             "/tmp/void-box-vsock-{}-{:08x}.sock",
             cid, runtime_id
         ));
-        let vsock = Arc::new(VsockDevice::restored_with_unix_socket(
+        let vsock = Arc::new(VsockDevice::with_unix_socket(
             cid,
             session_secret,
             socket_path.clone(),
@@ -690,9 +765,24 @@ impl MicroVm {
         // 11. Start event loop (same as cold boot)
         let (command_tx, mut command_rx) = mpsc::channel::<VmCommand>(32);
         let running_clone = running.clone();
-        let vsock_clone = Some(vsock.clone());
+        let control_channel = Arc::new(ControlChannel::new_restored(
+            vsock.connector(),
+            session_secret,
+        ));
+
+        // Eagerly establish the multiplex channel in parallel with the
+        // caller's work. The guest-agent is already up (restore path),
+        // so this typically completes in a single handshake round trip
+        // and the first real RPC sees a ready channel.
+        let warm = Arc::clone(&control_channel);
+        tokio::spawn(async move {
+            warm.warm_handshake().await;
+        });
+
+        let control_channel_clone = Some(control_channel.clone());
         let event_loop_handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime");
@@ -701,59 +791,7 @@ impl MicroVm {
                 while running_clone.load(Ordering::SeqCst) {
                     tokio::select! {
                         Some(cmd) = command_rx.recv() => {
-                            match cmd {
-                                VmCommand::Exec { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_exec_request(&request).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::ExecStreaming { request, response_tx, chunk_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_exec_request_streaming(&request, |chunk| {
-                                            let _ = chunk_tx.try_send(chunk);
-                                        }).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::WriteFile { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_write_file(&request.path, &request.content).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::MkdirP { request, response_tx } => {
-                                    let result = if let Some(ref vsock) = vsock_clone {
-                                        vsock.send_mkdir_p(&request.path).await
-                                    } else {
-                                        Err(Error::Guest("vsock not enabled".into()))
-                                    };
-                                    let _ = response_tx.send(result);
-                                }
-                                VmCommand::SubscribeTelemetry { aggregator, opts } => {
-                                    if let Some(ref vsock) = vsock_clone {
-                                        let vsock = vsock.clone();
-                                        let agg = aggregator.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = vsock.subscribe_telemetry(&opts, move |batch| {
-                                                agg.ingest(&batch);
-                                            }).await {
-                                                tracing::warn!("Telemetry subscription ended: {}", e);
-                                            }
-                                        });
-                                    }
-                                }
-                                VmCommand::Stop => {
-                                    running_clone.store(false, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
+                            dispatch_vm_command(cmd, control_channel_clone.as_ref(), &running_clone).await;
                         }
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
                     }
@@ -770,6 +808,7 @@ impl MicroVm {
             serial_output: Some(serial_rx),
             cid,
             vsock: Some(vsock),
+            control_channel: Some(control_channel),
             virtio_vsock_mmio: mmio_devices.virtio_vsock,
             virtio_net,
             command_tx,
@@ -1250,6 +1289,16 @@ impl MicroVm {
         self.vsock_socket_path.as_deref()
     }
 
+    /// Returns a [`GuestConnector`] for the configured vsock backend.
+    ///
+    /// Hides whether the VM uses Vhost-vsock (AF_VSOCK) or userspace vsock
+    /// (AF_UNIX) behind a single connector abstraction.
+    ///
+    /// [`GuestConnector`]: crate::backend::control_channel::GuestConnector
+    pub fn vsock_connector(&self) -> Option<crate::backend::control_channel::GuestConnector> {
+        self.vsock.as_ref().map(|v| v.connector())
+    }
+
     /// Check if the VM is currently running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
@@ -1356,6 +1405,7 @@ fn install_seccomp_filter() -> Result<()> {
         libc::SYS_close,
         libc::SYS_clock_gettime,
         libc::SYS_nanosleep,
+        libc::SYS_clock_nanosleep,
         libc::SYS_futex,
         libc::SYS_mmap,
         libc::SYS_munmap,

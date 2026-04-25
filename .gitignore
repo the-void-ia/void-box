@@ -10,4 +10,4 @@ CLAUDE.local.md
 .claude/*.local.*
 .idea
 .local-utils
-.worktrees
+.worktrees.claude/scheduled_tasks.lock
