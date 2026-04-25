@@ -8,8 +8,9 @@ on:
 permissions:
   contents: write
 
-env:
-  CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION || '2.1.53' }}
+# claude-code version + sha256 are pinned in scripts/agents/manifest.toml
+# (R-B5c.1). The build scripts read the manifest as the single source of
+# truth; do not re-export CLAUDE_CODE_VERSION here.
 
 jobs:
   # ── Linux builds (x86_64 + aarch64) ──────────────────────────────────────
@@ -57,7 +58,6 @@ jobs:
       - name: Build all artifacts
         run: |
           export BUSYBOX=/tmp/usr/bin/busybox
-          export CLAUDE_CODE_VERSION="${{ env.CLAUDE_CODE_VERSION }}"
           export VOID_BOX_KMOD_VERSION=6.8.0-51
           export VOID_BOX_KMOD_UPLOAD=52
           ./scripts/build_release_artifacts.sh ${{ github.ref_name }} ${{ matrix.arch }}
@@ -143,7 +143,6 @@ jobs:
 
       - name: Build guest artifacts
         run: |
-          export CLAUDE_CODE_VERSION="${{ env.CLAUDE_CODE_VERSION }}"
           export VOID_BOX_KMOD_VERSION=6.8.0-51
           export VOID_BOX_KMOD_UPLOAD=52
           OUT_CPIO=/tmp/rootfs.cpio.gz ARCH=aarch64 scripts/build_claude_rootfs.sh
