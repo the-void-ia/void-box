@@ -32,7 +32,10 @@ detect_guest_arch() {
 #
 # Reads: CLAUDE_BIN, CLAUDE_CODE_VERSION, CLAUDE_CODE_SHA256 (all optional)
 # Requires: GUEST_ARCH, IS_CROSS_BUILD (call detect_guest_arch first)
-# Sets: CLAUDE_BIN (absolute path to the resolved binary),
+# Sets: CLAUDE_BIN (path to the resolved binary; downloaded paths are
+#       absolute under $ROOT_DIR, but a caller-supplied CLAUDE_BIN env var
+#       is used as-is and may be relative — the function does not
+#       canonicalize it),
 #       CLAUDE_BUILD_PROVENANCE (one of: manifest, override, local-path)
 #
 # Discovery chain:
@@ -86,36 +89,61 @@ resolve_claude_binary() {
     done
   fi
 
-  # 3. CLAUDE_CODE_VERSION override path: must be accompanied by a matching
-  #    CLAUDE_CODE_SHA256. This is the R-B5c.1 guard: no silent unverified
-  #    fetch. The URL template still comes from the manifest so an override
-  #    can't silently point at an attacker-controlled origin.
+  # 3. CLAUDE_CODE_VERSION + manifest path. We fetch the manifest entry up
+  #    front so we can distinguish two cases that look identical from the
+  #    env vars alone:
+  #      a) `CLAUDE_CODE_VERSION` matches the manifest's pinned version —
+  #         not a real override, just an explicit pin to what the manifest
+  #         already says. No SHA env var required; we use the manifest's
+  #         pinned SHA. If `CLAUDE_CODE_SHA256` *is* set in this case, it
+  #         must equal the manifest SHA (catches typos and would-be
+  #         attacks that try to substitute a different hash).
+  #      b) `CLAUDE_CODE_VERSION` differs from the manifest pin — genuine
+  #         override. `CLAUDE_CODE_SHA256` is required (R-B5c.1 guard:
+  #         developers must supply the hash they ask the build to trust).
   if [[ -z "$CLAUDE_BIN" && -n "${CLAUDE_CODE_VERSION:-}" ]]; then
-    if [[ -z "${CLAUDE_CODE_SHA256:-}" ]]; then
-      echo "ERROR: CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION is set without a matching CLAUDE_CODE_SHA256." >&2
-      echo "  R-B5c.1 forbids unverified overrides." >&2
-      echo "  Supply the SHA-256 of the artifact you want the build to trust:" >&2
-      echo "    CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION CLAUDE_CODE_SHA256=<hex> $0" >&2
-      return 1
-    fi
-
-    local manifest_entry pinned_version manifest_url_template
+    local manifest_entry pinned_version manifest_url_template manifest_sha
     manifest_entry="$(agent_manifest_require claude-code linux "$GUEST_ARCH")" || return 1
     pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
     manifest_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
-    if [[ "$CLAUDE_CODE_VERSION" != "$pinned_version" ]]; then
+    manifest_sha="$(printf '%s\n' "$manifest_entry" | sed -n '3p')"
+
+    local effective_sha
+    if [[ "$CLAUDE_CODE_VERSION" == "$pinned_version" ]]; then
+      # Case (a): same as manifest pin.
+      effective_sha="$manifest_sha"
+      if [[ -n "${CLAUDE_CODE_SHA256:-}" && "$CLAUDE_CODE_SHA256" != "$manifest_sha" ]]; then
+        echo "ERROR: CLAUDE_CODE_VERSION matches the manifest pin ($pinned_version), but CLAUDE_CODE_SHA256 disagrees with the manifest SHA." >&2
+        echo "  manifest sha256: $manifest_sha" >&2
+        echo "  supplied sha256: $CLAUDE_CODE_SHA256" >&2
+        echo "  Drop CLAUDE_CODE_SHA256 to use the manifest, or fix the value." >&2
+        return 1
+      fi
+      CLAUDE_BUILD_PROVENANCE="manifest"
+    else
+      # Case (b): genuine override.
+      if [[ -z "${CLAUDE_CODE_SHA256:-}" ]]; then
+        echo "ERROR: CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION differs from the manifest pin ($pinned_version) without a matching CLAUDE_CODE_SHA256." >&2
+        echo "  R-B5c.1 forbids unverified overrides." >&2
+        echo "  Supply the SHA-256 of the artifact you want the build to trust:" >&2
+        echo "    CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION CLAUDE_CODE_SHA256=<hex> $0" >&2
+        echo "  Or unset CLAUDE_CODE_VERSION to use the manifest pin." >&2
+        return 1
+      fi
       # The override version is re-templated through the manifest's URL
       # pattern. If upstream changes the URL shape between pins, the
       # override will 404 — make that possibility visible up front.
       echo "[$log_prefix] WARN: CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION differs from manifest pin $pinned_version — reusing manifest URL template, which may be stale for the override version." >&2
+      effective_sha="$CLAUDE_CODE_SHA256"
+      CLAUDE_BUILD_PROVENANCE="override"
     fi
+
     local download_url="${manifest_url_template//\{version\}/$CLAUDE_CODE_VERSION}"
     local download_dir="$ROOT_DIR/target/claude-download"
     mkdir -p "$download_dir"
     CLAUDE_BIN="$download_dir/claude-${CLAUDE_CODE_VERSION}-${claude_platform}"
-    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$CLAUDE_CODE_SHA256" || return 1
+    _agent_fetch_and_verify "$log_prefix" "$download_url" "$CLAUDE_BIN" "$effective_sha" || return 1
     chmod +x "$CLAUDE_BIN"
-    CLAUDE_BUILD_PROVENANCE="override"
   fi
 
   # 4. Manifest default: no env-var override, no local binary.
@@ -154,7 +182,10 @@ resolve_claude_binary() {
 #
 # Reads: CODEX_BIN, CODEX_VERSION, CODEX_SHA256 (all optional)
 # Requires: GUEST_ARCH, IS_CROSS_BUILD (call detect_guest_arch first)
-# Sets: CODEX_BIN (absolute path to the resolved binary),
+# Sets: CODEX_BIN (path to the resolved binary; downloaded paths are
+#       absolute under $ROOT_DIR, but a caller-supplied CODEX_BIN env var
+#       is used as-is and may be relative — the function does not
+#       canonicalize it),
 #       CODEX_BUILD_PROVENANCE (one of: manifest, override, local-path)
 #
 # Discovery chain:
@@ -204,27 +235,43 @@ resolve_codex_binary() {
     fi
   fi
 
-  # 3. CODEX_VERSION override path: must be accompanied by a matching
-  #    CODEX_SHA256 (R-B5c.1 — no silent unverified fetch).
+  # 3. CODEX_VERSION + manifest path. See the matching comment on
+  #    resolve_claude_binary for the case split: same-as-manifest is a
+  #    no-op (uses pinned SHA), genuine override requires CODEX_SHA256.
   if [[ -z "$CODEX_BIN" && -n "${CODEX_VERSION:-}" ]]; then
-    if [[ -z "${CODEX_SHA256:-}" ]]; then
-      echo "ERROR: CODEX_VERSION=$CODEX_VERSION is set without a matching CODEX_SHA256." >&2
-      echo "  R-B5c.1 forbids unverified overrides." >&2
-      echo "  Supply the SHA-256 of the downloaded tarball you want the build to trust:" >&2
-      echo "    CODEX_VERSION=$CODEX_VERSION CODEX_SHA256=<hex> $0" >&2
-      return 1
-    fi
-
-    local manifest_entry pinned_version manifest_url_template
+    local manifest_entry pinned_version manifest_url_template manifest_sha
     manifest_entry="$(agent_manifest_require codex linux "$GUEST_ARCH")" || return 1
     pinned_version="$(printf '%s\n' "$manifest_entry" | sed -n '1p')"
     manifest_url_template="$(printf '%s\n' "$manifest_entry" | sed -n '2p')"
-    if [[ "$CODEX_VERSION" != "$pinned_version" ]]; then
+    manifest_sha="$(printf '%s\n' "$manifest_entry" | sed -n '3p')"
+
+    local effective_sha
+    if [[ "$CODEX_VERSION" == "$pinned_version" ]]; then
+      effective_sha="$manifest_sha"
+      if [[ -n "${CODEX_SHA256:-}" && "$CODEX_SHA256" != "$manifest_sha" ]]; then
+        echo "ERROR: CODEX_VERSION matches the manifest pin ($pinned_version), but CODEX_SHA256 disagrees with the manifest SHA." >&2
+        echo "  manifest sha256: $manifest_sha" >&2
+        echo "  supplied sha256: $CODEX_SHA256" >&2
+        echo "  Drop CODEX_SHA256 to use the manifest, or fix the value." >&2
+        return 1
+      fi
+      CODEX_BUILD_PROVENANCE="manifest"
+    else
+      if [[ -z "${CODEX_SHA256:-}" ]]; then
+        echo "ERROR: CODEX_VERSION=$CODEX_VERSION differs from the manifest pin ($pinned_version) without a matching CODEX_SHA256." >&2
+        echo "  R-B5c.1 forbids unverified overrides." >&2
+        echo "  Supply the SHA-256 of the downloaded tarball you want the build to trust:" >&2
+        echo "    CODEX_VERSION=$CODEX_VERSION CODEX_SHA256=<hex> $0" >&2
+        echo "  Or unset CODEX_VERSION to use the manifest pin." >&2
+        return 1
+      fi
       echo "[$log_prefix] WARN: CODEX_VERSION=$CODEX_VERSION differs from manifest pin $pinned_version — reusing manifest URL template, which may be stale for the override version." >&2
+      effective_sha="$CODEX_SHA256"
+      CODEX_BUILD_PROVENANCE="override"
     fi
+
     local download_url="${manifest_url_template//\{version\}/$CODEX_VERSION}"
-    _codex_fetch_verify_extract "$log_prefix" "$CODEX_VERSION" "$codex_target" "$download_url" "$CODEX_SHA256" || return 1
-    CODEX_BUILD_PROVENANCE="override"
+    _codex_fetch_verify_extract "$log_prefix" "$CODEX_VERSION" "$codex_target" "$download_url" "$effective_sha" || return 1
   fi
 
   # 4. Manifest default.

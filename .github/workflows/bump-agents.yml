@@ -44,17 +44,17 @@ jobs:
   discover:
     name: Discover (${{ matrix.agent }})
     runs-on: ubuntu-latest
+    # Job-level gate: when invoked via workflow_dispatch with `inputs.agent`
+    # set, only run the matching matrix leg. A previous shape used a
+    # step-level `if` + `exit 0`, which only ended the first step — every
+    # subsequent step (download, hash, open PR) still ran for the
+    # non-selected agent and could open an unintended PR.
+    if: ${{ inputs.agent == '' || inputs.agent == matrix.agent }}
     strategy:
       fail-fast: false
       matrix:
         agent: [claude-code, codex]
     steps:
-      - name: Skip if input.agent narrows the matrix
-        if: ${{ inputs.agent != '' && inputs.agent != matrix.agent }}
-        run: |
-          echo "skipping: input.agent=${{ inputs.agent }} != matrix.agent=${{ matrix.agent }}"
-          exit 0
-
       - uses: actions/checkout@v4
 
       - name: Discover latest upstream version

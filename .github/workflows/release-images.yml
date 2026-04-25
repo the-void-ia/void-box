@@ -16,9 +16,9 @@ on:
 permissions:
   contents: write  # Attach assets to release
 
-env:
-  CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION || '2.1.53' }}
-  CODEX_VERSION: ${{ vars.CODEX_VERSION || '0.118.0' }}
+# Agent versions + SHA-256s are pinned in scripts/agents/manifest.toml
+# (R-B5c.1). The build scripts read the manifest as the single source of
+# truth; do not re-export CLAUDE_CODE_VERSION / CODEX_VERSION here.
 
 jobs:
   build-images:
@@ -197,31 +197,59 @@ jobs:
         run: |
           set -euo pipefail
           python3 <<'PY'
-          import json, pathlib, re, sys
-          manifest = pathlib.Path("scripts/agents/manifest.toml").read_text()
-          section_pat = re.compile(
-              r"\[([\w\-\.]+)\]\n((?:(?!\[).*\n)*)",
-              re.MULTILINE,
-          )
-          kv_pat = re.compile(r'^([a-zA-Z0-9_]+)\s*=\s*"(.+)"\s*$', re.MULTILINE)
+          import json, pathlib, sys, tomllib
+          # Use tomllib (Python 3.11+ stdlib) rather than a regex scan so a
+          # malformed manifest fails this job loudly instead of silently
+          # producing a partial RELEASE_DIGESTS.json. ubuntu-latest ships
+          # python3.12 which has tomllib built in.
+          manifest_path = pathlib.Path("scripts/agents/manifest.toml")
+          try:
+              manifest = tomllib.loads(manifest_path.read_text())
+          except tomllib.TOMLDecodeError as exc:
+              sys.exit(f"ERROR: failed to parse {manifest_path}: {exc}")
+
+          required_fields = {"version", "url", "sha256"}
           agents: dict = {}
-          for header, body in section_pat.findall(manifest):
-              parts = header.split(".")
-              if len(parts) != 3:
-                  continue
-              agent, platform, arch = parts
-              fields = dict(kv_pat.findall(body))
-              if not {"version", "url", "sha256"}.issubset(fields):
-                  continue
-              agents.setdefault(agent, {}).setdefault(platform, {})[arch] = {
-                  "version": fields["version"],
-                  "url": fields["url"],
-                  "sha256": fields["sha256"],
-              }
-          out = {
-              "schema": 1,
-              "agents": agents,
-          }
+
+          for agent, platforms in manifest.items():
+              if not isinstance(platforms, dict):
+                  sys.exit(
+                      f"ERROR: invalid manifest structure for [{agent}]: "
+                      "expected a table of platforms"
+                  )
+              for platform, arch_map in platforms.items():
+                  if not isinstance(arch_map, dict):
+                      sys.exit(
+                          f"ERROR: invalid manifest structure for "
+                          f"[{agent}.{platform}]: expected a table of architectures"
+                      )
+                  for arch, fields in arch_map.items():
+                      if not isinstance(fields, dict):
+                          sys.exit(
+                              f"ERROR: invalid manifest structure for "
+                              f"[{agent}.{platform}.{arch}]: expected a table"
+                          )
+                      missing = sorted(required_fields - fields.keys())
+                      if missing:
+                          sys.exit(
+                              f"ERROR: manifest section [{agent}.{platform}.{arch}] "
+                              f"is missing required keys: {', '.join(missing)}"
+                          )
+                      invalid = sorted(
+                          k for k in required_fields if not isinstance(fields[k], str)
+                      )
+                      if invalid:
+                          sys.exit(
+                              f"ERROR: manifest section [{agent}.{platform}.{arch}] "
+                              f"has non-string values for: {', '.join(invalid)}"
+                          )
+                      agents.setdefault(agent, {}).setdefault(platform, {})[arch] = {
+                          "version": fields["version"],
+                          "url": fields["url"],
+                          "sha256": fields["sha256"],
+                      }
+
+          out = {"schema": 1, "agents": agents}
           pathlib.Path("RELEASE_DIGESTS.json").write_text(
               json.dumps(out, indent=2, sort_keys=True) + "\n"
           )

@@ -157,7 +157,9 @@ fn manifest_verify_accepts_matching_hash() {
 }
 
 #[test]
-fn claude_override_without_sha_is_rejected() {
+fn claude_override_differing_from_manifest_without_sha_is_rejected() {
+    // 99.99.99 differs from the pinned manifest version, so it's a
+    // genuine override and the SHA env var is required.
     let out = run_bash(
         r#"
         source scripts/lib/agent_rootfs_common.sh
@@ -173,8 +175,8 @@ fn claude_override_without_sha_is_rejected() {
     );
     let err = stderr(&out);
     assert!(
-        err.contains("CLAUDE_CODE_VERSION=99.99.99 is set without a matching CLAUDE_CODE_SHA256"),
-        "stderr did not name the missing SHA env: {err}"
+        err.contains("CLAUDE_CODE_VERSION=99.99.99 differs from the manifest pin"),
+        "stderr did not name the drift: {err}"
     );
     assert!(
         err.contains("R-B5c.1 forbids unverified overrides"),
@@ -183,7 +185,7 @@ fn claude_override_without_sha_is_rejected() {
 }
 
 #[test]
-fn codex_override_without_sha_is_rejected() {
+fn codex_override_differing_from_manifest_without_sha_is_rejected() {
     let out = run_bash(
         r#"
         source scripts/lib/agent_rootfs_common.sh
@@ -199,12 +201,117 @@ fn codex_override_without_sha_is_rejected() {
     );
     let err = stderr(&out);
     assert!(
-        err.contains("CODEX_VERSION=99.99.99 is set without a matching CODEX_SHA256"),
-        "stderr did not name the missing SHA env: {err}"
+        err.contains("CODEX_VERSION=99.99.99 differs from the manifest pin"),
+        "stderr did not name the drift: {err}"
     );
     assert!(
         err.contains("R-B5c.1 forbids unverified overrides"),
         "stderr did not cite R-B5c.1: {err}"
+    );
+}
+
+#[test]
+fn claude_version_matching_manifest_pin_is_accepted_without_sha() {
+    // Setting CLAUDE_CODE_VERSION to the manifest's currently-pinned
+    // version is not really an override — the resolver should treat it
+    // as a no-op and use the manifest's pinned SHA. This is the path CI
+    // workflows take when they (legacy) export CLAUDE_CODE_VERSION
+    // without a SHA.
+    //
+    // We stub the fetcher to return success without doing network I/O.
+    // The assertion is that the resolver gets past the SHA-required
+    // guard and reports provenance=manifest.
+    let pinned_version = pinned_manifest_field("claude-code", "linux", "x86_64", "version");
+    let out = run_bash(&format!(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        # Stub the fetcher: pretend the download succeeded.
+        _agent_fetch_and_verify() {{ touch "$3"; chmod +x "$3"; return 0; }}
+        # Stub `file -L ... ELF executable` check by replacing the file
+        # check with a no-op echo. The function only cares about the grep
+        # match, so prepend a wrapper.
+        file() {{ echo "ELF 64-bit LSB executable"; }}
+        CLAUDE_CODE_VERSION={pinned_version} resolve_claude_binary r-b5c1-test
+        "#,
+    ));
+    assert!(
+        out.status.success(),
+        "resolve_claude_binary must accept VERSION matching manifest pin without SHA, stderr={}",
+        stderr(&out)
+    );
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        combined.contains("[provenance=manifest]"),
+        "expected manifest provenance for same-version case: {combined}"
+    );
+    assert!(
+        !combined.contains("R-B5c.1 forbids"),
+        "must not complain about missing SHA when VERSION equals manifest pin: {combined}"
+    );
+}
+
+#[test]
+fn codex_version_matching_manifest_pin_is_accepted_without_sha() {
+    let pinned_version = pinned_manifest_field("codex", "linux", "x86_64", "version");
+    let out = run_bash(&format!(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        # Stubs: succeed both the fetch+verify and the post-extract bin
+        # discovery. _codex_fetch_verify_extract sets CODEX_BIN as a side
+        # effect, so we replace it directly.
+        _codex_fetch_verify_extract() {{
+            local cached="$ROOT_DIR/target/codex-download/codex-$2-$3"
+            mkdir -p "$(dirname "$cached")"
+            touch "$cached"; chmod +x "$cached"
+            CODEX_BIN="$cached"
+            return 0
+        }}
+        file() {{ echo "ELF 64-bit LSB executable"; }}
+        CODEX_VERSION={pinned_version} resolve_codex_binary r-b5c1-test
+        "#,
+    ));
+    assert!(
+        out.status.success(),
+        "resolve_codex_binary must accept VERSION matching manifest pin without SHA, stderr={}",
+        stderr(&out)
+    );
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        combined.contains("[provenance=manifest]"),
+        "expected manifest provenance for same-version case: {combined}"
+    );
+}
+
+#[test]
+fn claude_version_matching_manifest_with_disagreeing_sha_is_rejected() {
+    // If the user supplies VERSION=manifest-pin AND a SHA that disagrees
+    // with the manifest's SHA, that's a typo or attempted attack — fail
+    // loudly rather than silently using the manifest SHA.
+    let pinned_version = pinned_manifest_field("claude-code", "linux", "x86_64", "version");
+    let out = run_bash(&format!(
+        r#"
+        source scripts/lib/agent_rootfs_common.sh
+        ROOT_DIR="$PWD"
+        GUEST_ARCH=x86_64
+        IS_CROSS_BUILD=false
+        CLAUDE_CODE_VERSION={pinned_version} CLAUDE_CODE_SHA256=deadbeef \
+            resolve_claude_binary r-b5c1-test
+        "#,
+    ));
+    assert!(
+        !out.status.success(),
+        "must reject SHA env var that disagrees with manifest"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("CLAUDE_CODE_SHA256 disagrees with the manifest SHA"),
+        "stderr did not name the disagreement: {err}"
     );
 }
 
@@ -482,4 +589,30 @@ fn tempfile_path(name: &str) -> PathBuf {
         seq,
         Path::new(name).display()
     ))
+}
+
+/// Read a single field (`version`, `url`, or `sha256`) from the in-tree
+/// manifest by shelling out to the same awk parser the build scripts use.
+/// Used by tests that need to assert behavior against the currently-pinned
+/// values without hard-coding them.
+fn pinned_manifest_field(agent: &str, platform: &str, arch: &str, field: &str) -> String {
+    let line_n = match field {
+        "version" => "1p",
+        "url" => "2p",
+        "sha256" => "3p",
+        other => panic!("unknown manifest field: {other}"),
+    };
+    let script = format!(
+        r#"
+        source scripts/lib/agent_manifest.sh
+        agent_manifest_require {agent} {platform} {arch} | sed -n '{line_n}'
+        "#
+    );
+    let out = run_bash(&script);
+    assert!(
+        out.status.success(),
+        "failed to read manifest field {field} for [{agent}.{platform}.{arch}]: stderr={}",
+        stderr(&out)
+    );
+    stdout(&out).trim().to_string()
 }
