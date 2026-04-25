@@ -63,10 +63,22 @@ const STREAM_BUFFER: usize = 128;
 /// per-operation termination rules: `ExecRequest` terminates on
 /// `ExecResponse`; `SubscribeTelemetry` never terminates on its own
 /// (only on channel death).
+///
+/// **Streaming uses a split-channel design** to guarantee terminal
+/// frames are never silently dropped under backpressure. Non-terminal
+/// chunk frames go on a bounded `mpsc::Sender` with `try_send`
+/// (best-effort — dropping a chunk under sustained backpressure is
+/// acceptable for live output). The terminal frame goes on its own
+/// `oneshot::Sender`, which has no buffer to fill and cannot return
+/// `Full`. As long as the caller has not dropped its receiver, the
+/// terminal frame is always delivered. `Terminator::ChannelLifetime`
+/// streams (e.g. telemetry) never have a terminal, so `terminal` is
+/// `None`.
 enum Dispatch {
     Oneshot(oneshot::Sender<Message>),
     Stream {
-        sender: mpsc::Sender<Message>,
+        chunks: mpsc::Sender<Message>,
+        terminal: Option<oneshot::Sender<Message>>,
         terminator: Terminator,
     },
 }
@@ -221,7 +233,14 @@ impl MultiplexChannel {
         terminator: Terminator,
     ) -> Result<mpsc::Receiver<Message>> {
         let request_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        let (chunks_tx, mut chunks_rx) = mpsc::channel(STREAM_BUFFER);
+        let (terminal_tx_opt, terminal_rx_opt) = match terminator {
+            Terminator::OnMessageType(_) => {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            }
+            Terminator::ChannelLifetime => (None, None),
+        };
 
         {
             let mut pending = self.lock_pending()?;
@@ -231,7 +250,8 @@ impl MultiplexChannel {
             pending.slots.insert(
                 request_id,
                 Dispatch::Stream {
-                    sender: tx,
+                    chunks: chunks_tx,
+                    terminal: terminal_tx_opt,
                     terminator,
                 },
             );
@@ -243,7 +263,50 @@ impl MultiplexChannel {
             return Err(e);
         }
 
-        Ok(rx)
+        // For ChannelLifetime streams there is no terminal; hand the
+        // chunks receiver back directly. No forwarder task needed.
+        let Some(terminal_rx) = terminal_rx_opt else {
+            return Ok(chunks_rx);
+        };
+
+        // For OnMessageType streams, merge chunks + terminal into one
+        // mpsc receiver to keep the public API stable. The forwarder
+        // is biased toward the terminal so a queued terminal is never
+        // starved by a backlog of chunks; before delivering the
+        // terminal it drains any chunks already queued so caller order
+        // matches the wire order.
+        let (out_tx, out_rx) = mpsc::channel(STREAM_BUFFER);
+        tokio::spawn(async move {
+            let mut terminal_fut = std::pin::pin!(terminal_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    terminal_msg = &mut terminal_fut => {
+                        while let Ok(chunk) = chunks_rx.try_recv() {
+                            if out_tx.send(chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Ok(msg) = terminal_msg {
+                            let _ = out_tx.send(msg).await;
+                        }
+                        return;
+                    }
+                    maybe_chunk = chunks_rx.recv() => {
+                        match maybe_chunk {
+                            Some(chunk) => {
+                                if out_tx.send(chunk).await.is_err() {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(out_rx)
     }
 
     /// Returns `true` if the reader thread has marked the channel dead.
@@ -411,7 +474,11 @@ fn dispatch_frame(
             };
             let _ = tx.send(msg);
         }
-        Dispatch::Stream { sender, terminator } => {
+        Dispatch::Stream {
+            chunks,
+            terminal,
+            terminator,
+        } => {
             let is_terminal = match terminator {
                 Terminator::OnMessageType(t) => msg_type == t,
                 Terminator::ChannelLifetime => false,
@@ -420,15 +487,36 @@ fn dispatch_frame(
                 msg_type,
                 payload: body,
             };
-            if let Err(e) = sender.try_send(msg) {
-                debug!(
-                    "multiplex: stream receiver full or closed for request_id={request_id}: {e}"
+            if is_terminal {
+                // oneshot::Sender::send is sync, never blocks, never returns
+                // Full — the only failure is "receiver dropped", which is
+                // semantically equivalent to the caller having gone away.
+                if let Some(terminal_tx) = terminal {
+                    if terminal_tx.send(msg).is_err() {
+                        debug!(
+                            "multiplex: terminal receiver for request_id={request_id} dropped before terminal arrived"
+                        );
+                    }
+                } else {
+                    warn!(
+                        "multiplex: terminal frame on a Terminator::ChannelLifetime slot (request_id={request_id})"
+                    );
+                }
+                // Slot stays removed: terminal closes the stream.
+            } else {
+                if let Err(e) = chunks.try_send(msg) {
+                    debug!(
+                        "multiplex: chunk for request_id={request_id} dropped: {e} (chunks-channel backpressure; terminal frame will still be delivered)"
+                    );
+                }
+                guard.slots.insert(
+                    request_id,
+                    Dispatch::Stream {
+                        chunks,
+                        terminal,
+                        terminator,
+                    },
                 );
-            }
-            if !is_terminal {
-                guard
-                    .slots
-                    .insert(request_id, Dispatch::Stream { sender, terminator });
             }
         }
     }
@@ -627,6 +715,64 @@ mod tests {
         for index in 0..32 {
             assert!(seen.contains(&format!("reply-{index}")));
         }
+    }
+
+    /// Regression for an earlier bug: when the chunks-channel hit its
+    /// bounded capacity, the reader's `try_send` for the terminal
+    /// frame failed with `Full`, the slot was removed (sender dropped),
+    /// and the caller observed `"stream closed without ExecResponse"`
+    /// even though the guest had replied successfully.
+    ///
+    /// The fix splits chunks (mpsc, drop-on-full is OK) from the
+    /// terminal frame (oneshot, never returns `Full`). This test
+    /// verifies the terminal arrives even when the chunks channel
+    /// would have rejected it in the old design.
+    #[tokio::test]
+    async fn terminal_frame_survives_chunks_channel_backpressure() {
+        // Simulate the failure mode: guest emits many more chunks than
+        // STREAM_BUFFER can hold, then a terminal frame. With the
+        // single-channel try_send design this would silently drop the
+        // terminal under sustained load. With the split-channel design
+        // the terminal must always arrive.
+        let chunk_count = STREAM_BUFFER * 4;
+        let mut frames = Vec::with_capacity(chunk_count + 1);
+        for index in 0..chunk_count {
+            frames.push((
+                MessageType::ExecOutputChunk,
+                format!("chunk-{index}").into_bytes(),
+            ));
+        }
+        frames.push((MessageType::ExecResponse, b"final".to_vec()));
+
+        let (reader, writer, guest) = mock_pair();
+        let _guest_thread = spawn_mock_guest(guest, vec![MockReply { frames }]);
+
+        let channel = MultiplexChannel::new(reader, writer);
+        let mut rx = channel
+            .call_stream(
+                MessageType::ExecRequest,
+                b"run".to_vec(),
+                Terminator::OnMessageType(MessageType::ExecResponse),
+            )
+            .await
+            .expect("stream rpc");
+
+        // Drain until terminal. We don't care if some chunks were
+        // dropped under backpressure — chunks are best-effort. The
+        // contract being tested is that the *terminal* always arrives.
+        let mut saw_terminal = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if msg.msg_type == MessageType::ExecResponse {
+                assert_eq!(msg.payload, b"final");
+                saw_terminal = true;
+                break;
+            }
+        }
+        assert!(
+            saw_terminal,
+            "terminal frame must be delivered even when chunks channel saw backpressure"
+        );
     }
 
     #[tokio::test]

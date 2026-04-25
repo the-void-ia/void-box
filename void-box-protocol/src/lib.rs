@@ -88,16 +88,24 @@ pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// - **Ping payload** (v2): `[secret: 32 B][version: 4 B LE][flags: 1 B]` (37 B)
 /// - **Pong payload** (v2): `[version: 4 B LE][flags: 1 B]` (5 B)
 ///
-/// Backward compatibility is forward-compatible in both directions because
-/// every extension only appends bytes — old parsers read the prefix they
-/// know about, new parsers check `payload.len()` before reading the
-/// extension:
+/// The wire format is structurally append-only — every revision only adds
+/// trailing bytes, so older parsers can read newer prefixes:
 ///
 /// - v0 hosts sent a 32-byte Ping (no version). Parsers treat `len < 36`
 ///   as version 0.
 /// - v1 hosts/guests sent the 4-byte version but no flags. Parsers treat
 ///   `len < 37` (Ping) or `len < 5` (Pong) as flags=0.
 /// - v2 adds a flags byte (see [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]).
+///
+/// **Wire-level backward compatibility is not the same as semantic
+/// compatibility.** Starting in protocol v2, peers must negotiate
+/// `PROTO_FLAG_SUPPORTS_MULTIPLEX` during the Ping/Pong exchange:
+/// every post-handshake frame carries a 4-byte `request_id` prefix
+/// that pre-multiplex peers cannot decode, so guest-agent and host-side
+/// `ControlChannel` both hard-reject any peer that does not advertise
+/// the flag. The previous "per-RPC reconnect fallback" path has been
+/// removed. Older v0/v1 peers will fail at handshake with a clear
+/// protocol-version error rather than corrupt the byte stream.
 ///
 /// Use [`build_ping_payload`], [`parse_ping_payload`],
 /// [`build_pong_payload`], and [`parse_pong_payload`] instead of hand-
