@@ -74,7 +74,7 @@ Claude Code · OpenAI Codex · Ollama · LM Studio · OpenRouter · Together AI 
 ## Your data stays yours
 
 - **Hardware boundary per stage** — KVM/VZ isolation enforced by the CPU, not by the kernel or by process controls.
-- **Defense-in-depth** — seccomp-BPF on the VMM thread, command allowlists, session-secret auth on the vsock control channel, uid:1000 privilege drop, and SLIRP NAT isolation.
+- **Defense-in-depth** — seccomp-BPF on the VMM thread, session-secret auth on the vsock control channel, uid:1000 privilege drop, and SLIRP NAT isolation.
 - **Credentials never persist** — host OAuth tokens are mounted read-only; API keys are injected as session-scoped env vars and never written to disk inside the guest.
 - **Fully auditable** — every stage emits OTLP traces, metrics, and structured logs. Nothing in the run is a black box.
 - **Open source · self-hostable** — Apache-2.0. This repo. Inspect, fork, run on your own metal.

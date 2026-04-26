@@ -316,6 +316,20 @@ Layer 5: Network isolation (SLIRP)
   └─ CIDR deny list
 ```
 
+### Scope — what the sandbox does and does not defend
+
+void-box defends the host (and the host's other local state) from a compromised agent running inside the guest VM. It does **not** defend the contents of the guest VM from that same agent. The two halves of that boundary are worth spelling out, because at first read the layered defenses above can suggest a stronger in-guest property than they actually deliver.
+
+Once the guest-agent has authenticated, applied resource limits, and dropped privileges to uid:1000, the agent binary it spawns runs with ordinary Linux semantics inside the guest. It can `fork`, `execve` any binary on the rootfs that uid:1000 is allowed to read and execute, and write anywhere uid:1000 has write access (`/tmp`, the home directory, any `rw` host mount). There is no syscall filter on that child, no in-process policy hook between the LLM and the kernel — uid:1000, the SLIRP network policy, and `setrlimit` are the only restrictions that apply to the running agent.
+
+`DEFAULT_COMMAND_ALLOWLIST` (in `src/backend/mod.rs`) is **not** a sandbox in that sense. It is a vsock-side gate: it controls which binary the host can ask the guest to launch as the initial child of the guest-agent. It does not constrain what that child does once it is running, including which other binaries the child invokes via `execve`. If the initial child is `claude-code` and the LLM decides to call out to `bash`, `python`, `curl`, or anything else present on the rootfs, the allowlist is not in the path of that decision.
+
+This matters because **prompt injection is in scope for void-box's threat model**, and inside the guest it translates directly to arbitrary uid:1000-level execution. Anything the agent can read — files mounted in via 9p/virtiofs, host credentials staged for the run, the contents of `/workspace` — should be treated as exfiltratable to the LLM provider or to attacker-controlled outbound traffic that SLIRP allows. The defenses above stop a compromised agent from escaping to the host or to the host's wider local state; they do not stop it from misbehaving inside its own VM.
+
+For the canonical statement of what is and is not in scope as a vulnerability, including the active-work items that are not yet defended, see [`SECURITY.md`](../SECURITY.md). This subsection is intended as the prose explanation; `SECURITY.md` is the policy.
+
+<!-- TODO: link to published threat model once a public summary is released alongside the void-box source repo -->
+
 ### Session secret flow
 
 ```
