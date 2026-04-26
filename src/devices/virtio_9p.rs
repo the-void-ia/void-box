@@ -145,6 +145,21 @@ pub struct Virtio9pDevice {
     mount_tag: String,
     read_only: bool,
     fids: HashMap<u32, FidState>,
+    /// When `Some((uid, gid))`, every metadata response (Rgetattr) substitutes
+    /// the configured uid/gid for the host file's real values. Tsetattr
+    /// ATTR_UID/ATTR_GID are still silently accepted (the host process can't
+    /// chown to arbitrary uids without `CAP_CHOWN`), but the guest's view of
+    /// ownership is now stable and matches the configured value — no
+    /// "fake-success" cache illusion that flips back on the next revalidation.
+    ///
+    /// Used by RW host-dir mounts to make all files appear owned by the
+    /// guest sandbox uid (1000), regardless of the host runtime's uid.
+    /// Without this, on hosts where `process_uid != 1000` (e.g. GitHub-hosted
+    /// CI runners running as `runner` uid 1001) the guest sandbox uid sees
+    /// the mount as foreign-owned and fails with EPERM/EACCES on chmod /
+    /// open(O_CREAT) / mkdir against any path that has been re-validated
+    /// since the chown round-trip. See issue #52.
+    mapped_uid_gid: Option<(u32, u32)>,
     // internal virtqueue tracking
     avail_idx: u16,
     used_idx: u16,
@@ -200,9 +215,17 @@ impl Virtio9pDevice {
             mount_tag,
             read_only,
             fids: HashMap::new(),
+            mapped_uid_gid: None,
             avail_idx: 0,
             used_idx: 0,
         }
+    }
+
+    /// Configure uid/gid translation for metadata responses. See the
+    /// `mapped_uid_gid` field docs for the full rationale. Pass `None` to
+    /// disable (the default — pass-through to host metadata).
+    pub fn set_mapped_uid_gid(&mut self, mapped: Option<(u32, u32)>) {
+        self.mapped_uid_gid = mapped;
     }
 
     // -- MMIO interface (duck-typed, matching VirtioNetDevice) ----------------
@@ -1225,8 +1248,12 @@ impl Virtio9pDevice {
         resp.extend_from_slice(&request_mask.to_le_bytes());
         resp.extend_from_slice(&qid);
         resp.extend_from_slice(&metadata.mode().to_le_bytes()); // mode
-        resp.extend_from_slice(&metadata.uid().to_le_bytes()); // uid
-        resp.extend_from_slice(&metadata.gid().to_le_bytes()); // gid
+        let (uid, gid) = match self.mapped_uid_gid {
+            Some((u, g)) => (u, g),
+            None => (metadata.uid(), metadata.gid()),
+        };
+        resp.extend_from_slice(&uid.to_le_bytes()); // uid (mapped if configured)
+        resp.extend_from_slice(&gid.to_le_bytes()); // gid (mapped if configured)
         resp.extend_from_slice(&metadata.nlink().to_le_bytes()); // nlink
         resp.extend_from_slice(&metadata.rdev().to_le_bytes()); // rdev
         resp.extend_from_slice(&metadata.size().to_le_bytes()); // size
@@ -2566,6 +2593,126 @@ mod tests {
 
         let meta = fs::metadata(root.join("modme.txt")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+    }
+
+    // -- UID/GID translation tests --------------------------------------------
+    //
+    // Background: an unprivileged host process cannot honour a guest chown to
+    // an arbitrary uid (would need CAP_CHOWN). The Tsetattr handler therefore
+    // silently accepts ATTR_UID/ATTR_GID without performing the chown. That
+    // alone would be fine if Tgetattr also returned a stable owner — but
+    // without translation, getattr reports the real host uid (e.g. the runner
+    // uid on GitHub-hosted CI), which often does not match the guest sandbox
+    // uid (1000). Operations like `chmod` from the guest sandbox uid then
+    // hit local kernel EPERM ("not the file owner"), and writes to a
+    // tempdir-style 0700 parent hit EACCES. See issue #52.
+    //
+    // The fix: let the device map every metadata uid/gid to a configured
+    // value so the guest cache shows consistent ownership matching the
+    // sandbox uid.
+
+    /// Helper: parse the uid + gid fields out of a successful Rgetattr
+    /// payload. Layout per `handle_getattr`:
+    /// `valid(8) qid(13) mode(4) uid(4) gid(4) ...`. We add header +
+    /// type byte + tag — the body starts at index 7.
+    fn extract_getattr_uid_gid(resp: &[u8]) -> (u32, u32) {
+        assert_eq!(resp[4], R_GETATTR, "expected R_GETATTR, got {}", resp[4]);
+        let body = &resp[7..];
+        let off = 8 + QID_SIZE + 4; // valid + qid + mode
+        let uid = u32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+        let gid = u32::from_le_bytes(body[off + 4..off + 8].try_into().unwrap());
+        (uid, gid)
+    }
+
+    fn build_getattr_request(fid: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&fid.to_le_bytes());
+        payload.extend_from_slice(&0xFFFFu64.to_le_bytes()); // request_mask
+        build_request(T_GETATTR, 1, &payload)
+    }
+
+    #[test]
+    fn test_getattr_returns_host_uid_when_unmapped() {
+        // Baseline: without uid translation, getattr exposes the real host
+        // uid/gid. This is the pre-fix behaviour and pins it down so the
+        // mapped behaviour added next is unambiguous.
+        let (mut dev, tmp) = make_rw_device();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("plain.txt");
+        fs::write(&path, b"hi").unwrap();
+
+        dev.fids.insert(
+            1,
+            FidState {
+                path,
+                open_file: None,
+            },
+        );
+
+        let resp = dev.handle_9p_request(&build_getattr_request(1));
+        let (uid, gid) = extract_getattr_uid_gid(&resp);
+
+        // The file was just created by the test process, so the metadata's
+        // uid/gid match the running process — same numbers either side.
+        let expected_uid = unsafe { libc::geteuid() };
+        let expected_gid = unsafe { libc::getegid() };
+        assert_eq!(uid, expected_uid, "host uid should pass through");
+        assert_eq!(gid, expected_gid, "host gid should pass through");
+    }
+
+    #[test]
+    fn test_getattr_returns_mapped_uid_when_set() {
+        // The fix: when `mapped_uid_gid` is set on the device, every
+        // Tgetattr response substitutes the configured uid/gid for the
+        // metadata's real values. This is what keeps the guest sandbox
+        // uid (1000) seeing consistent ownership of mounted host dirs
+        // even when the host runtime process runs as a different uid.
+        let (mut dev, tmp) = make_rw_device();
+        dev.set_mapped_uid_gid(Some((1000, 1000)));
+
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("mapped.txt");
+        fs::write(&path, b"hi").unwrap();
+
+        dev.fids.insert(
+            1,
+            FidState {
+                path,
+                open_file: None,
+            },
+        );
+
+        let resp = dev.handle_9p_request(&build_getattr_request(1));
+        let (uid, gid) = extract_getattr_uid_gid(&resp);
+
+        assert_eq!(uid, 1000, "mapped uid must override real host uid");
+        assert_eq!(gid, 1000, "mapped gid must override real host gid");
+    }
+
+    #[test]
+    fn test_getattr_mapping_per_directory_too() {
+        // Same mapping applies to directory metadata. The 9p clients hit
+        // this on every parent-dir permission check; if the directory
+        // entry's uid disagreed with the file's mapped uid, chmod from
+        // inside the sandbox would still EPERM.
+        let (mut dev, tmp) = make_rw_device();
+        dev.set_mapped_uid_gid(Some((1000, 1000)));
+
+        let root = tmp.path().canonicalize().unwrap();
+
+        dev.fids.insert(
+            1,
+            FidState {
+                path: root.clone(),
+                open_file: None,
+            },
+        );
+
+        let resp = dev.handle_9p_request(&build_getattr_request(1));
+        let (uid, gid) = extract_getattr_uid_gid(&resp);
+
+        assert_eq!(uid, 1000, "mapped uid must apply to the mount root too");
+        assert_eq!(gid, 1000, "mapped gid must apply to the mount root too");
     }
 
     // -- Fsync tests ----------------------------------------------------------
