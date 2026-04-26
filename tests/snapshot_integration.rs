@@ -75,6 +75,36 @@ fn test_memory_mb() -> usize {
         .unwrap_or(256)
 }
 
+/// Diagnostic mode for the Azure CI flakiness investigation. When `VOID_BOX_DIAGNOSTIC=1`
+/// is set, the snapshot tests stop swallowing VM-creation and exec errors via
+/// graceful early-return and instead panic with the full error chain so the
+/// failing step is visible in CI output. Off by default so the local runs that
+/// gracefully skip on missing KVM keep their existing behaviour.
+#[allow(dead_code)]
+pub(crate) fn diagnostic_mode() -> bool {
+    matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1"))
+}
+
+/// Helper used by the snapshot tests: under `diagnostic_mode()` it panics with
+/// full context, otherwise it just `eprintln!`s and returns `None` so the test
+/// gracefully ends. The macro-shaped name keeps call sites short.
+#[allow(dead_code)]
+pub(crate) fn diag_or_skip<T, E: std::fmt::Display>(
+    label: &str,
+    result: Result<T, E>,
+) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if diagnostic_mode() {
+                panic!("[{label}] failed under VOID_BOX_DIAGNOSTIC=1: {e}");
+            }
+            eprintln!("  {label}: {e}");
+            None
+        }
+    }
+}
+
 /// Build a `VoidBoxConfig` from kernel/initramfs paths.
 fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -> VoidBoxConfig {
     build_config_vcpus(kernel, initramfs, 1)
@@ -906,21 +936,22 @@ async fn snapshot_cli_create_and_list() {
 
     // --- Cold boot ---
     eprintln!("[cli_create_list] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = diag_or_skip("[cli_create_list] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec failed: {e}");
-            return;
-        }
+    let Some(output) = diag_or_skip(
+        "[cli_create_list] vm.exec",
+        vm.exec("echo", &["ready"]).await,
+    ) else {
+        return;
     };
-    assert!(output.success());
+    assert!(
+        output.success(),
+        "[cli_create_list] exec returned exit={:?} stdout={:?} stderr={:?}",
+        output.exit_code,
+        output.stdout_str(),
+        output.stderr_str(),
+    );
 
     // --- Snapshot into the standard directory ---
     let config_hash =
@@ -982,21 +1013,20 @@ async fn snapshot_cli_delete() {
 
     // --- Cold boot ---
     eprintln!("[cli_delete] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = diag_or_skip("[cli_delete] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec failed: {e}");
-            return;
-        }
+    let Some(output) = diag_or_skip("[cli_delete] vm.exec", vm.exec("echo", &["ready"]).await)
+    else {
+        return;
     };
-    assert!(output.success());
+    assert!(
+        output.success(),
+        "[cli_delete] exec returned exit={:?} stdout={:?} stderr={:?}",
+        output.exit_code,
+        output.stdout_str(),
+        output.stderr_str(),
+    );
 
     // --- Snapshot ---
     let config_hash =
@@ -1062,21 +1092,22 @@ async fn snapshot_cli_create_diff() {
 
     // --- Cold boot & base snapshot ---
     eprintln!("[cli_create_diff] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = diag_or_skip("[cli_create_diff] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec failed: {e}");
-            return;
-        }
+    let Some(output) = diag_or_skip(
+        "[cli_create_diff] vm.exec",
+        vm.exec("echo", &["ready"]).await,
+    ) else {
+        return;
     };
-    assert!(output.success());
+    assert!(
+        output.success(),
+        "[cli_create_diff] exec returned exit={:?} stdout={:?} stderr={:?}",
+        output.exit_code,
+        output.stdout_str(),
+        output.stderr_str(),
+    );
 
     let config_hash =
         snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
@@ -1233,22 +1264,23 @@ async fn auto_snapshot_round_trip() {
 
     // --- Cold boot ---
     eprintln!("[auto_snapshot] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = diag_or_skip("[auto_snapshot] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
 
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
+    let Some(output) = diag_or_skip(
+        "[auto_snapshot] vm.exec (cold boot)",
+        vm.exec("echo", &["ready"]).await,
+    ) else {
+        return;
     };
-    assert!(output.success());
+    assert!(
+        output.success(),
+        "[auto_snapshot] cold boot exec returned exit={:?} stdout={:?} stderr={:?}",
+        output.exit_code,
+        output.stdout_str(),
+        output.stderr_str(),
+    );
     assert_eq!(output.stdout_str().trim(), "ready");
     eprintln!("[auto_snapshot] Cold boot OK");
 

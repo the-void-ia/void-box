@@ -60,6 +60,19 @@ fn backend_config() -> Option<BackendConfig> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).ok()?;
 
+    // Under VOID_BOX_DIAGNOSTIC=1, route the guest serial console to a file so
+    // the Azure-CI handshake-deadline failure leaves a host-readable trail
+    // ("did the guest kernel boot? did guest-agent reach vsock bind?"). The
+    // file path is stable so the CI workflow can upload it as an artifact.
+    let console = if matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1")) {
+        let path = std::env::var("VOID_BOX_DIAGNOSTIC_CONSOLE_PATH")
+            .unwrap_or_else(|_| "/tmp/void-box-persistent-channel-console.log".to_string());
+        eprintln!("persistent_channel: routing guest console to {path}");
+        GuestConsoleSink::File(PathBuf::from(path))
+    } else {
+        GuestConsoleSink::Disabled
+    };
+
     Some(BackendConfig {
         memory_mb: 2048,
         vcpus: 2,
@@ -68,7 +81,7 @@ fn backend_config() -> Option<BackendConfig> {
         rootfs: None,
         network: true,
         enable_vsock: true,
-        guest_console: GuestConsoleSink::Disabled,
+        guest_console: console,
         shared_dir: None,
         mounts: vec![],
         oci_rootfs: None,

@@ -197,6 +197,10 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
     }
 
     let Ok(program_c) = CString::new(request.program.as_str()) else {
+        kmsg(&format!(
+            "PTY child: program contains NUL byte ({:?}); _exit(127)",
+            request.program
+        ));
         unsafe {
             libc::_exit(127);
         }
@@ -206,6 +210,10 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
     argv_c.push(program_c.clone());
     for arg in &request.args {
         let Ok(arg_c) = CString::new(arg.as_str()) else {
+            kmsg(&format!(
+                "PTY child: arg contains NUL byte ({:?}); _exit(127)",
+                arg
+            ));
             unsafe {
                 libc::_exit(127);
             }
@@ -219,8 +227,22 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
     }
     argv_ptrs.push(std::ptr::null());
 
+    let path_for_log = std::env::var("PATH").unwrap_or_default();
     unsafe {
         libc::execvp(program_c.as_ptr(), argv_ptrs.as_ptr());
+        // execvp returned — that only happens on failure. Capture errno
+        // before any other libc call clobbers it so /dev/kmsg shows the
+        // exact reason. Diagnostic for "child exits 127 instead of N" CI
+        // flake (Azure nested-virt only).
+        let err = io::Error::last_os_error();
+        kmsg(&format!(
+            "PTY child: execvp({:?}, {:?}) failed: {} (raw_os_error={:?}); PATH={:?}; _exit(127)",
+            request.program,
+            request.args,
+            err,
+            err.raw_os_error(),
+            path_for_log,
+        ));
         libc::_exit(127);
     }
 }
