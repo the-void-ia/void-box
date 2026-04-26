@@ -36,17 +36,17 @@ Real workflows you can run today. Every stage executes inside its own KVM (Linux
 
 ### 🔬 Multi-stage research pipelines
 - **HackerNews researcher** — autonomous research agent that fetches, ranks, and summarizes top stories. Skills declared as files; one VM per run. ([`examples/hackernews/`](examples/hackernews/))
-- **Quant trading pipeline** — four sequential stages (research → analysis → strategy → risk), each in its own VM with its own skill set and resource budget. ([`examples/trading_pipeline.rs`](examples/trading_pipeline.rs))
-- **Parallel fan-out** — `.fan_out()` across N isolated VMs, then `.pipe()` results into a reducer stage. ([`examples/parallel_pipeline.rs`](examples/parallel_pipeline.rs))
+- **Quant trading pipeline** — four sequential stages (data → technical analysis → sentiment → portfolio strategy), each in its own micro-VM with its own skill set. ([`examples/trading_pipeline.rs`](examples/trading_pipeline.rs))
+- **Parallel fan-out** — `.fan_out()` runs branches in parallel, each in its own micro-VM (the example splits into a quant and a sentiment branch), then `.pipe()` merges the outputs into a downstream reducer stage. ([`examples/parallel_pipeline.rs`](examples/parallel_pipeline.rs))
 
 ### 🤖 Code review & PR automation
-- **Two-stage review pipeline** — analyzer stage clones the repo and proposes fixes; proposer stage opens a GitHub PR under an explicit command allowlist. The agent can't shell out to anything you didn't pre-declare. ([`examples/code_review/`](examples/code_review/))
+- **Two-stage review pipeline** — analyzer stage clones the repo and proposes fixes; proposer stage opens the GitHub PR. Each runs in its own micro-VM; the `GITHUB_TOKEN` is scoped to the proposer alone, so a prompt injection that compromises the analyzer can't reach the PR-opening machinery. ([`examples/code_review/`](examples/code_review/))
 
 ### 📡 Long-running agent gateways
-- **OpenClaw Telegram bot** — service-mode agent that runs indefinitely, accepts commands over Telegram, and dispatches them to a sandboxed LLM. Swap Claude → Ollama → LM Studio behind one config field. ([`examples/openclaw/openclaw_telegram.yaml`](examples/openclaw/openclaw_telegram.yaml))
+- **OpenClaw Telegram bot** — long-running gateway running as a service-mode workflow step that accepts commands over Telegram. Companion specs (`openclaw_telegram.yaml`, `_ollama.yaml`, `_lmstudio.yaml`) demonstrate Claude, Ollama, and LM Studio backends. ([`examples/openclaw/openclaw_telegram.yaml`](examples/openclaw/openclaw_telegram.yaml))
 
 ### 🏠 Local-first model experimentation
-- **Ollama / LM Studio backends** — local models reached through the SLIRP gateway. No API key, no host filesystem access from the guest, no traffic outside the loopback model port. ([`examples/ollama_local.rs`](examples/ollama_local.rs), [`examples/lm_studio_local.rs`](examples/lm_studio_local.rs))
+- **Ollama / LM Studio backends** — reach a local model through the SLIRP gateway (`10.0.2.2:<port>`). No API key, no SaaS round-trip — your prompts and the model's responses never leave the host. ([`examples/ollama_local.rs`](examples/ollama_local.rs), [`examples/lm_studio_local.rs`](examples/lm_studio_local.rs))
 
 👉 **[Browse all examples →](examples/README.md)**
 
