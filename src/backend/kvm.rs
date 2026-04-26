@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use void_box_protocol::SessionSecret;
 
 use crate::backend::control_channel::{ControlChannel, GuestStream, GUEST_AGENT_PORT};
 use crate::backend::{BackendConfig, GuestConsoleSink, VmmBackend};
@@ -161,11 +162,12 @@ impl VmmBackend for KvmBackend {
 
             // The session secret comes from the snapshot (baked into kernel cmdline)
             let snap = crate::vmm::snapshot::VmSnapshot::load(snapshot_dir)?;
-            let session_secret: [u8; 32] = snap
+            let session_secret_bytes: [u8; 32] = snap
                 .session_secret
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+            let session_secret = SessionSecret::new(session_secret_bytes);
 
             // Restored VMs always use the userspace vsock backend (Unix socket),
             // not AF_VSOCK (vhost).  The socket path is unique per restore instance.
@@ -238,7 +240,7 @@ impl VmmBackend for KvmBackend {
 
         // Apply security config
         vm_config.security = SecurityConfig {
-            session_secret: config.security.session_secret,
+            session_secret: config.security.session_secret.clone(),
             command_allowlist: config.security.command_allowlist,
             resource_limits: Default::default(),
             network_deny_list: config.security.network_deny_list,
@@ -475,11 +477,12 @@ impl VmmBackend for KvmBackend {
         let mut restored_vm = MicroVm::from_snapshot(&snap_path).await?;
 
         let snap = crate::vmm::snapshot::VmSnapshot::load(&snap_path)?;
-        let session_secret: [u8; 32] = snap
+        let session_secret_bytes: [u8; 32] = snap
             .session_secret
             .as_slice()
             .try_into()
             .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+        let session_secret = SessionSecret::new(session_secret_bytes);
 
         let socket_path = restored_vm
             .vsock_socket_path()

@@ -26,6 +26,7 @@ mod vm_preflight;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::sidecar;
+use void_box_protocol::SessionSecret;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -91,7 +92,7 @@ fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<Backend
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist: vec!["sh".into(), "wget".into(), "cat".into(), "echo".into()],
             network_deny_list: deny_list,
             max_connections_per_second: 50,

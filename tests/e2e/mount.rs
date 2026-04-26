@@ -30,6 +30,7 @@ mod vm_preflight;
 use void_box::backend::{
     BackendConfig, BackendSecurityConfig, GuestConsoleSink, MountConfig, VmmBackend,
 };
+use void_box_protocol::SessionSecret;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -105,7 +106,7 @@ fn build_config_with_mount(
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist: vec![
                 "sh".into(),
                 "cat".into(),

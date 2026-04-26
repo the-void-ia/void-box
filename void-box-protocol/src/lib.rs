@@ -18,8 +18,54 @@
 //! - **type**: one byte mapping to [`MessageType`].
 //! - **payload**: JSON-encoded body (may be empty).
 
+use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+// ---------------------------------------------------------------------------
+// SessionSecret
+// ---------------------------------------------------------------------------
+
+/// 32-byte vsock session secret, wrapped to enforce explicit access and
+/// auto-redact in `Debug`/`Display` and to zeroize on drop.
+///
+/// Lives in the protocol crate because the secret is conceptually tied to
+/// the wire format (Ping payload). Host code accesses the bytes via
+/// [`expose_secret`](Self::expose_secret) at the few places that need to
+/// emit the cmdline arg or serialize a snapshot.
+pub struct SessionSecret(SecretBox<[u8; 32]>);
+
+impl SessionSecret {
+    /// Wraps a 32-byte secret. The original array is moved into a heap
+    /// allocation owned by the inner `SecretBox`, which zeroes the bytes
+    /// when dropped.
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(SecretBox::new(Box::new(bytes)))
+    }
+
+    /// Borrows the underlying 32 bytes. Every call site is the audit point
+    /// for "this code is intentionally exposing the secret".
+    pub fn expose_secret(&self) -> &[u8; 32] {
+        self.0.expose_secret()
+    }
+}
+
+// `SecretBox<[u8; 32]>` does not impl `Clone` (zeroize's `[T; N]` is not a
+// `CloneableSecret` for arbitrary `T`), so we provide our own: copy the
+// bytes through the audit point and re-wrap.
+impl Clone for SessionSecret {
+    fn clone(&self) -> Self {
+        Self::new(*self.expose_secret())
+    }
+}
+
+// `SecretBox` already redacts in `Debug`; this impl just delegates so the
+// outer newtype carries the same guarantee without exposing the inner type.
+impl fmt::Debug for SessionSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SessionSecret([REDACTED])")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -1301,6 +1347,38 @@ mod tests {
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: PtyClosedResponse = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded.exit_code, 137);
+    }
+
+    #[test]
+    fn session_secret_debug_redacts() {
+        let secret = SessionSecret::new([0xABu8; 32]);
+        let rendered = format!("{:?}", secret);
+        let secret_lower_hex = "ab".repeat(32);
+        let secret_upper_hex = "AB".repeat(32);
+        let secret_byte_array = "171, ".repeat(31) + "171";
+        assert!(
+            !rendered.contains(&secret_lower_hex),
+            "Debug leaked lowercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_upper_hex),
+            "Debug leaked uppercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_byte_array),
+            "Debug leaked byte-array form of secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("REDACTED"),
+            "Debug should mark session secret as REDACTED: {rendered}"
+        );
+    }
+
+    #[test]
+    fn session_secret_clone_round_trips() {
+        let original = SessionSecret::new([0xCDu8; 32]);
+        let cloned = original.clone();
+        assert_eq!(original.expose_secret(), cloned.expose_secret());
     }
 
     #[test]

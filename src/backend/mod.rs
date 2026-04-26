@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use void_box_protocol::SessionSecret;
 
 use crate::error::Result;
 use crate::guest::protocol::{ExecOutputChunk, ExecResponse, TelemetrySubscribeRequest};
@@ -127,8 +128,8 @@ impl BackendConfig {
     /// memory, vCPUs). Everything else is set to safe defaults with vsock
     /// enabled and the default command allowlist.
     pub fn minimal(kernel: impl Into<PathBuf>, memory_mb: usize, vcpus: usize) -> Self {
-        let mut session_secret = [0u8; 32];
-        getrandom::fill(&mut session_secret).expect("getrandom");
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("getrandom");
         Self {
             memory_mb,
             vcpus,
@@ -145,7 +146,7 @@ impl BackendConfig {
             oci_rootfs_disk: None,
             env: Vec::new(),
             security: BackendSecurityConfig {
-                session_secret,
+                session_secret: SessionSecret::new(bytes),
                 command_allowlist: DEFAULT_COMMAND_ALLOWLIST
                     .iter()
                     .map(|s| s.to_string())
@@ -305,7 +306,7 @@ pub fn guest_accessible_bind_addr(port: u16) -> SocketAddr {
 #[derive(Debug, Clone)]
 pub struct BackendSecurityConfig {
     /// 32-byte session secret for vsock authentication.
-    pub session_secret: [u8; 32],
+    pub session_secret: SessionSecret,
     /// Command allowlist for the guest.
     pub command_allowlist: Vec<String>,
     /// Network deny list in CIDR notation.
@@ -527,4 +528,92 @@ pub fn create_backend() -> Box<dyn VmmBackend> {
 #[cfg(target_os = "macos")]
 pub fn create_backend() -> Box<dyn VmmBackend> {
     Box::new(vz::VzBackend::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn distinctive_security_config() -> BackendSecurityConfig {
+        BackendSecurityConfig {
+            session_secret: SessionSecret::new([0xAB; 32]),
+            command_allowlist: vec!["sh".to_string()],
+            network_deny_list: Vec::new(),
+            max_connections_per_second: 0,
+            max_concurrent_connections: 0,
+            seccomp: false,
+        }
+    }
+
+    /// `format!("{:?}", BackendSecurityConfig)` must not contain the secret in
+    /// any plausible textual form: the raw `0xAB` byte literals (the way
+    /// `[u8; 32]` derives `Debug`), the lowercase hex (`abab...`, the form the
+    /// host writes to the kernel cmdline), or the uppercase hex (`ABAB...`).
+    #[test]
+    fn debug_redacts_session_secret() {
+        let config = distinctive_security_config();
+        let rendered = format!("{:?}", config);
+        let secret_lower_hex = "ab".repeat(32);
+        let secret_upper_hex = "AB".repeat(32);
+        let secret_byte_array = "171, ".repeat(31) + "171"; // [u8; 32] derived Debug
+        assert!(
+            !rendered.contains(&secret_lower_hex),
+            "Debug leaked lowercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_upper_hex),
+            "Debug leaked uppercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_byte_array),
+            "Debug leaked byte-array form of secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("REDACTED"),
+            "Debug should mark session_secret as REDACTED: {rendered}"
+        );
+    }
+
+    /// The redaction must propagate to any container that derives `Debug` and
+    /// owns a `BackendSecurityConfig`. `BackendConfig` is the canonical such
+    /// container in `src/backend/`.
+    #[test]
+    fn debug_of_backend_config_redacts_session_secret() {
+        let security = distinctive_security_config();
+        let config = BackendConfig {
+            memory_mb: 512,
+            vcpus: 1,
+            kernel: PathBuf::from("/dev/null"),
+            initramfs: None,
+            rootfs: None,
+            network: false,
+            enable_vsock: true,
+            guest_console: GuestConsoleSink::Disabled,
+            shared_dir: None,
+            mounts: Vec::new(),
+            oci_rootfs: None,
+            oci_rootfs_dev: None,
+            oci_rootfs_disk: None,
+            env: Vec::new(),
+            security,
+            snapshot: None,
+            enable_snapshots: false,
+        };
+        let rendered = format!("{:?}", config);
+        let secret_lower_hex = "ab".repeat(32);
+        let secret_upper_hex = "AB".repeat(32);
+        let secret_byte_array = "171, ".repeat(31) + "171";
+        assert!(
+            !rendered.contains(&secret_lower_hex),
+            "BackendConfig Debug leaked lowercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_upper_hex),
+            "BackendConfig Debug leaked uppercase-hex secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&secret_byte_array),
+            "BackendConfig Debug leaked byte-array form of secret: {rendered}"
+        );
+    }
 }

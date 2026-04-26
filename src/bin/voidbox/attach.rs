@@ -392,8 +392,8 @@ fn prepare_credentials(
     if !matches!(provider, Some(LlmProvider::ClaudePersonal)) {
         return Ok(None);
     }
-    let json = discover_oauth_credentials()?;
-    let staged = stage_credentials(&json)?;
+    let secret_json = discover_oauth_credentials()?;
+    let staged = stage_credentials(&secret_json)?;
     Ok(Some(staged))
 }
 

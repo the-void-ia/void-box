@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
+use void_box_protocol::SessionSecret;
 
 use crate::backend::control_channel::{ControlChannel, GuestConnector, GUEST_AGENT_PORT};
 use crate::backend::{BackendConfig, GuestConsoleSink, VmmBackend};
@@ -115,7 +116,7 @@ pub struct VzBackend {
     /// Active span context for TRACEPARENT propagation.
     span_context: Option<SpanContext>,
     /// Session secret (kept for snapshot sidecar).
-    session_secret: Option<[u8; 32]>,
+    session_secret: Option<SessionSecret>,
     /// Snapshot of the BackendConfig used in start() (kept for snapshot sidecar).
     started_config: Option<StartedConfigInfo>,
     /// Full backend config for restart flows such as auto-snapshot.
@@ -487,7 +488,8 @@ impl VzBackend {
         if config.network {
             let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
             let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-            let mac_address = deterministic_mac_address(&config.security.session_secret);
+            let mac_address =
+                deterministic_mac_address(config.security.session_secret.expose_secret());
             unsafe {
                 net_config.setAttachment(Some(&nat_attachment));
                 net_config.setMACAddress(&mac_address);
@@ -625,7 +627,7 @@ impl VzBackend {
     }
 
     /// Extract socket device from a running VM and set up the control channel.
-    fn setup_control_channel(&mut self, session_secret: [u8; 32]) {
+    fn setup_control_channel(&mut self, session_secret: SessionSecret) {
         let vm_ref = self.vm.as_ref().unwrap();
         let socket_devices = unsafe { vm_ref.socketDevices() };
         let socket_device = socket_devices.objectAtIndex(0);
@@ -634,7 +636,7 @@ impl VzBackend {
         let socket_device = SendSyncDevice(socket_device);
 
         let connector = Self::build_connector(&socket_device, &self.vz_queue);
-        let control_channel = Arc::new(ControlChannel::new(connector, session_secret));
+        let control_channel = Arc::new(ControlChannel::new(connector, session_secret.clone()));
 
         self.socket_device = Some(socket_device);
         self.control_channel = Some(control_channel);
@@ -779,6 +781,7 @@ impl VzBackend {
 
         let session_secret = self
             .session_secret
+            .as_ref()
             .ok_or_else(|| crate::Error::Backend("no session secret".into()))?;
 
         std::fs::create_dir_all(dir)
@@ -829,7 +832,8 @@ impl VzBackend {
         info!("VzBackend: VM state saved");
 
         let meta = VzSnapshotMeta {
-            session_secret: session_secret.to_vec(),
+            // expose: serializing into snapshot metadata.
+            session_secret: session_secret.expose_secret().to_vec(),
             memory_mb: config_info.memory_mb,
             vcpus: config_info.vcpus,
             network: config_info.network,
@@ -879,10 +883,11 @@ impl VmmBackend for VzBackend {
 
                 // 1. Load sidecar metadata
                 let meta = VzSnapshotMeta::load(snapshot_dir)?;
-                let session_secret: [u8; 32] =
+                let session_secret_bytes: [u8; 32] =
                     meta.session_secret.as_slice().try_into().map_err(|_| {
                         crate::Error::Snapshot("invalid session_secret length in snapshot".into())
                     })?;
+                let session_secret = SessionSecret::new(session_secret_bytes);
 
                 // 2. Build VM configuration (same setup as cold boot).
                 //    Reuse the saved machine identifier so Apple's restore
@@ -1058,7 +1063,7 @@ impl VmmBackend for VzBackend {
                 boot_clock_secs,
             });
             self.machine_identifier = Some(machine_identifier_bytes);
-            self.setup_control_channel(config.security.session_secret);
+            self.setup_control_channel(config.security.session_secret.clone());
 
             Ok(())
         })?;
@@ -1348,7 +1353,7 @@ mod tests {
 
     fn test_security_config() -> BackendSecurityConfig {
         BackendSecurityConfig {
-            session_secret: [7u8; 32],
+            session_secret: SessionSecret::new([7u8; 32]),
             command_allowlist: Vec::new(),
             network_deny_list: Vec::new(),
             max_connections_per_second: 0,

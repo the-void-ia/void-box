@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
+use void_box_protocol::SessionSecret;
 
 use crate::devices::serial::SerialDevice;
 use crate::devices::virtio_9p::Virtio9pDevice;
@@ -257,13 +259,13 @@ impl MicroVm {
                 cold_boot_socket_path = Some(socket_path.clone());
                 Some(Arc::new(VsockDevice::with_unix_socket(
                     cid,
-                    config.security.session_secret,
+                    config.security.session_secret.clone(),
                     socket_path,
                 )?))
             } else {
                 Some(Arc::new(VsockDevice::with_secret(
                     cid,
-                    config.security.session_secret,
+                    config.security.session_secret.clone(),
                 )?))
             }
         } else {
@@ -465,7 +467,7 @@ impl MicroVm {
         let control_channel = vsock.as_ref().map(|device| {
             Arc::new(ControlChannel::with_boot_wait(
                 device.connector(),
-                *device.session_secret(),
+                device.session_secret().clone(),
                 boot_wait,
             ))
         });
@@ -620,11 +622,12 @@ impl MicroVm {
         }
 
         // 6. Re-create VsockDevice with the snapshot's session secret (skip boot wait, AF_UNIX)
-        let session_secret: [u8; 32] = snap
+        let session_secret_bytes: [u8; 32] = snap
             .session_secret
             .as_slice()
             .try_into()
             .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+        let session_secret = SessionSecret::new(session_secret_bytes);
         // Generate a unique runtime ID so multiple restores from the same
         // snapshot don't collide on the socket path.
         let mut id_bytes = [0u8; 4];
@@ -636,7 +639,7 @@ impl MicroVm {
         ));
         let vsock = Arc::new(VsockDevice::with_unix_socket(
             cid,
-            session_secret,
+            session_secret.clone(),
             socket_path.clone(),
         )?);
 
@@ -966,11 +969,12 @@ impl MicroVm {
             .as_ref()
             .map(|dev| dev.lock().unwrap().snapshot_state());
 
-        // 6. Get session secret from vsock device
+        // 6. Get session secret from vsock device.
+        // expose: serializing into snapshot metadata.
         let session_secret = self
             .vsock
             .as_ref()
-            .map(|v| v.session_secret().to_vec())
+            .map(|v| v.session_secret().expose_secret().to_vec())
             .unwrap_or_else(|| vec![0u8; 32]);
 
         // 7. Dump memory

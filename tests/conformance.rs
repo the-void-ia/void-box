@@ -26,6 +26,7 @@ mod vm_preflight;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::sidecar;
+use void_box_protocol::SessionSecret;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,7 +93,7 @@ fn backend_config_with(
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist,
             network_deny_list,
             max_connections_per_second: 50,

@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use void_box_protocol::SessionSecret;
+
 use super::SandboxConfig;
 use crate::backend::{BackendConfig, BackendSecurityConfig, VmmBackend};
 use crate::guest::protocol::TelemetrySubscribeRequest;
@@ -66,8 +68,8 @@ impl LocalSandbox {
             .ok_or_else(|| Error::Config("Kernel path required for local sandbox".into()))?;
 
         // Generate session secret
-        let mut session_secret = [0u8; 32];
-        getrandom::fill(&mut session_secret)
+        let mut session_secret_bytes = [0u8; 32];
+        getrandom::fill(&mut session_secret_bytes)
             .map_err(|e| Error::Config(format!("Failed to generate session secret: {}", e)))?;
 
         let backend_config = BackendConfig {
@@ -86,7 +88,7 @@ impl LocalSandbox {
             oci_rootfs_disk: self.config.oci_rootfs_disk.clone(),
             env: self.config.env.clone(),
             security: BackendSecurityConfig {
-                session_secret,
+                session_secret: SessionSecret::new(session_secret_bytes),
                 command_allowlist: Vec::new(), // Set via provisioning
                 network_deny_list: default_network_deny_list(),
                 max_connections_per_second: DEFAULT_MAX_CONNECTIONS_PER_SECOND,

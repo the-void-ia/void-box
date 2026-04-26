@@ -321,7 +321,7 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
         oci_rootfs_disk: None,
         env: vec![],
         security: void_box::backend::BackendSecurityConfig {
-            session_secret: [0xAB; 32],
+            session_secret: void_box_protocol::SessionSecret::new([0xAB; 32]),
             command_allowlist: vec![],
             network_deny_list: vec![],
             max_connections_per_second: 50,

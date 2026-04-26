@@ -25,6 +25,7 @@ use void_box::backend::vz::snapshot::VzSnapshotMeta;
 use void_box::backend::vz::VzBackend;
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::snapshot_store;
+use void_box_protocol::SessionSecret;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +66,7 @@ fn backend_config() -> Option<BackendConfig> {
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist: vec!["echo".into(), "sh".into()],
             network_deny_list: vec![],
             max_connections_per_second: 50,
@@ -160,7 +161,7 @@ async fn snapshot_vz_round_trip() {
     restore_cfg.snapshot = Some(snap_dir.path().to_path_buf());
     // Use the session secret from the snapshot sidecar
     let secret: [u8; 32] = meta.session_secret.as_slice().try_into().unwrap();
-    restore_cfg.security.session_secret = secret;
+    restore_cfg.security.session_secret = SessionSecret::new(secret);
 
     restored.start(restore_cfg).await.expect("restore failed");
     let restore_time = restore_start.elapsed();
@@ -307,7 +308,8 @@ async fn snapshot_vz_restore_overrides_drifting_config() {
     restore_cfg.network = true;
     restore_cfg.memory_mb = meta.memory_mb + 128;
     restore_cfg.vcpus = meta.vcpus + 1;
-    restore_cfg.security.session_secret = meta.session_secret.as_slice().try_into().unwrap();
+    let restore_secret_bytes: [u8; 32] = meta.session_secret.as_slice().try_into().unwrap();
+    restore_cfg.security.session_secret = SessionSecret::new(restore_secret_bytes);
 
     let mut restored = VzBackend::new();
     restored

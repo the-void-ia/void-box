@@ -22,6 +22,7 @@ use std::path::PathBuf;
 mod vm_preflight;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
+use void_box_protocol::SessionSecret;
 
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
 const CONCURRENT_EXEC_COUNT: usize = 16;
@@ -89,7 +90,7 @@ fn backend_config() -> Option<BackendConfig> {
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist: vec!["sh".into(), "echo".into()],
             network_deny_list: vec![],
             max_connections_per_second: 200,
