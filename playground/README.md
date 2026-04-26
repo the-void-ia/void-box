@@ -11,11 +11,11 @@ OTLP to Grafana Tempo and Prometheus.
 
 **Trace waterfall (Grafana Tempo)**
 
-![Trace waterfall in Grafana Tempo](../site/assets/img/void-box-tracing-3.png)
+![Trace waterfall in Grafana Tempo](../assets/void-box-tracing-3.png)
 
 **Pipeline stage metrics (Prometheus)**
 
-![Pipeline metrics in Prometheus](../site/assets/img/void-box-metrics.png)
+![Pipeline metrics in Prometheus](../assets/void-box-metrics.png)
 
 ## Prerequisites
 

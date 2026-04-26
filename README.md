@@ -40,7 +40,7 @@
 > **Status:** v0.1. Vendor-neutral agent runtime with hardware-isolated execution. APIs stabilizing.
 
 <p align="center">
-  <img src="site/assets/img/hn_demo.gif" alt="hn_demo — two-stage stock analysis pipeline" width="800">
+  <img src="assets/hn_demo.gif" alt="hn_demo — two-stage stock analysis pipeline" width="800">
 </p>
 
 ---
@@ -105,8 +105,8 @@ Use the matching `.rpm` name from [Releases](https://github.com/the-void-ia/void
 
 | | |
 |---|---|
-| **[Getting Started](https://the-void-ia.github.io/void-box/guides/getting-started/)** | First run, environment variables, API keys |
-| **[Install (site)](https://the-void-ia.github.io/void-box/)** | Copy-paste install block and direct tarball links |
+| **[Getting Started](https://voidplatform.ai/docs/getting-started/)** | First run, environment variables, API keys |
+| **[Install (site)](https://voidplatform.ai/docs/installation/)** | Copy-paste install block and direct tarball links |
 
 If you use Rust already, you can also `cargo install void-box` for the CLI only — pair it with kernel and initramfs from a [release tarball](https://github.com/the-void-ia/void-box/releases) or another install method above.
 
