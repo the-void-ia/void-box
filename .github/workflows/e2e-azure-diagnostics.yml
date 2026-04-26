@@ -48,6 +48,10 @@ env:
   # bounded.
   RUST_LOG: void_box=trace,debug
   VOID_BOX_DIAGNOSTIC: "1"
+  # `inputs.tests` is null on `push` events (input defaults only apply to
+  # `workflow_dispatch`), so capture an effective value here and use it in
+  # every step `if:` below.
+  TESTS_FILTER: ${{ inputs.tests || 'all' }}
 
 jobs:
   diagnostics:
@@ -120,7 +124,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run persistent_channel
-        if: ${{ inputs.tests == 'all' || contains(inputs.tests, 'persistent_channel') }}
+        if: ${{ env.TESTS_FILTER == 'all' || contains(env.TESTS_FILTER, 'persistent_channel') }}
         # Diagnostic-only: the suite is expected to fail on Azure. We surface
         # the failure as a job warning and continue so subsequent suites also
         # run and produce their own artifacts.
@@ -135,7 +139,7 @@ jobs:
             2>&1 | tee /tmp/persistent_channel-test.log
 
       - name: Run pty_nonzero_exit_code
-        if: ${{ inputs.tests == 'all' || contains(inputs.tests, 'pty') }}
+        if: ${{ env.TESTS_FILTER == 'all' || contains(env.TESTS_FILTER, 'pty') }}
         continue-on-error: true
         run: |
           if [ ! -e /dev/vhost-vsock ]; then
@@ -148,7 +152,7 @@ jobs:
             2>&1 | tee /tmp/pty-test.log
 
       - name: Run snapshot_integration (failing subset)
-        if: ${{ inputs.tests == 'all' || contains(inputs.tests, 'snapshot') }}
+        if: ${{ env.TESTS_FILTER == 'all' || contains(env.TESTS_FILTER, 'snapshot') }}
         continue-on-error: true
         # Stick to the four tests the disable-commit explicitly listed plus
         # `snapshot_cold_boot_vs_restore` (the one that hung last time). Any
