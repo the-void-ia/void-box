@@ -786,6 +786,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "subtle",
  "void-box-protocol",
 ]
 

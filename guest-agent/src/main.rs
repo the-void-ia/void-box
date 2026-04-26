@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 // Import shared wire-format types from the protocol crate (single source of truth).
 use void_box_protocol::{
@@ -299,6 +300,16 @@ pub(crate) fn kmsg_emerg(msg: &str) {
         use std::io::Write;
         let _ = writeln!(f, "<0>guest-agent: {}", msg);
     }
+}
+
+/// Constant-time equality check between a peer-supplied secret slice and the
+/// expected 32-byte session secret.
+///
+/// `subtle::ConstantTimeEq` does not branch on byte position, so a mismatch in
+/// the last byte takes the same time as a mismatch in the first byte; a
+/// short-circuit `memcmp` would not.
+fn session_secret_matches(peer_secret: &[u8], expected_secret: &[u8; 32]) -> bool {
+    peer_secret.ct_eq(&expected_secret[..]).into()
 }
 
 /// Parse the session secret from `/proc/cmdline` (`voidbox.secret=HEX`).
@@ -2074,7 +2085,7 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                         return Err("Authentication failed: malformed Ping payload".into());
                     };
 
-                    if peer_secret != &expected_secret[..] {
+                    if !session_secret_matches(peer_secret, expected_secret) {
                         eprintln!("Authentication failed: invalid secret");
                         return Err("Authentication failed: invalid session secret".into());
                     }
@@ -3430,5 +3441,40 @@ mod tests {
         // Verify the diagnostic dump runs without panicking.
         // On a dev machine it will log "unreadable" for most sysfs paths.
         dump_mount_diagnostics("mount0", "/nonexistent/path");
+    }
+
+    #[test]
+    fn test_session_secret_matches_accepts_correct_secret() {
+        let expected = [0xABu8; 32];
+        assert!(session_secret_matches(&expected, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_wrong_secret() {
+        let expected = [0xABu8; 32];
+        let mut wrong = expected;
+        wrong[0] ^= 0xFF;
+        assert!(!session_secret_matches(&wrong, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_last_byte_mismatch() {
+        // Differ only in the final byte: a short-circuit memcmp would fall
+        // through 31 equal bytes before rejecting, which a constant-time
+        // compare must not. The functional assertion is rejection; the
+        // timing property is structural (delegated to subtle::ConstantTimeEq).
+        let expected = [0xABu8; 32];
+        let mut wrong = expected;
+        wrong[31] ^= 0x01;
+        assert!(!session_secret_matches(&wrong, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_wrong_length() {
+        let expected = [0xABu8; 32];
+        let too_short = [0xABu8; 31];
+        let too_long = [0xABu8; 33];
+        assert!(!session_secret_matches(&too_short, &expected));
+        assert!(!session_secret_matches(&too_long, &expected));
     }
 }
