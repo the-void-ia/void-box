@@ -58,11 +58,15 @@ jobs:
           sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
           # Ensure kernel modules are available for the running kernel
           sudo apt-get install -y -qq linux-modules-$(uname -r) || true
-          # `scripts/lib/agent_rootfs_common.sh::setup_busybox` defaults
-          # BUSYBOX to /usr/bin/busybox; Ubuntu's busybox-static lands
-          # the multi-call binary at /bin/busybox. Symlink so the
-          # default lookup succeeds without env-var plumbing.
-          [ -e /usr/bin/busybox ] || sudo ln -sf /bin/busybox /usr/bin/busybox
+          # Resolve the installed busybox path and export it so the build
+          # step (and any future step) gets `BUSYBOX=<actual path>` from
+          # the workflow env. Avoids mutating system paths via symlinks
+          # and works regardless of whether the package lands the binary
+          # at /bin/busybox or /usr/bin/busybox.
+          BUSYBOX_PATH="$(command -v busybox)"
+          test -n "$BUSYBOX_PATH" \
+            || { echo "::error::busybox not on PATH after busybox-static install"; exit 1; }
+          echo "BUSYBOX=$BUSYBOX_PATH" >> "$GITHUB_ENV"
 
       # ---- Rust toolchain ----
       - name: Install Rust stable + musl target
@@ -86,10 +90,11 @@ jobs:
       - name: Build test initramfs (guest-agent + claudio)
         # `install_busybox` (scripts/lib/guest_common.sh) requires the
         # BUSYBOX env var to be set — file existence alone is not
-        # enough. Without this the build silently produces an
-        # initramfs with no `/bin/sh`, see commit 004190b.
-        env:
-          BUSYBOX: /usr/bin/busybox
+        # enough. Without it the build silently produces an initramfs
+        # with no `/bin/sh`, see commit 004190b. The earlier
+        # "Install system packages" step writes BUSYBOX=$(command -v
+        # busybox) to $GITHUB_ENV so this step inherits the resolved
+        # path automatically.
         run: scripts/build_test_image.sh
 
       # ---- Unit + integration tests ----
@@ -154,12 +159,17 @@ jobs:
             -- --ignored --test-threads=1
 
       - name: Run snapshot integration tests
-        env:
-          VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
-          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        # `KERNEL_VERSION` is not defined in this workflow, so a literal
+        # `env: VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}`
+        # would expand to `/boot/vmlinuz-` and force the run body to
+        # override it anyway. Set everything in the run body via
+        # `uname -r` and skip the dead env: block.
         run: |
           KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
-          if [ -f "$KERNEL_COPY" ]; then
-            export VOID_BOX_KERNEL="$KERNEL_COPY"
+          if [ ! -f "$KERNEL_COPY" ]; then
+            echo "::error::expected kernel copy at $KERNEL_COPY (staged by 'Run E2E KVM tests' step)"
+            exit 1
           fi
+          export VOID_BOX_KERNEL="$KERNEL_COPY"
+          export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
           cargo test --test snapshot_integration -- --ignored --test-threads=1

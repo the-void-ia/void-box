@@ -64,9 +64,17 @@ fn backend_config() -> Option<BackendConfig> {
     // the Azure-CI handshake-deadline failure leaves a host-readable trail
     // ("did the guest kernel boot? did guest-agent reach vsock bind?"). The
     // file path is stable so the CI workflow can upload it as an artifact.
+    //
+    // `GuestConsoleSink::File` opens the file in append mode (see
+    // `src/backend/kvm.rs::open_guest_console_file`), which would let stale
+    // output from a previous run accumulate and confuse later captures.
+    // Truncate the path here so each test invocation starts with a fresh log.
     let console = if matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1")) {
         let path = std::env::var("VOID_BOX_DIAGNOSTIC_CONSOLE_PATH")
             .unwrap_or_else(|_| "/tmp/void-box-persistent-channel-console.log".to_string());
+        if let Err(e) = std::fs::File::create(&path) {
+            eprintln!("persistent_channel: failed to truncate console log {path}: {e}");
+        }
         eprintln!("persistent_channel: routing guest console to {path}");
         GuestConsoleSink::File(PathBuf::from(path))
     } else {

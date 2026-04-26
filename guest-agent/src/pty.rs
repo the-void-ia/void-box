@@ -227,7 +227,6 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
     }
     argv_ptrs.push(std::ptr::null());
 
-    let path_for_log = std::env::var("PATH").unwrap_or_default();
     unsafe {
         libc::execvp(program_c.as_ptr(), argv_ptrs.as_ptr());
         // execvp returned — that only happens on failure. Capture errno
@@ -236,14 +235,20 @@ fn run_pty_child(request: &PtyOpenRequest) -> ! {
         // flake (Azure nested-virt only). KERN_EMERG so the message
         // bypasses the guest kernel's `loglevel=0` filter and reaches
         // ttyS0.
+        //
+        // Deliberately minimal payload: program name (needed to identify
+        // the failing exec), arg count (lets us tell apart wrong-shape
+        // calls from missing-binary), errno + raw_os_error (the actual
+        // reason). The full args and PATH are NOT logged — args may
+        // carry user-supplied secrets (e.g. API keys passed as flags),
+        // and the host serial console may be archived as an artifact.
         let err = io::Error::last_os_error();
         kmsg_emerg(&format!(
-            "PTY child: execvp({:?}, {:?}) failed: {} (raw_os_error={:?}); PATH={:?}; _exit(127)",
+            "PTY child: execvp({:?}, argc={}) failed: {} (raw_os_error={:?}); _exit(127)",
             request.program,
-            request.args,
+            request.args.len(),
             err,
             err.raw_os_error(),
-            path_for_log,
         ));
         libc::_exit(127);
     }

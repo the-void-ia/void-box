@@ -85,21 +85,40 @@ pub(crate) fn diagnostic_mode() -> bool {
     matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1"))
 }
 
-/// Helper used by the snapshot tests: under `diagnostic_mode()` it panics with
-/// full context, otherwise it just `eprintln!`s and returns `None` so the test
-/// gracefully ends. The macro-shaped name keeps call sites short.
+/// Format an error and its `source()` chain, one cause per line.
+///
+/// `Display` on a thiserror-derived `void_box::Error` shows only the top
+/// message; the underlying I/O / vsock / serde context lives behind
+/// `source()`. The diagnostic path needs every layer to be useful.
 #[allow(dead_code)]
-pub(crate) fn diag_or_skip<T, E: std::fmt::Display>(
-    label: &str,
-    result: Result<T, E>,
-) -> Option<T> {
+fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str("\n    caused by: ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Helper used by the snapshot tests: under `diagnostic_mode()` it panics with
+/// the full error chain (top message + every `source()`), otherwise it just
+/// `eprintln!`s and returns `None` so the test gracefully ends. The
+/// macro-shaped name keeps call sites short.
+#[allow(dead_code)]
+pub(crate) fn diag_or_skip<T, E>(label: &str, result: Result<T, E>) -> Option<T>
+where
+    E: std::error::Error + 'static,
+{
     match result {
         Ok(v) => Some(v),
         Err(e) => {
+            let chain = format_error_chain(&e);
             if diagnostic_mode() {
-                panic!("[{label}] failed under VOID_BOX_DIAGNOSTIC=1: {e}");
+                panic!("[{label}] failed under VOID_BOX_DIAGNOSTIC=1: {chain}");
             }
-            eprintln!("  {label}: {e}");
+            eprintln!("  {label}: {chain}");
             None
         }
     }
