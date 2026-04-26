@@ -293,7 +293,7 @@ pub(crate) fn kmsg(msg: &str) {
 /// to the host (e.g. PTY child execvp errno before `_exit(127)`). Normal
 /// progress/lifecycle logs should stick to [`kmsg`] so they do not flood
 /// production runs. See `src/vmm/config.rs::kernel_cmdline` for the loglevel
-/// pin and `.github/workflows/e2e-azure-diagnostics.yml` for the consumer.
+/// pin.
 pub(crate) fn kmsg_emerg(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
         use std::io::Write;
