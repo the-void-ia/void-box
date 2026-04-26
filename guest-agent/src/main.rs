@@ -287,6 +287,20 @@ pub(crate) fn kmsg(msg: &str) {
     }
 }
 
+/// Writes a message to /dev/kmsg at `KERN_EMERG` (priority `<0>`) so it
+/// bypasses the guest kernel's `loglevel=0` cmdline filter and lands on the
+/// serial console. Use only for failure-path diagnostics that must be visible
+/// to the host (e.g. PTY child execvp errno before `_exit(127)`). Normal
+/// progress/lifecycle logs should stick to [`kmsg`] so they do not flood
+/// production runs. See `src/vmm/config.rs::kernel_cmdline` for the loglevel
+/// pin and `.github/workflows/e2e-azure-diagnostics.yml` for the consumer.
+pub(crate) fn kmsg_emerg(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        use std::io::Write;
+        let _ = writeln!(f, "<0>guest-agent: {}", msg);
+    }
+}
+
 /// Parse the session secret from `/proc/cmdline` (`voidbox.secret=HEX`).
 fn parse_session_secret() -> Option<[u8; 32]> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;

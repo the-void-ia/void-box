@@ -84,8 +84,13 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools
+          # busybox-static: see e2e.yml for the full rationale. Without
+          # it the test initramfs ships without `/bin/sh`+`ip`, which is
+          # the actual root cause of the "Azure-only flakiness" the
+          # disabled tests were chasing.
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
           sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          [ -e /usr/bin/busybox ] || sudo ln -sf /bin/busybox /usr/bin/busybox
 
       - name: Install Rust stable + musl target
         uses: dtolnay/rust-toolchain@stable

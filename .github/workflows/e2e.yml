@@ -43,9 +43,26 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools
+          # busybox-static is REQUIRED — `scripts/build_test_image.sh`
+          # silently builds an initramfs with no `/bin/sh` when BUSYBOX
+          # is unset (see `scripts/lib/guest_common.sh::install_busybox`).
+          # Guests without `/bin/sh`+`ip` fail in two ways:
+          #   - `Command::new("ip")` from guest-agent's setup_network()
+          #     hangs PID 1 (see AGENTS.md "Known issues" — vsock
+          #     control-channel timeout) → persistent_channel handshake
+          #     deadline.
+          #   - `vm.exec("echo", …)` returns ENOENT in the guest agent
+          #     → snapshot suite asserts fail, pty `sh -c "exit 42"`
+          #     hits the execvp(127) child path.
+          # All three failures share this single missing dep.
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
           # Ensure kernel modules are available for the running kernel
           sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          # `scripts/lib/agent_rootfs_common.sh::setup_busybox` defaults
+          # BUSYBOX to /usr/bin/busybox; Ubuntu's busybox-static lands
+          # the multi-call binary at /bin/busybox. Symlink so the
+          # default lookup succeeds without env-var plumbing.
+          [ -e /usr/bin/busybox ] || sudo ln -sf /bin/busybox /usr/bin/busybox
 
       # ---- Rust toolchain ----
       - name: Install Rust stable + musl target
