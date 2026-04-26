@@ -111,6 +111,10 @@ jobs:
             ${{ runner.os }}-e2e-azure-diag-
 
       - name: Build test initramfs (guest-agent + claudio)
+        # `install_busybox` (scripts/lib/guest_common.sh) requires
+        # `BUSYBOX` to be exported — see e2e.yml for the full rationale.
+        env:
+          BUSYBOX: /usr/bin/busybox
         run: scripts/build_test_image.sh
 
       - name: Stage kernel and initramfs

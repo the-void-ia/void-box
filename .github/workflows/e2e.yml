@@ -84,6 +84,12 @@ jobs:
 
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
+        # `install_busybox` (scripts/lib/guest_common.sh) requires the
+        # BUSYBOX env var to be set — file existence alone is not
+        # enough. Without this the build silently produces an
+        # initramfs with no `/bin/sh`, see commit 004190b.
+        env:
+          BUSYBOX: /usr/bin/busybox
         run: scripts/build_test_image.sh
 
       # ---- Unit + integration tests ----
