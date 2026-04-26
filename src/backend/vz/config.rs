@@ -38,7 +38,7 @@ pub fn build_kernel_cmdline_with_clock(config: &BackendConfig, epoch_secs: u64) 
     // overlays it with a tmpfs upper layer. See AGENTS.md for details.
     append_common_guest_kernel_args(
         &mut parts,
-        &config.security.session_secret,
+        config.security.session_secret.expose_secret(),
         epoch_secs,
         config.network,
         true,
@@ -60,6 +60,7 @@ mod tests {
     use super::*;
     use crate::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
     use std::path::PathBuf;
+    use void_box_protocol::SessionSecret;
 
     const TEST_CLOCK_SECS: u64 = 1_700_000_000;
 
@@ -80,7 +81,7 @@ mod tests {
             oci_rootfs_disk: None,
             env: vec![],
             security: BackendSecurityConfig {
-                session_secret: [0xAB; 32],
+                session_secret: SessionSecret::new([0xAB; 32]),
                 command_allowlist: vec![],
                 network_deny_list: vec![],
                 max_connections_per_second: 50,

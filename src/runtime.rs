@@ -1352,8 +1352,8 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
 fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredentials>> {
     match llm {
         Some(l) if l.provider.eq_ignore_ascii_case("claude-personal") => {
-            let json = crate::credentials::discover_oauth_credentials()?;
-            Ok(Some(crate::credentials::stage_credentials(&json)?))
+            let secret_json = crate::credentials::discover_oauth_credentials()?;
+            Ok(Some(crate::credentials::stage_credentials(&secret_json)?))
         }
         _ => Ok(None),
     }
@@ -1373,7 +1373,7 @@ fn prepare_codex(llm: Option<&LlmSpec>) -> Option<StagedCredentials> {
         return None;
     }
     match crate::credentials::discover_codex_credentials() {
-        Ok(json) => match crate::credentials::stage_codex_credentials(&json) {
+        Ok(secret_json) => match crate::credentials::stage_codex_credentials(&secret_json) {
             Ok(staged) => Some(staged),
             Err(e) => {
                 tracing::warn!("Failed to stage codex credentials: {}", e);

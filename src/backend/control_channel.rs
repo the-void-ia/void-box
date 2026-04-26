@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
+use void_box_protocol::SessionSecret;
 
 use crate::backend::multiplex::{FrameSender, MultiplexChannel, Terminator};
 use crate::guest::protocol::{
@@ -136,7 +137,7 @@ pub struct ControlChannel {
     /// Factory for creating new guest connections.
     connector: GuestConnector,
     /// 32-byte session secret for authentication.
-    session_secret: [u8; 32],
+    session_secret: SessionSecret,
     /// Whether the initial boot wait has been applied.
     boot_wait_done: Arc<AtomicBool>,
     /// Cold-boot wait applied once before the first connect attempt.
@@ -156,7 +157,7 @@ impl ControlChannel {
     /// Equivalent to [`Self::with_boot_wait`] with `boot_wait =
     /// Duration::ZERO`. Appropriate for userspace-vsock connectors
     /// where connect is buffered against guest readiness.
-    pub fn new(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
+    pub fn new(connector: GuestConnector, session_secret: SessionSecret) -> Self {
         Self::with_boot_wait(connector, session_secret, Duration::ZERO)
     }
 
@@ -168,7 +169,7 @@ impl ControlChannel {
     /// before the host's first `libc::connect` reaches the driver.
     pub fn with_boot_wait(
         connector: GuestConnector,
-        session_secret: [u8; 32],
+        session_secret: SessionSecret,
         boot_wait: Duration,
     ) -> Self {
         Self {
@@ -181,7 +182,7 @@ impl ControlChannel {
     }
 
     /// Creates a control channel for a restored VM (skips the boot wait).
-    pub fn new_restored(connector: GuestConnector, session_secret: [u8; 32]) -> Self {
+    pub fn new_restored(connector: GuestConnector, session_secret: SessionSecret) -> Self {
         Self {
             connector,
             session_secret,
@@ -237,7 +238,7 @@ impl ControlChannel {
         }
 
         let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
+        let session_secret = self.session_secret.clone();
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
         let boot_wait = self.boot_wait;
 
@@ -558,7 +559,7 @@ impl ControlChannel {
         request: PtyOpenRequest,
     ) -> Result<super::pty_session::PtySession> {
         let connector = Arc::clone(&self.connector);
-        let session_secret = self.session_secret;
+        let session_secret = self.session_secret.clone();
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
         tokio::task::spawn_blocking(move || {
             super::pty_session::PtySession::open(
@@ -579,7 +580,7 @@ impl ControlChannel {
 /// Uses [`std::thread::sleep`] for backoff delays (not `tokio::time::sleep`).
 pub(crate) fn connect_with_handshake_sync(
     connector: &GuestConnector,
-    session_secret: &[u8; 32],
+    session_secret: &SessionSecret,
     boot_wait_done: &AtomicBool,
     boot_wait: Duration,
     handshake_timeout: Duration,
@@ -658,7 +659,7 @@ pub(crate) fn connect_with_handshake_sync(
         let ping_msg = Message {
             msg_type: MessageType::Ping,
             payload: void_box_protocol::build_ping_payload(
-                session_secret,
+                session_secret.expose_secret(),
                 void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX,
             ),
         };
@@ -727,7 +728,7 @@ pub(crate) fn connect_with_handshake_sync(
 /// split read/write halves fails.
 pub(crate) fn establish_multiplex_channel(
     connector: &GuestConnector,
-    session_secret: &[u8; 32],
+    session_secret: &SessionSecret,
     boot_wait_done: &AtomicBool,
     boot_wait: Duration,
     handshake_timeout: Duration,

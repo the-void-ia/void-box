@@ -121,6 +121,8 @@ pub struct VmSnapshot {
     /// Base | Diff.
     pub snapshot_type: SnapshotType,
     /// Session secret that the guest-agent expects (from kernel cmdline).
+    /// Stored as raw bytes because the snapshot is serialized to disk via
+    /// postcard; in-memory holders use `void_box_protocol::SessionSecret`.
     pub session_secret: Vec<u8>,
     /// Virtio-net device state (None if networking was disabled).
     #[serde(default)]

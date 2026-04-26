@@ -37,10 +37,42 @@
 //! # }
 //! ```
 
+use secrecy::{ExposeSecret, SecretString};
+
 /// The guest binary name for Claude Code and all Claude-compatible
 /// providers (Ollama, LmStudio, Custom, ClaudePersonal). These all route
 /// through the same Bun-built `claude-code` binary via `ANTHROPIC_BASE_URL`.
 const CLAUDE_CODE_BINARY: &str = "claude-code";
+
+/// API key for a Custom LLM provider, wrapped to enforce explicit access
+/// (`expose_secret()`) and auto-redact in `Debug`/`Display`.
+pub struct ApiKey(SecretString);
+
+impl ApiKey {
+    /// Wraps a string as an API key. Accepts anything `Into<String>` so call
+    /// sites stay short.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(SecretString::from(key.into()))
+    }
+
+    /// Borrows the underlying string. Audit point for "this code is
+    /// intentionally exposing the key".
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl Clone for ApiKey {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ApiKey([REDACTED])")
+    }
+}
 
 /// LLM backend provider for an [`VoidBox`](crate::agent_box::VoidBox).
 ///
@@ -98,7 +130,7 @@ pub enum LlmProvider {
         /// Base URL of the API (e.g. `"https://openrouter.ai/api/v1"`).
         base_url: String,
         /// API key (optional for local services).
-        api_key: Option<String>,
+        api_key: Option<ApiKey>,
         /// Model name override.
         model: Option<String>,
     },
@@ -197,7 +229,7 @@ impl LlmProvider {
             ref mut api_key, ..
         } = self
         {
-            *api_key = Some(key.into());
+            *api_key = Some(ApiKey::new(key));
         }
         self
     }
@@ -439,7 +471,7 @@ impl LlmProvider {
                     ("HOME".into(), "/home/sandbox".into()),
                 ];
                 if let Some(key) = api_key {
-                    vars.push(("ANTHROPIC_API_KEY".into(), key.clone()));
+                    vars.push(("ANTHROPIC_API_KEY".into(), key.expose_secret().to_string()));
                 }
                 vars
             }
@@ -863,5 +895,32 @@ mod tests {
         assert_eq!(LlmProvider::ollama("x").image_flavor(), "claude");
         assert_eq!(LlmProvider::lm_studio("x").image_flavor(), "claude");
         assert_eq!(LlmProvider::custom("x").image_flavor(), "claude");
+    }
+
+    /// `format!("{:?}", LlmProvider::Custom { api_key: Some(...) })` must not
+    /// contain the API key in plaintext. Uses a known-distinctive value so the
+    /// substring search is unambiguous against any future formatter quirks.
+    #[test]
+    fn debug_of_llm_provider_custom_redacts_api_key() {
+        const SENTINEL: &str = "super-secret-12345";
+        let provider = LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: Some(ApiKey::new(SENTINEL)),
+            model: Some("test-model".into()),
+        };
+        let rendered = format!("{:?}", provider);
+        assert!(
+            !rendered.contains(SENTINEL),
+            "Debug leaked api_key: {rendered}"
+        );
+        assert!(
+            rendered.contains("REDACTED"),
+            "Debug should mark api_key as REDACTED: {rendered}"
+        );
+        // Sanity: non-secret fields still surface.
+        assert!(
+            rendered.contains("example.test"),
+            "Debug must still print non-secret fields: {rendered}"
+        );
     }
 }

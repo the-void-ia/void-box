@@ -229,6 +229,7 @@ async fn real_claude_uses_void_mcp_tools() {
 #[ignore = "requires VM backend + kernel/initramfs"]
 async fn diagnostic_void_mcp_starts_in_guest() {
     use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
+    use void_box_protocol::SessionSecret;
 
     if vm_preflight::require_kvm_usable().is_err() {
         eprintln!("skipping: VM backend not available");
@@ -279,7 +280,7 @@ async fn diagnostic_void_mcp_starts_in_guest() {
         oci_rootfs_disk: None,
         env: vec![],
         security: BackendSecurityConfig {
-            session_secret: secret,
+            session_secret: SessionSecret::new(secret),
             command_allowlist: vec!["sh".into(), "void-mcp".into(), "echo".into(), "cat".into()],
             network_deny_list: vec!["169.254.0.0/16".into()],
             max_connections_per_second: 50,

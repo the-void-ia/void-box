@@ -31,6 +31,8 @@ const VZ_META_FILE: &str = "vz_meta.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VzSnapshotMeta {
     /// 32-byte session secret (hex-encoded for JSON safety).
+    /// Stored as raw bytes because the sidecar is serialized to disk as JSON;
+    /// in-memory holders use `void_box_protocol::SessionSecret`.
     pub session_secret: Vec<u8>,
     /// Memory size in megabytes.
     pub memory_mb: usize,

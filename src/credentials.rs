@@ -17,6 +17,7 @@
 //! whose `Drop` impl removes the directory when the value goes out of scope.
 
 use crate::{Error, Result};
+use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 
 /// Staged credentials ready to be mounted into the guest VM.
@@ -34,9 +35,9 @@ pub struct StagedCredentials {
 /// - **macOS**: reads from the system Keychain via `security find-generic-password`.
 /// - **Linux**: reads `~/.claude/.credentials.json`.
 ///
-/// Returns the raw JSON string on success, or a user-friendly error directing
-/// the user to run `claude auth login`.
-pub fn discover_oauth_credentials() -> Result<String> {
+/// Returns the raw JSON wrapped in [`SecretString`] on success, or a
+/// user-friendly error directing the user to run `claude auth login`.
+pub fn discover_oauth_credentials() -> Result<SecretString> {
     #[cfg(target_os = "macos")]
     {
         discover_macos()
@@ -48,7 +49,7 @@ pub fn discover_oauth_credentials() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn discover_macos() -> Result<String> {
+fn discover_macos() -> Result<SecretString> {
     let user = std::env::var("USER").map_err(|_| {
         Error::Config("cannot determine current user (USER env var not set)".into())
     })?;
@@ -79,11 +80,11 @@ fn discover_macos() -> Result<String> {
         .to_string();
 
     validate_credentials_json(&json)?;
-    Ok(json)
+    Ok(SecretString::from(json))
 }
 
 #[cfg(target_os = "linux")]
-fn discover_linux() -> Result<String> {
+fn discover_linux() -> Result<SecretString> {
     let home = std::env::var("HOME").map_err(|_| {
         Error::Config("HOME not set; cannot locate ~/.claude/.credentials.json".into())
     })?;
@@ -98,7 +99,7 @@ fn discover_linux() -> Result<String> {
     })?;
 
     validate_credentials_json(&json)?;
-    Ok(json)
+    Ok(SecretString::from(json))
 }
 
 /// Light validation: parse as JSON and check for the expected top-level key.
@@ -120,14 +121,15 @@ fn validate_credentials_json(json: &str) -> Result<()> {
 /// Creates a temp directory with a `.credentials.json` file (0600 permissions).
 /// The returned [`StagedCredentials`] holds the directory alive; dropping it
 /// removes the staged files.
-pub fn stage_credentials(creds_json: &str) -> Result<StagedCredentials> {
+pub fn stage_credentials(creds_json: &SecretString) -> Result<StagedCredentials> {
     let dir = tempfile::Builder::new()
         .prefix("voidbox-claude-creds-")
         .tempdir()
         .map_err(|e| Error::Config(format!("failed to create temp dir for credentials: {e}")))?;
 
     let creds_path = dir.path().join(".credentials.json");
-    fs::write(&creds_path, creds_json)
+    // expose: writing the OAuth JSON to the staged 0600 file.
+    fs::write(&creds_path, creds_json.expose_secret())
         .map_err(|e| Error::Config(format!("failed to write credentials file: {e}")))?;
 
     #[cfg(unix)]
@@ -153,8 +155,8 @@ pub fn stage_credentials(creds_json: &str) -> Result<StagedCredentials> {
 /// Codex stores credentials as plain JSON at `~/.codex/auth.json` on both
 /// Linux and macOS — there is no Keychain integration. The file contains
 /// the OAuth tokens (when authenticated via `codex login`) and/or a stored
-/// API key. Returns the raw JSON string on success.
-pub fn discover_codex_credentials() -> Result<String> {
+/// API key. Returns the raw JSON wrapped in [`SecretString`] on success.
+pub fn discover_codex_credentials() -> Result<SecretString> {
     let home = std::env::var("HOME")
         .map_err(|_| Error::Config("HOME not set; cannot locate ~/.codex/auth.json".into()))?;
     let path = std::path::Path::new(&home).join(".codex/auth.json");
@@ -168,7 +170,7 @@ pub fn discover_codex_credentials() -> Result<String> {
     })?;
 
     validate_codex_credentials_json(&json)?;
-    Ok(json)
+    Ok(SecretString::from(json))
 }
 
 /// Light validation: parse as JSON and check for the expected `auth_mode` key.
@@ -191,14 +193,15 @@ fn validate_codex_credentials_json(json: &str) -> Result<()> {
 /// returned [`StagedCredentials`] holds the directory alive; dropping it
 /// removes the staged file. Mount the temp dir at `/home/sandbox/.codex`
 /// in the guest.
-pub fn stage_codex_credentials(creds_json: &str) -> Result<StagedCredentials> {
+pub fn stage_codex_credentials(creds_json: &SecretString) -> Result<StagedCredentials> {
     let dir = tempfile::Builder::new()
         .prefix("voidbox-codex-creds-")
         .tempdir()
         .map_err(|e| Error::Config(format!("failed to create temp dir for codex creds: {e}")))?;
 
     let auth_path = dir.path().join("auth.json");
-    fs::write(&auth_path, creds_json)
+    // expose: writing the OAuth JSON to the staged 0600 file.
+    fs::write(&auth_path, creds_json.expose_secret())
         .map_err(|e| Error::Config(format!("failed to write codex auth.json: {e}")))?;
 
     #[cfg(unix)]
@@ -248,7 +251,7 @@ mod tests {
     #[test]
     fn test_stage_credentials() {
         let json = r#"{"claudeAiOauth":{"accessToken":"tok"}}"#;
-        let staged = stage_credentials(json).unwrap();
+        let staged = stage_credentials(&SecretString::from(json)).unwrap();
 
         let creds_path = Path::new(&staged.host_path).join(".credentials.json");
         assert!(creds_path.exists());
@@ -294,7 +297,7 @@ mod tests {
     #[test]
     fn test_stage_codex_credentials() {
         let json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok"}}"#;
-        let staged = stage_codex_credentials(json).unwrap();
+        let staged = stage_codex_credentials(&SecretString::from(json)).unwrap();
 
         let auth_path = Path::new(&staged.host_path).join("auth.json");
         assert!(auth_path.exists());
@@ -315,7 +318,7 @@ mod tests {
         let json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok"}}"#;
         let path;
         {
-            let staged = stage_codex_credentials(json).unwrap();
+            let staged = stage_codex_credentials(&SecretString::from(json)).unwrap();
             path = staged.host_path.clone();
             assert!(Path::new(&path).exists());
         }
@@ -327,7 +330,7 @@ mod tests {
         let json = r#"{"claudeAiOauth":{"accessToken":"tok"}}"#;
         let path;
         {
-            let staged = stage_credentials(json).unwrap();
+            let staged = stage_credentials(&SecretString::from(json)).unwrap();
             path = staged.host_path.clone();
             assert!(Path::new(&path).exists());
         }

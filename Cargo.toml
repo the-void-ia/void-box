@@ -63,6 +63,7 @@ byteorder = "1"
 sha2 = "0.10"
 indicatif = "0.18"
 tempfile = "3"
+secrecy = { workspace = true }
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -184,6 +185,11 @@ path = "src/bin/voidbox-rpc-bench/main.rs"
 
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]
+
+[workspace.dependencies]
+# Wrapper types for in-memory secrets: compile-enforced `.expose_secret()`
+# audit point, auto-redacted `Debug`, zeroize-on-drop. See R-B1.4.
+secrecy = "0.10"
 
 # guest-agent builds as a tiny static init binary for the guest initramfs.
 # Use `cargo build -p guest-agent --release` with these workspace-level settings.

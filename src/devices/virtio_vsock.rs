@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::debug;
+use void_box_protocol::SessionSecret;
 
 use crate::{Error, Result};
 
@@ -36,7 +37,7 @@ pub struct VsockDevice {
     /// validates it against the secret in its kernel cmdline.
     ///
     /// [`ControlChannel`]: crate::backend::control_channel::ControlChannel
-    session_secret: [u8; 32],
+    session_secret: SessionSecret,
     /// When set, connect via AF_UNIX instead of AF_VSOCK (userspace backend).
     unix_socket_path: Option<PathBuf>,
 }
@@ -44,11 +45,11 @@ pub struct VsockDevice {
 impl VsockDevice {
     /// Create a new vsock device with the given CID and session secret.
     pub fn new(cid: u32) -> Result<Self> {
-        Self::with_secret(cid, [0u8; 32])
+        Self::with_secret(cid, SessionSecret::new([0u8; 32]))
     }
 
     /// Create a new vsock device with the given CID and session secret.
-    pub fn with_secret(cid: u32, session_secret: [u8; 32]) -> Result<Self> {
+    pub fn with_secret(cid: u32, session_secret: SessionSecret) -> Result<Self> {
         if cid < 3 {
             return Err(Error::Config(format!(
                 "Invalid CID {}: must be >= 3 (0-2 reserved)",
@@ -71,7 +72,7 @@ impl VsockDevice {
     /// Creates a vsock device that connects via AF_UNIX (userspace backend).
     pub fn with_unix_socket(
         cid: u32,
-        session_secret: [u8; 32],
+        session_secret: SessionSecret,
         socket_path: PathBuf,
     ) -> Result<Self> {
         if cid < 3 {
@@ -98,7 +99,7 @@ impl VsockDevice {
     }
 
     /// Get the session secret (for snapshot capture).
-    pub fn session_secret(&self) -> &[u8; 32] {
+    pub fn session_secret(&self) -> &SessionSecret {
         &self.session_secret
     }
 

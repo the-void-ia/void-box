@@ -18,6 +18,7 @@ use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, Termi
 use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::{flag as signal_flag, low_level, SigId};
 use tracing::{debug, warn};
+use void_box_protocol::SessionSecret;
 
 use crate::guest::protocol::{
     Message, MessageType, PtyClosedResponse, PtyOpenRequest, PtyOpenedResponse, PtyResizeRequest,
@@ -127,7 +128,7 @@ impl PtySession {
     /// exchange fails, or if the guest rejects the request.
     pub fn open(
         connector: &GuestConnector,
-        session_secret: &[u8; 32],
+        session_secret: &SessionSecret,
         boot_wait_done: &std::sync::atomic::AtomicBool,
         request: &PtyOpenRequest,
     ) -> Result<Self> {

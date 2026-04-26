@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use void_box_protocol::SessionSecret;
+
 use crate::{Error, Result};
 
 // Re-export from the cross-platform backend module for backward compatibility.
@@ -26,11 +28,11 @@ pub enum VsockBackendType {
 ///
 /// All security features are mandatory by default. No opt-out toggles
 /// unless there's a concrete development need.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SecurityConfig {
     /// 32-byte session secret for vsock authentication.
     /// Auto-generated via `getrandom` in `Default`.
-    pub session_secret: [u8; 32],
+    pub session_secret: SessionSecret,
     /// Allowlist of commands that may be executed in the guest.
     pub command_allowlist: Vec<String>,
     /// Per-process resource limits for the guest.
@@ -45,32 +47,12 @@ pub struct SecurityConfig {
     pub seccomp: bool,
 }
 
-impl std::fmt::Debug for SecurityConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SecurityConfig")
-            .field("session_secret", &"[REDACTED]")
-            .field("command_allowlist", &self.command_allowlist)
-            .field("resource_limits", &self.resource_limits)
-            .field("network_deny_list", &self.network_deny_list)
-            .field(
-                "max_connections_per_second",
-                &self.max_connections_per_second,
-            )
-            .field(
-                "max_concurrent_connections",
-                &self.max_concurrent_connections,
-            )
-            .field("seccomp", &self.seccomp)
-            .finish()
-    }
-}
-
 impl Default for SecurityConfig {
     fn default() -> Self {
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).expect("Failed to generate session secret");
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("Failed to generate session secret");
         Self {
-            session_secret: secret,
+            session_secret: SessionSecret::new(bytes),
             command_allowlist: DEFAULT_COMMAND_ALLOWLIST
                 .iter()
                 .map(|s| s.to_string())
@@ -281,7 +263,7 @@ impl VoidBoxConfig {
             .as_secs();
         crate::backend::append_common_guest_kernel_args(
             &mut cmdline,
-            &self.security.session_secret,
+            self.security.session_secret.expose_secret(),
             epoch_secs,
             self.network,
             false,
