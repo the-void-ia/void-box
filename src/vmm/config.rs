@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use secrecy::ExposeSecret;
 use void_box_protocol::SessionSecret;
 
 use crate::{Error, Result};

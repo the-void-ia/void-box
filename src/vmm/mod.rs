@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use secrecy::ExposeSecret;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 use void_box_protocol::SessionSecret;
