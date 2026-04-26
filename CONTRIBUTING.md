@@ -292,19 +292,7 @@ Looking for ideas? Here are some areas that need work:
 
 ## Code of Conduct
 
-### Our Standards
-
-- Be respectful and inclusive
-- Provide constructive feedback
-- Focus on what's best for the community
-- Show empathy towards others
-
-### Unacceptable Behavior
-
-- Harassment or discriminatory language
-- Personal attacks or trolling
-- Publishing private information
-- Other conduct inappropriate in a professional setting
+This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md). Report concerns privately to **contact@voidplatform.ai**.
 
 ## License
 
