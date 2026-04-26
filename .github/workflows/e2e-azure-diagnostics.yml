@@ -28,6 +28,14 @@ on:
         required: false
         default: "all"
         type: string
+  # `workflow_dispatch` cannot fire from a non-default branch until the
+  # workflow file lands on `main`, so during the active CI investigation
+  # we also trigger on push to this specific diagnostic branch. This
+  # `push` trigger is intended to be removed once the workflow is in
+  # `main` and `workflow_dispatch` works for the team.
+  push:
+    branches:
+      - "diag/azure-ci-flakiness"
 
 permissions:
   contents: read
