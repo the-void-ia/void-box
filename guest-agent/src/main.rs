@@ -40,6 +40,17 @@ const HOST_CID: u32 = 2;
 
 const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
 
+// Mirrors `ALLOWED_WRITE_ROOTS` for the host-driven `ReadFile` RPC; see R-B2.2.
+// The current host call sites of `send_read_file` all read paths under
+// `/workspace` (`src/runtime.rs` `persist_workflow_artifacts` reads
+// `/workspace/result.json` and per-artifact paths joined onto
+// `/workspace/`; `src/agent_box.rs` reads `BoxConfig::output_file` which
+// defaults to `/workspace/output.json`), so the baseline of
+// `/workspace`, `/home`, `/etc/voidbox` is sufficient. Convenience is
+// not justification for widening — document a concrete reason here when
+// changing this list.
+const ALLOWED_READ_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
+
 /// Parsed session secret from kernel cmdline (set once at startup).
 static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 static OCI_ROOTFS_SETUP_ONCE: std::sync::Once = std::sync::Once::new();
@@ -2874,17 +2885,89 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
 }
 
 fn handle_read_file(request: &ReadFileRequest) -> ReadFileResponse {
-    match std::fs::read(&request.path) {
-        Ok(content) => ReadFileResponse {
-            success: true,
-            content,
-            error: None,
-        },
-        Err(e) => ReadFileResponse {
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        return ReadFileResponse {
             success: false,
             content: Vec::new(),
-            error: Some(e.to_string()),
-        },
+            error: Some(format!("OCI rootfs not ready: {}", e)),
+        };
+    }
+    fs_guard::init_read_roots(&ALLOWED_READ_ROOTS);
+
+    let target = Path::new(&request.path);
+    let fd = match fs_guard::resolve_for_read(target) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!(
+                    "Refusing read outside allowed roots {:?}: {} ({})",
+                    ALLOWED_READ_ROOTS, request.path, e
+                )),
+            };
+        }
+    };
+
+    // Upgrade the resolved O_PATH fd to a real read fd by re-opening
+    // through `/proc/self/fd/<n>`. This is the documented `O_PATH ->
+    // O_RDONLY` recipe; the kernel resolves the magic-link to the
+    // already-resolved inode without re-walking the user-supplied path.
+    use std::os::fd::AsRawFd as _;
+    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let c_path = match std::ffi::CString::new(proc_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!("invalid /proc fd path for {}", request.path)),
+            };
+        }
+    };
+    let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if read_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return ReadFileResponse {
+            success: false,
+            content: Vec::new(),
+            error: Some(format!("Failed to open {}: {}", request.path, err)),
+        };
+    }
+    use std::os::fd::FromRawFd as _;
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
+
+    let mut content = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = unsafe {
+            libc::read(
+                owned.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!("Failed to read {}: {}", request.path, err)),
+            };
+        }
+        if n == 0 {
+            break;
+        }
+        content.extend_from_slice(&buf[..n as usize]);
+    }
+
+    ReadFileResponse {
+        success: true,
+        content,
+        error: None,
     }
 }
 

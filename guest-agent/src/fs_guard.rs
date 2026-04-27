@@ -13,15 +13,14 @@
 //!
 //! This module replaces that with kernel-side resolution: at first
 //! use we cache an `O_PATH | O_DIRECTORY` fd for every entry in
-//! [`ALLOWED_WRITE_ROOTS`], and every per-request resolution calls
-//! `openat2` against that fd with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`.
-//! The kernel walks the path, refuses to cross any symlink (planted
-//! by the agent or otherwise), and returns an fd anchored *inside*
-//! the allowed root. Callers then use the resulting fd for the
-//! subsequent op (`write`, `fchown`, `fchmod`, `mkdirat`) and never
-//! re-open the path by string, which is what would re-introduce the
-//! TOCTOU window. `handle_read_file` is migrated by R-B2.2 — see
-//! [`init_read_roots`] / [`resolve_for_read`].
+//! [`ALLOWED_WRITE_ROOTS`] / [`ALLOWED_READ_ROOTS`], and every
+//! per-request resolution calls `openat2` against that fd with
+//! `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`. The kernel walks the path,
+//! refuses to cross any symlink (planted by the agent or otherwise),
+//! and returns an fd anchored *inside* the allowed root. Callers then
+//! use the resulting fd for the subsequent op (`write`, `read`,
+//! `fchown`, `fchmod`, `mkdirat`) and never re-open the path by string,
+//! which is what would re-introduce the TOCTOU window.
 //!
 //! The cached fds live for the lifetime of the process. Re-opening per
 //! request would itself be a TOCTOU: an attacker who can replace the
@@ -33,6 +32,7 @@
 //! See R-B2.1 / R-B2.2 in the void-security threat model.
 //!
 //! [`ALLOWED_WRITE_ROOTS`]: crate::ALLOWED_WRITE_ROOTS
+//! [`ALLOWED_READ_ROOTS`]: crate::ALLOWED_READ_ROOTS
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -130,10 +130,6 @@ pub(crate) fn init() {
 /// Open every entry in `roots`, treating it as the read allowlist.
 /// Mirrors [`init`] but for the read side. Failures are fatal — same
 /// rationale as [`init`].
-///
-/// Allowed dead in the R-B2.1 commit; wired into `handle_read_file`
-/// by R-B2.2.
-#[allow(dead_code)]
 pub(crate) fn init_read_roots(roots: &'static [&'static str]) {
     if READ_ROOTS.get().is_some() {
         return;
@@ -214,10 +210,6 @@ pub(crate) fn resolve_for_write(path: &Path) -> Result<OwnedFd, FsGuardError> {
 /// Resolve `path` against the `ALLOWED_READ_ROOTS` table. See
 /// [`resolve_for_write`] for the resolution semantics — only the root
 /// table differs.
-///
-/// Allowed dead in the R-B2.1 commit; wired into `handle_read_file`
-/// by R-B2.2.
-#[allow(dead_code)]
 pub(crate) fn resolve_for_read(path: &Path) -> Result<OwnedFd, FsGuardError> {
     resolve_in_table(path, read_roots())
 }
@@ -426,7 +418,6 @@ fn write_roots() -> &'static [RootEntry] {
         .expect("WRITE_ROOTS populated by init")
 }
 
-#[allow(dead_code)] // R-B2.2 wires this in for resolve_for_read
 fn read_roots() -> &'static [RootEntry] {
     READ_ROOTS
         .get()
