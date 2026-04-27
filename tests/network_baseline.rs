@@ -16,13 +16,13 @@
 //! Run with: `cargo test --test network_baseline`
 
 #![cfg(target_os = "linux")]
-// Imports used by test cases added in tasks 0A.2–0A.9.
+// Imports and helpers used by test cases added in tasks 0A.2–0A.9.
 #![allow(unused_imports, dead_code)]
 
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    EthernetRepr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
-    UdpPacket, UdpRepr,
+    EthernetRepr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
+    TcpRepr, UdpPacket, UdpRepr,
 };
 use std::net::{TcpListener, UdpSocket};
 use void_box::network::slirp::{
@@ -31,6 +31,8 @@ use void_box::network::slirp::{
 
 const GUEST_EPHEMERAL_PORT: u16 = 49152;
 const ETH_HDR_LEN: usize = 14;
+const IPV4_MIN_HDR_LEN: usize = 20;
+const TCP_MIN_HDR_LEN: usize = 20;
 const UDP_HDR_LEN: usize = 8;
 
 /// Builds a minimal IPv4-over-Ethernet TCP segment from guest to a
@@ -82,8 +84,8 @@ fn build_tcp_frame(
     let mut tcp = TcpPacket::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
     tcp_repr.emit(
         &mut tcp,
-        &smoltcp::wire::IpAddress::Ipv4(SLIRP_GUEST_IP),
-        &smoltcp::wire::IpAddress::Ipv4(dst_ip),
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(dst_ip),
         &Default::default(),
     );
     buf
@@ -113,8 +115,8 @@ fn build_udp_frame(dst_ip: Ipv4Address, src_port: u16, dst_port: u16, payload: &
     let mut udp = UdpPacket::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
     udp_repr.emit(
         &mut udp,
-        &smoltcp::wire::IpAddress::Ipv4(SLIRP_GUEST_IP),
-        &smoltcp::wire::IpAddress::Ipv4(dst_ip),
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(dst_ip),
         UDP_HDR_LEN + payload.len(),
         |b| b.copy_from_slice(payload),
         &Default::default(),
