@@ -787,6 +787,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "tempfile",
  "void-box-protocol",
 ]
 

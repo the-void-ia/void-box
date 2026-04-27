@@ -73,6 +73,42 @@ initramfs files when memory is too low) must surface a clear diagnostic on the
    operator can connect the warning to a later guest error without a separate
    debugging session.
 
+### Doc-comment style
+
+Module-level and function-level doc comments should explain *why* the code is
+structured the way it is, not narrate its evolution. Avoid phrases like
+"previously did X, now does Y," "this module replaces…," or "tests for X were
+removed in [ticket]" — they read fine in a PR description, but in code they
+rot when later changes land and they push the structural rationale onto the
+reader to reconstruct from history.
+
+State the rationale in present tense, in terms of what the alternative would
+get wrong:
+
+```rust
+// ✓ structural — explains why the chosen approach is correct
+//! Lexical path checks cannot defend against planted symlinks: the
+//! string the check inspects and the inode the kernel writes to are
+//! not the same object. This module gates every path through
+//! `openat2` with `RESOLVE_NO_SYMLINKS` …
+
+// ✗ historical — narrates evolution; ages poorly
+//! `handle_write_file` previously gated paths through a lexical check.
+//! This module replaces that with kernel-side resolution …
+```
+
+Keep concrete attack examples or worked use-cases when they're pedagogically
+useful — those are illustrations, not history.
+
+Avoid ticket IDs (`R-B*`, `R-arch-*`) and PR/commit references inside doc
+comments and inline comments. They belong in commit messages and PR
+descriptions where they're audit trail; in code they age into noise as the
+ticketing context evolves. Likewise, **never reference a private repository
+by name in public source** (e.g. don't write `// see void-security threat
+model …`). If a reasoning trail lives in a private repo, the most a public
+file should expose is an opaque ID at most — and ideally not even that;
+prefer to inline the structural reasoning directly.
+
 ## Platform parity
 
 **Contributions must work on both Linux (KVM) and macOS (VZ).** Validate on both
