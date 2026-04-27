@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 /// Errors from CLI backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -65,36 +69,195 @@ impl LocalBackend {
     }
 }
 
+/// Transport selected from the configured daemon URL.
+///
+/// The TCP path uses `reqwest`; the AF_UNIX path uses a hand-written
+/// HTTP/1.1 close-connection client over `tokio::net::UnixStream` because
+/// reqwest 0.13 does not ship a unix-socket connector. The two paths share
+/// no buffers but produce identical wire requests against the daemon's
+/// hand-rolled HTTP server.
+enum Transport {
+    Tcp {
+        base_url: String,
+        client: reqwest::Client,
+    },
+    Unix {
+        socket_path: PathBuf,
+        #[allow(dead_code)]
+        display_url: String,
+    },
+}
+
+const UNIX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// HTTP client for the daemon: all remote CLI access goes through here.
 pub struct RemoteBackend {
+    #[allow(dead_code)]
     pub daemon_url: String,
-    client: reqwest::Client,
+    bearer_token: Option<String>,
+    transport: Transport,
 }
 
 impl RemoteBackend {
+    #[allow(dead_code)]
     pub fn new(daemon_url: String) -> Self {
+        Self::with_token(daemon_url, None)
+    }
+
+    pub fn with_token(daemon_url: String, bearer_token: Option<String>) -> Self {
+        let transport = Self::build_transport(&daemon_url);
         Self {
             daemon_url,
+            bearer_token,
+            transport,
+        }
+    }
+
+    fn build_transport(daemon_url: &str) -> Transport {
+        if let Some(rest) = daemon_url.strip_prefix("unix://") {
+            // Optional "host" segment after the scheme is meaningless for
+            // unix sockets; tolerate any spelling and keep only the path.
+            let trimmed = rest.trim_end_matches('/');
+            return Transport::Unix {
+                socket_path: PathBuf::from(trimmed),
+                display_url: daemon_url.trim_end_matches('/').to_string(),
+            };
+        }
+        Transport::Tcp {
+            base_url: daemon_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
         }
     }
 
+    #[allow(dead_code)]
     fn base_url(&self) -> &str {
-        self.daemon_url.trim_end_matches('/')
+        match &self.transport {
+            Transport::Tcp { base_url, .. } => base_url.as_str(),
+            Transport::Unix { display_url, .. } => display_url.as_str(),
+        }
     }
 
-    async fn get_text(&self, url: &str) -> Result<String, BackendError> {
-        self.client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.to_string(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))
+    fn auth_header(&self) -> Option<(&str, &str)> {
+        self.bearer_token
+            .as_deref()
+            .map(|tok| ("authorization", tok))
+    }
+
+    /// Perform an HTTP request and return raw response bytes plus the
+    /// status line for both transports. The unix path speaks
+    /// `Connection: close` HTTP/1.1 because the daemon does the same.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, BackendError> {
+        match &self.transport {
+            Transport::Tcp { base_url, client } => {
+                let url = format!("{base_url}{path}");
+                let mut req = match method {
+                    "GET" => client.get(&url),
+                    "POST" => client.post(&url),
+                    "PUT" => client.put(&url),
+                    "DELETE" => client.delete(&url),
+                    other => {
+                        return Err(BackendError::DaemonError(format!(
+                            "unsupported method {other}"
+                        )))
+                    }
+                };
+                if let Some((k, v)) = self.auth_header() {
+                    req = req.header(k, format!("Bearer {v}"));
+                }
+                if let Some(ct) = content_type {
+                    req = req.header("content-type", ct);
+                }
+                if let Some(b) = body {
+                    req = req.body(b.to_string());
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| BackendError::DaemonUnreachable {
+                        url: url.clone(),
+                        detail: e.to_string(),
+                    })?;
+                let status = resp.status().as_u16();
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| BackendError::DaemonError(e.to_string()))?;
+                Ok(HttpResponse { status, body: text })
+            }
+            Transport::Unix { socket_path, .. } => {
+                self.send_unix(socket_path, method, path, body, content_type)
+                    .await
+            }
+        }
+    }
+
+    async fn send_unix(
+        &self,
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, BackendError> {
+        let mut request = String::new();
+        request.push_str(&format!("{method} {path} HTTP/1.1\r\n"));
+        request.push_str("Host: voidbox.sock\r\n");
+        request.push_str("Connection: close\r\n");
+        if let Some((k, v)) = self.auth_header() {
+            request.push_str(&format!("{k}: Bearer {v}\r\n"));
+        }
+        if let Some(ct) = content_type {
+            request.push_str(&format!("Content-Type: {ct}\r\n"));
+        }
+        let body_bytes = body.unwrap_or("").as_bytes();
+        if body.is_some() {
+            request.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+        } else {
+            request.push_str("Content-Length: 0\r\n");
+        }
+        request.push_str("\r\n");
+
+        let url = format!("unix://{}", socket_path.display());
+        let send_fut = async move {
+            let mut stream = UnixStream::connect(socket_path).await.map_err(|e| {
+                BackendError::DaemonUnreachable {
+                    url: url.clone(),
+                    detail: e.to_string(),
+                }
+            })?;
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|e| BackendError::DaemonError(format!("unix write failed: {e}")))?;
+            stream
+                .write_all(body_bytes)
+                .await
+                .map_err(|e| BackendError::DaemonError(format!("unix body write failed: {e}")))?;
+            let mut response = Vec::with_capacity(4096);
+            stream
+                .read_to_end(&mut response)
+                .await
+                .map_err(|e| BackendError::DaemonError(format!("unix read failed: {e}")))?;
+            parse_http_response(&response)
+        };
+
+        match tokio::time::timeout(UNIX_HTTP_TIMEOUT, send_fut).await {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::DaemonError(
+                "unix socket request timed out".into(),
+            )),
+        }
+    }
+
+    async fn get_text(&self, path: &str) -> Result<String, BackendError> {
+        let resp = self.send("GET", path, None, None).await?;
+        Ok(resp.body)
     }
 
     /// Parse daemon JSON response bodies; empty body → `null`.
@@ -108,15 +271,15 @@ impl RemoteBackend {
 
     /// `GET /v1/runs/{run_id}/events` — run log stream.
     pub async fn logs(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}/events", self.base_url(), run_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/runs/{run_id}/events");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
     /// `GET /v1/runs/{run_id}` — run status.
     pub async fn status(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}", self.base_url(), run_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/runs/{run_id}");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
@@ -126,24 +289,11 @@ impl RemoteBackend {
         file: &str,
         input: Option<String>,
     ) -> Result<String, BackendError> {
-        let url = format!("{}/v1/runs", self.base_url());
         let body = serde_json::json!({ "file": file, "input": input }).to_string();
-        let text = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))?;
-
-        let value = serde_json::from_str::<serde_json::Value>(&text)
+        let resp = self
+            .send("POST", "/v1/runs", Some(&body), Some("application/json"))
+            .await?;
+        let value = serde_json::from_str::<serde_json::Value>(&resp.body)
             .map_err(|e| BackendError::DaemonError(format!("invalid JSON from daemon: {e}")))?;
         let run_id = value
             .get("run_id")
@@ -159,46 +309,54 @@ impl RemoteBackend {
         role: &str,
         content: &str,
     ) -> Result<(), BackendError> {
-        let url = format!("{}/v1/sessions/{}/messages", self.base_url(), session_id);
         let body = serde_json::json!({ "role": role, "content": content }).to_string();
-        self.client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?;
+        let path = format!("/v1/sessions/{session_id}/messages");
+        self.send("POST", &path, Some(&body), Some("application/json"))
+            .await?;
         Ok(())
     }
 
     /// `GET /v1/sessions/{session_id}/messages` — session message history.
     pub async fn get_messages(&self, session_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/sessions/{}/messages", self.base_url(), session_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/sessions/{session_id}/messages");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
     /// `POST /v1/runs/{run_id}/cancel` — cancel a run.
     pub async fn cancel_run(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}/cancel", self.base_url(), run_id);
-        let text = self
-            .client
-            .post(&url)
-            .body("{}")
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))?;
-        Self::parse_json_body(&text)
+        let path = format!("/v1/runs/{run_id}/cancel");
+        let resp = self
+            .send("POST", &path, Some("{}"), Some("application/json"))
+            .await?;
+        Self::parse_json_body(&resp.body)
     }
+}
+
+struct HttpResponse {
+    #[allow(dead_code)]
+    status: u16,
+    body: String,
+}
+
+fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, BackendError> {
+    let header_end = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| {
+            BackendError::DaemonError("malformed HTTP response (no header end)".into())
+        })?;
+    let head = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|e| BackendError::DaemonError(format!("non-utf8 response headers: {e}")))?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| BackendError::DaemonError("malformed status line".into()))?;
+    let body_start = header_end + 4;
+    let body = String::from_utf8_lossy(&bytes[body_start..]).into_owned();
+    Ok(HttpResponse { status, body })
 }
 
 #[cfg(test)]

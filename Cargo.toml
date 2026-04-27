@@ -64,6 +64,7 @@ sha2 = "0.10"
 indicatif = "0.18"
 tempfile = "3"
 secrecy = { workspace = true }
+subtle = "2"
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -153,6 +154,18 @@ path = "tests/e2e/agent_mcp.rs"
 [[test]]
 name = "orchestration_contract"
 path = "tests/orchestration_contract.rs"
+
+[[test]]
+name = "daemon_unix_perms"
+path = "tests/daemon_unix_perms.rs"
+
+[[test]]
+name = "daemon_auth"
+path = "tests/daemon_auth.rs"
+
+[[test]]
+name = "daemon_unix_round_trip"
+path = "tests/daemon_unix_round_trip.rs"
 
 [[test]]
 name = "conformance"

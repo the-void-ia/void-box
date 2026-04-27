@@ -84,7 +84,7 @@ The behaviors below are documented current state and are tracked under the ongoi
 
 | Behavior | Status |
 |---|---|
-| `voidbox serve` accepts unauthenticated requests on `127.0.0.1:43100`. | Per-run authentication model in design. |
+| `voidbox serve` defaults to an AF_UNIX socket (mode `0o600`); TCP requires `--listen tcp://…` plus a bearer token. | Active; closes the local cross-user RCE on multi-user hosts. |
 | The sidecar HTTP server binds an interface reachable beyond loopback on macOS (Virtualization.framework NAT). | Bearer-token auth in design; tighter macOS bind contingent on a VZ-specific interface. |
 | GHCR base images and GitHub Releases artifacts are integrity-verified with SHA-256 but not cryptographically signed. | Sigstore signing + verification on the roadmap. |
 | The privileged `ReadFile` vsock RPC has no path restriction at the guest-agent layer. | Read-side `openat2`-based restriction planned alongside the `WriteFile` / `MkdirP` fix. |

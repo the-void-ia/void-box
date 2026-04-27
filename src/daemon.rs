@@ -1,17 +1,19 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_box::ServiceExit;
+use crate::daemon_listen::{self, ListenAddress};
 use crate::error::ApiError;
 use crate::persistence::{
     generate_event_id, legacy_to_v2_event_type, now_ms, now_rfc3339, provider_from_env,
@@ -20,6 +22,18 @@ use crate::persistence::{
 use crate::spec::{AgentMode, RunKind, RunSpec};
 
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Authentication policy applied to every accepted connection.
+///
+/// AF_UNIX listeners delegate to the kernel's mode-`0o600` ACL — only the
+/// daemon's uid can `connect(2)`, so the route layer skips the bearer check.
+/// TCP listeners share the address space with every local user, so a
+/// bearer-token compare runs in front of the route table.
+#[derive(Clone)]
+enum AuthMode {
+    UnixSocket,
+    BearerToken(Arc<SecretString>),
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -34,6 +48,7 @@ struct AppState {
         >,
     >,
     sidecar_handles: Arc<Mutex<HashMap<String, Arc<crate::sidecar::SidecarHandle>>>>,
+    auth: AuthMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,17 +102,83 @@ struct AppendMessageRequest {
     content: String,
 }
 
-pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    serve_on_listener(listener).await
+/// Configuration for [`serve`]: address plus the bearer token required by
+/// TCP listeners.
+pub struct ServeConfig {
+    pub address: ListenAddress,
+    pub token: Option<SecretString>,
 }
 
-/// Serve the daemon on an already-bound listener.
+/// Bind the listener described by `config` and serve until cancelled.
+///
+/// AF_UNIX listeners are created with mode `0o600` so the kernel rejects
+/// `connect(2)` from any uid other than the daemon's. TCP listeners require
+/// a bearer token because loopback is shared across local accounts.
+pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    match config.address {
+        ListenAddress::Unix(path) => {
+            let listener = bind_unix_socket(&path)?;
+            info!(path = %path.display(), "[void-box] daemon listening on unix://{}", path.display());
+            serve_unix(listener, AuthMode::UnixSocket).await
+        }
+        ListenAddress::Tcp(addr) => {
+            let token = config
+                .token
+                .ok_or_else::<Box<dyn std::error::Error>, _>(|| {
+                    Box::new(daemon_listen::ListenConfigError::MissingTcpToken)
+                })?;
+            let listener = TcpListener::bind(addr).await?;
+            serve_tcp(listener, AuthMode::BearerToken(Arc::new(token))).await
+        }
+    }
+}
+
+/// Serve the daemon on an already-bound TCP listener.
 ///
 /// Useful for tests that need to reserve a port before spawning the server:
 /// binding here (rather than reserving a port and re-binding later) closes the
 /// TOCTOU window where another process could claim the port in between.
+///
+/// Tests use this path with a generated bearer token (or with no auth if they
+/// pass `None`, which currently emits a `WARN` and accepts every request — the
+/// CLI never produces this state because `serve` rejects it up-front).
 pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+    serve_on_listener_with_token(listener, None).await
+}
+
+/// Same as [`serve_on_listener`] but lets the caller supply a bearer token
+/// for tests that exercise the auth path.
+pub async fn serve_on_listener_with_token(
+    listener: TcpListener,
+    token: Option<SecretString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth = match token {
+        Some(secret) => AuthMode::BearerToken(Arc::new(secret)),
+        None => {
+            warn!("daemon TCP listener has no bearer token configured; accepting all requests");
+            AuthMode::BearerToken(Arc::new(SecretString::from(String::new())))
+        }
+    };
+    serve_tcp(listener, auth).await
+}
+
+fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    daemon_listen::remove_stale_socket(path)?;
+    let listener = UnixListener::bind(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(listener)
+}
+
+async fn build_app_state(auth: AuthMode) -> AppState {
     let provider = provider_from_env();
     let mut initial_runs = provider.load_runs().unwrap_or_default();
 
@@ -108,12 +189,20 @@ pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std:
     // observers see the transition and the run is no longer a ghost.
     reconcile_orphan_runs_on_startup(&mut initial_runs, provider.as_ref());
 
-    let state = AppState {
+    AppState {
         runs: Arc::new(Mutex::new(initial_runs)),
         provider,
         telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
         sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
-    };
+        auth,
+    }
+}
+
+async fn serve_tcp(
+    listener: TcpListener,
+    auth: AuthMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = build_app_state(auth).await;
 
     let addr = listener.local_addr()?;
     println!("[void-box] daemon listening on http://{}", addr);
@@ -132,6 +221,23 @@ pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std:
             debug!(?peer, "daemon spawned handler starting");
             if let Err(e) = handle_stream(stream, state).await {
                 debug!(?peer, %e, "daemon connection error");
+            }
+        });
+    }
+}
+
+async fn serve_unix(
+    listener: UnixListener,
+    auth: AuthMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = build_app_state(auth).await;
+    loop {
+        debug!("daemon awaiting accept (unix)");
+        let (stream, _addr) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_stream(stream, state).await {
+                debug!(%e, "daemon unix connection error");
             }
         });
     }
@@ -207,16 +313,77 @@ fn parse_content_length(headers: &str) -> usize {
     0
 }
 
-async fn handle_stream(
-    mut stream: TcpStream,
-    state: AppState,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let peer = stream.peer_addr().ok();
-    debug!(?peer, "handle_stream enter");
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// Auth chokepoint that runs in front of the route table.
+///
+/// AF_UNIX listeners short-circuit because the kernel already gates
+/// `connect(2)` on the socket's `0o600` mode. TCP listeners require the
+/// caller to present a matching bearer token; the comparison is constant
+/// time so a network attacker cannot probe the token byte-by-byte.
+fn enforce_auth(auth: &AuthMode, headers: &str) -> Option<(String, String, Vec<u8>)> {
+    match auth {
+        AuthMode::UnixSocket => None,
+        AuthMode::BearerToken(expected) => {
+            // Empty expected token = test-only "no auth" mode (see
+            // `serve_on_listener`); preserve the historical behavior.
+            if expected.expose_secret().is_empty() {
+                return None;
+            }
+            let presented = header_value(headers, "authorization")
+                .and_then(daemon_listen::parse_bearer)
+                .unwrap_or("");
+            let expected_bytes = expected.expose_secret().as_bytes();
+            let presented_bytes = presented.as_bytes();
+            // ConstantTimeEq compares equal-length slices in constant time.
+            // For length mismatches we still drive the comparison against
+            // the expected secret so the work performed is uncorrelated
+            // with secret length.
+            let lengths_match = presented_bytes.len() == expected_bytes.len();
+            let bytes_eq: bool = if lengths_match {
+                presented_bytes.ct_eq(expected_bytes).into()
+            } else {
+                let _ = expected_bytes.ct_eq(expected_bytes);
+                false
+            };
+            if lengths_match && bytes_eq {
+                None
+            } else {
+                Some(unauthorized_response())
+            }
+        }
+    }
+}
+
+fn unauthorized_response() -> (String, String, Vec<u8>) {
+    (
+        "401 Unauthorized".to_string(),
+        "application/json".to_string(),
+        ApiError::unauthorized("missing or invalid bearer token")
+            .to_json()
+            .into_bytes(),
+    )
+}
+
+async fn handle_stream<S>(mut stream: S, state: AppState) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    debug!("handle_stream enter");
 
     let mut buf = vec![0u8; MAX_REQUEST_BYTES];
     let mut total = 0usize;
-    debug!(?peer, "handle_stream reading");
+    debug!("handle_stream reading");
 
     let header_end = loop {
         if total >= buf.len() {
@@ -228,7 +395,7 @@ async fn handle_stream(
         let n = stream.read(&mut buf[total..]).await?;
         if n == 0 {
             if total == 0 {
-                debug!(?peer, "handle_stream eof");
+                debug!("handle_stream eof");
             }
             return Ok(());
         }
@@ -238,7 +405,7 @@ async fn handle_stream(
             break pos;
         }
     };
-    debug!(?peer, bytes = total, "handle_stream headers complete");
+    debug!(bytes = total, "handle_stream headers complete");
 
     let headers_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let body_start = header_end + 4;
@@ -282,28 +449,28 @@ async fn handle_stream(
         .split_once('?')
         .map_or((raw_path, None), |(p, q)| (p, Some(q)));
 
-    debug!(?peer, method, path, "handle_stream routing");
-    let (status, content_type, payload) = route_request(method, path, query, body, state).await;
-    debug!(?peer, method, path, %status, "handle_stream route complete");
+    debug!(method, path, "handle_stream routing");
+    let (status, content_type, payload) =
+        route_request(method, path, query, &headers_str, body, state).await;
+    debug!(method, path, %status, "handle_stream route complete");
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         payload.len(),
     );
-    debug!(?peer, method, path, "handle_stream writing header");
+    debug!(method, path, "handle_stream writing header");
     stream.write_all(header.as_bytes()).await?;
-    debug!(?peer, method, path, "handle_stream header write complete");
+    debug!(method, path, "handle_stream header write complete");
     debug!(
-        ?peer,
         method,
         path,
         bytes = payload.len(),
         "handle_stream writing body"
     );
     stream.write_all(&payload).await?;
-    debug!(?peer, method, path, "handle_stream body write complete");
-    debug!(?peer, "handle_stream exit");
+    debug!(method, path, "handle_stream body write complete");
+    debug!("handle_stream exit");
     Ok(())
 }
 
@@ -327,10 +494,14 @@ async fn route_request(
     method: &str,
     path: &str,
     query: Option<&str>,
+    headers: &str,
     body: &str,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
     debug!(method, path, "route_request enter");
+    if let Some(reject) = enforce_auth(&state.auth, headers) {
+        return reject;
+    }
     match (method, path) {
         ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
@@ -2696,6 +2867,100 @@ mod tests {
                 assert!(runs[id].terminal_event_id.is_none());
             }
             assert!(provider.saved.lock().unwrap().is_empty());
+        }
+    }
+
+    mod auth {
+        use super::super::*;
+
+        fn make_state(auth: AuthMode) -> AppState {
+            AppState {
+                runs: Arc::new(Mutex::new(HashMap::new())),
+                provider: provider_from_env(),
+                telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
+                sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
+                auth,
+            }
+        }
+
+        #[test]
+        fn unix_socket_mode_skips_auth_check() {
+            let state = make_state(AuthMode::UnixSocket);
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer wrong\r\n").is_none());
+            assert!(enforce_auth(&state.auth, "").is_none());
+        }
+
+        #[test]
+        fn bearer_mode_rejects_missing_header() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            let reject = enforce_auth(&state.auth, "Host: example\r\n").expect("expected reject");
+            assert!(reject.0.starts_with("401"));
+        }
+
+        #[test]
+        fn bearer_mode_rejects_wrong_token() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            let reject =
+                enforce_auth(&state.auth, "Authorization: Bearer wrong\r\n").expect("reject");
+            assert!(reject.0.starts_with("401"));
+        }
+
+        #[test]
+        fn bearer_mode_accepts_matching_token() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer expected\r\n").is_none());
+        }
+
+        #[test]
+        fn bearer_mode_with_empty_expected_token_passes_all() {
+            // The test-only "no auth" mode used by `serve_on_listener`.
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                String::new(),
+            ))));
+            assert!(enforce_auth(&state.auth, "").is_none());
+        }
+
+        #[tokio::test]
+        async fn serve_refuses_tcp_without_token() {
+            use crate::daemon_listen::ListenAddress;
+            let cfg = ServeConfig {
+                address: ListenAddress::Tcp("127.0.0.1:0".parse().unwrap()),
+                token: None,
+            };
+            let err = serve(cfg).await.unwrap_err();
+            assert!(
+                err.to_string().contains("bearer token"),
+                "expected bearer-token error, got: {err}"
+            );
+        }
+    }
+
+    mod unix_listener {
+        use super::super::*;
+        use std::os::unix::fs::MetadataExt;
+
+        #[tokio::test]
+        async fn bind_unix_socket_sets_owner_only_perms() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            let _listener = bind_unix_socket(&path).expect("bind");
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_replaces_stale_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            std::fs::write(&path, b"stale").unwrap();
+            let _listener = bind_unix_socket(&path).expect("bind despite stale file");
+            assert!(path.exists());
         }
     }
 }

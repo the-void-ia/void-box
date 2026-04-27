@@ -115,11 +115,19 @@ pub struct ResolvedConfig {
     pub paths: CliPaths,
     pub kernel: Option<PathBuf>,
     pub initramfs: Option<PathBuf>,
+    /// Bearer token used by the CLI when talking to a TCP daemon. Read at
+    /// load time from `VOIDBOX_DAEMON_TOKEN` or, if unset, from the file at
+    /// `VOIDBOX_DAEMON_TOKEN_FILE`. Always `None` for AF_UNIX daemons.
+    pub daemon_token: Option<String>,
 }
 
 impl ResolvedConfig {
+    /// Default daemon URL: the AF_UNIX path the daemon resolves at startup.
+    /// Both ends consult `void_box::daemon_listen::default_unix_socket_path`
+    /// so a same-uid invocation auto-discovers the socket.
     pub fn default_daemon_url() -> String {
-        "http://127.0.0.1:43100".into()
+        let path = void_box::daemon_listen::default_unix_socket_path();
+        format!("unix://{}", path.display())
     }
 }
 
@@ -198,6 +206,14 @@ pub fn load_and_merge(
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| "info".into());
 
+    let daemon_token = std::env::var("VOIDBOX_DAEMON_TOKEN").ok().or_else(|| {
+        std::env::var("VOIDBOX_DAEMON_TOKEN_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|raw| raw.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
     ResolvedConfig {
         log_level,
         daemon_url: merged
@@ -207,6 +223,7 @@ pub fn load_and_merge(
         kernel: merged.paths.kernel,
         initramfs: merged.paths.initramfs,
         paths,
+        daemon_token,
     }
 }
 
