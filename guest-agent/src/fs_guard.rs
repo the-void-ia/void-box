@@ -458,18 +458,20 @@ mod tests {
     //! normally run. This sidesteps having to fixture `/workspace`,
     //! `/home`, `/etc/voidbox` on the test host.
     //!
-    //! The single-init pattern means we share the static state across
-    //! all tests — `OnceLock` ignores re-`set` calls, so tests serialise
-    //! through a `Mutex` and operate on the one fixture `init` configured.
-    //! This matches the prod model (init once, hold for process life).
+    //! The whole test module shares one fixture: `OnceLock<FixtureRoots>`
+    //! runs the init closure at most once, and concurrent first callers
+    //! serialise inside `get_or_init` while one of them runs. Subsequent
+    //! callers receive a `&'static FixtureRoots` with no synchronisation.
+    //! This matches the prod model (init once, hold for process life)
+    //! and removes the reentrancy class that arises from holding a
+    //! `MutexGuard` across a nested fixture call.
 
     use super::*;
     use std::io::Write as _;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
-    static FIXTURE_LOCK: Mutex<Option<FixtureRoots>> = Mutex::new(None);
+    static FIXTURE: OnceLock<FixtureRoots> = OnceLock::new();
 
     struct FixtureRoots {
         // Hold tempdirs for the whole test process. Dropping these would
@@ -480,30 +482,34 @@ mod tests {
         read_root: PathBuf,
     }
 
-    fn ensure_fixture() -> std::sync::MutexGuard<'static, Option<FixtureRoots>> {
-        let mut guard = FIXTURE_LOCK.lock().expect("fixture lock poisoned");
-        if guard.is_some() {
-            return guard;
-        }
+    fn ensure_fixture() -> &'static FixtureRoots {
+        FIXTURE.get_or_init(|| {
+            let write_dir = tempfile::tempdir().expect("create write tempdir");
+            let read_dir = tempfile::tempdir().expect("create read tempdir");
+            let write_root = write_dir.path().to_path_buf();
+            let read_root = read_dir.path().to_path_buf();
 
-        let write_dir = tempfile::tempdir().expect("create write tempdir");
-        let read_dir = tempfile::tempdir().expect("create read tempdir");
-        let write_root = write_dir.path().to_path_buf();
-        let read_root = read_dir.path().to_path_buf();
+            let write_entry = open_one_root(&write_root);
+            let read_entry = open_one_root(&read_root);
 
-        let write_entry = open_one_root(&write_root);
-        let read_entry = open_one_root(&read_root);
+            // The closure runs at most once, so these `set`s cannot
+            // race with another initialiser. `expect` over `let _ =`
+            // catches any future bug that re-introduces a parallel
+            // path that touches the same statics.
+            WRITE_ROOTS
+                .set(vec![write_entry])
+                .expect("WRITE_ROOTS already initialised before fixture");
+            READ_ROOTS
+                .set(vec![read_entry])
+                .expect("READ_ROOTS already initialised before fixture");
 
-        let _ = WRITE_ROOTS.set(vec![write_entry]);
-        let _ = READ_ROOTS.set(vec![read_entry]);
-
-        *guard = Some(FixtureRoots {
-            _write_root: write_dir,
-            _read_root: read_dir,
-            write_root,
-            read_root,
-        });
-        guard
+            FixtureRoots {
+                _write_root: write_dir,
+                _read_root: read_dir,
+                write_root,
+                read_root,
+            }
+        })
     }
 
     fn open_one_root(path: &Path) -> RootEntry {
@@ -530,19 +536,11 @@ mod tests {
     }
 
     fn write_root_path() -> PathBuf {
-        ensure_fixture()
-            .as_ref()
-            .expect("fixture set")
-            .write_root
-            .clone()
+        ensure_fixture().write_root.clone()
     }
 
     fn read_root_path() -> PathBuf {
-        ensure_fixture()
-            .as_ref()
-            .expect("fixture set")
-            .read_root
-            .clone()
+        ensure_fixture().read_root.clone()
     }
 
     // Acceptance: symlink under root pointing outside is rejected.
@@ -691,7 +689,6 @@ mod tests {
     // Read-side mirrors of the write-side negatives.
     #[test]
     fn read_rejects_symlink_escape() {
-        let _g = ensure_fixture();
         let root = read_root_path();
         let outside = tempfile::tempdir().expect("outside");
         let secret = outside.path().join("secret.txt");
@@ -709,7 +706,6 @@ mod tests {
 
     #[test]
     fn read_rejects_dotdot_escape() {
-        let _g = ensure_fixture();
         let root = read_root_path();
         std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
         let target = root.join("sub").join("..").join("..").join("etc").join("x");
@@ -722,7 +718,9 @@ mod tests {
 
     #[test]
     fn read_rejects_absolute_outside_roots() {
-        let _g = ensure_fixture();
+        // The fixture has to run before resolve_for_read can dereference
+        // READ_ROOTS, even though this test doesn't need the path itself.
+        ensure_fixture();
         let err = resolve_for_read(Path::new("/etc/shadow")).expect_err("must reject");
         assert!(
             matches!(err, FsGuardError::OutsideAllowedRoots),
