@@ -31,10 +31,14 @@ on:
   workflow_dispatch:
     inputs:
       agent:
-        description: "Limit to one agent (claude-code, codex, or empty for both)"
+        description: "Which agent to bump"
         required: false
-        default: ""
-        type: string
+        default: all
+        type: choice
+        options:
+          - all
+          - claude-code
+          - codex
 
 permissions:
   contents: write
@@ -44,16 +48,18 @@ jobs:
   discover:
     name: Discover (${{ matrix.agent }})
     runs-on: ubuntu-latest
-    # Job-level gate: when invoked via workflow_dispatch with `inputs.agent`
-    # set, only run the matching matrix leg. A previous shape used a
-    # step-level `if` + `exit 0`, which only ended the first step — every
-    # subsequent step (download, hash, open PR) still ran for the
-    # non-selected agent and could open an unintended PR.
-    if: ${{ inputs.agent == '' || inputs.agent == matrix.agent }}
+    # Matrix-level filter: when invoked via workflow_dispatch with
+    # `inputs.agent` set, expand the matrix to just that agent so the
+    # unwanted leg is never scheduled. Using a job-level `if` here would
+    # fail validation — `matrix` is not in scope at job-level `if`. A
+    # previous shape used a step-level `if` + `exit 0`, which only ended
+    # the first step — every subsequent step (download, hash, open PR)
+    # still ran for the non-selected agent and could open an unintended
+    # PR. Filtering at the strategy level avoids both pitfalls.
     strategy:
       fail-fast: false
       matrix:
-        agent: [claude-code, codex]
+        agent: ${{ (inputs.agent == '' || inputs.agent == 'all') && fromJSON('["claude-code", "codex"]') || fromJSON(format('["{0}"]', inputs.agent)) }}
     steps:
       - uses: actions/checkout@v4
 
