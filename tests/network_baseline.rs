@@ -199,3 +199,86 @@ fn tcp_handshake_emits_synack() {
     assert_eq!(ctrl, TcpControl::Syn, "control flags include SYN+ACK");
     assert_eq!(ack, 1001, "ack = guest_seq + 1");
 }
+
+#[test]
+fn tcp_data_round_trip() {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    // Spawn a thread that accepts and echoes one chunk.
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 16];
+        let n = sock.read(&mut buf).unwrap();
+        sock.write_all(&buf[..n]).unwrap();
+    });
+
+    let mut stack = SlirpStack::new().expect("stack");
+
+    // SYN
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            1000,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    // Drain SYN-ACK; capture our_seq.
+    let synack_frames = drain_n(&mut stack, 4);
+    let (our_seq, _ack, _ctrl, _len) = synack_frames
+        .iter()
+        .find_map(|f| parse_tcp_to_guest(f))
+        .expect("synack");
+
+    // ACK the SYN-ACK (completes handshake).
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            1001,
+            our_seq + 1,
+            TcpControl::None,
+            &[],
+        ))
+        .unwrap();
+
+    // Send 5 bytes of data.
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            1001,
+            our_seq + 1,
+            TcpControl::Psh,
+            b"hello",
+        ))
+        .unwrap();
+
+    // Wait for server to echo and stack to relay back.
+    server.join().unwrap();
+    let mut total_payload = 0;
+    for _ in 0..40 {
+        let frames = drain_n(&mut stack, 1);
+        for f in frames.iter() {
+            if let Some((_, _, _, len)) = parse_tcp_to_guest(f) {
+                total_payload += len;
+            }
+        }
+        if total_payload >= 5 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        total_payload >= 5,
+        "expected at least 5 bytes echoed back to guest, got {total_payload}"
+    );
+}
