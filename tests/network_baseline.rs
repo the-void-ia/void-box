@@ -166,3 +166,36 @@ fn drain_n(stack: &mut SlirpStack, n: usize) -> Vec<Vec<u8>> {
     }
     out
 }
+
+#[test]
+fn tcp_handshake_emits_synack() {
+    // Bind a host listener on 127.0.0.1 so the stack's connect()
+    // succeeds. SLIRP rewrites 10.0.2.2 → 127.0.0.1.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    let mut stack = SlirpStack::new().expect("stack");
+
+    // Guest sends SYN to gateway IP at the listener's port.
+    let syn = build_tcp_frame(
+        SLIRP_GATEWAY_IP,
+        GUEST_EPHEMERAL_PORT,
+        host_port,
+        1000,
+        0,
+        TcpControl::Syn,
+        &[],
+    );
+    stack.process_guest_frame(&syn).expect("process syn");
+
+    // Drain — SYN-ACK should be queued.
+    let frames = drain_n(&mut stack, 4);
+    let synack = frames
+        .iter()
+        .find_map(|f| parse_tcp_to_guest(f))
+        .expect("synack emitted");
+
+    let (_seq, ack, ctrl, _len) = synack;
+    assert_eq!(ctrl, TcpControl::Syn, "control flags include SYN+ACK");
+    assert_eq!(ack, 1001, "ack = guest_seq + 1");
+}
