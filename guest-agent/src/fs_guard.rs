@@ -751,11 +751,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target);
         let fd = create_dirs_in_root(&target).expect("creates levels");
         assert!(target.exists());
-        // Use the returned fd to fchown — confirms it's a real fd to
-        // the leaf directory.
-        let res = unsafe { libc::fchown(fd.as_raw_fd(), 0, 0) };
-        // EPERM is fine (running as non-root in tests); we just want to
-        // verify the syscall reaches a directory.
-        assert!(res == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
+        // Confirm the returned fd is open and points at a directory.
+        // We deliberately avoid `fchown` here — containerised CI
+        // runners disagree on which errno a non-root chown returns
+        // (EPERM, EACCES, or something else, depending on security
+        // profile and filesystem).
+        let mut fd_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let res = unsafe { libc::fstat(fd.as_raw_fd(), fd_stat.as_mut_ptr()) };
+        assert_eq!(res, 0, "fstat on resolved fd should succeed");
+        let fd_stat = unsafe { fd_stat.assume_init() };
+        assert_eq!(
+            fd_stat.st_mode & libc::S_IFMT,
+            libc::S_IFDIR,
+            "resolved fd should point at a directory"
+        );
     }
 }
