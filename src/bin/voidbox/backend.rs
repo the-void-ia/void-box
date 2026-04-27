@@ -1,8 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request as HyperRequest};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
+use hyperlocal::{UnixConnector, Uri as HyperLocalUri};
+
+/// Hyper client over `hyperlocal::UnixConnector`. The legacy client wraps a
+/// connection pool and request multiplexer over `Connection: keep-alive`,
+/// matching what the daemon serves on the same transport.
+type UnixHyperClient = HyperClient<UnixConnector, Full<Bytes>>;
 
 /// Errors from CLI backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -71,17 +80,21 @@ impl LocalBackend {
 
 /// Transport selected from the configured daemon URL.
 ///
-/// The TCP path uses `reqwest`; the AF_UNIX path uses a hand-written
-/// HTTP/1.1 close-connection client over `tokio::net::UnixStream` because
-/// reqwest 0.13 does not ship a unix-socket connector. The two paths share
-/// no buffers but produce identical wire requests against the daemon's
-/// hand-rolled HTTP server.
+/// `reqwest` does not ship a unix-socket connector, so the two paths use
+/// different HTTP stacks: TCP goes through `reqwest`, AF_UNIX goes through
+/// `hyper-util`'s legacy client over `hyperlocal::UnixConnector`. Both
+/// produce the same `/v1/...` wire format against the daemon's HTTP API,
+/// so callers above this layer don't observe the split.
 enum Transport {
     Tcp {
         base_url: String,
         client: reqwest::Client,
     },
     Unix {
+        // Boxed because the hyper client struct is materially bigger than
+        // reqwest::Client; an unboxed field would unbalance the enum and
+        // trigger clippy::large_enum_variant.
+        client: Box<UnixHyperClient>,
         socket_path: PathBuf,
         #[allow(dead_code)]
         display_url: String,
@@ -118,8 +131,11 @@ impl RemoteBackend {
             // Optional "host" segment after the scheme is meaningless for
             // unix sockets; tolerate any spelling and keep only the path.
             let trimmed = rest.trim_end_matches('/');
+            let socket_path = PathBuf::from(trimmed);
+            let client = HyperClient::builder(TokioExecutor::new()).build(UnixConnector);
             return Transport::Unix {
-                socket_path: PathBuf::from(trimmed),
+                client: Box::new(client),
+                socket_path,
                 display_url: daemon_url.trim_end_matches('/').to_string(),
             };
         }
@@ -143,9 +159,11 @@ impl RemoteBackend {
             .map(|tok| ("authorization", tok))
     }
 
-    /// Perform an HTTP request and return raw response bytes plus the
-    /// status line for both transports. The unix path speaks
-    /// `Connection: close` HTTP/1.1 because the daemon does the same.
+    /// Perform an HTTP request and return the response body and status. The
+    /// TCP path uses `reqwest`; the unix path uses `hyper-util`'s legacy
+    /// client over `hyperlocal::UnixConnector`. Both paths speak the same
+    /// `/v1/...` HTTP wire format that the daemon serves, so the returned
+    /// shape is identical regardless of transport.
     async fn send(
         &self,
         method: &str,
@@ -190,61 +208,70 @@ impl RemoteBackend {
                     .map_err(|e| BackendError::DaemonError(e.to_string()))?;
                 Ok(HttpResponse { status, body: text })
             }
-            Transport::Unix { socket_path, .. } => {
-                self.send_unix(socket_path, method, path, body, content_type)
-                    .await
+            Transport::Unix {
+                client,
+                socket_path,
+                ..
+            } => {
+                self.send_unix(
+                    client.as_ref(),
+                    socket_path,
+                    method,
+                    path,
+                    body,
+                    content_type,
+                )
+                .await
             }
         }
     }
 
     async fn send_unix(
         &self,
+        client: &UnixHyperClient,
         socket_path: &Path,
         method: &str,
         path: &str,
         body: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<HttpResponse, BackendError> {
-        let mut request = String::new();
-        request.push_str(&format!("{method} {path} HTTP/1.1\r\n"));
-        request.push_str("Host: voidbox.sock\r\n");
-        request.push_str("Connection: close\r\n");
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|e| BackendError::DaemonError(format!("unsupported method: {e}")))?;
+        let uri: hyper::Uri = HyperLocalUri::new(socket_path, path).into();
+
+        let mut builder = HyperRequest::builder().method(method).uri(uri);
         if let Some((k, v)) = self.auth_header() {
-            request.push_str(&format!("{k}: Bearer {v}\r\n"));
+            builder = builder.header(k, format!("Bearer {v}"));
         }
         if let Some(ct) = content_type {
-            request.push_str(&format!("Content-Type: {ct}\r\n"));
+            builder = builder.header("content-type", ct);
         }
-        let body_bytes = body.unwrap_or("").as_bytes();
-        if body.is_some() {
-            request.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
-        } else {
-            request.push_str("Content-Length: 0\r\n");
-        }
-        request.push_str("\r\n");
 
-        let url = format!("unix://{}", socket_path.display());
-        let send_fut = async move {
-            let mut stream = UnixStream::connect(socket_path).await.map_err(|e| {
-                BackendError::DaemonUnreachable {
-                    url: url.clone(),
-                    detail: e.to_string(),
-                }
-            })?;
-            stream
-                .write_all(request.as_bytes())
+        let body_bytes = body
+            .map(|s| Bytes::copy_from_slice(s.as_bytes()))
+            .unwrap_or_default();
+        let request = builder
+            .body(Full::new(body_bytes))
+            .map_err(|e| BackendError::DaemonError(format!("build request: {e}")))?;
+
+        let display_url = format!("unix://{}", socket_path.display());
+        let send_fut = async {
+            let resp =
+                client
+                    .request(request)
+                    .await
+                    .map_err(|e| BackendError::DaemonUnreachable {
+                        url: display_url,
+                        detail: e.to_string(),
+                    })?;
+            let status = resp.status().as_u16();
+            let collected = resp
+                .into_body()
+                .collect()
                 .await
-                .map_err(|e| BackendError::DaemonError(format!("unix write failed: {e}")))?;
-            stream
-                .write_all(body_bytes)
-                .await
-                .map_err(|e| BackendError::DaemonError(format!("unix body write failed: {e}")))?;
-            let mut response = Vec::with_capacity(4096);
-            stream
-                .read_to_end(&mut response)
-                .await
-                .map_err(|e| BackendError::DaemonError(format!("unix read failed: {e}")))?;
-            parse_http_response(&response)
+                .map_err(|e| BackendError::DaemonError(format!("read response body: {e}")))?;
+            let body = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+            Ok(HttpResponse { status, body })
         };
 
         match tokio::time::timeout(UNIX_HTTP_TIMEOUT, send_fut).await {
@@ -337,26 +364,6 @@ struct HttpResponse {
     #[allow(dead_code)]
     status: u16,
     body: String,
-}
-
-fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, BackendError> {
-    let header_end = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            BackendError::DaemonError("malformed HTTP response (no header end)".into())
-        })?;
-    let head = std::str::from_utf8(&bytes[..header_end])
-        .map_err(|e| BackendError::DaemonError(format!("non-utf8 response headers: {e}")))?;
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| BackendError::DaemonError("malformed status line".into()))?;
-    let body_start = header_end + 4;
-    let body = String::from_utf8_lossy(&bytes[body_start..]).into_owned();
-    Ok(HttpResponse { status, body })
 }
 
 #[cfg(test)]
