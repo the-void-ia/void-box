@@ -90,6 +90,7 @@ pub mod snapshot_store;
 pub mod agent_box;
 pub mod credentials;
 pub mod daemon;
+pub mod daemon_listen;
 pub mod image;
 pub mod llm;
 pub mod persistence;

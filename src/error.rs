@@ -25,6 +25,7 @@ pub enum ApiErrorCode {
     RetrievalTimeout,
     PayloadTooLarge,
     TooManyRequests,
+    Unauthorized,
 }
 
 /// Structured API error response: `{"code":"NOT_FOUND","message":"...","retryable":false}`.
@@ -153,6 +154,14 @@ impl ApiError {
             code: ApiErrorCode::TooManyRequests,
             message: message.into(),
             retryable: true,
+        }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            code: ApiErrorCode::Unauthorized,
+            message: message.into(),
+            retryable: false,
         }
     }
 
