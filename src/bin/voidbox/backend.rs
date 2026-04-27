@@ -4,13 +4,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request as HyperRequest};
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use hyperlocal::{UnixConnector, Uri as HyperLocalUri};
 
-/// Hyper client over `hyperlocal::UnixConnector`. The legacy client wraps a
-/// connection pool and request multiplexer over `Connection: keep-alive`,
-/// matching what the daemon serves on the same transport.
+/// Hyper legacy client over a TCP connector. The legacy client wraps a
+/// connection pool over `Connection: keep-alive`, matching what the daemon
+/// serves on the same transport.
+type TcpHyperClient = HyperClient<HttpConnector, Full<Bytes>>;
+
+/// Hyper legacy client over `hyperlocal::UnixConnector`. Same client shape as
+/// `TcpHyperClient` — only the connector differs, so dispatch can share one
+/// code path once the URI is built.
 type UnixHyperClient = HyperClient<UnixConnector, Full<Bytes>>;
 
 /// Errors from CLI backend operations.
@@ -80,20 +86,23 @@ impl LocalBackend {
 
 /// Transport selected from the configured daemon URL.
 ///
-/// `reqwest` does not ship a unix-socket connector, so the two paths use
-/// different HTTP stacks: TCP goes through `reqwest`, AF_UNIX goes through
-/// `hyper-util`'s legacy client over `hyperlocal::UnixConnector`. Both
-/// produce the same `/v1/...` wire format against the daemon's HTTP API,
-/// so callers above this layer don't observe the split.
+/// Both arms drive `hyper-util`'s legacy client; only the connector type
+/// differs (`HttpConnector` for TCP, `hyperlocal::UnixConnector` for AF_UNIX).
+/// The connectors are concrete, non-interchangeable types, so the enum keeps
+/// them apart while `RemoteBackend::send` builds a single `hyper::Uri` and
+/// dispatches through whichever client the variant carries.
 enum Transport {
     Tcp {
         base_url: String,
-        client: reqwest::Client,
+        // Boxed for the same reason as `Unix`: `clippy::large_enum_variant`
+        // — the hyper legacy client owns a connection pool and a connector,
+        // which is materially bigger than the variant we'd otherwise pair
+        // it with.
+        client: Box<TcpHyperClient>,
     },
     Unix {
-        // Boxed because the hyper client struct is materially bigger than
-        // reqwest::Client; an unboxed field would unbalance the enum and
-        // trigger clippy::large_enum_variant.
+        // Boxed for `clippy::large_enum_variant` — same shape as `Tcp`,
+        // different connector.
         client: Box<UnixHyperClient>,
         socket_path: PathBuf,
         #[allow(dead_code)]
@@ -101,7 +110,10 @@ enum Transport {
     },
 }
 
-const UNIX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-request HTTP timeout for the daemon transport. Applied uniformly to
+/// both TCP and AF_UNIX dispatch so callers see the same bound regardless of
+/// the configured socket scheme.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// HTTP client for the daemon: all remote CLI access goes through here.
 pub struct RemoteBackend {
@@ -148,9 +160,10 @@ impl RemoteBackend {
                 display_url: daemon_url.trim_end_matches('/').to_string(),
             };
         }
+        let client = HyperClient::builder(TokioExecutor::new()).build(HttpConnector::new());
         Transport::Tcp {
             base_url: daemon_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: Box::new(client),
         }
     }
 
@@ -168,11 +181,13 @@ impl RemoteBackend {
             .map(|tok| ("authorization", tok))
     }
 
-    /// Perform an HTTP request and return the response body and status. The
-    /// TCP path uses `reqwest`; the unix path uses `hyper-util`'s legacy
-    /// client over `hyperlocal::UnixConnector`. Both paths speak the same
-    /// `/v1/...` HTTP wire format that the daemon serves, so the returned
-    /// shape is identical regardless of transport.
+    /// Perform an HTTP request and return the response body and status.
+    ///
+    /// Both transports drive the same hyper legacy client shape; only the
+    /// connector and URI construction differ. The shared body of the
+    /// function builds one `Full<Bytes>` request, dispatches it through the
+    /// variant-specific client, and uniformly bounds the round-trip with
+    /// `HTTP_TIMEOUT`.
     async fn send(
         &self,
         method: &str,
@@ -180,73 +195,21 @@ impl RemoteBackend {
         body: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<HttpResponse, BackendError> {
-        match &self.transport {
-            Transport::Tcp { base_url, client } => {
-                let url = format!("{base_url}{path}");
-                let mut req = match method {
-                    "GET" => client.get(&url),
-                    "POST" => client.post(&url),
-                    "PUT" => client.put(&url),
-                    "DELETE" => client.delete(&url),
-                    other => {
-                        return Err(BackendError::DaemonError(format!(
-                            "unsupported method {other}"
-                        )))
-                    }
-                };
-                if let Some((k, v)) = self.auth_header() {
-                    req = req.header(k, format!("Bearer {v}"));
-                }
-                if let Some(ct) = content_type {
-                    req = req.header("content-type", ct);
-                }
-                if let Some(b) = body {
-                    req = req.body(b.to_string());
-                }
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| BackendError::DaemonUnreachable {
-                        url: url.clone(),
-                        detail: e.to_string(),
-                    })?;
-                let status = resp.status().as_u16();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| BackendError::DaemonError(e.to_string()))?;
-                Ok(HttpResponse { status, body: text })
-            }
-            Transport::Unix {
-                client,
-                socket_path,
-                ..
-            } => {
-                self.send_unix(
-                    client.as_ref(),
-                    socket_path,
-                    method,
-                    path,
-                    body,
-                    content_type,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn send_unix(
-        &self,
-        client: &UnixHyperClient,
-        socket_path: &Path,
-        method: &str,
-        path: &str,
-        body: Option<&str>,
-        content_type: Option<&str>,
-    ) -> Result<HttpResponse, BackendError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|e| BackendError::DaemonError(format!("unsupported method: {e}")))?;
-        let uri: hyper::Uri = HyperLocalUri::new(socket_path, path).into();
+        let (uri, display_url) = match &self.transport {
+            Transport::Tcp { base_url, .. } => {
+                let url = format!("{base_url}{path}");
+                let uri: hyper::Uri = url.parse().map_err(|e| {
+                    BackendError::DaemonError(format!("invalid daemon URL {url:?}: {e}"))
+                })?;
+                (uri, url)
+            }
+            Transport::Unix { socket_path, .. } => {
+                let uri: hyper::Uri = HyperLocalUri::new(socket_path, path).into();
+                (uri, format!("unix://{}", socket_path.display()))
+            }
+        };
 
         let mut builder = HyperRequest::builder().method(method).uri(uri);
         if let Some((k, v)) = self.auth_header() {
@@ -255,7 +218,6 @@ impl RemoteBackend {
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
         }
-
         let body_bytes = body
             .map(|s| Bytes::copy_from_slice(s.as_bytes()))
             .unwrap_or_default();
@@ -263,31 +225,38 @@ impl RemoteBackend {
             .body(Full::new(body_bytes))
             .map_err(|e| BackendError::DaemonError(format!("build request: {e}")))?;
 
-        let display_url = format!("unix://{}", socket_path.display());
-        let send_fut = async {
-            let resp =
-                client
-                    .request(request)
-                    .await
-                    .map_err(|e| BackendError::DaemonUnreachable {
-                        url: display_url,
-                        detail: e.to_string(),
+        let send_fut =
+            async {
+                let resp = match &self.transport {
+                    Transport::Tcp { client, .. } => {
+                        client.request(request).await.map_err(|e| {
+                            BackendError::DaemonUnreachable {
+                                url: display_url.clone(),
+                                detail: e.to_string(),
+                            }
+                        })?
+                    }
+                    Transport::Unix { client, .. } => {
+                        client.request(request).await.map_err(|e| {
+                            BackendError::DaemonUnreachable {
+                                url: display_url.clone(),
+                                detail: e.to_string(),
+                            }
+                        })?
+                    }
+                };
+                let status = resp.status().as_u16();
+                let collected =
+                    resp.into_body().collect().await.map_err(|e| {
+                        BackendError::DaemonError(format!("read response body: {e}"))
                     })?;
-            let status = resp.status().as_u16();
-            let collected = resp
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| BackendError::DaemonError(format!("read response body: {e}")))?;
-            let body = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
-            Ok(HttpResponse { status, body })
-        };
+                let body = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+                Ok(HttpResponse { status, body })
+            };
 
-        match tokio::time::timeout(UNIX_HTTP_TIMEOUT, send_fut).await {
+        match tokio::time::timeout(HTTP_TIMEOUT, send_fut).await {
             Ok(result) => result,
-            Err(_) => Err(BackendError::DaemonError(
-                "unix socket request timed out".into(),
-            )),
+            Err(_) => Err(BackendError::DaemonError("daemon request timed out".into())),
         }
     }
 
