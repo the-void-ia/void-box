@@ -169,12 +169,30 @@ fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
         }
     }
     daemon_listen::remove_stale_socket(path)?;
-    let listener = UnixListener::bind(path)?;
+    // Tighten umask around bind so the socket is born `0o600` rather than
+    // `0o777 & ~umask` (typically `0o755` under default umask `0o022`). The
+    // post-bind chmod still runs as belt-and-braces, but with the umask in
+    // place there is no window where a different uid could `connect(2)`
+    // before the chmod takes effect — the kernel-enforced boundary the
+    // threat model relies on holds across the entire bind sequence.
     #[cfg(unix)]
-    {
+    let listener = {
         use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `umask` is process-global; the daemon binds its listener
+        // once at startup, before background work that might want a
+        // different umask is started. Restoring the prior value below
+        // keeps the broader process invariant intact.
+        let prior_umask = unsafe { libc::umask(0o077) };
+        let bind_result = UnixListener::bind(path);
+        unsafe {
+            libc::umask(prior_umask);
+        }
+        let listener = bind_result?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+        listener
+    };
+    #[cfg(not(unix))]
+    let listener = UnixListener::bind(path)?;
     Ok(listener)
 }
 
@@ -2955,12 +2973,27 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn bind_unix_socket_replaces_stale_file() {
+        async fn bind_unix_socket_replaces_stale_socket() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("voidbox.sock");
-            std::fs::write(&path, b"stale").unwrap();
-            let _listener = bind_unix_socket(&path).expect("bind despite stale file");
+            // Plant a real stale socket file: bind once, drop. The kernel
+            // leaves the inode in the filesystem until something unlinks it.
+            let stale = bind_unix_socket(&path).expect("first bind");
+            drop(stale);
             assert!(path.exists());
+            let _listener = bind_unix_socket(&path).expect("rebind despite stale socket");
+            assert!(path.exists());
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_refuses_non_socket_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            std::fs::write(&path, b"important data").unwrap();
+            let err = bind_unix_socket(&path).expect_err("must refuse non-socket file");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            // The user's file is still there — we did not silently delete it.
+            assert_eq!(std::fs::read(&path).unwrap(), b"important data");
         }
     }
 }

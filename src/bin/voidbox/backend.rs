@@ -128,8 +128,17 @@ impl RemoteBackend {
 
     fn build_transport(daemon_url: &str) -> Transport {
         if let Some(rest) = daemon_url.strip_prefix("unix://") {
-            // Optional "host" segment after the scheme is meaningless for
-            // unix sockets; tolerate any spelling and keep only the path.
+            // Require an absolute path. Three slashes (`unix:///abs/path`)
+            // is the canonical Docker/curl/hyperlocal form; an authority
+            // segment (`unix://host/path`) has no meaning for AF_UNIX and
+            // would silently turn into a relative path here. Reject loudly.
+            if !rest.starts_with('/') {
+                panic!(
+                    "invalid daemon URL {daemon_url:?}: unix:// scheme requires an \
+                     absolute socket path (e.g. unix:///run/user/1000/voidbox.sock); \
+                     got {rest:?}"
+                );
+            }
             let trimmed = rest.trim_end_matches('/');
             let socket_path = PathBuf::from(trimmed);
             let client = HyperClient::builder(TokioExecutor::new()).build(UnixConnector);

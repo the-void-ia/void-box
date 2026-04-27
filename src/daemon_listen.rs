@@ -222,6 +222,9 @@ fn read_token_file(path: &Path) -> Result<SecretString, ListenConfigError> {
     Ok(SecretString::from(trimmed))
 }
 
+/// Reject token files readable or writable by group / other. The check is
+/// "owner-only," not strict equality with `0o600`: more-restrictive modes
+/// like `0o400` (owner-read-only) are also acceptable and equally safe.
 #[cfg(unix)]
 fn require_token_file_perms(path: &Path, metadata: &fs::Metadata) -> Result<(), ListenConfigError> {
     use std::os::unix::fs::MetadataExt;
@@ -229,7 +232,10 @@ fn require_token_file_perms(path: &Path, metadata: &fs::Metadata) -> Result<(), 
     if mode & 0o077 != 0 {
         return Err(ListenConfigError::TokenFileError {
             path: path.to_path_buf(),
-            detail: format!("token file mode is 0o{mode:03o}, must be 0o600"),
+            detail: format!(
+                "token file mode is 0o{mode:03o}, must not be group/other accessible \
+                 (typical fix: chmod 0600 <path>)"
+            ),
         });
     }
     Ok(())
@@ -352,15 +358,39 @@ pub fn parse_bearer(header_value: &str) -> Option<&str> {
     }
 }
 
-/// Cleanup wrapper that removes a stale unix socket file if it already
-/// exists. Returns `Ok(())` on missing-file as well as successful removal so
-/// the daemon can call this unconditionally before binding.
+/// Remove a stale unix-socket file if one exists at `path`. Refuses to
+/// delete entries that are not sockets — operators occasionally point
+/// `--listen unix://...` at the wrong path, and silently `unlink`-ing a
+/// regular file at that path would be data loss.
+///
+/// Returns `Ok(())` if the path is missing or was a socket that has been
+/// removed; returns `AlreadyExists` if a non-socket entry occupies the
+/// path (the caller should surface this to the user).
 pub fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a unix socket; refusing to remove. \
+                     Pick a different --listen path or delete it manually.",
+                    path.display()
+                ),
+            ));
+        }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    fs::remove_file(path)
 }
 
 #[cfg(test)]
