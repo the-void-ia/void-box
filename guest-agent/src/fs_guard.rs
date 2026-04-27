@@ -1,35 +1,37 @@
 //! Kernel-resolved path allowlist for privileged FS RPCs.
 //!
 //! `handle_write_file`, `handle_mkdir_p`, `chown_recursive`, and
-//! `handle_read_file` previously gated their target paths through
-//! `is_allowed_guest_path`, a *lexical* check that stripped `.`/`..`
-//! components but never resolved intermediate symlinks. The uid-1000
-//! agent could plant `/home/sandbox/.claude -> /etc/cron.d/`; a
-//! `WriteFileRequest { path: "/home/sandbox/.claude/rooted", ... }` then
-//! passed the lexical check (it starts with `/home`) but the underlying
-//! `std::fs::write` followed the symlink and landed at
-//! `/etc/cron.d/rooted` written with PID-1 privileges — trivial root
-//! escalation inside the guest.
+//! `handle_read_file` run as PID 1 inside the guest and accept absolute
+//! paths from the host over vsock. Without help, a uid-1000 agent that
+//! plants a symlink under an allowlisted root (e.g.
+//! `/home/sandbox/.claude -> /etc/cron.d/`) can deflect any of those
+//! privileged ops out of the allowlist: a `WriteFileRequest { path:
+//! "/home/sandbox/.claude/rooted", ... }` writes to `/etc/cron.d/rooted`
+//! with PID-1 privileges, which is trivial root escalation inside the
+//! guest.
 //!
-//! This module replaces that with kernel-side resolution: at first
-//! use we cache an `O_PATH | O_DIRECTORY` fd for every entry in
-//! [`ALLOWED_WRITE_ROOTS`] / [`ALLOWED_READ_ROOTS`], and every
-//! per-request resolution calls `openat2` against that fd with
-//! `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS`. The kernel walks the path,
-//! refuses to cross any symlink (planted by the agent or otherwise),
-//! and returns an fd anchored *inside* the allowed root. Callers then
-//! use the resulting fd for the subsequent op (`write`, `read`,
-//! `fchown`, `fchmod`, `mkdirat`) and never re-open the path by string,
-//! which is what would re-introduce the TOCTOU window.
+//! Lexical path checks (strip `.`/`..`, prefix-compare against an
+//! allowlist) cannot defend against this. Symlink resolution happens in
+//! the kernel only when the file op runs, *after* the check; the string
+//! the check inspects and the inode the kernel writes to are not the
+//! same object. There is also a TOCTOU window between any user-space
+//! check and the file op, even ignoring symlinks.
 //!
-//! The cached fds live for the lifetime of the process. Re-opening per
+//! This module gates every path through `openat2(O_PATH)` with
+//! `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` against an `O_PATH |
+//! O_DIRECTORY` fd cached for each entry in [`ALLOWED_WRITE_ROOTS`] /
+//! [`ALLOWED_READ_ROOTS`]. The kernel walks the path, refuses to cross
+//! any symlink, and returns an fd anchored *inside* the allowed root.
+//! Callers use the resulting fd for the subsequent op (`write`, `read`,
+//! `fchown`, `fchmod`, `mkdirat`); they never re-open the path by
+//! string, since doing so would re-introduce the TOCTOU window.
+//!
+//! The cached fds are held for the lifetime of the process. Opening per
 //! request would itself be a TOCTOU: an attacker who can replace the
 //! root directory between resolution and use defeats the guarantee.
-//! `openat2` and the resolve flags are Linux ≥ 5.6; `_exit` (rather
-//! than `panic!`) on the probe so PID 1 dies cleanly without unwinding
-//! into a partially-initialised init.
-//!
-//! See R-B2.1 / R-B2.2 in the void-security threat model.
+//! `openat2` and the resolve flags require Linux ≥ 5.6; if the probe
+//! fails, init `_exit`s rather than `panic!`s so PID 1 dies cleanly
+//! without unwinding through a partially-initialised init.
 //!
 //! [`ALLOWED_WRITE_ROOTS`]: crate::ALLOWED_WRITE_ROOTS
 //! [`ALLOWED_READ_ROOTS`]: crate::ALLOWED_READ_ROOTS
@@ -89,21 +91,21 @@ impl std::fmt::Display for FsGuardError {
 /// to call multiple times; subsequent calls are O(1) once init has
 /// succeeded.
 ///
-/// Init is deliberately lazy rather than eager-at-`main`: in OCI-rootfs
-/// mode the guest pivots into a new root *after* boot, so opening
-/// `/workspace` at boot would cache an fd against the initramfs inode
-/// that pivot_root then orphans. Lazy init lets the first FS RPC
-/// trigger the open after `wait_for_oci_setup_ready`, by which point
-/// the visible filesystem matches the resolved fds for the rest of the
-/// process lifetime.
+/// Init is lazy rather than eager-at-`main` because OCI-rootfs mode
+/// pivots into a new root *after* boot. Opening `/workspace` at boot
+/// would cache an fd against the initramfs inode that `pivot_root`
+/// then orphans. Lazy init defers the open to the first FS RPC, which
+/// already gates on `wait_for_oci_setup_ready` — by that point the
+/// visible filesystem matches the inodes the cached fds will name for
+/// the rest of the process lifetime.
 ///
-/// The read-side table is populated by [`init_read_roots`] (R-B2.2);
-/// the two are independent so each requirement's call-site migration
-/// can land in its own commit.
+/// The read-side table is populated by [`init_read_roots`]; the two
+/// tables are independent and can be initialised on different code
+/// paths without any cross-coupling.
 ///
-/// Failures are *fatal* and route through `kmsg_emerg` + `_exit(101)`:
-/// silent fallback to the lexical check would defeat the whole point
-/// of this module (the threat model relies on kernel-side resolution).
+/// Failures are *fatal* and route through `kmsg_emerg` + `_exit(101)`.
+/// Silent fallback to a weaker check would defeat the security
+/// guarantee the rest of this module is built around.
 pub(crate) fn init() {
     if WRITE_ROOTS.get().is_some() {
         return;
@@ -686,7 +688,7 @@ mod tests {
         unsafe { libc::close(raw) };
     }
 
-    // R-B2.2 — read-side mirrors of the write-side negatives.
+    // Read-side mirrors of the write-side negatives.
     #[test]
     fn read_rejects_symlink_escape() {
         let _g = ensure_fixture();

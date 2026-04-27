@@ -40,7 +40,7 @@ const HOST_CID: u32 = 2;
 
 const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
 
-// Mirrors `ALLOWED_WRITE_ROOTS` for the host-driven `ReadFile` RPC; see R-B2.2.
+// Mirrors `ALLOWED_WRITE_ROOTS` for the host-driven `ReadFile` RPC.
 // The current host call sites of `send_read_file` all read paths under
 // `/workspace` (`src/runtime.rs` `persist_workflow_artifacts` reads
 // `/workspace/result.json` and per-artifact paths joined onto
@@ -3399,12 +3399,11 @@ mod tests {
         assert_eq!(parse_open_fds("oops"), 0);
     }
 
-    // The `is_allowed_guest_path` / `normalize_path` lexical helpers and
-    // their tests were removed in R-B2.1: privileged FS RPCs now resolve
-    // paths via `fs_guard` (`openat2` with `RESOLVE_IN_ROOT |
-    // RESOLVE_NO_SYMLINKS` against cached root fds), with negative-case
-    // tests covering symlink/`..`/outside-root attempts living in
-    // `fs_guard::tests`.
+    // Path-allowlist coverage lives in `fs_guard::tests`, not here.
+    // Privileged FS RPCs route every path through `fs_guard`'s
+    // `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)` against cached
+    // root fds; the symlink/`..`/outside-root negative cases sit
+    // alongside the helper they exercise.
 
     #[test]
     fn test_page_size_bytes_positive() {
