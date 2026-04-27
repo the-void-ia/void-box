@@ -64,10 +64,23 @@ async fn same_uid_can_connect() {
     let socket = dir.path().join("voidbox.sock");
 
     let handle = spawn_daemon_on(socket.clone()).await;
-    // Give the listener one tick to enter accept().
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let _ = UnixStream::connect(&socket).expect("same-uid connect must succeed");
+    // Wait for the listener to enter accept() via a bounded retry loop;
+    // a fixed sleep is flaky on slow CI.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("same-uid connect must succeed once listener is ready: {err}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
     handle.abort();
 }
 
@@ -94,7 +107,24 @@ async fn different_uid_cannot_connect() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("voidbox.sock");
     let handle = spawn_daemon_on(socket.clone()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Confirm the listener is accepting (parent is uid 0 so same-uid
+    // connect succeeds) before forking the child that tries as nobody.
+    // Bounded retry rather than a fixed sleep — flake-resistant on CI.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("daemon listener not ready: {err}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
 
     // Pick a low-privilege uid that is essentially always present on Linux
     // (`nobody` is uid 65534 on Debian/Ubuntu and most distros). The exact

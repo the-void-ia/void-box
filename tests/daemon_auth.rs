@@ -17,21 +17,40 @@ mod test_net;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use secrecy::SecretString;
 
 const TOKEN: &str = "deadbeef-test-token";
 
+/// Env vars are process-global. `cargo test` runs the three tests in this
+/// file concurrently within one binary; without this lock they race on
+/// `VOIDBOX_STATE_DIR`. Held only during the brief setup-then-init window
+/// where the daemon reads the env, then released so other tests can take
+/// their turn (each daemon thread is already pinned to its own tempdir
+/// path by the time the lock drops).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 fn start_daemon_with_token() -> SocketAddr {
     let (addr, listener) = test_net::reserve_localhost_listener();
     listener.set_nonblocking(true).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // Hold the lock just long enough for the daemon to read
+            // VOIDBOX_STATE_DIR during init. We can't restore the prior
+            // value reliably here (tests run forever), but we serialise so
+            // each daemon sees the value its own setup put in place.
+            let _guard = ENV_LOCK.lock().unwrap();
             let dir = tempfile::tempdir().unwrap();
             std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
             let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            // Signal init progress past the env read; the lock can release
+            // as soon as we leave this scope.
+            let _ = ready_tx.send(());
+            drop(_guard);
             let _ = void_box::daemon::serve_on_listener_with_token(
                 tokio_listener,
                 Some(SecretString::from(TOKEN.to_string())),
@@ -39,6 +58,10 @@ fn start_daemon_with_token() -> SocketAddr {
             .await;
         });
     });
+    // Wait until the daemon thread has read the env and dropped the lock,
+    // so the next test calling start_daemon_with_token() can acquire it
+    // without racing.
+    let _ = ready_rx.recv_timeout(Duration::from_secs(5));
 
     for _ in 0..50 {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {

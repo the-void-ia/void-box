@@ -45,9 +45,20 @@ async fn server_and_client_resolve_to_same_path() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let mut client = UnixStream::connect(&client_path).await.expect("connect");
+    // Wait for the listener to be accepting via a bounded retry loop
+    // rather than a fixed sleep; CI runs vary widely in how fast the
+    // spawned task actually reaches `accept`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut client = loop {
+        match UnixStream::connect(&client_path).await {
+            Ok(stream) => break stream,
+            Err(err) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = err;
+            }
+            Err(err) => panic!("connect: {err}"),
+        }
+    };
     client
         .write_all(b"GET /v1/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await
