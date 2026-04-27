@@ -1,8 +1,46 @@
 use std::path::{Path, PathBuf};
 
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use void_box::snapshot_store;
+
+/// Read a bearer-token file via `void_box::daemon_listen::read_token_file`
+/// — same `0o600`-style owner-only perm check the daemon applies. Returns
+/// `None` and falls through to the next discovery tier on any failure.
+///
+/// When `explicit` is true (the operator pointed `VOIDBOX_DAEMON_TOKEN_FILE`
+/// at this path), failures emit a one-line `eprintln!` warning so a
+/// misconfigured token file produces a hint rather than a confusing 401
+/// from the daemon. When `explicit` is false (tier-3 auto-discovery at
+/// `~/.config/voidbox/daemon-token`), missing files are silent — they're
+/// the expected state until the daemon generates one — but loose
+/// permissions still warn, since that's a real misconfig regardless of
+/// how we found the file.
+fn read_secure_token_file_or_warn(path_str: Option<String>, explicit: bool) -> Option<String> {
+    let path_str = path_str?;
+    let path = Path::new(&path_str);
+    if !explicit && !path.exists() {
+        return None;
+    }
+    match void_box::daemon_listen::read_token_file(path) {
+        Ok(secret) => {
+            let trimmed = secret.expose_secret().trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: ignoring daemon token at {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 /// Resolved filesystem paths used by the CLI.
 #[derive(Debug, Clone)]
@@ -209,11 +247,7 @@ pub fn load_and_merge(
     let daemon_token = std::env::var("VOIDBOX_DAEMON_TOKEN")
         .ok()
         .or_else(|| {
-            std::env::var("VOIDBOX_DAEMON_TOKEN_FILE")
-                .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|raw| raw.trim().to_string())
-                .filter(|s| !s.is_empty())
+            read_secure_token_file_or_warn(std::env::var("VOIDBOX_DAEMON_TOKEN_FILE").ok(), true)
         })
         .or_else(|| {
             // Tier-3 fallback: pick up the token the daemon auto-generates
@@ -221,10 +255,7 @@ pub fn load_and_merge(
             // path on both sides converges client and server with zero
             // env-var plumbing for the typical local-dev TCP case.
             let path = void_box::daemon_listen::default_token_path();
-            std::fs::read_to_string(&path)
-                .ok()
-                .map(|raw| raw.trim().to_string())
-                .filter(|s| !s.is_empty())
+            read_secure_token_file_or_warn(Some(path.to_string_lossy().into_owned()), false)
         });
 
     ResolvedConfig {

@@ -202,7 +202,13 @@ pub fn resolve_tcp_token(
     })
 }
 
-fn read_token_file(path: &Path) -> Result<SecretString, ListenConfigError> {
+/// Read a bearer-token file, enforcing the same `0o600`-style owner-only
+/// permission check the daemon applies. Public so the CLI client uses the
+/// same policy when consuming `VOIDBOX_DAEMON_TOKEN_FILE` and the tier-3
+/// auto-discovery path; otherwise the daemon would refuse a loose-perm
+/// file at startup while the client silently sent its contents over the
+/// wire.
+pub fn read_token_file(path: &Path) -> Result<SecretString, ListenConfigError> {
     let metadata = fs::metadata(path).map_err(|err| ListenConfigError::TokenFileError {
         path: path.to_path_buf(),
         detail: err.to_string(),
