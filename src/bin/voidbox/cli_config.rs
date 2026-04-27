@@ -206,13 +206,26 @@ pub fn load_and_merge(
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| "info".into());
 
-    let daemon_token = std::env::var("VOIDBOX_DAEMON_TOKEN").ok().or_else(|| {
-        std::env::var("VOIDBOX_DAEMON_TOKEN_FILE")
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|raw| raw.trim().to_string())
-            .filter(|s| !s.is_empty())
-    });
+    let daemon_token = std::env::var("VOIDBOX_DAEMON_TOKEN")
+        .ok()
+        .or_else(|| {
+            std::env::var("VOIDBOX_DAEMON_TOKEN_FILE")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|raw| raw.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            // Tier-3 fallback: pick up the token the daemon auto-generates
+            // and persists when started without explicit token wiring. Same
+            // path on both sides converges client and server with zero
+            // env-var plumbing for the typical local-dev TCP case.
+            let path = void_box::daemon_listen::default_token_path();
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
 
     ResolvedConfig {
         log_level,

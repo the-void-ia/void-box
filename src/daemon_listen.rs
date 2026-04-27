@@ -161,9 +161,11 @@ pub struct ResolvedToken {
 /// 1. `--token-file` if `cli_token_file` is `Some`.
 /// 2. The `VOIDBOX_DAEMON_TOKEN_FILE` environment variable.
 /// 3. The `VOIDBOX_DAEMON_TOKEN` environment variable.
-/// 4. A freshly generated 32-byte hex token written to a `0o600` file under
-///    `default_token_directory()` whose path is returned for the daemon to
-///    log at INFO.
+/// 4. A freshly generated 32-byte hex token written to a `0o600` file at
+///    [`default_token_path`] (under `$XDG_CONFIG_HOME/voidbox/`) whose path
+///    is returned for the daemon to log at INFO. The CLI reads from the
+///    same path as a tier-3 fallback below the env vars, so server and
+///    client converge with no manual wiring in the same-host case.
 ///
 /// The CLI / env file paths must already be `0o600`; loose permissions
 /// (group- or world-readable bits) are rejected up front so an operator
@@ -248,13 +250,13 @@ fn generate_and_persist_token() -> Result<(PathBuf, SecretString), ListenConfigE
         detail: format!("getrandom failed: {err}"),
     })?;
     let hex = hex_encode(&bytes);
-    let dir = default_token_directory();
-    fs::create_dir_all(&dir).map_err(|err| ListenConfigError::TokenFileError {
-        path: dir.clone(),
-        detail: err.to_string(),
-    })?;
-    let uid = current_uid();
-    let path = dir.join(format!("daemon-token-{uid}"));
+    let path = default_token_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| ListenConfigError::TokenFileError {
+            path: parent.to_path_buf(),
+            detail: err.to_string(),
+        })?;
+    }
     write_token_file(&path, &hex)?;
     Ok((path, SecretString::from(hex)))
 }
@@ -294,20 +296,31 @@ fn write_token_file(path: &Path, contents: &str) -> Result<(), ListenConfigError
     Ok(())
 }
 
-fn default_token_directory() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+/// Path the daemon writes auto-generated TCP tokens to, and that the CLI
+/// reads as a tier-3 fallback when neither `VOIDBOX_DAEMON_TOKEN` nor
+/// `VOIDBOX_DAEMON_TOKEN_FILE` is set. Lives under the per-user config dir
+/// so server and client converge on the same path without coordination.
+///
+/// Resolution order:
+/// 1. `$XDG_CONFIG_HOME/voidbox/daemon-token`
+/// 2. `$HOME/.config/voidbox/daemon-token`
+/// 3. `/tmp/voidbox-$UID/daemon-token` (last resort, e.g. `HOME` unset)
+pub fn default_token_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         let p = PathBuf::from(dir);
         if !p.as_os_str().is_empty() {
-            return p.join("voidbox");
+            return p.join("voidbox").join("daemon-token");
         }
     }
     if let Ok(home) = std::env::var("HOME") {
         let p = PathBuf::from(home);
         if !p.as_os_str().is_empty() {
-            return p.join(".void-box");
+            return p.join(".config").join("voidbox").join("daemon-token");
         }
     }
-    PathBuf::from("/tmp").join(format!("voidbox-{}", current_uid()))
+    PathBuf::from("/tmp")
+        .join(format!("voidbox-{}", current_uid()))
+        .join("daemon-token")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -556,17 +569,21 @@ mod tests {
 
     #[test]
     fn resolve_tcp_token_generates_when_nothing_configured() {
-        let runtime = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let config_root = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         with_env(
             &[
                 (DAEMON_TOKEN_ENV, None),
                 (DAEMON_TOKEN_FILE_ENV, None),
-                ("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap())),
+                (
+                    "XDG_CONFIG_HOME",
+                    Some(config_root.path().to_str().unwrap()),
+                ),
             ],
             || {
                 let resolved = resolve_tcp_token(None).unwrap();
                 let generated_path = resolved.generated_path.expect("token should be generated");
-                assert!(generated_path.starts_with(runtime.path()));
+                let expected = config_root.path().join("voidbox").join("daemon-token");
+                assert_eq!(generated_path, expected);
                 let on_disk = fs::read_to_string(&generated_path).unwrap();
                 assert_eq!(on_disk.trim(), resolved.token.expose_secret());
                 #[cfg(unix)]
