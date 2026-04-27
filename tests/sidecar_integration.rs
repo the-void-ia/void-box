@@ -9,7 +9,6 @@ use void_box::sidecar::{start_sidecar, InboxEntry, InboxSnapshot};
 #[path = "common/net.rs"]
 mod test_net;
 
-/// Response data extracted in the blocking thread.
 struct Resp {
     status: u16,
     body: Value,

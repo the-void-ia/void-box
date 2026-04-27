@@ -35,10 +35,11 @@ opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_ex
 # HTTP client (for fetching remote skills from skills.sh)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 futures-util = "0.3"
-# AF_UNIX HTTP transport for the CLI -> daemon path. `reqwest` has no
-# unix-socket transport; `hyperlocal` provides a `UnixConnector` for the
-# `hyper-util` legacy client. `hyper`/`hyper-util`/`http-body-util` are
-# already in the workspace dep tree (transitive via reqwest).
+# HTTP transport for the CLI -> daemon path (both AF_UNIX and TCP).
+# `hyper-util` supplies the legacy `Client` over `HttpConnector` (TCP) or
+# `hyperlocal::UnixConnector` (AF_UNIX); `reqwest` is not used here because
+# it has no unix-socket connector. `hyper`/`hyper-util`/`http-body-util`
+# are already in the workspace dep tree (transitive via reqwest).
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"

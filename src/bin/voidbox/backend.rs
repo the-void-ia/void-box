@@ -92,17 +92,15 @@ impl LocalBackend {
 /// them apart while `RemoteBackend::send` builds a single `hyper::Uri` and
 /// dispatches through whichever client the variant carries.
 enum Transport {
+    // Both variants box the hyper client so the enum variants stay similar
+    // in size — a `HyperClient` owns a connection pool plus a connector,
+    // which would otherwise dominate the enum and trigger
+    // `clippy::large_enum_variant`.
     Tcp {
         base_url: String,
-        // Boxed for the same reason as `Unix`: `clippy::large_enum_variant`
-        // — the hyper legacy client owns a connection pool and a connector,
-        // which is materially bigger than the variant we'd otherwise pair
-        // it with.
         client: Box<TcpHyperClient>,
     },
     Unix {
-        // Boxed for `clippy::large_enum_variant` — same shape as `Tcp`,
-        // different connector.
         client: Box<UnixHyperClient>,
         socket_path: PathBuf,
         #[allow(dead_code)]
