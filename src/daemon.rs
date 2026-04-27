@@ -133,32 +133,42 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
     }
 }
 
-/// Serve the daemon on an already-bound TCP listener.
+/// Serve the daemon on an already-bound TCP listener with a bearer token
+/// gating every request. Tests reserve a port before spawning the server
+/// so the bind-here-rather-than-rebind-later sequence closes the TOCTOU
+/// window where another process could claim the port in between.
 ///
-/// Useful for tests that need to reserve a port before spawning the server:
-/// binding here (rather than reserving a port and re-binding later) closes the
-/// TOCTOU window where another process could claim the port in between.
-///
-/// Tests use this path with a generated bearer token (or with no auth if they
-/// pass `None`, which currently emits a `WARN` and accepts every request — the
-/// CLI never produces this state because `serve` rejects it up-front).
-pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
-    serve_on_listener_with_token(listener, None).await
-}
-
-/// Same as [`serve_on_listener`] but lets the caller supply a bearer token
-/// for tests that exercise the auth path.
+/// The token is non-optional: an embedder that calls this from outside
+/// the daemon CLI must explicitly think about authentication. Tests that
+/// genuinely need an unauthenticated TCP daemon (where the test client
+/// itself doesn't send `Authorization`) call
+/// [`serve_on_listener_no_auth`] instead — the name makes the security
+/// implication impossible to miss at the call site.
 pub async fn serve_on_listener_with_token(
     listener: TcpListener,
-    token: Option<SecretString>,
+    token: SecretString,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let auth = match token {
-        Some(secret) => AuthMode::BearerToken(Arc::new(secret)),
-        None => {
-            warn!("daemon TCP listener has no bearer token configured; accepting all requests");
-            AuthMode::BearerToken(Arc::new(SecretString::from(String::new())))
-        }
-    };
+    serve_tcp(listener, AuthMode::BearerToken(Arc::new(token))).await
+}
+
+/// Test-only serve entry point that accepts every request without
+/// checking `Authorization`. The empty-string token doesn't actually
+/// authorise anything — it makes the auth chokepoint match-and-allow on
+/// any request whose `Authorization` header presents an empty bearer,
+/// which is what tests with no-auth clients send (none).
+///
+/// **Do not use this from production code.** The renamed-from-old
+/// `serve_on_listener` shape exists only because three legacy integration
+/// tests (`orchestration_contract`, `sidecar_integration`,
+/// `e2e/service_mode`) predate the auth chokepoint and want a daemon
+/// they can hit without token plumbing. New tests should use
+/// [`serve_on_listener_with_token`] with a known fixture token instead.
+#[doc(hidden)]
+pub async fn serve_on_listener_no_auth(
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn!("daemon TCP listener has no bearer token configured; accepting all requests");
+    let auth = AuthMode::BearerToken(Arc::new(SecretString::from(String::new())));
     serve_tcp(listener, auth).await
 }
 

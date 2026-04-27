@@ -110,7 +110,7 @@ fn start_daemon(kernel: &std::path::Path, initramfs: &std::path::Path) -> Socket
             std::env::set_var("VOID_BOX_KERNEL", kernel.to_str().unwrap());
             std::env::set_var("VOID_BOX_INITRAMFS", initramfs.to_str().unwrap());
             let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            void_box::daemon::serve_on_listener(tokio_listener)
+            void_box::daemon::serve_on_listener_no_auth(tokio_listener)
                 .await
                 .unwrap();
         });

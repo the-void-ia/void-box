@@ -392,7 +392,7 @@ fn start_daemon() -> SocketAddr {
             let dir = tempfile::tempdir().unwrap();
             std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
             let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            let _ = void_box::daemon::serve_on_listener(tokio_listener).await;
+            let _ = void_box::daemon::serve_on_listener_no_auth(tokio_listener).await;
         });
     });
 

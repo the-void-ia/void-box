@@ -53,7 +53,7 @@ fn start_daemon_with_token() -> SocketAddr {
             drop(_guard);
             let _ = void_box::daemon::serve_on_listener_with_token(
                 tokio_listener,
-                Some(SecretString::from(TOKEN.to_string())),
+                SecretString::from(TOKEN.to_string()),
             )
             .await;
         });

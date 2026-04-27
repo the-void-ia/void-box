@@ -154,8 +154,13 @@ pub struct ResolvedConfig {
     pub kernel: Option<PathBuf>,
     pub initramfs: Option<PathBuf>,
     /// Bearer token used by the CLI when talking to a TCP daemon. Read at
-    /// load time from `VOIDBOX_DAEMON_TOKEN` or, if unset, from the file at
-    /// `VOIDBOX_DAEMON_TOKEN_FILE`. Always `None` for AF_UNIX daemons.
+    /// load time from `VOIDBOX_DAEMON_TOKEN`, `VOIDBOX_DAEMON_TOKEN_FILE`,
+    /// or `~/.config/voidbox/daemon-token` (in that priority). Always
+    /// `None` for AF_UNIX daemons — the resolution is short-circuited
+    /// when `daemon_url` starts with `unix://`, both because the token
+    /// would never be used (AF_UNIX gates access via socket permissions)
+    /// and to avoid spurious warnings from a stale or misconfigured
+    /// token file that isn't actually relevant to this run.
     pub daemon_token: Option<String>,
 }
 
@@ -244,25 +249,41 @@ pub fn load_and_merge(
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| "info".into());
 
-    let daemon_token = std::env::var("VOIDBOX_DAEMON_TOKEN")
-        .ok()
-        .or_else(|| {
-            read_secure_token_file_or_warn(std::env::var("VOIDBOX_DAEMON_TOKEN_FILE").ok(), true)
-        })
-        .or_else(|| {
-            // Tier-3 fallback: pick up the token the daemon auto-generates
-            // and persists when started without explicit token wiring. Same
-            // path on both sides converges client and server with zero
-            // env-var plumbing for the typical local-dev TCP case.
-            let path = void_box::daemon_listen::default_token_path();
-            read_secure_token_file_or_warn(Some(path.to_string_lossy().into_owned()), false)
-        });
+    // The bearer token is only sent on TCP daemon URLs; AF_UNIX gates
+    // access via socket permissions. Skipping the resolution work for
+    // unix:// URLs avoids spurious "bad perms" warnings from a stale
+    // ~/.config/voidbox/daemon-token (or a misconfigured
+    // VOIDBOX_DAEMON_TOKEN_FILE) when the user has switched back to a
+    // local AF_UNIX daemon — the file isn't being used either way.
+    let resolved_daemon_url = merged
+        .daemon_url
+        .clone()
+        .unwrap_or_else(ResolvedConfig::default_daemon_url);
+    let daemon_token = if resolved_daemon_url.starts_with("unix://") {
+        None
+    } else {
+        std::env::var("VOIDBOX_DAEMON_TOKEN")
+            .ok()
+            .or_else(|| {
+                read_secure_token_file_or_warn(
+                    std::env::var("VOIDBOX_DAEMON_TOKEN_FILE").ok(),
+                    true,
+                )
+            })
+            .or_else(|| {
+                // Tier-3 fallback: pick up the token the daemon
+                // auto-generates and persists when started without
+                // explicit token wiring. Same path on both sides
+                // converges client and server with zero env-var plumbing
+                // for the typical local-dev TCP case.
+                let path = void_box::daemon_listen::default_token_path();
+                read_secure_token_file_or_warn(Some(path.to_string_lossy().into_owned()), false)
+            })
+    };
 
     ResolvedConfig {
         log_level,
-        daemon_url: merged
-            .daemon_url
-            .unwrap_or_else(ResolvedConfig::default_daemon_url),
+        daemon_url: resolved_daemon_url,
         banner: merged.banner.unwrap_or(true),
         kernel: merged.paths.kernel,
         initramfs: merged.paths.initramfs,
