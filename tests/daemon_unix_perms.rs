@@ -27,12 +27,10 @@ fn current_uid() -> u32 {
 }
 
 async fn spawn_daemon_on(socket_path: PathBuf) -> tokio::task::JoinHandle<()> {
-    // The test binds the listener identically to the production code path
-    // (`bind_unix_socket` in `src/daemon.rs`) — same `0o600` mode, same
-    // pre-bind cleanup. `serve_on_listener` is not used because it is
-    // TCP-only; the relevant question here is whether the kernel-enforced
+    // The test binds with the same `0o600` mode the production daemon
+    // uses; the relevant question here is whether the kernel-enforced
     // ACL on the bound path keeps a foreign uid out, not the daemon's
-    // request handling.
+    // request handling. A minimal accept loop suffices.
     let listener = bind_test_socket(&socket_path);
     tokio::spawn(async move {
         loop {

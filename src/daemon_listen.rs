@@ -14,8 +14,14 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -125,7 +131,6 @@ fn is_writable_dir(path: &Path) -> bool {
     // is not enough (ACLs, mount options like `noexec`/`ro`, etc. all matter).
     #[cfg(unix)]
     unsafe {
-        use std::ffi::CString;
         let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else {
             return false;
         };
@@ -233,7 +238,6 @@ pub fn read_token_file(path: &Path) -> Result<SecretString, ListenConfigError> {
 /// like `0o400` (owner-read-only) are also acceptable and equally safe.
 #[cfg(unix)]
 fn require_token_file_perms(path: &Path, metadata: &fs::Metadata) -> Result<(), ListenConfigError> {
-    use std::os::unix::fs::MetadataExt;
     let mode = metadata.mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(ListenConfigError::TokenFileError {
@@ -273,39 +277,97 @@ fn generate_and_persist_token() -> Result<(PathBuf, SecretString), ListenConfigE
     Ok((path, SecretString::from(hex)))
 }
 
+/// Atomically write `contents` to `path` with mode `0o600`.
+///
+/// Uses the temp-file-plus-rename pattern: contents are written to a fresh
+/// temp file in the same directory (created via `O_CREAT | O_EXCL` with
+/// mode `0o600` from the start), then `rename(2)`'d over `path`. The
+/// rename is atomic on every Unix filesystem we run on, so a concurrent
+/// reader sees either the old contents or the new contents in full —
+/// never a partially-written file, and never one whose mode is briefly
+/// looser than `0o600`.
+///
+/// Why not open the target path directly with `truncate(true)` and chmod
+/// afterwards: `OpenOptions::mode(0o600)` only applies to fresh creates,
+/// not truncations. A target that already exists with looser perms would
+/// keep those perms across the truncate, leaving a sub-millisecond
+/// window where the new contents are on disk under the looser mode while
+/// the post-write `set_permissions` is in flight. Routing through a
+/// sibling temp file with `O_CREAT | O_EXCL` removes that window because
+/// the temp path never pre-exists to inherit perms from.
 fn write_token_file(path: &Path, contents: &str) -> Result<(), ListenConfigError> {
-    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ListenConfigError::TokenFileError {
+            path: path.to_path_buf(),
+            detail: "token path has no parent directory".into(),
+        })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| ListenConfigError::TokenFileError {
+            path: path.to_path_buf(),
+            detail: "token path has no file-name component".into(),
+        })?;
+    // Per-pid uniqueness: the daemon is the only writer, but PID isolates
+    // any future concurrent writers (e.g. tests run in parallel) without
+    // needing entropy beyond what the OS already gives us.
+    let temp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
+    let temp_path = parent.join(&temp_name);
+
+    // Best-effort cleanup of any leftover temp from a crashed prior run.
+    let _ = fs::remove_file(&temp_path);
+
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options
-        .open(path)
+        .open(&temp_path)
         .map_err(|err| ListenConfigError::TokenFileError {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             detail: err.to_string(),
         })?;
     file.write_all(contents.as_bytes())
         .map_err(|err| ListenConfigError::TokenFileError {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             detail: err.to_string(),
         })?;
-    // Tighten mode in case the file pre-existed with looser bits before
-    // truncation (OpenOptions::mode only applies to fresh creates).
+    // `set_permissions` here is belt-and-braces — `OpenOptions::mode` on
+    // a fresh `O_CREAT | O_EXCL` create already fixes the mode to 0o600,
+    // but an exotic filesystem that ignores the create-mode bits is
+    // corrected here.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
             ListenConfigError::TokenFileError {
-                path: path.to_path_buf(),
+                path: temp_path.clone(),
                 detail: err.to_string(),
             }
         })?;
     }
-    Ok(())
+    // sync_all() ensures the contents hit the platter before the rename
+    // is observable; otherwise a power-loss between rename and fsync
+    // could leave the new path pointing at an empty inode.
+    file.sync_all()
+        .map_err(|err| ListenConfigError::TokenFileError {
+            path: temp_path.clone(),
+            detail: err.to_string(),
+        })?;
+    drop(file);
+    fs::rename(&temp_path, path).map_err(|err| {
+        // Surface both paths so the operator sees what we tried.
+        let _ = fs::remove_file(&temp_path);
+        ListenConfigError::TokenFileError {
+            path: path.to_path_buf(),
+            detail: format!(
+                "rename {} -> {}: {err}",
+                temp_path.display(),
+                path.display()
+            ),
+        }
+    })
 }
 
 /// Path the daemon writes auto-generated TCP tokens to, and that the CLI
@@ -380,7 +442,6 @@ pub fn remove_stale_socket(path: &Path) -> io::Result<()> {
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::FileTypeExt;
         if !metadata.file_type().is_socket() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -543,7 +604,6 @@ mod tests {
         fs::write(&path, "hunter2").unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         }
         let err = read_token_file(&path).unwrap_err();
@@ -558,7 +618,6 @@ mod tests {
         fs::write(&path, "hunter2\n").unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let token = read_token_file(&path).unwrap();
@@ -572,7 +631,6 @@ mod tests {
         fs::write(&path, "from-file").unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         with_env(
@@ -624,7 +682,6 @@ mod tests {
                 assert_eq!(on_disk.trim(), resolved.token.expose_secret());
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::MetadataExt;
                     let mode = fs::metadata(&generated_path).unwrap().mode() & 0o777;
                     assert_eq!(mode, 0o600);
                 }

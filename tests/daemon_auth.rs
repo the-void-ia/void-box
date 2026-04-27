@@ -17,40 +17,42 @@ mod test_net;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use secrecy::SecretString;
 
 const TOKEN: &str = "deadbeef-test-token";
 
-/// Env vars are process-global. `cargo test` runs the three tests in this
-/// file concurrently within one binary; without this lock they race on
-/// `VOIDBOX_STATE_DIR`. Held only during the brief setup-then-init window
-/// where the daemon reads the env, then released so other tests can take
-/// their turn (each daemon thread is already pinned to its own tempdir
-/// path by the time the lock drops).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+/// All tests in this binary share one state dir. `VOIDBOX_STATE_DIR` is
+/// process-global env, and `cargo test` runs `#[test]`s concurrently —
+/// the previous design's mutex-around-set_var only narrowed the race
+/// window without closing it (the daemon's env read happens later, in
+/// `build_app_state`, after the lock drops). Initialising via `OnceLock`
+/// removes the race surface entirely: the env is set exactly once, every
+/// daemon thread reads the same value. The auth tests don't write
+/// conflicting state — they exercise the chokepoint by route, not the
+/// run-store contents — so a shared dir is sound.
+static SHARED_STATE_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn ensure_shared_state_dir() {
+    SHARED_STATE_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("create shared state tempdir");
+        // Set once across all tests. `get_or_init` serialises concurrent
+        // first callers internally, so the env mutation is single-writer.
+        std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
+        dir
+    });
+}
 
 fn start_daemon_with_token() -> SocketAddr {
+    ensure_shared_state_dir();
     let (addr, listener) = test_net::reserve_localhost_listener();
     listener.set_nonblocking(true).unwrap();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            // Hold the lock just long enough for the daemon to read
-            // VOIDBOX_STATE_DIR during init. We can't restore the prior
-            // value reliably here (tests run forever), but we serialise so
-            // each daemon sees the value its own setup put in place.
-            let _guard = ENV_LOCK.lock().unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
             let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            // Signal init progress past the env read; the lock can release
-            // as soon as we leave this scope.
-            let _ = ready_tx.send(());
-            drop(_guard);
             let _ = void_box::daemon::serve_on_listener_with_token(
                 tokio_listener,
                 SecretString::from(TOKEN.to_string()),
@@ -58,10 +60,6 @@ fn start_daemon_with_token() -> SocketAddr {
             .await;
         });
     });
-    // Wait until the daemon thread has read the env and dropped the lock,
-    // so the next test calling start_daemon_with_token() can acquire it
-    // without racing.
-    let _ = ready_rx.recv_timeout(Duration::from_secs(5));
 
     for _ in 0..50 {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {

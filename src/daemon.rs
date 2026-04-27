@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,8 +33,19 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// bearer-token compare runs in front of the route table.
 #[derive(Clone)]
 enum AuthMode {
+    /// AF_UNIX listener — `connect(2)` is gated by socket-mode `0o600`,
+    /// so by the time a request reaches the route the kernel has already
+    /// confirmed the peer's uid. No application-level auth needed.
     UnixSocket,
+    /// TCP listener with required bearer-token authentication. The token
+    /// is compared in constant time against the value the operator
+    /// configured at daemon startup.
     BearerToken(Arc<SecretString>),
+    /// Test-only mode that accepts every request without authentication.
+    /// Constructable only via `serve_on_listener_no_auth`, which is
+    /// `#[doc(hidden)]` and named to surface the security implication
+    /// at the call site. Production paths cannot reach this variant.
+    Disabled,
 }
 
 #[derive(Clone)]
@@ -151,25 +164,21 @@ pub async fn serve_on_listener_with_token(
     serve_tcp(listener, AuthMode::BearerToken(Arc::new(token))).await
 }
 
-/// Test-only serve entry point that accepts every request without
-/// checking `Authorization`. The empty-string token doesn't actually
-/// authorise anything — it makes the auth chokepoint match-and-allow on
-/// any request whose `Authorization` header presents an empty bearer,
-/// which is what tests with no-auth clients send (none).
+/// Test-only serve entry point that accepts **every** request without
+/// checking `Authorization`. Used by integration tests that do not send a
+/// bearer header.
 ///
-/// **Do not use this from production code.** The renamed-from-old
-/// `serve_on_listener` shape exists only because three legacy integration
-/// tests (`orchestration_contract`, `sidecar_integration`,
-/// `e2e/service_mode`) predate the auth chokepoint and want a daemon
-/// they can hit without token plumbing. New tests should use
-/// [`serve_on_listener_with_token`] with a known fixture token instead.
+/// **Do not use this from production code.** The function name carries
+/// the security implication; `#[doc(hidden)]` keeps it out of public
+/// rustdoc. Routes through [`AuthMode::Disabled`], so an embedder cannot
+/// reach this code path by accidentally constructing an empty
+/// `SecretString` and calling [`serve_on_listener_with_token`].
 #[doc(hidden)]
 pub async fn serve_on_listener_no_auth(
     listener: TcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    warn!("daemon TCP listener has no bearer token configured; accepting all requests");
-    let auth = AuthMode::BearerToken(Arc::new(SecretString::from(String::new())));
-    serve_tcp(listener, auth).await
+    warn!("daemon TCP listener has authentication disabled; accepting all requests");
+    serve_tcp(listener, AuthMode::Disabled).await
 }
 
 fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
@@ -187,7 +196,6 @@ fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
     // threat model relies on holds across the entire bind sequence.
     #[cfg(unix)]
     let listener = {
-        use std::os::unix::fs::PermissionsExt;
         // SAFETY: `umask` is process-global; the daemon binds its listener
         // once at startup, before background work that might want a
         // different umask is started. Restoring the prior value below
@@ -361,13 +369,8 @@ fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
 /// time so a network attacker cannot probe the token byte-by-byte.
 fn enforce_auth(auth: &AuthMode, headers: &str) -> Option<(String, String, Vec<u8>)> {
     match auth {
-        AuthMode::UnixSocket => None,
+        AuthMode::UnixSocket | AuthMode::Disabled => None,
         AuthMode::BearerToken(expected) => {
-            // Empty expected token = test-only "no auth" mode (see
-            // `serve_on_listener`); preserve the historical behavior.
-            if expected.expose_secret().is_empty() {
-                return None;
-            }
             let presented = header_value(headers, "authorization")
                 .and_then(daemon_listen::parse_bearer)
                 .unwrap_or("");
@@ -2946,12 +2949,14 @@ mod tests {
         }
 
         #[test]
-        fn bearer_mode_with_empty_expected_token_passes_all() {
-            // The test-only "no auth" mode used by `serve_on_listener`.
-            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
-                String::new(),
-            ))));
+        fn disabled_mode_passes_all_requests_regardless_of_header() {
+            // `AuthMode::Disabled` is the test-only no-auth variant; it
+            // bypasses the bearer-token check entirely. Confirm both an
+            // empty-header request and one bearing a wrong-looking token
+            // are accepted.
+            let state = make_state(AuthMode::Disabled);
             assert!(enforce_auth(&state.auth, "").is_none());
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer wrong-token\r\n").is_none());
         }
 
         #[tokio::test]
