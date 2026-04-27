@@ -346,10 +346,28 @@ impl MicroVm {
             let mut dev =
                 Virtio9pDevice::new(&first_mount.host_path, "mount0", first_mount.read_only);
             dev.set_mmio_base(0xd100_0000);
+            // RW mounts: map metadata uid/gid to the guest sandbox uid (1000)
+            // so the sandboxed guest user sees consistent ownership of the
+            // mount, regardless of whether the host runtime process runs as
+            // uid 1000 (developer laptop) or some other uid (CI runners).
+            // Without this, chown via 9p Tsetattr is silently accepted but
+            // not applied, and subsequent ops that re-validate the metadata
+            // expose the real host uid → EACCES on writes / EPERM on chmod
+            // from inside the sandbox. RO mounts don't need translation —
+            // the guest never modifies them. See `Virtio9pDevice::mapped_uid_gid`
+            // and issue #52.
+            if !first_mount.read_only {
+                dev.set_mapped_uid_gid(Some((1000, 1000)));
+            }
             debug!(
-                "virtio-9p MMIO at {:#x}, tag='mount0', root={}",
+                "virtio-9p MMIO at {:#x}, tag='mount0', root={}, mapped_uid_gid={:?}",
                 dev.mmio_base(),
                 first_mount.host_path,
+                if first_mount.read_only {
+                    None
+                } else {
+                    Some((1000u32, 1000u32))
+                },
             );
             Some(Arc::new(Mutex::new(dev)))
         } else {

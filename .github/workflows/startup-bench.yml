@@ -1,0 +1,203 @@
+name: Startup Bench
+
+# Two layers, both run in this workflow:
+#
+#   1. **Divan micro-bench** — `cargo bench --bench startup`. Pure-compute
+#      hot paths (Message::serialize/deserialize, kernel_cmdline,
+#      getrandom). No KVM, no nested virt, no L2 boot — same wall-clock
+#      cost on every Linux runner. Cheap regression gate.
+#
+#   2. **Wall-clock harness** — `voidbox-startup-bench --iters 20
+#      --breakdown`. Boots a real KVM VM through the slim kernel + test
+#      initramfs and measures cold-boot + warm-restore p50/p95/p99 end
+#      to end. Informational only on this runner: the GitHub-hosted
+#      `ubuntu-latest` is L2 nested under Hyper-V, so absolute numbers
+#      are slower than bare-metal Linux/KVM. The verify-skill thresholds
+#      (cold p50 ≤ 400 ms, warm p50 ≤ 200 ms) are bare-metal targets;
+#      attempting a strict gate here would flake on every run. Posting
+#      the numbers as a step summary + artifact builds a baseline so a
+#      future PR can flip the gate on if Azure runner perf stabilises.
+#
+# Triggers:
+#   - Weekly schedule (Mondays 06:00 UTC).
+#   - Manual via `workflow_dispatch`.
+#   - PRs that touch the startup hot path.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC — slot before the workday starts in most TZs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "voidbox-startup-bench iterations (per phase)"
+        required: false
+        default: "20"
+        type: string
+  pull_request:
+    paths:
+      - "src/vmm/**"
+      - "src/backend/**"
+      - "src/devices/**"
+      - "guest-agent/**"
+      - "void-box-protocol/**"
+      - "benches/**"
+      - "src/bin/voidbox-startup-bench/**"
+      - "scripts/build_slim_kernel.sh"
+      - "scripts/build_test_image.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/startup-bench.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: Startup bench (Ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture host environment
+        run: |
+          set -x
+          uname -a
+          nproc
+          free -h
+          # Hyper-V / Azure detection — informational, helps interpret
+          # the wall-clock numbers if they regress.
+          grep -E "^(model name|hypervisor)" /proc/cpuinfo | sort -u
+
+      - name: Enable KVM access
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sudo modprobe vhost_vsock || true
+          sudo chmod a+rw /dev/vhost-vsock 2>/dev/null || true
+          ls -la /dev/kvm
+          ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          # busybox-static: same reason as e2e.yml — `build_test_image.sh`
+          # silently skips `/bin/sh` install if BUSYBOX is unset.
+          # build-essential + flex/bison/bc/libssl-dev/libelf-dev/xz-utils:
+          # required by `scripts/build_slim_kernel.sh` to compile Linux from
+          # source on the runner (no Docker fallback needed on Linux).
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static \
+            build-essential flex bison bc libssl-dev libelf-dev xz-utils
+          sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          BUSYBOX_PATH="$(command -v busybox)"
+          test -n "$BUSYBOX_PATH" \
+            || { echo "::error::busybox not on PATH after busybox-static install"; exit 1; }
+          echo "BUSYBOX=$BUSYBOX_PATH" >> "$GITHUB_ENV"
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Distinct key from `e2e.yml` so this workflow's release-mode
+          # build artifacts don't poison the e2e debug cache and vice
+          # versa.
+          key: ${{ runner.os }}-startup-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-startup-bench-
+
+      - name: Cache slim kernel
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: target/vmlinux-slim-x86_64
+          # The slim kernel is fully reproducible from
+          # `scripts/build_slim_kernel.sh`'s pinned `KERNEL_VER`,
+          # `FC_COMMIT`, and `FC_CONFIG_MAJMIN`. Hash the script — every
+          # change to the pins busts the cache.
+          key: slim-kernel-x86_64-${{ hashFiles('scripts/build_slim_kernel.sh') }}
+
+      - name: Build slim kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        # ~10 minutes from cold; only fires when the cache key changes.
+        run: scripts/build_slim_kernel.sh
+
+      - name: Build test initramfs
+        run: scripts/build_test_image.sh
+
+      - name: Build voidbox-startup-bench (release)
+        # Release mode matches the verify-skill measurement and avoids
+        # debug-build noise dominating subsecond timings.
+        run: cargo build --release --bin voidbox-startup-bench
+
+      - name: Run divan micro-bench (regression gate)
+        # The micro-benches are pure-compute and stable across CI hosts.
+        # `divan` exits non-zero only on panic; this step always passes
+        # unless the bench file itself fails to run. We capture the
+        # output for the artifact so the numbers are reviewable.
+        run: |
+          mkdir -p target/tmp
+          cargo bench --bench startup 2>&1 | tee target/tmp/divan.log
+
+          {
+            echo "## Divan micro-bench (cargo bench --bench startup)"
+            echo
+            echo '```'
+            grep -E 'fastest|median|slowest|^[a-z_]+\.' target/tmp/divan.log \
+              || tail -40 target/tmp/divan.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run wall-clock harness (informational)
+        # No threshold gate — Azure nested-virt is slower than the
+        # bare-metal targets the verify-skill thresholds were tuned for.
+        # `continue-on-error` keeps the workflow green even if the
+        # harness fails outright (e.g. missing /dev/vhost-vsock on a
+        # future runner image change). The artifact preserves the log
+        # either way.
+        continue-on-error: true
+        env:
+          ITERS: ${{ inputs.iters || '20' }}
+          VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          if [ ! -e /dev/vhost-vsock ]; then
+            echo "::warning::/dev/vhost-vsock not available; skipping wall-clock harness"
+            exit 0
+          fi
+          ls -la "$VOID_BOX_KERNEL" "$VOID_BOX_INITRAMFS"
+          ./target/release/voidbox-startup-bench --iters "$ITERS" --breakdown 2>&1 \
+            | tee target/tmp/wallclock.log
+
+          {
+            echo
+            echo "## Wall-clock harness (voidbox-startup-bench --iters $ITERS --breakdown)"
+            echo
+            echo "Reference (Fedora 43 / KVM / slim x86_64): cold p50 ≈ 252 ms, warm p50 ≈ 138 ms."
+            echo "GitHub-hosted \`ubuntu-latest\` is L2 nested under Hyper-V; absolute numbers run slower."
+            echo
+            echo '```'
+            grep -E '^(cold|warm)\.' target/tmp/wallclock.log || tail -40 target/tmp/wallclock.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-bench-${{ github.run_id }}
+          path: target/tmp/*.log
+          retention-days: 30
