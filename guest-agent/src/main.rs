@@ -9,12 +9,13 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("guest-agent is Linux-only (runs as PID 1 inside the micro-VM)");
 
+mod fs_guard;
 mod pty;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2749,60 +2750,126 @@ fn write_framed(fd: RawFd, msg: &[u8]) -> Result<(), String> {
 /// Runs as root (no privilege drop) since this is host-initiated provisioning.
 /// After writing, the file and its parent directories are chowned to uid 1000
 /// so the sandbox user can read them (e.g., when claudio runs as uid 1000).
+///
+/// Path resolution is delegated to `fs_guard`, which uses `openat2` with
+/// `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` against a cached root fd. The
+/// resolved fd is used directly for the write — no path-string re-open
+/// after resolution, which is what would re-introduce a TOCTOU window.
 fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
-    let target = Path::new(&request.path);
-    if !is_allowed_guest_path(target) {
+    // In OCI-rootfs mode the cached fs_guard root fds must be opened
+    // post-pivot, otherwise resolution targets orphaned initramfs
+    // inodes; mirrors the gate `handle_exec` already enforces.
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
         return WriteFileResponse {
             success: false,
-            error: Some(format!(
-                "Refusing write outside allowed roots {:?}: {}",
-                ALLOWED_WRITE_ROOTS, request.path
-            )),
+            error: Some(format!("OCI rootfs not ready: {}", e)),
         };
     }
 
-    // Create parent directories if requested
+    let target = Path::new(&request.path);
+
     if request.create_parents {
         if let Some(parent) = target.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = fs_guard::create_dirs_in_root(parent) {
                 return WriteFileResponse {
                     success: false,
                     error: Some(format!(
-                        "Failed to create parent dirs {}: {}",
-                        parent.display(),
-                        e
+                        "Refusing mkdir for parents of {}: {}",
+                        request.path, e
                     )),
                 };
             }
-            // Make parent directories readable by sandbox user (uid 1000)
             chown_recursive(parent);
         }
     }
 
-    // Write the file content
-    match std::fs::write(&request.path, &request.content) {
-        Ok(()) => {
-            // Make the file readable by sandbox user (uid 1000)
-            let c_path = std::ffi::CString::new(request.path.as_str()).unwrap_or_default();
-            unsafe {
-                libc::chown(c_path.as_ptr(), 1000, 1000);
-                // Ensure file is world-readable
-                libc::chmod(c_path.as_ptr(), 0o644);
-            }
-            kmsg(&format!(
-                "Wrote {} bytes to {}",
-                request.content.len(),
-                request.path
-            ));
-            WriteFileResponse {
-                success: true,
-                error: None,
-            }
+    let (parent_fd, basename) = match fs_guard::resolve_parent_for_write(target) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!(
+                    "Refusing write outside allowed roots {:?}: {} ({})",
+                    ALLOWED_WRITE_ROOTS, request.path, e
+                )),
+            };
         }
-        Err(e) => WriteFileResponse {
+    };
+
+    // Open the leaf via the resolved parent fd with O_NOFOLLOW so a
+    // final-component symlink the agent plants (after the parent walk
+    // resolves) cannot redirect the write. The parent walk itself is
+    // protected by RESOLVE_NO_SYMLINKS; this closes the leaf-only race.
+    let basename_c = match std::ffi::CString::new(basename.as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!("invalid basename in path: {}", request.path)),
+            };
+        }
+    };
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            basename_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return WriteFileResponse {
             success: false,
-            error: Some(format!("Failed to write {}: {}", request.path, e)),
-        },
+            error: Some(format!("Failed to open {}: {}", request.path, err)),
+        };
+    }
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let mut written = 0usize;
+    while written < request.content.len() {
+        let n = unsafe {
+            libc::write(
+                owned.as_raw_fd(),
+                request.content[written..].as_ptr() as *const libc::c_void,
+                request.content.len() - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!("Failed to write {}: {}", request.path, err)),
+            };
+        }
+        if n == 0 {
+            break;
+        }
+        written += n as usize;
+    }
+
+    if unsafe { libc::fchown(owned.as_raw_fd(), 1000, 1000) } != 0 {
+        // Best-effort, matches the prior behaviour of the path-based chown.
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!("fchown({}) failed: {}", request.path, err));
+    }
+    if unsafe { libc::fchmod(owned.as_raw_fd(), 0o644) } != 0 {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!("fchmod({}) failed: {}", request.path, err));
+    }
+
+    kmsg(&format!(
+        "Wrote {} bytes to {}",
+        request.content.len(),
+        request.path
+    ));
+    WriteFileResponse {
+        success: true,
+        error: None,
     }
 }
 
@@ -2841,26 +2908,34 @@ fn handle_file_stat(request: &FileStatRequest) -> FileStatResponse {
 
 /// Recursively chown a path and its parents to uid 1000:1000.
 /// Only affects directories that are owned by root.
+///
+/// Uses `fs_guard` to obtain a kernel-resolved fd at each level, then
+/// `fchown`/`fchmod` against the fd. A planted symlink at any level
+/// fails the kernel walk via `RESOLVE_NO_SYMLINKS`; a directory whose
+/// `fstat.uid` is not 0 is skipped (mirrors the prior `lstat`-then-skip
+/// behaviour, but via fd so there's no second filesystem walk).
 fn chown_recursive(path: &std::path::Path) {
-    if !is_allowed_guest_path(path) {
-        return;
-    }
-
-    let mut current = path.to_path_buf();
-    loop {
-        if !is_allowed_guest_path(&current) {
-            break;
+    let ancestors = match fs_guard::ancestors_for_write(path) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    use std::os::fd::AsRawFd as _;
+    for fd in &ancestors {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            continue;
         }
-        chown_dir_if_root_owned(&current);
-
-        if is_allowed_root(&current) {
-            break;
+        // Only chown root-owned directories — matches the prior
+        // chown_dir_if_root_owned semantics.
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            continue;
         }
-        match current.parent() {
-            Some(p) if p != current => {
-                current = p.to_path_buf();
-            }
-            _ => break,
+        if st.st_uid != 0 {
+            continue;
+        }
+        unsafe {
+            libc::fchown(fd.as_raw_fd(), 1000, 1000);
+            libc::fchmod(fd.as_raw_fd(), 0o755);
         }
     }
 }
@@ -2869,20 +2944,23 @@ fn chown_recursive(path: &std::path::Path) {
 /// Runs as root (no privilege drop) since this is host-initiated provisioning.
 /// After creating, directories are chowned to uid 1000 so the sandbox user
 /// can access them.
+///
+/// Path creation walks via `fs_guard::create_dirs_in_root`, which
+/// `mkdirat`s each component against the latest resolved fd and re-resolves
+/// with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` between steps. A planted
+/// symlink at any level fails the resolve rather than redirecting the
+/// `mkdir`; the kernel never walks a path string we hand it.
 fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
-    let target = Path::new(&request.path);
-    if !is_allowed_guest_path(target) {
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
         return MkdirPResponse {
             success: false,
-            error: Some(format!(
-                "Refusing mkdir outside allowed roots {:?}: {}",
-                ALLOWED_WRITE_ROOTS, request.path
-            )),
+            error: Some(format!("OCI rootfs not ready: {}", e)),
         };
     }
 
-    match std::fs::create_dir_all(&request.path) {
-        Ok(()) => {
+    let target = Path::new(&request.path);
+    match fs_guard::create_dirs_in_root(target) {
+        Ok(_fd) => {
             chown_recursive(target);
             kmsg(&format!("Created directory {}", request.path));
             MkdirPResponse {
@@ -2893,8 +2971,8 @@ fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
         Err(e) => MkdirPResponse {
             success: false,
             error: Some(format!(
-                "Failed to create directory {}: {}",
-                request.path, e
+                "Refusing mkdir outside allowed roots {:?}: {} ({})",
+                ALLOWED_WRITE_ROOTS, request.path, e
             )),
         },
     }
@@ -3198,62 +3276,6 @@ fn page_size_bytes() -> u64 {
     }
 }
 
-fn is_allowed_guest_path(path: &Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-
-    let normalized = normalize_path(path);
-    ALLOWED_WRITE_ROOTS.iter().any(|root| {
-        let root_path = Path::new(root);
-        normalized == root_path || normalized.starts_with(root_path)
-    })
-}
-
-fn is_allowed_root(path: &Path) -> bool {
-    ALLOWED_WRITE_ROOTS
-        .iter()
-        .any(|root| path == Path::new(root))
-}
-
-fn chown_dir_if_root_owned(path: &Path) {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    if meta.uid() != 0 {
-        return;
-    }
-
-    if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_ref()) {
-        unsafe {
-            libc::chown(c_path.as_ptr(), 1000, 1000);
-            // Ensure directory is traversable
-            libc::chmod(c_path.as_ptr(), 0o755);
-        }
-    }
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(seg) => normalized.push(seg),
-            Component::Prefix(_) => {}
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        normalized
-    }
-}
-
 /// Get current time as Unix milliseconds.
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
@@ -3294,30 +3316,12 @@ mod tests {
         assert_eq!(parse_open_fds("oops"), 0);
     }
 
-    #[test]
-    fn test_allowed_guest_path_policy() {
-        assert!(is_allowed_guest_path(Path::new("/workspace/file.txt")));
-        assert!(is_allowed_guest_path(Path::new(
-            "/home/sandbox/.claude/skills/x.md"
-        )));
-        assert!(!is_allowed_guest_path(Path::new("/usr/local/bin/foo")));
-        assert!(!is_allowed_guest_path(Path::new("/etc/hosts")));
-        assert!(!is_allowed_guest_path(Path::new("relative/path")));
-    }
-
-    #[test]
-    fn test_normalize_path() {
-        assert_eq!(
-            normalize_path(Path::new("/workspace/a/../b/./c")),
-            PathBuf::from("/workspace/b/c")
-        );
-    }
-
-    #[test]
-    fn test_chown_recursive_stays_in_allowed_roots() {
-        // Function should be a no-op for disallowed roots.
-        chown_recursive(Path::new("/usr/local/bin"));
-    }
+    // The `is_allowed_guest_path` / `normalize_path` lexical helpers and
+    // their tests were removed in R-B2.1: privileged FS RPCs now resolve
+    // paths via `fs_guard` (`openat2` with `RESOLVE_IN_ROOT |
+    // RESOLVE_NO_SYMLINKS` against cached root fds), with negative-case
+    // tests covering symlink/`..`/outside-root attempts living in
+    // `fs_guard::tests`.
 
     #[test]
     fn test_page_size_bytes_positive() {
