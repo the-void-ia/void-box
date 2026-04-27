@@ -170,6 +170,10 @@ path = "tests/oci_integration.rs"
 name = "observe_codex"
 path = "tests/observe_codex.rs"
 
+[[test]]
+name = "network_baseline"
+path = "tests/network_baseline.rs"
+
 [[bench]]
 name = "startup"
 path = "benches/startup.rs"
