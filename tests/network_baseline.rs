@@ -521,3 +521,91 @@ fn tcp_deny_list_emits_rst() {
         .map(|(_, _, ctrl, _)| ctrl == TcpControl::Rst);
     assert_eq!(rst, Some(true), "deny-list IP must get RST");
 }
+
+/// Builds an ARP request Ethernet frame from the guest asking "who has
+/// `target_ip`?". The sender is the guest MAC/IP; target hardware address
+/// is zeroed as per ARP request convention.
+fn build_arp_request(target_ip: Ipv4Address) -> Vec<u8> {
+    let arp_repr = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Request,
+        source_hardware_addr: EthernetAddress(GUEST_MAC),
+        source_protocol_addr: SLIRP_GUEST_IP,
+        target_hardware_addr: EthernetAddress([0; 6]),
+        target_protocol_addr: target_ip,
+    };
+    let eth_repr = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress([0xff; 6]),
+        ethertype: EthernetProtocol::Arp,
+    };
+    let total = ETH_HDR_LEN + arp_repr.buffer_len();
+    let mut buf = vec![0u8; total];
+    let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth_repr.emit(&mut eth);
+    let mut arp = ArpPacket::new_unchecked(&mut buf[ETH_HDR_LEN..]);
+    arp_repr.emit(&mut arp);
+    buf
+}
+
+/// Parses an Ethernet frame as an ARP reply.
+///
+/// Returns `Some((source_hardware_addr, source_protocol_addr))` when the
+/// frame carries an ARP reply opcode, `None` otherwise.
+fn parse_arp_reply(frame: &[u8]) -> Option<(EthernetAddress, Ipv4Address)> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Arp {
+        return None;
+    }
+    let arp = ArpPacket::new_checked(eth.payload()).ok()?;
+    let repr = ArpRepr::parse(&arp).ok()?;
+    if let ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr,
+        source_protocol_addr,
+        ..
+    } = repr
+    {
+        Some((source_hardware_addr, source_protocol_addr))
+    } else {
+        None
+    }
+}
+
+#[test]
+fn arp_replies_for_gateway() {
+    let mut stack = SlirpStack::new().unwrap();
+    stack
+        .process_guest_frame(&build_arp_request(SLIRP_GATEWAY_IP))
+        .unwrap();
+    let reply = drain_n(&mut stack, 2)
+        .into_iter()
+        .find_map(|f| parse_arp_reply(&f))
+        .expect("arp reply for gateway");
+    assert_eq!(reply.1, SLIRP_GATEWAY_IP);
+    assert_eq!(reply.0, EthernetAddress(GATEWAY_MAC));
+}
+
+#[test]
+fn arp_replies_for_random_subnet_ip() {
+    let mut stack = SlirpStack::new().unwrap();
+    stack
+        .process_guest_frame(&build_arp_request(Ipv4Address::new(10, 0, 2, 99)))
+        .unwrap();
+    let reply = drain_n(&mut stack, 2)
+        .into_iter()
+        .find_map(|f| parse_arp_reply(&f))
+        .expect("arp reply for in-subnet IP");
+    assert_eq!(reply.0, EthernetAddress(GATEWAY_MAC));
+}
+
+#[test]
+fn arp_does_not_reply_for_guest_ip() {
+    let mut stack = SlirpStack::new().unwrap();
+    stack
+        .process_guest_frame(&build_arp_request(SLIRP_GUEST_IP))
+        .unwrap();
+    let reply = drain_n(&mut stack, 2)
+        .into_iter()
+        .find_map(|f| parse_arp_reply(&f));
+    assert!(reply.is_none(), "stack must not claim guest's own IP");
+}
