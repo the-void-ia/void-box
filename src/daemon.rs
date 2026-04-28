@@ -130,9 +130,9 @@ pub struct ServeConfig {
 pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
     match config.address {
         ListenAddress::Unix(path) => {
-            let listener = bind_unix_socket(&path)?;
+            let (listener, guard) = bind_unix_socket(&path)?;
             info!(path = %path.display(), "[void-box] daemon listening on unix://{}", path.display());
-            serve_unix(listener, AuthMode::UnixSocket).await
+            serve_unix(listener, AuthMode::UnixSocket, guard).await
         }
         ListenAddress::Tcp(addr) => {
             let token = config
@@ -181,7 +181,32 @@ pub async fn serve_on_listener_no_auth(
     serve_tcp(listener, AuthMode::Disabled).await
 }
 
-fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
+/// RAII unlink for the daemon's AF_UNIX socket file.
+///
+/// Holds the bound socket path; on drop, calls
+/// [`daemon_listen::remove_stale_socket`] so the file is unlinked on every
+/// exit path: graceful shutdown, panic, signal-triggered shutdown, or any
+/// future error return out of the serve loop. The remove helper refuses to
+/// unlink non-socket entries, so a path collision is never silently
+/// destructive.
+struct UnixSocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for UnixSocketGuard {
+    fn drop(&mut self) {
+        match daemon_listen::remove_stale_socket(&self.path) {
+            Ok(()) => debug!(path = %self.path.display(), "removed unix socket on shutdown"),
+            Err(err) => warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove unix socket on shutdown"
+            ),
+        }
+    }
+}
+
+fn bind_unix_socket(path: &Path) -> std::io::Result<(UnixListener, UnixSocketGuard)> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -211,7 +236,10 @@ fn bind_unix_socket(path: &Path) -> std::io::Result<UnixListener> {
     };
     #[cfg(not(unix))]
     let listener = UnixListener::bind(path)?;
-    Ok(listener)
+    let guard = UnixSocketGuard {
+        path: path.to_path_buf(),
+    };
+    Ok((listener, guard))
 }
 
 async fn build_app_state(auth: AuthMode) -> AppState {
@@ -265,18 +293,71 @@ async fn serve_tcp(
 async fn serve_unix(
     listener: UnixListener,
     auth: AuthMode,
+    _guard: UnixSocketGuard,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = build_app_state(auth).await;
+    // The guard lives for the duration of this future; on any return path
+    // — clean shutdown, accept error, panic, task cancellation — its Drop
+    // unlinks the socket file. `_guard` is bound rather than passed by
+    // value into a sub-scope so the borrow checker keeps it alive across
+    // every `.await` below.
+    let mut shutdown = shutdown_signal();
     loop {
         debug!("daemon awaiting accept (unix)");
-        let (stream, _addr) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_stream(stream, state).await {
-                debug!(%e, "daemon unix connection error");
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("[void-box] daemon shutdown signal received; closing listener");
+                return Ok(());
             }
-        });
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(stream, state).await {
+                        debug!(%e, "daemon unix connection error");
+                    }
+                });
+            }
+        }
     }
+}
+
+/// Future that resolves on the first SIGINT or SIGTERM the process
+/// receives. Returned as a boxed `Future` so the caller can pin it once
+/// and `select!` against it across the accept loop without re-arming on
+/// every iteration (which would lose the signal between iterations).
+fn shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            // If installing the SIGTERM handler fails (e.g., a sandbox
+            // forbids signal-handler registration), fall back to ctrl_c
+            // alone rather than aborting startup — the listener still
+            // works, the operator just has fewer ways to ask it to stop.
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    warn!(%err, "failed to install SIGTERM handler; relying on SIGINT only");
+                    None
+                }
+            };
+            match term.as_mut() {
+                Some(term) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                },
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    })
 }
 
 /// Mark every non-terminal persisted run as `Failed` with a `run.failed`
@@ -2982,7 +3063,7 @@ mod tests {
         async fn bind_unix_socket_sets_owner_only_perms() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("voidbox.sock");
-            let _listener = bind_unix_socket(&path).expect("bind");
+            let (_listener, _guard) = bind_unix_socket(&path).expect("bind");
             let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
@@ -2991,13 +3072,32 @@ mod tests {
         async fn bind_unix_socket_replaces_stale_socket() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("voidbox.sock");
-            // Plant a real stale socket file: bind once, drop. The kernel
-            // leaves the inode in the filesystem until something unlinks it.
-            let stale = bind_unix_socket(&path).expect("first bind");
-            drop(stale);
+            // Plant a stale socket file via a raw `UnixListener::bind` so
+            // the [`UnixSocketGuard`] is not involved — we are exercising
+            // the rebind-over-stale-inode path, not the guard's unlink.
+            // The kernel leaves the inode in the filesystem until
+            // something unlinks it; dropping a guard-less listener is
+            // exactly the "previous daemon crashed" state we model here.
+            let raw = UnixListener::bind(&path).expect("first bind");
+            drop(raw);
             assert!(path.exists());
-            let _listener = bind_unix_socket(&path).expect("rebind despite stale socket");
+            let (_listener, _guard) = bind_unix_socket(&path).expect("rebind despite stale socket");
             assert!(path.exists());
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_unlinks_on_guard_drop() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            let (listener, guard) = bind_unix_socket(&path).expect("bind");
+            assert!(path.exists());
+            drop(listener);
+            drop(guard);
+            assert!(
+                !path.exists(),
+                "guard drop must unlink the socket file at {}",
+                path.display()
+            );
         }
 
         #[tokio::test]
@@ -3005,7 +3105,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("voidbox.sock");
             std::fs::write(&path, b"important data").unwrap();
-            let err = bind_unix_socket(&path).expect_err("must refuse non-socket file");
+            let err = bind_unix_socket(&path)
+                .map(|_| ())
+                .expect_err("must refuse non-socket file");
             assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
             // The user's file is still there — we did not silently delete it.
             assert_eq!(std::fs::read(&path).unwrap(), b"important data");
