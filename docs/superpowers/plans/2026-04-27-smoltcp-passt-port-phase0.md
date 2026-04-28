@@ -13,8 +13,16 @@
 **Spec:** [`2026-04-27-smoltcp-passt-port.md`](2026-04-27-smoltcp-passt-port.md)
 
 **Goal:** Land the test/bench baseline, the `NetworkBackend` trait
-abstraction, and the `SlirpStack → SmoltcpBackend` rename, with zero
+abstraction, and the `SlirpStack → SlirpBackend` rename, with zero
 user-visible behavior change.
+
+**Naming rationale:** The new name is role-based, not
+implementation-based. "Slirp" denotes the user-mode-NAT networking
+role (same role libslirp / passt / pasta fill); "smoltcp" is just the
+library we use to build it. Future siblings — `TapBackend`,
+`VhostNetBackend` — follow the same role-based convention. Renaming
+to `SmoltcpBackend` would leak the implementation library into the
+public type name and lose this symmetry.
 
 **Architecture:** Three additive workstreams (correctness pins, divan
 microbenches, wall-clock e2e harness) followed by a mechanical
@@ -1831,43 +1839,25 @@ git commit -m "refactor(vmm): construct network backend behind dyn trait"
 
 ---
 
-### Task 0D.7: Rename `SlirpStack → SmoltcpBackend`
+### Task 0D.7: Rename `SlirpStack → SlirpBackend`
 
 **Files:**
-- Modify: `src/network/slirp.rs`, `src/network/mod.rs`,
-  `tests/network_baseline.rs`, `benches/network.rs`,
-  `src/devices/virtio_net.rs`, `src/vmm/mod.rs`,
-  any other references LSP turns up.
+- Modify: `src/network/slirp.rs`, `tests/network_baseline.rs`,
+  `benches/network.rs`, `src/devices/virtio_net.rs`,
+  `src/vmm/mod.rs`, any other references LSP turns up.
+
+The module file `src/network/slirp.rs` keeps its name — only the
+type is renamed. (The current filename already aligns with the new
+type name, and matches the convention used elsewhere in the repo:
+`src/devices/virtio_net.rs` holds `VirtioNetDevice`, not a
+`virtio_net_device.rs` file.)
 
 - [ ] **Step 1: Use LSP rename** (`rust-analyzer` rename refactor) on
-  `SlirpStack` → `SmoltcpBackend`. **Do not text-substitute** — the
-  rename also touches `tests/network_baseline.rs` imports and any
-  `pub use` re-exports.
-- [ ] **Step 2: Rename the file.**
+  `SlirpStack` → `SlirpBackend`. **Do not text-substitute** — the
+  rename also touches `tests/network_baseline.rs` imports, the
+  `benches/network.rs` imports, and any `pub use` re-exports.
 
-```bash
-git mv src/network/slirp.rs src/network/smoltcp_backend.rs
-```
-
-Update `src/network/mod.rs`:
-
-```rust
-// Before:
-pub mod slirp;
-
-// After:
-pub mod smoltcp_backend;
-
-// Compatibility re-export — drop in Phase 1 once external users
-// migrate:
-#[deprecated(note = "use smoltcp_backend")]
-pub use smoltcp_backend as slirp;
-```
-
-> **Apply `rust-style`:** keep the deprecated re-export terse. No
-> multi-line doc; one `#[deprecated]` attribute is enough.
-
-- [ ] **Step 3: Build + run all tests.**
+- [ ] **Step 2: Build + run all tests.**
 
 ```bash
 cargo check
@@ -1875,15 +1865,13 @@ cargo test --workspace --all-features
 cargo test --test network_baseline
 ```
 
-- [ ] **Step 4: Update test/bench imports** to use the new path
-  (`void_box::network::smoltcp_backend::SmoltcpBackend`,
-  `GUEST_MAC`, etc.).
-- [ ] **Step 5: Final build.** `cargo check`
-- [ ] **Step 6: Commit.**
+- [ ] **Step 3: Final build.** `cargo check`
+
+- [ ] **Step 4: Commit.**
 
 ```bash
 git add -A
-git commit -m "refactor(network): rename SlirpStack to SmoltcpBackend"
+git commit -m "refactor(network): rename SlirpStack to SlirpBackend"
 ```
 
 ---
@@ -1979,7 +1967,7 @@ Implements Phase 0 of `docs/superpowers/plans/2026-04-27-smoltcp-passt-port.md`.
 
 **Zero user-visible behavior change.** This PR lands:
 
-- `tests/network_baseline.rs` — 14 unit-level pins for the smoltcp
+- `tests/network_baseline.rs` — 13 unit-level pins for the smoltcp-based
   SLIRP stack, including three deliberately-broken assertions that
   flip in Phases 1, 2, 3.
 - `benches/network.rs` — divan microbenches for SLIRP hot paths
@@ -1987,9 +1975,10 @@ Implements Phase 0 of `docs/superpowers/plans/2026-04-27-smoltcp-passt-port.md`.
 - `voidbox-network-bench` — wall-clock e2e harness with metric names
   matching passt's published table.
 - `NetworkBackend` trait in `src/network/mod.rs`.
-- `SlirpStack` renamed to `SmoltcpBackend`; `poll` replaced by
-  `drain_to_guest(&mut Vec<Vec<u8>>)` to drop the per-poll
-  allocation.
+- `SlirpStack` renamed to `SlirpBackend` (role-based name,
+  symmetric with future `TapBackend`/`VhostNetBackend`); `poll`
+  replaced by `drain_to_guest(&mut Vec<Vec<u8>>)` to drop the
+  per-poll allocation.
 
 ## Test plan
 
@@ -2029,7 +2018,8 @@ in subsequent phases — do not "fix" them in this PR:
 - [ ] Trait surface in 0D.1 matches the spec doc exactly
   (`drain_to_guest` out-param, `is_healthy` default-true).
 - [ ] Rename in 0D.7 uses LSP rename (rust-analyzer-ssr), not text
-  substitution.
+  substitution. Type renames to `SlirpBackend` (role-based, not
+  `SmoltcpBackend`).
 - [ ] Validation gate in 0E.1 covers fmt, clippy, workspace tests,
   baseline tests, microbenches, VM suites, aarch64 cross-check,
   macOS smoke.

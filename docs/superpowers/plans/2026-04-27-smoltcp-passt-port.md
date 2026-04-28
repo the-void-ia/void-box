@@ -109,8 +109,10 @@ The 2026-04-12 plan proposed:
 1. Extract `NetworkBackend` trait. **Kept.**
 2. Add `PasstBackend` (Linux-only, opt-in). **Replaced** with in-tree
    improvements to the smoltcp-based backend.
-3. Cleanup rename `SlirpStack → SmoltcpBackend`. **Kept**, moved into
-   Phase 0 alongside the trait extraction.
+3. Cleanup rename `SlirpStack → SlirpBackend`. **Kept**, moved into
+   Phase 0 alongside the trait extraction. Role-based name (matches
+   future `TapBackend`/`VhostNetBackend`); does not leak the smoltcp
+   library dependency.
 
 The trait surface from the prior plan is tightened (`poll` becomes an
 out-param to drop the per-call `Vec<Vec<u8>>` allocation; explicit
@@ -225,7 +227,7 @@ detailed task lists for later ones.
 
 | Phase | Scope | Risk | Plan doc |
 |---|---|---|---|
-| **0** | Baseline tests + benches + `NetworkBackend` trait extraction + `SlirpStack → SmoltcpBackend` rename. **Zero user-visible behavior change.** | Low | [`2026-04-27-smoltcp-passt-port-phase0.md`](2026-04-27-smoltcp-passt-port-phase0.md) |
+| **0** | Baseline tests + benches + `NetworkBackend` trait extraction + `SlirpStack → SlirpBackend` rename. **Zero user-visible behavior change.** | Low | [`2026-04-27-smoltcp-passt-port-phase0.md`](2026-04-27-smoltcp-passt-port-phase0.md) |
 | **1** | ICMP echo via unprivileged `SOCK_DGRAM IPPROTO_ICMP`, with sysctl-fallback to drop. | Low | TBD when 0 lands |
 | **2** | Generalize UDP: per-flow connected sockets, drop port-53 limit, keep DNS fast-path/cache. | Low–medium | TBD when 1 lands |
 | **3** | TCP relay rewrite using `MSG_PEEK` + sequence mirroring. Drop `to_guest: Vec<u8>` and 256 KB cap. | **High** — gnarliest of the lot. Snapshot integration tests are the gate. | TBD when 2 lands |
@@ -312,7 +314,7 @@ allocations per packet    3        0               0
 | File | Change |
 |---|---|
 | `src/network/mod.rs` | Add `NetworkBackend` trait |
-| `src/network/slirp.rs` | `impl NetworkBackend for SlirpStack`, rename type, tighten `poll` to `drain_to_guest` |
+| `src/network/slirp.rs` | `impl NetworkBackend for SlirpStack`, rename type to `SlirpBackend`, tighten `poll` to `drain_to_guest` |
 | `src/devices/virtio_net.rs` | Hold `Arc<Mutex<dyn NetworkBackend>>` instead of concrete `SlirpStack` |
 | `src/vmm/mod.rs` | Update construction at cold-boot + snapshot-restore sites |
 | `tests/network_baseline.rs` | **New file**: ~14 unit-level pins |
