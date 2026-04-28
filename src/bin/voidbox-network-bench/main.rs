@@ -41,8 +41,51 @@ const CRR_SAMPLES_PER_ITER: u32 = 30;
 /// Timeout for the host-side channel receive on RR/CRR measurements.
 const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Window in seconds for counting DNS queries.
+const DNS_QPS_WINDOW_SECS: u32 = 10;
+
+/// SLIRP DNS resolver address inside the guest.
+const SLIRP_DNS_ADDR: &str = "10.0.2.3";
+
 #[derive(Parser, Debug)]
-#[command(version, about = "VoidBox network benchmark harness")]
+#[command(
+    version,
+    about = "VoidBox network benchmark harness",
+    long_about = "VoidBox network benchmark harness\n\
+\n\
+Boots one VM, exercises TCP throughput, TCP RR/CRR latency, and UDP DNS qps,\n\
+then emits a JSON report suitable for automated diffing.\n\
+\n\
+REQUIRED ENVIRONMENT VARIABLES\n\
+  VOID_BOX_KERNEL      Path to the guest kernel image (vmlinuz / vmlinux).\n\
+  VOID_BOX_INITRAMFS   Path to the guest initramfs (cpio.gz).\n\
+\n\
+RECOMMENDED WORKFLOW — CAPTURING AND DIFFING A BASELINE\n\
+  # 1. Before a refactor or networking-stack change, capture a baseline:\n\
+  cargo run --bin voidbox-network-bench -- --output baseline.json\n\
+\n\
+  # 2. Make your change, then capture a post-change report:\n\
+  cargo run --bin voidbox-network-bench -- --output after.json\n\
+\n\
+  # 3. Compare with diff or a JSON-diff tool:\n\
+  diff baseline.json after.json\n\
+  # Or with jq for a side-by-side view of individual metrics:\n\
+  jq -s '.[0] as $b | .[1] as $a | {metric: keys} | .metric[] |\n\
+    {metric: ., before: $b[.], after: $a[.]}' baseline.json after.json\n\
+\n\
+METRIC NAMES\n\
+  tcp_throughput_g2h_mbps   Guest→host TCP throughput (Mbps)\n\
+  tcp_rr_latency_us_p50     Persistent-connection round-trip latency p50 (µs)\n\
+  tcp_rr_latency_us_p99     Persistent-connection round-trip latency p99 (µs)\n\
+  tcp_crr_latency_us_p50    Connect-request-response latency p50 (µs)\n\
+  udp_dns_qps               UDP DNS queries per second against SLIRP resolver\n\
+\n\
+The metric names mirror the columns in passt's published performance table so\n\
+results can be compared directly.\n\
+\n\
+FAST SMOKE RUN\n\
+  cargo run --bin voidbox-network-bench -- --iterations 1 --no-throughput"
+)]
 struct Cli {
     /// Number of iterations per metric.
     #[arg(long, default_value_t = 5)]
@@ -118,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.tcp_rr_latency_us_p50 = rr_p50;
     report.tcp_rr_latency_us_p99 = rr_p99;
     report.tcp_crr_latency_us_p50 = measure_crr_latency(&sandbox, cli.iterations).await?;
+    report.udp_dns_qps = measure_dns_qps(&sandbox).await?;
 
     sandbox.stop().await?;
 
@@ -460,6 +504,116 @@ async fn measure_crr_latency(
 
     let p50 = percentile(&mut all_samples, 0.50).as_micros() as f64;
     Ok(Some(p50))
+}
+
+/// Measure UDP DNS query throughput against the SLIRP resolver.
+///
+/// Runs a BusyBox `sh` loop inside the guest for `DNS_QPS_WINDOW_SECS` seconds.
+/// Each iteration sends a raw DNS query for `example.com` (type A) to the SLIRP
+/// resolver via `nc -u` and checks whether a non-empty reply arrived, counting
+/// successes.  Returns `qps = successes / window_secs`.
+///
+/// Using raw UDP via `nc -u` avoids a dependency on `nslookup` or `dig`, which
+/// are not present in the minimal test initramfs.  The DNS query is a
+/// pre-encoded fixed packet (transaction-id `0x1234`, type A, class IN);
+/// the SLIRP resolver's response need only be non-empty to count as a success.
+///
+/// The SLIRP stack handles DNS at `10.0.2.3`; after the first query the
+/// resolver's cache should absorb subsequent lookups, so the measurement
+/// captures the in-stack UDP turnaround cost rather than upstream RTT.
+///
+/// Returns `None` on exec failure or if the guest output cannot be parsed.
+async fn measure_dns_qps(sandbox: &Sandbox) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let window = DNS_QPS_WINDOW_SECS;
+    let dns_addr = SLIRP_DNS_ADDR;
+
+    // Minimal DNS query packet for "example.com" A IN (29 bytes), pre-encoded.
+    // Header: txid=0x1234, flags=0x0100 (RD), qdcount=1.
+    // Question: 0x07 "example" 0x03 "com" 0x00, qtype=A(1), qclass=IN(1).
+    let dns_query_hex = "\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\
+                         \\x07\\x65\\x78\\x61\\x6d\\x70\\x6c\\x65\
+                         \\x03\\x63\\x6f\\x6d\\x00\\x00\\x01\\x00\\x01";
+
+    // BusyBox nc exits as soon as its stdin reaches EOF regardless of the -w
+    // timeout.  When stdin is a file (`nc < file`), nc sends the file contents
+    // and exits before the UDP reply can arrive from SLIRP's async resolver.
+    //
+    // Fix: pipe from a subshell that sends the query bytes then immediately
+    // runs `sleep 0`.  The `sleep 0` extends the pipe's lifetime by one
+    // process, keeping nc's stdin open just long enough to allow the shell to
+    // fork both cat and sleep before stdin closes.  After the subshell exits,
+    // nc still waits up to `-w2` seconds for an incoming UDP reply.
+    //
+    // Timing analysis:
+    //   - First query: SLIRP forwards to upstream DNS (≤100 ms typical).
+    //     The reply arrives well within the 2-second -w2 window.
+    //   - Subsequent queries: SLIRP serves from its 60-second cache (<1 ms).
+    //     The reply arrives almost immediately.
+    //   - Each iteration takes ~1 s (dominated by the -w1 timeout that fires
+    //     after the reply is received and nc drains its stdin).
+    //
+    // The guest emits "count=<N>" on a dedicated line so the host can compute
+    // a precise f64 qps without relying on integer division inside the guest.
+    let guest_cmd = format!(
+        "printf '{dns_query_hex}' > /tmp/_dq.bin; \
+         end=$(($(date +%s) + {window})); \
+         count=0; \
+         while [ \"$(date +%s)\" -lt \"$end\" ]; do \
+           bytes=$({{ cat /tmp/_dq.bin; sleep 0; }} | nc -u -w1 {dns_addr} 53 2>/dev/null | wc -c); \
+           if [ \"$bytes\" -gt 0 ]; then \
+             count=$((count + 1)); \
+           fi; \
+         done; \
+         echo \"count=$count\""
+    );
+
+    let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+
+    let output = match exec_result {
+        Err(exec_err) => {
+            tracing::warn!(error = %exec_err, "dns_qps exec error; skipping");
+            return Ok(None);
+        }
+        Ok(output) => output,
+    };
+
+    if !output.success() {
+        tracing::warn!(
+            exit_code = ?output.exit_code,
+            stderr = output.stderr_str(),
+            "dns_qps guest command non-zero exit; skipping"
+        );
+        return Ok(None);
+    }
+
+    let stdout = output.stdout_str();
+    tracing::debug!(
+        stdout = stdout,
+        stderr = output.stderr_str(),
+        "dns_qps guest output"
+    );
+
+    // Parse "count=<N>" emitted by the guest; compute qps as f64 on the host
+    // to avoid integer-division truncation inside the shell.
+    let count_value: Option<f64> = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("count="))
+        .and_then(|value_str| value_str.trim().parse::<f64>().ok());
+
+    match count_value {
+        Some(count) => {
+            let qps = count / window as f64;
+            eprintln!("dns_qps: {qps:.2} qps (count={count}, window={window}s)");
+            Ok(Some(qps))
+        }
+        None => {
+            tracing::warn!(
+                stdout = stdout,
+                "dns_qps: could not parse count line from guest output; skipping"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Host-side echo server for CRR latency.
