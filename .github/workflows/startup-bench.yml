@@ -1,13 +1,19 @@
 name: Startup Bench
 
-# Two layers, both run in this workflow:
+# Three layers, all run in this workflow:
 #
-#   1. **Divan micro-bench** — `cargo bench --bench startup`. Pure-compute
-#      hot paths (Message::serialize/deserialize, kernel_cmdline,
-#      getrandom). No KVM, no nested virt, no L2 boot — same wall-clock
-#      cost on every Linux runner. Cheap regression gate.
+#   1. **Divan micro-bench (startup)** — `cargo bench --bench startup`.
+#      Pure-compute hot paths (Message::serialize/deserialize,
+#      kernel_cmdline, getrandom). No KVM, no nested virt, no L2 boot —
+#      same wall-clock cost on every Linux runner. Cheap regression gate.
 #
-#   2. **Wall-clock harness** — `voidbox-startup-bench --iters 20
+#   2. **Divan micro-bench (network)** — `cargo bench --bench network`.
+#      SLIRP hot paths (process_syn, poll_idle, process_arp_request,
+#      poll_with_n_flows, dns_cache_hit, dns_cache_miss). Also pure
+#      compute, no nested virt — stable regression gate for the network
+#      stack without requiring KVM or a real VM boot.
+#
+#   3. **Wall-clock harness** — `voidbox-startup-bench --iters 20
 #      --breakdown`. Boots a real KVM VM through the slim kernel + test
 #      initramfs and measures cold-boot + warm-restore p50/p95/p99 end
 #      to end. Informational only on this runner: the GitHub-hosted
@@ -158,6 +164,25 @@ jobs:
             echo '```'
             grep -E 'fastest|median|slowest|^[a-z_]+\.' target/tmp/divan.log \
               || tail -40 target/tmp/divan.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run network divan micro-bench (regression gate)
+        # Same regression-detection role as the startup divan step, but
+        # for SLIRP hot paths: process_syn, poll_idle, process_arp_request,
+        # poll_with_n_flows, dns_cache_hit, dns_cache_miss. Pure compute,
+        # no nested virt — stable across CI hosts. Output captured for
+        # artifact + step summary.
+        run: |
+          cargo bench --bench network 2>&1 | tee target/tmp/divan-network.log
+
+          {
+            echo
+            echo "## Divan network micro-bench (cargo bench --bench network)"
+            echo
+            echo '```'
+            grep -E 'fastest|median|slowest|^[a-z_]+\.' target/tmp/divan-network.log \
+              || tail -40 target/tmp/divan-network.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
