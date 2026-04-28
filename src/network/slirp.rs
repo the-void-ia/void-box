@@ -427,6 +427,12 @@ impl SlirpStack {
         frames
     }
 
+    /// Drain frames destined to the guest into `out`. Reuses the buffer
+    /// across calls. See [`crate::network::NetworkBackend::drain_to_guest`].
+    pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        out.append(&mut self.poll());
+    }
+
     /// Extract the DNS question section (bytes after the 12-byte header up to
     /// and including the QCLASS) to use as a cache key.  This is stable for
     /// identical queries regardless of the random transaction ID.
