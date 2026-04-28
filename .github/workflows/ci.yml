@@ -30,29 +30,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `jlumbroso/free-disk-space` is Ubuntu-only (uses apt-get); guard
+      # so the macOS leg of the matrix skips it without erroring.
+      - name: Free runner disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Replaces three separate `actions/cache@v4` steps (registry / git
+      # / target). Swatinem/rust-cache prunes workspace crates and
+      # `target/incremental` before saving, so the cache can't grow
+      # without bound the way the raw `target/` cache did.
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: test-${{ matrix.rust }}
 
       - name: Build workspace binaries
         run: |

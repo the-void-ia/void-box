@@ -66,6 +66,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same disk-pressure mitigation as `e2e.yml` — this job builds the
+      # slim kernel from source (~4-5 GB), the test initramfs, and a
+      # release-mode cargo build, then caches `target/` across runs.
+      # `large-packages: false` keeps the cleanup fast; Android+.NET+
+      # Haskell+swap reclaim the ~28 GB headroom we need.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
       - name: Capture host environment
         run: |
           set -x
@@ -105,19 +121,13 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      # Distinct shared-key from `e2e.yml` so this workflow's
+      # release-mode build artifacts don't poison the e2e debug cache
+      # and vice versa.
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # Distinct key from `e2e.yml` so this workflow's release-mode
-          # build artifacts don't poison the e2e debug cache and vice
-          # versa.
-          key: ${{ runner.os }}-startup-bench-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-startup-bench-
+          shared-key: startup-bench
 
       - name: Cache slim kernel
         id: kernel-cache

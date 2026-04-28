@@ -27,6 +27,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Reclaim ~28 GB by removing GitHub's preinstalled Android SDK,
+      # .NET, Haskell, Docker images, and swapfile. Required because the
+      # default ubuntu-latest image leaves only ~14 GB free, and the
+      # combined cargo target + initramfs + kernel copy + multiple
+      # `cargo test --test <name>` rebuilds blow past that ceiling
+      # (every E2E run on 2026-04-28 failed with "No space left on
+      # device" until this step was added). `large-packages: false`
+      # skips the slow apt-remove path; the Android delete alone
+      # buys ~14 GB in seconds.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
       # ---- KVM setup ----
       - name: Enable KVM access
         run: |
@@ -75,16 +95,16 @@ jobs:
           targets: ${{ matrix.musl-target }}
 
       # ---- Cargo cache ----
+      # Swatinem/rust-cache is Rust-aware: it caches `~/.cargo/registry`
+      # and `~/.cargo/git` whole, but prunes `target/` to drop workspace
+      # crates and incremental build artifacts before saving — which is
+      # exactly the unbounded-growth portion that filled the disk on the
+      # raw `actions/cache@v4` setup. Cache key is auto-derived from
+      # Cargo.lock + rustc version + job + matrix.
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-e2e-${{ matrix.musl-target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-e2e-${{ matrix.musl-target }}-
+          shared-key: e2e-${{ matrix.musl-target }}
 
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
