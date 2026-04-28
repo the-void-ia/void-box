@@ -132,7 +132,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
         ListenAddress::Unix(path) => {
             let (listener, guard) = bind_unix_socket(&path)?;
             info!(path = %path.display(), "[void-box] daemon listening on unix://{}", path.display());
-            serve_unix(listener, AuthMode::UnixSocket, guard).await
+            serve_unix(guard, listener, AuthMode::UnixSocket).await
         }
         ListenAddress::Tcp(addr) => {
             let token = config
@@ -219,8 +219,13 @@ fn bind_unix_socket(path: &Path) -> std::io::Result<(UnixListener, UnixSocketGua
     // place there is no window where a different uid could `connect(2)`
     // before the chmod takes effect — the kernel-enforced boundary the
     // threat model relies on holds across the entire bind sequence.
+    // Construct the guard immediately after a successful `bind` so any
+    // post-bind failure (e.g. `set_permissions` denied by an exotic FS,
+    // ENOSPC mid-chmod) still unlinks the freshly-created socket inode on
+    // the error return. Constructing it later would defeat the point of
+    // the guard for exactly the failure modes this PR is meant to catch.
     #[cfg(unix)]
-    let listener = {
+    let (listener, guard) = {
         // SAFETY: `umask` is process-global; the daemon binds its listener
         // once at startup, before background work that might want a
         // different umask is started. Restoring the prior value below
@@ -231,13 +236,19 @@ fn bind_unix_socket(path: &Path) -> std::io::Result<(UnixListener, UnixSocketGua
             libc::umask(prior_umask);
         }
         let listener = bind_result?;
+        let guard = UnixSocketGuard {
+            path: path.to_path_buf(),
+        };
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        listener
+        (listener, guard)
     };
     #[cfg(not(unix))]
-    let listener = UnixListener::bind(path)?;
-    let guard = UnixSocketGuard {
-        path: path.to_path_buf(),
+    let (listener, guard) = {
+        let listener = UnixListener::bind(path)?;
+        let guard = UnixSocketGuard {
+            path: path.to_path_buf(),
+        };
+        (listener, guard)
     };
     Ok((listener, guard))
 }
@@ -291,11 +302,19 @@ async fn serve_tcp(
 }
 
 async fn serve_unix(
+    _guard: UnixSocketGuard,
     listener: UnixListener,
     auth: AuthMode,
-    _guard: UnixSocketGuard,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = build_app_state(auth).await;
+    // Function parameters drop in reverse declaration order, so `_guard`
+    // is declared first to ensure `listener` drops before it: the kernel
+    // socket fd closes first, then the path is unlinked. This avoids a
+    // brief window where the path is gone but the listener fd is still
+    // accepting; a new daemon racing to bind the same path would still
+    // succeed (fresh inode), but the order matches the comment's claim
+    // and is what the next reader expects.
+    //
     // The guard lives for the duration of this future; on any return path
     // — clean shutdown, accept error, panic, task cancellation — its Drop
     // unlinks the socket file. `_guard` is bound rather than passed by
@@ -343,19 +362,48 @@ fn shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> +
                     None
                 }
             };
+            // `ctrl_c()` and `term.recv()` can complete with errors or stream
+            // closures that aren't actually shutdown signals: a sandbox refusing
+            // signal-handler installation, or the SIGTERM dispatcher closing.
+            // Treating those as shutdown would cause the daemon to exit seconds
+            // after starting, with no useful diagnostic. Park on `pending()` in
+            // those cases so a working signal source still wins, and so the
+            // accept loop keeps serving when no signal source survives.
             match term.as_mut() {
                 Some(term) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
+                    res = tokio::signal::ctrl_c() => match res {
+                        Ok(()) => {}
+                        Err(err) => {
+                            warn!(%err, "ctrl_c handler failed; relying on SIGTERM only");
+                            std::future::pending::<()>().await;
+                        }
+                    },
+                    res = term.recv() => match res {
+                        Some(()) => {}
+                        None => {
+                            warn!("SIGTERM stream closed; relying on SIGINT only");
+                            std::future::pending::<()>().await;
+                        }
+                    },
                 },
-                None => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
+                None => match tokio::signal::ctrl_c().await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(%err, "ctrl_c handler failed; signal-based shutdown disabled");
+                        std::future::pending::<()>().await;
+                    }
+                },
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = tokio::signal::ctrl_c().await;
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(%err, "ctrl_c handler failed; signal-based shutdown disabled");
+                    std::future::pending::<()>().await;
+                }
+            }
         }
     })
 }
