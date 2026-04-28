@@ -870,6 +870,10 @@ cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -
 cargo test --workspace --exclude guest-agent --all-features
 ```
 
+### macOS dev setup
+
+After a fresh `cargo build`, codesign the binary so VZ accepts it: `bash scripts/sign-macos.sh`. Re-run after every rebuild — the script is idempotent and a no-op on non-Darwin hosts.
+
 ### aarch64 cross-check (required when touching `src/vmm/arch/aarch64/` or arch-neutral VMM code)
 
 CI runs on native aarch64 (`ubuntu-24.04-arm`). To catch issues locally from an
