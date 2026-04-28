@@ -329,7 +329,7 @@ jobs:
           bumps = plan["bumps"]
           skipped = [a for a in ("x86_64", "aarch64")
                      if a not in {b["arch"] for b in bumps}]
-          print(f"Automated R-B5c.1 bump for `{agent}` to version `{version}`.")
+          print(f"Automated bump for `{agent}` to version `{version}`.")
           print()
           print("| tuple | prev | url | sha256 (computed by CI) |")
           print("| --- | --- | --- | --- |")
@@ -371,8 +371,16 @@ jobs:
               print()
               print("Each printed `sha256:…` must match the row above for the corresponding arch.")
           print()
-          print("Manual review of the version+hash combination is the human gate")
-          print("required by R-B5c.1.")
+          print("## Why this needs a human")
+          print()
+          print("Once merged, the hashes above lock these binaries in place — every")
+          print("future build aborts unless the download matches byte-for-byte. CI")
+          print("just computed them from a single fetch against upstream, so merging")
+          print("without spot-checking trusts whatever upstream served at that one")
+          print("moment. The cross-check above is what catches a CDN-edge tamper or")
+          print("an upstream-account compromise before it propagates into our")
+          print("images. A surprise version jump (off-schedule, several releases at")
+          print("once, pre-release tag) is its own signal worth a second look.")
           PY
 
           gh pr create \
