@@ -315,11 +315,12 @@ impl MicroVm {
         // Virtio-net with SLIRP backend if networking is enabled
         let virtio_net = if config.network {
             debug!("Setting up SLIRP networking");
-            let slirp = Arc::new(Mutex::new(SlirpStack::with_security(
-                config.security.max_concurrent_connections,
-                config.security.max_connections_per_second,
-                &config.security.network_deny_list,
-            )?));
+            let slirp: Arc<Mutex<dyn crate::network::NetworkBackend>> =
+                Arc::new(Mutex::new(SlirpStack::with_security(
+                    config.security.max_concurrent_connections,
+                    config.security.max_connections_per_second,
+                    &config.security.network_deny_list,
+                )?));
             let mut net_device = VirtioNetDevice::new(slirp)?;
             net_device.set_mmio_base(0xd000_0000);
             debug!(
@@ -685,7 +686,8 @@ impl MicroVm {
         // 7b. Restore virtio-net if snapshot had networking enabled
         let virtio_net: Option<Arc<Mutex<VirtioNetDevice>>> = if snap.config.network {
             if let Some(ref net_state) = snap.net_state {
-                let slirp = Arc::new(Mutex::new(SlirpStack::new()?));
+                let slirp: Arc<Mutex<dyn crate::network::NetworkBackend>> =
+                    Arc::new(Mutex::new(SlirpStack::new()?));
                 let mut net_dev = VirtioNetDevice::new(slirp)?;
                 net_dev.restore_state(net_state);
                 net_dev.set_mmio_base(0xd000_0000);
