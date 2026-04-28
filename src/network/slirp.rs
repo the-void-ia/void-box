@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,13 @@ const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
 const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
+
+/// ICMP unprivileged probe state.
+///
+/// `0` = unknown (not yet probed), `1` = available, `2` = unavailable
+/// (kernel returned `EACCES` or `EPERM` — typically `net.ipv4.ping_group_range`
+/// excludes the calling GID). Once set to `2`, `open_icmp_socket` short-circuits.
+static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
 
 // ──────────────────────────────────────────────────────────────────────
 //  TCP NAT connection tracking
@@ -153,7 +161,15 @@ struct IcmpEchoEntry {
 ///
 /// Returns `Err` if the kernel rejects the call (e.g. the
 /// `net.ipv4.ping_group_range` sysctl excludes the current GID).
+/// After the first rejection, subsequent calls short-circuit and return
+/// `PermissionDenied` without retrying the syscall.
 fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
+    if ICMP_PROBE.load(Ordering::Relaxed) == 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ICMP unprivileged probe previously failed",
+        ));
+    }
     // SAFETY: socket(2) returns -1 on error; we check before wrapping.
     // IPPROTO_ICMP + SOCK_DGRAM is the unprivileged ICMP path: the kernel
     // handles ICMP framing, no CAP_NET_RAW required.
@@ -165,8 +181,22 @@ fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
         )
     };
     if raw < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+            // First failure transitions 0 → 2 and emits the warn-once log.
+            // swap returns the previous value; only log if we were the first
+            // to set it.
+            if ICMP_PROBE.swap(2, Ordering::Relaxed) != 2 {
+                warn!(
+                    "SLIRP: unprivileged ICMP unavailable on this host \
+                     (sysctl net.ipv4.ping_group_range likely restricts \
+                     it); ICMP echo from guests will be dropped."
+                );
+            }
+        }
+        return Err(err);
     }
+    ICMP_PROBE.store(1, Ordering::Relaxed);
     // SAFETY: `raw` is a valid fd from socket(2); UdpSocket adopts
     // ownership and closes on drop.
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(raw) })
