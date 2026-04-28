@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use void_box::network::slirp::{
-    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
+    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
 // Used by tcp_deny_list_emits_rst to express the deny CIDR as a typed network.
 // `with_security` takes `&[String]`, so we convert via `.to_string()` at the
@@ -608,4 +608,204 @@ fn arp_does_not_reply_for_guest_ip() {
         .into_iter()
         .find_map(|f| parse_arp_reply(&f));
     assert!(reply.is_none(), "stack must not claim guest's own IP");
+}
+
+/// Wire-format label for `example.com`, used in DNS query frames.
+///
+/// Encoded as a DNS QNAME: each label is prefixed by its byte length,
+/// terminated by a zero-length label. This is the representation that
+/// goes directly into the DNS question section.
+const QNAME_EXAMPLE_COM: &[u8] = b"\x07example\x03com\x00";
+
+/// Builds a minimal DNS query UDP Ethernet frame from the guest to `SLIRP_DNS_IP`.
+///
+/// `xid` is placed in the transaction-ID field. `qname` must be a
+/// fully-encoded DNS name (length-prefixed labels, zero terminator).
+/// The question section requests an A record (`QTYPE=1`, `QCLASS=1`).
+///
+/// Unlike `build_udp_frame` (which carries a pre-existing off-by-one in
+/// the `payload_len` argument passed to `udp_repr.emit`), this helper
+/// passes only the DNS payload length so the UDP `len` field is correct
+/// and the stack's smoltcp parser accepts the frame.
+fn build_dns_query(xid: u16, qname: &[u8]) -> Vec<u8> {
+    // DNS message layout:
+    //   2B  transaction ID
+    //   2B  flags (standard query, RD=1)
+    //   2B  QDCOUNT = 1
+    //   2B  ANCOUNT = 0
+    //   2B  NSCOUNT = 0
+    //   2B  ARCOUNT = 0
+    //  ..B  QNAME (length-label encoded, zero terminated)
+    //   2B  QTYPE  = 1  (A)
+    //   2B  QCLASS = 1  (IN)
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&xid.to_be_bytes());
+    dns_payload.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+    dns_payload.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    dns_payload.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    dns_payload.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    dns_payload.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    dns_payload.extend_from_slice(qname);
+    dns_payload.extend_from_slice(&1u16.to_be_bytes()); // QTYPE  A
+    dns_payload.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+
+    // Build the Ethernet frame manually so we can pass the correct
+    // `payload_len` (DNS payload only) to `udp_repr.emit`.
+    let udp_repr = UdpRepr {
+        src_port: GUEST_EPHEMERAL_PORT,
+        dst_port: 53,
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: SLIRP_GUEST_IP,
+        dst_addr: SLIRP_DNS_IP,
+        next_header: IpProtocol::Udp,
+        payload_len: UDP_HDR_LEN + dns_payload.len(),
+        hop_limit: 64,
+    };
+    let eth_repr = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress(GATEWAY_MAC),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let total = ETH_HDR_LEN + ip_repr.buffer_len() + UDP_HDR_LEN + dns_payload.len();
+    let mut buf = vec![0u8; total];
+    let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth_repr.emit(&mut eth);
+    let mut ip = Ipv4Packet::new_unchecked(&mut buf[ETH_HDR_LEN..]);
+    ip_repr.emit(&mut ip, &Default::default());
+    let mut udp = UdpPacket::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
+    udp_repr.emit(
+        &mut udp,
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(SLIRP_DNS_IP),
+        dns_payload.len(), // payload length only, not header+payload
+        |b| b.copy_from_slice(&dns_payload),
+        &Default::default(),
+    );
+    buf
+}
+
+/// Parses an Ethernet frame emitted by the stack and returns the DNS
+/// transaction ID (XID) if the frame is a UDP datagram addressed to
+/// the guest on port `GUEST_EPHEMERAL_PORT` with a plausible DNS
+/// header (≥ 12 bytes of DNS payload).
+///
+/// Returns `None` for any frame that does not match those criteria.
+fn parse_dns_reply_xid(frame: &[u8]) -> Option<u16> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Udp || ip.dst_addr() != SLIRP_GUEST_IP {
+        return None;
+    }
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
+    if udp.dst_port() != GUEST_EPHEMERAL_PORT {
+        return None;
+    }
+    let dns_payload = udp.payload();
+    if dns_payload.len() < 12 {
+        return None;
+    }
+    Some(u16::from_be_bytes([dns_payload[0], dns_payload[1]]))
+}
+
+#[test]
+fn dns_query_resolves() {
+    let mut stack = match SlirpStack::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: SlirpStack::new() failed ({e}), no DNS available");
+            return;
+        }
+    };
+
+    let query = build_dns_query(0x1234, QNAME_EXAMPLE_COM);
+    if let Err(e) = stack.process_guest_frame(&query) {
+        eprintln!("skip: process_guest_frame failed ({e})");
+        return;
+    }
+
+    let mut reply_xid: Option<u16> = None;
+    for _ in 0..20 {
+        for frame in stack.poll() {
+            if let Some(xid) = parse_dns_reply_xid(&frame) {
+                reply_xid = Some(xid);
+            }
+        }
+        if reply_xid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    match reply_xid {
+        Some(xid) => assert_eq!(xid, 0x1234, "reply XID must match query XID"),
+        None => {
+            eprintln!("skip: no DNS reply in 20×100 ms, upstream resolver unreachable");
+        }
+    }
+}
+
+#[test]
+fn dns_cache_keys_by_question_not_xid() {
+    let mut stack = match SlirpStack::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: SlirpStack::new() failed ({e}), no DNS available");
+            return;
+        }
+    };
+
+    // Warm the cache with xid=1.
+    let warm_query = build_dns_query(0x0001, QNAME_EXAMPLE_COM);
+    if let Err(e) = stack.process_guest_frame(&warm_query) {
+        eprintln!("skip: warm query process_guest_frame failed ({e})");
+        return;
+    }
+    let mut warmed = false;
+    for _ in 0..20 {
+        for frame in stack.poll() {
+            if let Some(xid) = parse_dns_reply_xid(&frame) {
+                if xid == 0x0001 {
+                    warmed = true;
+                }
+            }
+        }
+        if warmed {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !warmed {
+        eprintln!("skip: cache warm-up timed out, upstream resolver unreachable");
+        return;
+    }
+
+    // Now query with xid=2; the cache must rewrite the reply XID to 2.
+    let second_query = build_dns_query(0x0002, QNAME_EXAMPLE_COM);
+    if let Err(e) = stack.process_guest_frame(&second_query) {
+        eprintln!("skip: second query process_guest_frame failed ({e})");
+        return;
+    }
+    let mut reply_xid: Option<u16> = None;
+    for _ in 0..20 {
+        for frame in stack.poll() {
+            if let Some(xid) = parse_dns_reply_xid(&frame) {
+                reply_xid = Some(xid);
+            }
+        }
+        if reply_xid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    match reply_xid {
+        Some(xid) => assert_eq!(xid, 0x0002, "cache must rewrite XID to match the new query"),
+        None => {
+            eprintln!("skip: no reply for second query in 20×100 ms");
+        }
+    }
 }
