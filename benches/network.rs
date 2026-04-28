@@ -105,3 +105,26 @@ fn process_arp_request(bencher: Bencher) {
         let _ = stack.process_guest_frame(divan::black_box(&buf));
     });
 }
+
+/// Open `n` distinct guest→gateway flows, then time `poll()`.
+///
+/// Each iteration builds `n` SYN frames with unique source ports and feeds
+/// them into a single [`SlirpStack`], producing up to `n` NAT table entries.
+/// `process_guest_frame` errors are ignored — the goal is "many NAT entries",
+/// not "all connections succeed" (the default rate-limit may drop some).
+///
+/// The timed section is a single `poll()` call on the pre-populated stack,
+/// so the measurement reflects the NAT-walk cost at that table size.
+/// Today the walk is `O(n)`; the unified flow table planned for Phase 4
+/// should keep the same asymptotic complexity but with smaller constants.
+#[divan::bench(args = [1, 100, 1000])]
+fn poll_with_n_flows(bencher: Bencher, n: usize) {
+    let mut stack = SlirpStack::new().unwrap();
+    for i in 0..n {
+        let frame = build_syn(49152u16.wrapping_add(i as u16), 1);
+        let _ = stack.process_guest_frame(&frame);
+    }
+    bencher.bench_local(|| {
+        let _ = divan::black_box(&mut stack).poll();
+    });
+}
