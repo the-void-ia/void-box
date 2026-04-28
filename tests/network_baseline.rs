@@ -1,6 +1,6 @@
 //! Layer-1 correctness pins for the smoltcp-based SLIRP stack.
 //!
-//! These tests drive `SlirpStack` directly with synthetic Ethernet
+//! These tests drive `SlirpBackend` directly with synthetic Ethernet
 //! frames — no VM, no kernel, no host sockets to outside hosts. The
 //! goal is to lock observable behavior (including deliberately broken
 //! behavior) so the passt-pattern refactor's diff is legible to
@@ -31,7 +31,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use void_box::network::slirp::{
-    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
+    SlirpBackend, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
 use void_box::network::NetworkBackend;
 // Used by tcp_deny_list_emits_rst to express the deny CIDR as a typed network.
@@ -169,7 +169,7 @@ fn parse_tcp_to_guest(frame: &[u8]) -> Option<(u32, u32, TcpControl, usize)> {
 
 /// Drains frames the stack wants to send to the guest, calling `poll`
 /// up to `n` times.
-fn drain_n(stack: &mut SlirpStack, n: usize) -> Vec<Vec<u8>> {
+fn drain_n(stack: &mut SlirpBackend, n: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for _ in 0..n {
         out.extend(stack.poll());
@@ -184,7 +184,7 @@ fn tcp_handshake_emits_synack() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
-    let mut stack = SlirpStack::new().expect("stack");
+    let mut stack = SlirpBackend::new().expect("stack");
 
     // Guest sends SYN to gateway IP at the listener's port.
     let syn = build_tcp_frame(
@@ -223,7 +223,7 @@ fn tcp_data_round_trip() {
         sock.write_all(&buf[..n]).unwrap();
     });
 
-    let mut stack = SlirpStack::new().expect("stack");
+    let mut stack = SlirpBackend::new().expect("stack");
 
     // SYN
     stack
@@ -341,7 +341,7 @@ fn tcp_to_host_buffer_drops_at_256kb() {
         std::thread::sleep(std::time::Duration::from_secs(10));
     });
 
-    let mut stack = SlirpStack::new().expect("stack");
+    let mut stack = SlirpBackend::new().expect("stack");
 
     // Handshake.
     stack
@@ -439,7 +439,7 @@ fn tcp_to_host_buffer_drops_at_256kb() {
 #[test]
 fn tcp_rate_limit_emits_rst() {
     // 5 conn/s allowance; 10 attempts.
-    let mut stack = SlirpStack::with_security(64, 5, &[]).unwrap();
+    let mut stack = SlirpBackend::with_security(64, 5, &[]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
@@ -470,7 +470,7 @@ fn tcp_rate_limit_emits_rst() {
 
 #[test]
 fn tcp_max_concurrent_emits_rst() {
-    let mut stack = SlirpStack::with_security(2, 1000, &[]).unwrap();
+    let mut stack = SlirpBackend::with_security(2, 1000, &[]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
@@ -506,7 +506,7 @@ fn tcp_deny_list_emits_rst() {
     // CIDR at compile-check time, then convert to the expected string form.
     let deny_cidr: Ipv4Net = "169.254.169.254/32".parse().unwrap();
     let deny_strings = [deny_cidr.to_string()];
-    let mut stack = SlirpStack::with_security(64, 1000, &deny_strings).unwrap();
+    let mut stack = SlirpBackend::with_security(64, 1000, &deny_strings).unwrap();
 
     stack
         .process_guest_frame(&build_tcp_frame(
@@ -577,7 +577,7 @@ fn parse_arp_reply(frame: &[u8]) -> Option<(EthernetAddress, Ipv4Address)> {
 
 #[test]
 fn arp_replies_for_gateway() {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     stack
         .process_guest_frame(&build_arp_request(SLIRP_GATEWAY_IP))
         .unwrap();
@@ -591,7 +591,7 @@ fn arp_replies_for_gateway() {
 
 #[test]
 fn arp_replies_for_random_subnet_ip() {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     stack
         .process_guest_frame(&build_arp_request(Ipv4Address::new(10, 0, 2, 99)))
         .unwrap();
@@ -604,7 +604,7 @@ fn arp_replies_for_random_subnet_ip() {
 
 #[test]
 fn arp_does_not_reply_for_guest_ip() {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     stack
         .process_guest_frame(&build_arp_request(SLIRP_GUEST_IP))
         .unwrap();
@@ -717,10 +717,10 @@ fn parse_dns_reply_xid(frame: &[u8]) -> Option<u16> {
 
 #[test]
 fn dns_query_resolves() {
-    let mut stack = match SlirpStack::new() {
+    let mut stack = match SlirpBackend::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("skip: SlirpStack::new() failed ({e}), no DNS available");
+            eprintln!("skip: SlirpBackend::new() failed ({e}), no DNS available");
             return;
         }
     };
@@ -754,10 +754,10 @@ fn dns_query_resolves() {
 
 #[test]
 fn dns_cache_keys_by_question_not_xid() {
-    let mut stack = match SlirpStack::new() {
+    let mut stack = match SlirpBackend::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("skip: SlirpStack::new() failed ({e}), no DNS available");
+            eprintln!("skip: SlirpBackend::new() failed ({e}), no DNS available");
             return;
         }
     };
@@ -828,7 +828,7 @@ fn udp_non_dns_silently_dropped() {
         .set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .unwrap();
 
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     stack
         .process_guest_frame(&build_udp_frame(
             SLIRP_GATEWAY_IP,
@@ -884,7 +884,7 @@ fn icmp_echo_silently_dropped() {
     let mut icmp = Icmpv4Packet::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
     icmp_repr.emit(&mut icmp, &Default::default());
 
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     stack.process_guest_frame(&buf).unwrap();
     let frames = drain_n(&mut stack, 4);
 
@@ -912,6 +912,6 @@ fn icmp_echo_silently_dropped() {
 fn slirp_backend_implements_network_backend() {
     fn assert_send<T: Send>() {}
     fn assert_backend<T: NetworkBackend>() {}
-    assert_send::<SlirpStack>();
-    assert_backend::<SlirpStack>();
+    assert_send::<SlirpBackend>();
+    assert_backend::<SlirpBackend>();
 }

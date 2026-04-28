@@ -239,7 +239,7 @@ fn parse_resolv_conf() -> Vec<String> {
 //  SLIRP Stack
 // ──────────────────────────────────────────────────────────────────────
 
-pub struct SlirpStack {
+pub struct SlirpBackend {
     queue: Arc<Mutex<PacketQueue>>,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -264,7 +264,7 @@ pub struct SlirpStack {
     pending_dns: Vec<PendingDnsQuery>,
 }
 
-impl SlirpStack {
+impl SlirpBackend {
     pub fn new() -> Result<Self> {
         Self::with_security(64, 50, &["169.254.0.0/16".to_string()])
     }
@@ -436,7 +436,7 @@ impl SlirpStack {
     /// Allocates a fresh [`Vec`] on every call. Prefer [`drain_to_guest`],
     /// which writes into a caller-supplied buffer and avoids the allocation.
     ///
-    /// [`drain_to_guest`]: SlirpStack::drain_to_guest
+    /// [`drain_to_guest`]: SlirpBackend::drain_to_guest
     #[deprecated(note = "use drain_to_guest")]
     pub fn poll(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -1116,13 +1116,13 @@ impl SlirpStack {
     }
 }
 
-impl NetworkBackend for SlirpStack {
+impl NetworkBackend for SlirpBackend {
     fn process_guest_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        SlirpStack::process_guest_frame(self, frame).map_err(|e| io::Error::other(e.to_string()))
+        SlirpBackend::process_guest_frame(self, frame).map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
-        SlirpStack::drain_to_guest(self, out)
+        SlirpBackend::drain_to_guest(self, out)
     }
 }
 
@@ -1222,9 +1222,9 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
     !sum as u16
 }
 
-impl Default for SlirpStack {
+impl Default for SlirpBackend {
     fn default() -> Self {
-        Self::new().expect("Failed to create default SlirpStack")
+        Self::new().expect("Failed to create default SlirpBackend")
     }
 }
 
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_slirp_stack_creation() {
-        let stack = SlirpStack::new();
+        let stack = SlirpBackend::new();
         assert!(stack.is_ok());
     }
 

@@ -790,7 +790,7 @@ impl VirtioNetDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::slirp::SlirpStack;
+    use crate::network::slirp::SlirpBackend;
 
     #[test]
     fn test_virtio_net_header() {
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn test_mmio_magic() {
         let slirp: Arc<Mutex<dyn NetworkBackend>> =
-            Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn test_mmio_version() {
         let slirp: Arc<Mutex<dyn NetworkBackend>> =
-            Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn test_device_type() {
         let slirp: Arc<Mutex<dyn NetworkBackend>> =
-            Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];

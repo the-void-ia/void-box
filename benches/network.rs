@@ -16,7 +16,7 @@ use smoltcp::wire::{
     UdpPacket, UdpRepr,
 };
 use void_box::network::slirp::{
-    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
+    SlirpBackend, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
 
 fn main() {
@@ -69,14 +69,14 @@ fn build_syn(src_port: u16, dst_port: u16) -> Vec<u8> {
 fn process_syn(bencher: Bencher) {
     let frame = build_syn(49152, 1);
     bencher.bench_local(|| {
-        let mut stack = SlirpStack::new().unwrap();
+        let mut stack = SlirpBackend::new().unwrap();
         let _ = stack.process_guest_frame(divan::black_box(&frame));
     });
 }
 
 #[divan::bench]
 fn poll_idle(bencher: Bencher) {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     bencher.bench_local(|| {
         let _ = divan::black_box(&mut stack).poll();
     });
@@ -104,7 +104,7 @@ fn process_arp_request(bencher: Bencher) {
     arp_repr.emit(&mut a);
 
     bencher.bench_local(|| {
-        let mut stack = SlirpStack::new().unwrap();
+        let mut stack = SlirpBackend::new().unwrap();
         let _ = stack.process_guest_frame(divan::black_box(&buf));
     });
 }
@@ -112,7 +112,7 @@ fn process_arp_request(bencher: Bencher) {
 /// Open `n` distinct guest→gateway flows, then time `poll()`.
 ///
 /// Each iteration builds `n` SYN frames with unique source ports and feeds
-/// them into a single [`SlirpStack`], producing up to `n` NAT table entries.
+/// them into a single [`SlirpBackend`], producing up to `n` NAT table entries.
 /// `process_guest_frame` errors are ignored — the goal is "many NAT entries",
 /// not "all connections succeed" (the default rate-limit may drop some).
 ///
@@ -122,7 +122,7 @@ fn process_arp_request(bencher: Bencher) {
 /// should keep the same asymptotic complexity but with smaller constants.
 #[divan::bench(args = [1, 100, 1000])]
 fn poll_with_n_flows(bencher: Bencher, n: usize) {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     for i in 0..n {
         let frame = build_syn(49152u16.wrapping_add(i as u16), 1);
         let _ = stack.process_guest_frame(&frame);
@@ -137,7 +137,7 @@ fn poll_with_n_flows(bencher: Bencher, n: usize) {
 /// `xid` is placed in the DNS transaction-ID field. The question section
 /// queries `example.com` for an A record. The frame is a complete Ethernet →
 /// IPv4 → UDP → DNS wire encoding suitable for passing to
-/// [`SlirpStack::process_guest_frame`].
+/// [`SlirpBackend::process_guest_frame`].
 fn build_dns_query_for_bench(xid: u16) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&xid.to_be_bytes());
@@ -185,7 +185,7 @@ fn build_dns_query_for_bench(xid: u16) -> Vec<u8> {
 /// Times the stack's DNS processing path when the cache has no entry for the
 /// queried name.
 ///
-/// Each iteration creates a fresh [`SlirpStack`] (so the DNS cache is empty)
+/// Each iteration creates a fresh [`SlirpBackend`] (so the DNS cache is empty)
 /// and processes one DNS query frame. The measurement captures stack
 /// initialisation plus first-query cache-miss handling, giving a baseline for
 /// the cold-cache cost.
@@ -193,7 +193,7 @@ fn build_dns_query_for_bench(xid: u16) -> Vec<u8> {
 fn dns_cache_miss(bencher: Bencher) {
     let frame = build_dns_query_for_bench(1);
     bencher.bench_local(|| {
-        let mut stack = SlirpStack::new().unwrap();
+        let mut stack = SlirpBackend::new().unwrap();
         let _ = stack.process_guest_frame(divan::black_box(&frame));
     });
 }
@@ -207,7 +207,7 @@ fn dns_cache_miss(bencher: Bencher) {
 /// same name) on the warm stack, isolating the cache-hit fast path.
 #[divan::bench]
 fn dns_cache_hit(bencher: Bencher) {
-    let mut stack = SlirpStack::new().unwrap();
+    let mut stack = SlirpBackend::new().unwrap();
     let warm = build_dns_query_for_bench(1);
     let _ = stack.process_guest_frame(&warm);
     for _ in 0..20 {
