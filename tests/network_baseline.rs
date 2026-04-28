@@ -123,7 +123,7 @@ fn build_udp_frame(dst_ip: Ipv4Address, src_port: u16, dst_port: u16, payload: &
         &mut udp,
         &IpAddress::Ipv4(SLIRP_GUEST_IP),
         &IpAddress::Ipv4(dst_ip),
-        UDP_HDR_LEN + payload.len(),
+        payload.len(),
         |b| b.copy_from_slice(payload),
         &Default::default(),
     );
