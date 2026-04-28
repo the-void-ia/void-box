@@ -30,6 +30,10 @@ use std::os::unix::io::AsRawFd;
 use void_box::network::slirp::{
     SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
+// Used by tcp_deny_list_emits_rst to express the deny CIDR as a typed network.
+// `with_security` takes `&[String]`, so we convert via `.to_string()` at the
+// call site; this import is kept here (module scope) per project convention.
+use ipnet::Ipv4Net;
 
 const GUEST_EPHEMERAL_PORT: u16 = 49152;
 const ETH_HDR_LEN: usize = 14;
@@ -426,4 +430,94 @@ fn tcp_to_host_buffer_drops_at_256kb() {
          already landed — flip the assertion to `assert!(!saw_close)` and \
          verify all 2 500 chunks are eventually acknowledged."
     );
+}
+
+#[test]
+fn tcp_rate_limit_emits_rst() {
+    // 5 conn/s allowance; 10 attempts.
+    let mut stack = SlirpStack::with_security(64, 5, &[]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    let mut rsts = 0;
+    for i in 0..10 {
+        stack
+            .process_guest_frame(&build_tcp_frame(
+                SLIRP_GATEWAY_IP,
+                GUEST_EPHEMERAL_PORT + i as u16,
+                host_port,
+                1000,
+                0,
+                TcpControl::Syn,
+                &[],
+            ))
+            .unwrap();
+        for f in drain_n(&mut stack, 2) {
+            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(&f) {
+                if ctrl == TcpControl::Rst {
+                    rsts += 1;
+                }
+            }
+        }
+    }
+    assert!(rsts >= 4, "expected ≥4 RSTs from rate limit, saw {rsts}");
+    drop(listener);
+}
+
+#[test]
+fn tcp_max_concurrent_emits_rst() {
+    let mut stack = SlirpStack::with_security(2, 1000, &[]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    // Open 4 distinct connections; cap is 2.
+    let mut rsts = 0;
+    for i in 0..4 {
+        stack
+            .process_guest_frame(&build_tcp_frame(
+                SLIRP_GATEWAY_IP,
+                GUEST_EPHEMERAL_PORT + i,
+                host_port,
+                1000,
+                0,
+                TcpControl::Syn,
+                &[],
+            ))
+            .unwrap();
+        for f in drain_n(&mut stack, 2) {
+            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(&f) {
+                if ctrl == TcpControl::Rst {
+                    rsts += 1;
+                }
+            }
+        }
+    }
+    assert!(rsts >= 1, "expected RST after concurrent limit, saw {rsts}");
+    drop(listener);
+}
+
+#[test]
+fn tcp_deny_list_emits_rst() {
+    // `with_security` takes `&[String]`; parse via `Ipv4Net` to validate the
+    // CIDR at compile-check time, then convert to the expected string form.
+    let deny_cidr: Ipv4Net = "169.254.169.254/32".parse().unwrap();
+    let deny_strings = [deny_cidr.to_string()];
+    let mut stack = SlirpStack::with_security(64, 1000, &deny_strings).unwrap();
+
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            Ipv4Address::new(169, 254, 169, 254),
+            GUEST_EPHEMERAL_PORT,
+            80,
+            1000,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+    let rst = drain_n(&mut stack, 2)
+        .into_iter()
+        .find_map(|f| parse_tcp_to_guest(&f))
+        .map(|(_, _, ctrl, _)| ctrl == TcpControl::Rst);
+    assert_eq!(rst, Some(true), "deny-list IP must get RST");
 }
