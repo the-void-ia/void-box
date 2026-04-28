@@ -10,6 +10,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Read-only token: this workflow only runs tests; nothing it does
+# requires write access. Declared explicitly so a future change to the
+# org-level default workflow permissions can't silently widen it.
+permissions:
+  contents: read
+
 jobs:
   e2e-macos:
     name: E2E VZ (macOS Apple Silicon)

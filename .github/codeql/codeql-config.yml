@@ -1,0 +1,16 @@
+name: "CodeQL config"
+
+# Skip non-shipping code paths from CodeQL analysis. The Rust scanner's
+# `cleartext-logging` query repeatedly false-positives on these trees: it
+# can't see through redacting `Debug` impls (`ApiKey`, `SessionSecret`),
+# treats correlation identifiers like `session_id` as credentials, and
+# misattributes line locations to `#[tokio::test]` / `#[tokio::main]`
+# attribute macros. The previous workflow was a permanent dismiss-and-
+# repeat treadmill. Production code (`src/`, `void-box-protocol/`,
+# `voidbox-oci/`, `void-mcp/`, `void-message/`, `guest-agent/`) keeps
+# full coverage — only demo / playground / mock-CLI directories are
+# excluded.
+paths-ignore:
+  - examples/**
+  - playground/**
+  - claudio/**

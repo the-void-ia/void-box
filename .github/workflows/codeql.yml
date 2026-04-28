@@ -1,0 +1,53 @@
+name: CodeQL
+
+# Replaces GitHub's "default setup" so we can pin path/rule filters
+# alongside the code (see `.github/codeql/codeql-config.yml`).
+# Default setup must be disabled in the repo's Code-security settings
+# once this workflow lands, otherwise both will run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly re-scan to catch query-pack updates against unchanged code.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `build-mode: none` keeps the Rust scanner in source-only mode
+      # (matching what default setup runs today) — no full cargo build,
+      # so disk pressure is modest. Skipping `free-disk-space` here.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a  # v3.35.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: .github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a  # v3.35.2
+        with:
+          category: "/language:${{ matrix.language }}"

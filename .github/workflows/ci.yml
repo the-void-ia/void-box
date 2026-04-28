@@ -10,6 +10,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Default GITHUB_TOKEN scope for every job below: read-only on contents,
+# nothing else. This workflow doesn't push, doesn't open PRs, doesn't
+# write artifacts to releases — read is all it needs. Declaring it
+# explicitly so a change to the org-level default permissions doesn't
+# silently widen this workflow's privileges.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
