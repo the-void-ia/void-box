@@ -388,27 +388,29 @@ impl SlirpStack {
         Ok(())
     }
 
-    /// Poll the stack. Returns ethernet frames to send to the guest.
-    pub fn poll(&mut self) -> Vec<Vec<u8>> {
-        // Check rx_queue size before polling
+    /// Drain frames destined to the guest into `out`, reusing the caller's
+    /// buffer across calls and avoiding a fresh allocation on every tick.
+    ///
+    /// See [`crate::network::NetworkBackend::drain_to_guest`].
+    pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        // Check rx_queue size before polling.
         let rx_count = {
             let q = self.queue.lock().unwrap();
             q.rx_queue.len()
         };
 
-        // 1. Let smoltcp handle ARP
+        // 1. Let smoltcp handle ARP.
         let ts = smol_instant_now();
         let mut dev = VirtualDevice::new(self.queue.clone());
         let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
 
-        // 2. Resolve pending DNS queries (off vCPU thread)
+        // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
 
-        // 3. Process TCP NAT data relay
+        // 3. Process TCP NAT data relay.
         self.relay_tcp_nat_data();
 
-        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames
-        let mut frames = Vec::new();
+        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames.
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
@@ -420,17 +422,24 @@ impl SlirpStack {
                     self.inject_to_guest.len()
                 );
             }
-            frames.append(&mut q.tx_queue);
+            out.append(&mut q.tx_queue);
         }
-        frames.append(&mut self.inject_to_guest);
-
-        frames
+        out.append(&mut self.inject_to_guest);
     }
 
-    /// Drain frames destined to the guest into `out`. Reuses the buffer
-    /// across calls. See [`crate::network::NetworkBackend::drain_to_guest`].
-    pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
-        out.append(&mut self.poll());
+    /// Poll the stack and return ethernet frames to send to the guest.
+    ///
+    /// # Deprecated
+    ///
+    /// Allocates a fresh [`Vec`] on every call. Prefer [`drain_to_guest`],
+    /// which writes into a caller-supplied buffer and avoids the allocation.
+    ///
+    /// [`drain_to_guest`]: SlirpStack::drain_to_guest
+    #[deprecated(note = "use drain_to_guest")]
+    pub fn poll(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        self.drain_to_guest(&mut out);
+        out
     }
 
     /// Extract the DNS question section (bytes after the 12-byte header up to

@@ -6,6 +6,9 @@
 //! behavior) so the passt-pattern refactor's diff is legible to
 //! reviewers.
 //!
+//! TODO(0D.4): migrate poll() → drain_to_guest() and remove #[allow(deprecated)].
+#![allow(deprecated)]
+//!
 //! Three tests assert *broken* behavior on purpose. Each is marked
 //! `BROKEN_ON_PURPOSE` and flips in the phase that fixes it:
 //!

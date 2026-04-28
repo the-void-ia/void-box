@@ -5,6 +5,8 @@
 //!
 //! Run with: `cargo bench --bench network`
 
+// TODO(0D.5): migrate poll() → drain_to_guest() and remove this allowance.
+#![allow(deprecated)]
 #![cfg(target_os = "linux")]
 
 use divan::Bencher;

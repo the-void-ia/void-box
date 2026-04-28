@@ -656,7 +656,9 @@ impl VirtioNetDevice {
 
     /// Get frames waiting to be received by guest (RX path)
     pub fn get_rx_frames(&mut self) -> Vec<Vec<u8>> {
-        // Poll SLIRP for new packets
+        // Poll SLIRP for new packets.
+        // TODO(0D.4): migrate to drain_to_guest once NetworkBackend is wired in.
+        #[allow(deprecated)]
         let frames = {
             let mut slirp = self.slirp.lock().unwrap();
             slirp.poll()
