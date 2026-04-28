@@ -179,6 +179,11 @@ name = "startup"
 path = "benches/startup.rs"
 harness = false
 
+[[bench]]
+name = "network"
+path = "benches/network.rs"
+harness = false
+
 [[bin]]
 name = "voidbox-startup-bench"
 path = "src/bin/voidbox-startup-bench/main.rs"
