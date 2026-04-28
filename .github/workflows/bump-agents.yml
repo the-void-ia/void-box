@@ -309,10 +309,15 @@ jobs:
           # Plain push for a fresh branch. If a previous run of this job
           # already opened a branch with the same name (e.g. the prior PR
           # was closed without merging), fall back to --force-with-lease
-          # so we don't silently overwrite unrelated work.
+          # so we don't silently overwrite unrelated work. The shallow
+          # checkout never fetched the bump branch, so a bare
+          # --force-with-lease has no baseline to compare and fails with
+          # "stale info"; fetch the remote ref first so the lease has
+          # something concrete to expect.
           if ! git push origin "$branch"; then
-            echo "Branch exists on remote; retrying with --force-with-lease"
-            git push --force-with-lease origin "$branch"
+            echo "Branch exists on remote; fetching it for --force-with-lease baseline"
+            git fetch origin "$branch":"refs/remotes/origin/$branch"
+            git push --force-with-lease="$branch:refs/remotes/origin/$branch" origin "$branch"
           fi
 
           body_file="$(mktemp)"
