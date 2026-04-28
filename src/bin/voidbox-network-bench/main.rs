@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -31,6 +31,15 @@ const BENCH_MEMORY_MB: usize = 1024;
 
 /// SLIRP host-gateway address reachable from inside the guest.
 const SLIRP_HOST_ADDR: &str = "10.0.2.2";
+
+/// Number of RR samples collected per iteration.
+const RR_SAMPLES_PER_ITER: u32 = 100;
+
+/// Number of CRR samples collected per iteration.
+const CRR_SAMPLES_PER_ITER: u32 = 30;
+
+/// Timeout for the host-side channel receive on RR/CRR measurements.
+const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Parser, Debug)]
 #[command(version, about = "VoidBox network benchmark harness")]
@@ -79,9 +88,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mut report = Report::default();
 
-    if !cli.no_throughput {
-        report.tcp_throughput_g2h_mbps = measure_tcp_throughput_g2h(cli.iterations).await?;
+    // Boot one shared VM for all measurements that require a live guest.
+    // Throughput and latency measurements reuse this single sandbox to avoid
+    // paying the boot cost multiple times.
+    let sandbox = Sandbox::local()
+        .from_env()?
+        .memory_mb(BENCH_MEMORY_MB)
+        .network(true)
+        .build()?;
+
+    // Prime the VM (triggers boot + vsock handshake) before any timed work.
+    let probe = sandbox.exec("sh", &["-c", ":"]).await?;
+    if !probe.success() {
+        return Err(format!(
+            "VM probe exec failed: exit={:?} stderr={}",
+            probe.exit_code,
+            probe.stderr_str()
+        )
+        .into());
     }
+
+    if !cli.no_throughput {
+        report.tcp_throughput_g2h_mbps =
+            measure_tcp_throughput_g2h(&sandbox, cli.iterations).await?;
+    }
+
+    // Latency measurements always run (--no-throughput only skips throughput).
+    let (rr_p50, rr_p99) = measure_rr_latency(&sandbox, cli.iterations).await?;
+    report.tcp_rr_latency_us_p50 = rr_p50;
+    report.tcp_rr_latency_us_p99 = rr_p99;
+    report.tcp_crr_latency_us_p50 = measure_crr_latency(&sandbox, cli.iterations).await?;
+
+    sandbox.stop().await?;
 
     let json = serde_json::to_string_pretty(&report)?;
     match cli.output {
@@ -93,32 +131,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Measure guest-to-host TCP throughput.
 ///
-/// Binds a host-side TCP listener on `127.0.0.1:0`, boots a VM, and execs a
-/// BusyBox shell snippet that pipes `dd` output to `nc`.  The host drain thread
-/// records bytes received and wall-clock elapsed time; Mbps is computed from
-/// those two numbers.  Runs `iterations` times and returns the mean.
+/// Binds a host-side TCP listener on `127.0.0.1:0` and execs a BusyBox shell
+/// snippet inside `sandbox` that pipes `dd` output to `nc`.  The host drain
+/// thread records bytes received and wall-clock elapsed time; Mbps is computed
+/// from those two numbers.  Runs `iterations` times and returns the mean.
 ///
 /// Returns `None` if every iteration fails to parse or times out.
 async fn measure_tcp_throughput_g2h(
+    sandbox: &Sandbox,
     iterations: u32,
 ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
-    let sandbox = Sandbox::local()
-        .from_env()?
-        .memory_mb(BENCH_MEMORY_MB)
-        .network(true)
-        .build()?;
-
-    // Prime the VM (triggers boot + vsock handshake) before the timed loop.
-    let probe = sandbox.exec("sh", &["-c", ":"]).await?;
-    if !probe.success() {
-        return Err(format!(
-            "VM probe exec failed: exit={:?} stderr={}",
-            probe.exit_code,
-            probe.stderr_str()
-        )
-        .into());
-    }
-
     let mut mbps_samples: Vec<f64> = Vec::new();
 
     for iteration_index in 0..iterations {
@@ -193,8 +215,6 @@ async fn measure_tcp_throughput_g2h(
         }
     }
 
-    sandbox.stop().await?;
-
     if mbps_samples.is_empty() {
         return Ok(None);
     }
@@ -235,9 +255,235 @@ fn drain_stream(stream: &mut TcpStream) -> u64 {
     total_bytes
 }
 
-#[allow(dead_code)]
 fn percentile(samples: &mut [Duration], p: f64) -> Duration {
     samples.sort();
     let idx = ((samples.len() as f64) * p).clamp(0.0, samples.len() as f64 - 1.0) as usize;
     samples[idx]
+}
+
+/// Measure TCP RR (Request-Response) latency on a kept-open connection.
+///
+/// The guest pipes `RR_SAMPLES_PER_ITER` null bytes over a single `nc`
+/// connection (`dd if=/dev/zero bs=1 count=N | nc host port`).  The host
+/// accepts one connection and services each byte as an independent echo
+/// round-trip, timing each host-side `read + write` pair.
+///
+/// Using dd+nc avoids BusyBox shell limitations around interactive TCP
+/// sockets while still measuring per-message in-flight latency on a
+/// persistent connection.  The first sample from each iteration is discarded
+/// because the first byte arrival absorbs TCP connect and Nagle jitter from
+/// the guest side.  Remaining samples are accumulated across all iterations;
+/// p50 and p99 are computed over the union.
+///
+/// Returns `(p50_us, p99_us)`, both `None` if no samples were collected.
+async fn measure_rr_latency(
+    sandbox: &Sandbox,
+    iterations: u32,
+) -> Result<(Option<f64>, Option<f64>), Box<dyn std::error::Error>> {
+    let mut all_samples: Vec<Duration> = Vec::new();
+
+    for iteration_index in 0..iterations {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let host_port = listener.local_addr()?.port();
+
+        let (echo_tx, echo_rx) = mpsc::channel::<Vec<Duration>>();
+
+        std::thread::spawn(move || {
+            let samples = rr_echo_server(&listener, RR_SAMPLES_PER_ITER);
+            let _ = echo_tx.send(samples);
+        });
+
+        // Guest: pipe RR_SAMPLES_PER_ITER zero bytes over one nc connection.
+        // dd generates the bytes; nc forwards them to the host echo server.
+        // The guest does not need to read the echoed bytes — the host drives
+        // the timing loop and closes when done.  BusyBox dd + nc suffice.
+        let guest_cmd = format!(
+            "dd if=/dev/zero bs=1 count={n} 2>/dev/null | nc {host} {port}",
+            n = RR_SAMPLES_PER_ITER,
+            host = SLIRP_HOST_ADDR,
+            port = host_port,
+        );
+
+        let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+        if let Err(exec_err) = exec_result {
+            tracing::warn!(
+                iteration = iteration_index,
+                error = %exec_err,
+                "rr iteration exec error; skipping"
+            );
+        }
+
+        match echo_rx.recv_timeout(LATENCY_RECV_TIMEOUT) {
+            Err(recv_err) => {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %recv_err,
+                    "rr echo channel receive error; skipping"
+                );
+            }
+            Ok(mut samples) => {
+                // Discard first sample (absorbs TCP connect jitter).
+                if samples.len() > 1 {
+                    samples.remove(0);
+                }
+                let count = samples.len();
+                let p50_us = if count > 0 {
+                    percentile(&mut samples.clone(), 0.50).as_micros()
+                } else {
+                    0
+                };
+                eprintln!("rr[{iteration_index:>2}]: {count} samples, p50={p50_us} µs");
+                all_samples.extend(samples);
+            }
+        }
+    }
+
+    if all_samples.is_empty() {
+        return Ok((None, None));
+    }
+
+    let p50 = percentile(&mut all_samples, 0.50).as_micros() as f64;
+    let p99 = percentile(&mut all_samples, 0.99).as_micros() as f64;
+    Ok((Some(p50), Some(p99)))
+}
+
+/// Host-side echo server for RR latency.
+///
+/// Accepts one connection, then for each of the `count` iterations: reads
+/// one byte, times that read, writes the byte back, and records the elapsed
+/// duration.  Returns the list of per-round-trip host-side durations.
+///
+/// The timer starts just before the blocking `read` call and stops after the
+/// `write` returns.  This measures the host-observed round-trip time: the
+/// interval from "host waiting for a byte" to "host has written the echo",
+/// which is approximately the guest-side send→receive latency plus the
+/// network stack overhead on both sides.
+fn rr_echo_server(listener: &TcpListener, count: u32) -> Vec<Duration> {
+    let Ok((mut stream, _)) = listener.accept() else {
+        return Vec::new();
+    };
+
+    let mut samples = Vec::with_capacity(count as usize);
+    let mut buf = [0u8; 1];
+
+    for _ in 0..count {
+        let start = Instant::now();
+        match stream.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        match stream.write_all(&buf) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        samples.push(start.elapsed());
+    }
+
+    samples
+}
+
+/// Measure TCP CRR (Connect-Request-Response) latency.
+///
+/// Each sample is one full `accept + read + write + close` cycle on the host,
+/// timed from `accept` returning to the connection dropping.  The guest runs
+/// a shell loop that performs `CRR_SAMPLES_PER_ITER` independent `nc` invocations
+/// per iteration (each is a full connect → send → recv → close).
+///
+/// Host-side timing is the ground truth: the host observes when the
+/// connection arrives and when it closes, so each sample faithfully captures
+/// the TCP setup + data round-trip + teardown cost end-to-end.
+///
+/// Returns `p50_us` across all collected samples, or `None` if none arrived.
+async fn measure_crr_latency(
+    sandbox: &Sandbox,
+    iterations: u32,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let mut all_samples: Vec<Duration> = Vec::new();
+
+    for iteration_index in 0..iterations {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let host_port = listener.local_addr()?.port();
+
+        // The host accepts CRR_SAMPLES_PER_ITER connections, times each cycle,
+        // and sends results back over a channel.
+        let (crr_tx, crr_rx) = mpsc::channel::<Vec<Duration>>();
+        let sample_count = CRR_SAMPLES_PER_ITER;
+
+        std::thread::spawn(move || {
+            let samples = crr_echo_server(&listener, sample_count);
+            let _ = crr_tx.send(samples);
+        });
+
+        // Guest: loop CRR_SAMPLES_PER_ITER times; each iteration is a full
+        // nc invocation (connect → send one byte → read echo → disconnect).
+        let n = CRR_SAMPLES_PER_ITER;
+        let guest_cmd = format!(
+            "i=0; while [ $i -lt {n} ]; do printf 'A' | nc {host} {port}; i=$((i+1)); done",
+            host = SLIRP_HOST_ADDR,
+            port = host_port,
+            n = n,
+        );
+
+        let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+        if let Err(exec_err) = exec_result {
+            tracing::warn!(
+                iteration = iteration_index,
+                error = %exec_err,
+                "crr iteration exec error; skipping"
+            );
+        }
+
+        match crr_rx.recv_timeout(LATENCY_RECV_TIMEOUT) {
+            Err(recv_err) => {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %recv_err,
+                    "crr echo channel receive error; skipping"
+                );
+            }
+            Ok(samples) => {
+                let count = samples.len();
+                let p50_us = if count > 0 {
+                    percentile(&mut samples.clone(), 0.50).as_micros()
+                } else {
+                    0
+                };
+                eprintln!("crr[{iteration_index:>2}]: {count} samples, p50={p50_us} µs");
+                all_samples.extend(samples);
+            }
+        }
+    }
+
+    if all_samples.is_empty() {
+        return Ok(None);
+    }
+
+    let p50 = percentile(&mut all_samples, 0.50).as_micros() as f64;
+    Ok(Some(p50))
+}
+
+/// Host-side echo server for CRR latency.
+///
+/// Accepts `count` independent connections in sequence.  For each: starts the
+/// timer on `accept`, reads one byte, writes it back, closes the connection,
+/// and stops the timer.  Returns all per-connection durations.
+fn crr_echo_server(listener: &TcpListener, count: u32) -> Vec<Duration> {
+    let mut samples = Vec::with_capacity(count as usize);
+    let mut buf = [0u8; 1];
+
+    for _ in 0..count {
+        let start = Instant::now();
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        // Read the request byte and echo it back.
+        if stream.read_exact(&mut buf).is_ok() {
+            let _ = stream.write_all(&buf);
+        }
+        // Explicit drop closes the connection.
+        drop(stream);
+        samples.push(start.elapsed());
+    }
+
+    samples
 }
