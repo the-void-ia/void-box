@@ -21,8 +21,8 @@
 
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    EthernetRepr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
-    TcpRepr, UdpPacket, UdpRepr,
+    EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
+    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
@@ -841,5 +841,65 @@ fn udp_non_dns_silently_dropped() {
         !received,
         "BROKEN_ON_PURPOSE: today UDP-to-non-53 is dropped. \
          If this fires, Phase 2 likely landed — flip to assert!(received)."
+    );
+}
+
+/// BROKEN_ON_PURPOSE — flips in Phase 1.
+///
+/// Today: ICMP echo requests are silently dropped at
+/// `slirp.rs:637`. Phase 1 adds `IPPROTO_ICMP SOCK_DGRAM` echo
+/// translation.
+#[test]
+fn icmp_echo_silently_dropped() {
+    // Build a minimal ICMP echo request as an IPv4 packet inside an
+    // Ethernet frame. We don't have an `IcmpRepr` builder set up; do
+    // it by hand against smoltcp wire types.
+    let icmp_repr = Icmpv4Repr::EchoRequest {
+        ident: 0xbeef,
+        seq_no: 1,
+        data: b"ping",
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: SLIRP_GUEST_IP,
+        dst_addr: Ipv4Address::new(8, 8, 8, 8),
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp_repr.buffer_len(),
+        hop_limit: 64,
+    };
+    let eth_repr = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress(GATEWAY_MAC),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let total = ETH_HDR_LEN + ip_repr.buffer_len() + icmp_repr.buffer_len();
+    let mut buf = vec![0u8; total];
+    let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth_repr.emit(&mut eth);
+    let mut ip = Ipv4Packet::new_unchecked(&mut buf[ETH_HDR_LEN..]);
+    ip_repr.emit(&mut ip, &Default::default());
+    let mut icmp = Icmpv4Packet::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
+    icmp_repr.emit(&mut icmp, &Default::default());
+
+    let mut stack = SlirpStack::new().unwrap();
+    stack.process_guest_frame(&buf).unwrap();
+    let frames = drain_n(&mut stack, 4);
+
+    let saw_icmp_reply = frames.iter().any(|f| {
+        EthernetFrame::new_checked(f.as_slice())
+            .ok()
+            .and_then(|e| {
+                if e.ethertype() != EthernetProtocol::Ipv4 {
+                    return None;
+                }
+                Ipv4Packet::new_checked(e.payload()).ok().map(|ip| {
+                    ip.next_header() == IpProtocol::Icmp && ip.dst_addr() == SLIRP_GUEST_IP
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        !saw_icmp_reply,
+        "BROKEN_ON_PURPOSE: today ICMP echo is dropped. \
+         Phase 1 should flip this to assert!(saw_icmp_reply)."
     );
 }
