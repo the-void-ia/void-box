@@ -141,8 +141,7 @@ struct IcmpEchoEntry {
     /// rewrites the id to a kernel-assigned value when the `SOCK_DGRAM`
     /// ICMP socket sends; we translate back to `guest_id` when emitting the
     /// reply frame.
-    // Read in Task 1.3 (relay_icmp_echo) when translating the reply frame.
-    #[allow(dead_code)]
+    // Read in `relay_icmp_echo` when translating the reply frame.
     guest_id: u16,
     last_activity: Instant,
 }
@@ -469,7 +468,10 @@ impl SlirpBackend {
         // 3. Process TCP NAT data relay.
         self.relay_tcp_nat_data();
 
-        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames.
+        // 4. Relay ICMP echo replies from host sockets back to the guest.
+        self.relay_icmp_echo();
+
+        // 5. Collect frames: smoltcp ARP responses + our NAT-built frames.
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
@@ -1198,6 +1200,105 @@ impl SlirpBackend {
         for key in to_remove {
             self.tcp_nat.remove(&key);
         }
+    }
+
+    /// Drain replies from each active ICMP echo socket and emit echo-reply
+    /// frames to the guest.
+    ///
+    /// Called on every [`drain_to_guest`] tick.  Entries idle longer than
+    /// `ICMP_IDLE_TIMEOUT` are evicted.
+    fn relay_icmp_echo(&mut self) {
+        const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+        let now = Instant::now();
+
+        let keys: Vec<IcmpEchoKey> = self.icmp_echo.keys().copied().collect();
+        for key in keys {
+            let frame = {
+                let Some(entry) = self.icmp_echo.get_mut(&key) else {
+                    continue;
+                };
+                if now.duration_since(entry.last_activity) > ICMP_IDLE_TIMEOUT {
+                    None // mark for removal below
+                } else {
+                    let mut buf = [0u8; 1500];
+                    match entry.sock.recv_from(&mut buf) {
+                        Ok((n, _addr)) => {
+                            entry.last_activity = now;
+                            // Wrap in Some to distinguish from the idle-timeout
+                            // None arm in the outer match.
+                            Some(Self::build_icmp_echo_reply_to_guest(
+                                key.dst_ip,
+                                entry.guest_id,
+                                &buf[..n],
+                            ))
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            match frame {
+                None => {
+                    // Idle timeout — evict entry.
+                    self.icmp_echo.remove(&key);
+                }
+                Some(Some(frame_bytes)) => self.inject_to_guest.push(frame_bytes),
+                Some(None) => {} // build failed; drop silently
+            }
+        }
+    }
+
+    /// Build an Ethernet/IPv4/ICMP echo-reply frame addressed to the guest.
+    ///
+    /// `src_ip` is the original ping destination (becomes the reply source).
+    /// `guest_id` is the ICMP identifier to write into the reply so the guest
+    /// can match it against its outstanding echo request.
+    /// `raw_icmp` is the raw ICMP packet received from the host kernel via
+    /// the `SOCK_DGRAM IPPROTO_ICMP` socket (no IP header; ICMP type + code +
+    /// checksum + payload).
+    ///
+    /// Returns `Some(frame)` on success, `None` if the packet cannot be parsed
+    /// or is not an `EchoReply`.
+    fn build_icmp_echo_reply_to_guest(
+        src_ip: Ipv4Address,
+        guest_id: u16,
+        raw_icmp: &[u8],
+    ) -> Option<Vec<u8>> {
+        let icmp = Icmpv4Packet::new_checked(raw_icmp).ok()?;
+        let parsed = Icmpv4Repr::parse(&icmp, &Default::default()).ok()?;
+        // Copy the payload before `icmp` / `parsed` go out of scope so we can
+        // build the outgoing `EchoReply` with a fresh borrow.  Mirrors the
+        // same pattern used in `handle_icmp_frame` (Task 1.2).
+        let (seq_no, data_owned) = match parsed {
+            Icmpv4Repr::EchoReply { seq_no, data, .. } => (seq_no, data.to_vec()),
+            _ => return None,
+        };
+        let reply = Icmpv4Repr::EchoReply {
+            ident: guest_id,
+            seq_no,
+            data: &data_owned,
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: src_ip,
+            dst_addr: SLIRP_GUEST_IP,
+            next_header: IpProtocol::Icmp,
+            payload_len: reply.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GATEWAY_MAC),
+            dst_addr: EthernetAddress(GUEST_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + reply.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut icmp_out = Icmpv4Packet::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        reply.emit(&mut icmp_out, &Default::default());
+        Some(buf)
     }
 
     // ── Packet building helpers ──────────────────────────────────────
