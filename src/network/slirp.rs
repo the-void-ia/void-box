@@ -19,10 +19,12 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::network::NetworkBackend;
 
 /// Cached DNS response with expiry.
 struct DnsCacheEntry {
@@ -1111,6 +1113,16 @@ impl SlirpStack {
         buf[udp_offset + 8..].copy_from_slice(payload);
 
         buf
+    }
+}
+
+impl NetworkBackend for SlirpStack {
+    fn process_guest_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        SlirpStack::process_guest_frame(self, frame).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        SlirpStack::drain_to_guest(self, out)
     }
 }
 

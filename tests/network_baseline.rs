@@ -33,6 +33,7 @@ use std::os::unix::io::AsRawFd;
 use void_box::network::slirp::{
     SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
+use void_box::network::NetworkBackend;
 // Used by tcp_deny_list_emits_rst to express the deny CIDR as a typed network.
 // `with_security` takes `&[String]`, so we convert via `.to_string()` at the
 // call site; this import is kept here (module scope) per project convention.
@@ -905,4 +906,12 @@ fn icmp_echo_silently_dropped() {
         "BROKEN_ON_PURPOSE: today ICMP echo is dropped. \
          Phase 1 should flip this to assert!(saw_icmp_reply)."
     );
+}
+
+#[test]
+fn slirp_backend_implements_network_backend() {
+    fn assert_send<T: Send>() {}
+    fn assert_backend<T: NetworkBackend>() {}
+    assert_send::<SlirpStack>();
+    assert_backend::<SlirpStack>();
 }
