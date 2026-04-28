@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::FromRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,9 +50,9 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, IpAddress,
-    IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
-    TcpSeqNumber, UdpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, Icmpv4Packet,
+    Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
+    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
 };
 
 use tracing::{debug, trace, warn};
@@ -132,8 +132,6 @@ struct IcmpEchoKey {
 }
 
 /// State for one in-flight ICMP echo request from the guest.
-// Fields are read in the upcoming task 1.2/1.3 (handle_icmp_frame / relay_icmp_echo).
-#[allow(dead_code)]
 struct IcmpEchoEntry {
     /// Host-side socket: `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`.
     /// Set non-blocking; the kernel handles ICMP framing — no
@@ -143,6 +141,8 @@ struct IcmpEchoEntry {
     /// rewrites the id to a kernel-assigned value when the `SOCK_DGRAM`
     /// ICMP socket sends; we translate back to `guest_id` when emitting the
     /// reply frame.
+    // Read in Task 1.3 (relay_icmp_echo) when translating the reply frame.
+    #[allow(dead_code)]
     guest_id: u16,
     last_activity: Instant,
 }
@@ -154,8 +154,6 @@ struct IcmpEchoEntry {
 ///
 /// Returns `Err` if the kernel rejects the call (e.g. the
 /// `net.ipv4.ping_group_range` sysctl excludes the current GID).
-// Called in the upcoming task 1.2 (handle_icmp_frame).
-#[allow(dead_code)]
 fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
     // SAFETY: socket(2) returns -1 on error; we check before wrapping.
     // IPPROTO_ICMP + SOCK_DGRAM is the unprivileged ICMP path: the kernel
@@ -303,8 +301,6 @@ pub struct SlirpBackend {
     /// TCP NAT table
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
     /// ICMP echo NAT table (guest id + dst → host socket).
-    /// Populated in task 1.2 (handle_icmp_frame).
-    #[allow(dead_code)]
     icmp_echo: HashMap<IcmpEchoKey, IcmpEchoEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
@@ -712,7 +708,12 @@ impl SlirpBackend {
             }
         }
 
-        // Everything else (ICMP, etc.) – drop silently
+        // ICMP echo requests — forward via unprivileged SOCK_DGRAM IPPROTO_ICMP socket
+        if protocol == IpProtocol::Icmp {
+            return self.handle_icmp_frame(&ipv4);
+        }
+
+        // Everything else – drop silently
         trace!("SLIRP: dropping {:?} packet to {}", protocol, dst_ip);
         Ok(())
     }
@@ -759,6 +760,80 @@ impl SlirpBackend {
             query: query.to_vec(),
             guest_src_port: src_port,
         });
+        Ok(())
+    }
+
+    // ── ICMP echo forwarding ─────────────────────────────────────────
+
+    /// Forward a guest ICMP echo request to the host kernel via an unprivileged
+    /// `SOCK_DGRAM IPPROTO_ICMP` socket.
+    ///
+    /// The kernel rewrites the ICMP identifier on `send_to`; the entry stores
+    /// the guest's original `ident` so the reply path (Task 1.3) can translate
+    /// it back before injecting the frame into the guest.
+    fn handle_icmp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
+        let icmp = match Icmpv4Packet::new_checked(ipv4.payload()) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let repr = match Icmpv4Repr::parse(&icmp, &Default::default()) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        let (ident, seq_no, data) = match repr {
+            Icmpv4Repr::EchoRequest {
+                ident,
+                seq_no,
+                data,
+            } => (ident, seq_no, data),
+            _ => return Ok(()), // only echo request handled today
+        };
+
+        // Copy data before the mutable borrow of self.icmp_echo below.
+        let data_owned: Vec<u8> = data.to_vec();
+
+        let key = IcmpEchoKey {
+            guest_id: ident,
+            dst_ip: ipv4.dst_addr(),
+        };
+        let entry = match self.icmp_echo.entry(key) {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let sock = match open_icmp_socket() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Sysctl-driven fallback handled in Task 1.4.
+                        trace!("SLIRP ICMP: open socket failed: {e}");
+                        return Ok(());
+                    }
+                };
+                vacant.insert(IcmpEchoEntry {
+                    sock,
+                    guest_id: ident,
+                    last_activity: Instant::now(),
+                })
+            }
+        };
+        entry.last_activity = Instant::now();
+
+        // Build a wire ICMP echo packet with seq + data; the kernel will
+        // rewrite the ident on send_to.
+        let req = Icmpv4Repr::EchoRequest {
+            ident: 0, // kernel rewrites
+            seq_no,
+            data: &data_owned,
+        };
+        let mut buf = vec![0u8; req.buffer_len()];
+        let mut pkt = Icmpv4Packet::new_unchecked(&mut buf);
+        req.emit(&mut pkt, &Default::default());
+
+        let dst = SocketAddr::from((
+            Ipv4Addr::from(ipv4.dst_addr().0),
+            0u16, // port ignored for ICMP
+        ));
+        if let Err(e) = entry.sock.send_to(&buf, dst) {
+            trace!("SLIRP ICMP: send_to failed: {e}");
+        }
         Ok(())
     }
 
