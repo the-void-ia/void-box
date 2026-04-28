@@ -809,3 +809,37 @@ fn dns_cache_keys_by_question_not_xid() {
         }
     }
 }
+
+/// BROKEN_ON_PURPOSE — flips in Phase 2.
+///
+/// Today: UDP datagrams to any port other than 53 are silently
+/// dropped (`slirp.rs:637` "drop silently"). A bound host UDP socket
+/// receives nothing.
+#[test]
+fn udp_non_dns_silently_dropped() {
+    // Bind a host UDP socket; we'll prove nothing arrives.
+    let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let host_port = host_sock.local_addr().unwrap().port();
+    host_sock
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .unwrap();
+
+    let mut stack = SlirpStack::new().unwrap();
+    stack
+        .process_guest_frame(&build_udp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            b"hello",
+        ))
+        .unwrap();
+    let _ = drain_n(&mut stack, 4);
+
+    let mut buf = [0u8; 32];
+    let received = host_sock.recv(&mut buf).is_ok();
+    assert!(
+        !received,
+        "BROKEN_ON_PURPOSE: today UDP-to-non-53 is dropped. \
+         If this fires, Phase 2 likely landed — flip to assert!(received)."
+    );
+}
