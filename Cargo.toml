@@ -192,6 +192,10 @@ path = "src/bin/voidbox-startup-bench/main.rs"
 name = "voidbox-rpc-bench"
 path = "src/bin/voidbox-rpc-bench/main.rs"
 
+[[bin]]
+name = "voidbox-network-bench"
+path = "src/bin/voidbox-network-bench/main.rs"
+
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]
 
