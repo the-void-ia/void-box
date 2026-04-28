@@ -11,9 +11,10 @@ use divan::Bencher;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
+    UdpPacket, UdpRepr,
 };
 use void_box::network::slirp::{
-    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
+    SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
 
 fn main() {
@@ -126,5 +127,93 @@ fn poll_with_n_flows(bencher: Bencher, n: usize) {
     }
     bencher.bench_local(|| {
         let _ = divan::black_box(&mut stack).poll();
+    });
+}
+
+/// Builds a minimal DNS A-query Ethernet frame from the guest to [`SLIRP_DNS_IP`].
+///
+/// `xid` is placed in the DNS transaction-ID field. The question section
+/// queries `example.com` for an A record. The frame is a complete Ethernet →
+/// IPv4 → UDP → DNS wire encoding suitable for passing to
+/// [`SlirpStack::process_guest_frame`].
+fn build_dns_query_for_bench(xid: u16) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&xid.to_be_bytes());
+    // flags: RD=1; QDCOUNT=1; ANCOUNT/NSCOUNT/ARCOUNT = 0
+    payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // QNAME: \x07example\x03com\x00
+    payload.extend_from_slice(b"\x07example\x03com\x00");
+    // QTYPE=A (1), QCLASS=IN (1)
+    payload.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+    let udp_repr = UdpRepr {
+        src_port: 49152,
+        dst_port: 53,
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: SLIRP_GUEST_IP,
+        dst_addr: SLIRP_DNS_IP,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + payload.len(),
+        hop_limit: 64,
+    };
+    let eth = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress(GATEWAY_MAC),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let total = 14 + ip_repr.buffer_len() + 8 + payload.len();
+    let mut buf = vec![0u8; total];
+    let mut e = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth.emit(&mut e);
+    let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+    ip_repr.emit(&mut ip, &Default::default());
+    let mut udp = UdpPacket::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+    udp_repr.emit(
+        &mut udp,
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(SLIRP_DNS_IP),
+        payload.len(),
+        |b| b.copy_from_slice(&payload),
+        &Default::default(),
+    );
+    buf
+}
+
+/// Times the stack's DNS processing path when the cache has no entry for the
+/// queried name.
+///
+/// Each iteration creates a fresh [`SlirpStack`] (so the DNS cache is empty)
+/// and processes one DNS query frame. The measurement captures stack
+/// initialisation plus first-query cache-miss handling, giving a baseline for
+/// the cold-cache cost.
+#[divan::bench]
+fn dns_cache_miss(bencher: Bencher) {
+    let frame = build_dns_query_for_bench(1);
+    bencher.bench_local(|| {
+        let mut stack = SlirpStack::new().unwrap();
+        let _ = stack.process_guest_frame(divan::black_box(&frame));
+    });
+}
+
+/// Times the stack's DNS processing path when a cache entry already exists for
+/// the queried name.
+///
+/// Before the timed section, one query is injected and the stack is polled
+/// for up to one second to allow the upstream DNS response to populate the
+/// cache. The timed section then processes a second query (different XID,
+/// same name) on the warm stack, isolating the cache-hit fast path.
+#[divan::bench]
+fn dns_cache_hit(bencher: Bencher) {
+    let mut stack = SlirpStack::new().unwrap();
+    let warm = build_dns_query_for_bench(1);
+    let _ = stack.process_guest_frame(&warm);
+    for _ in 0..20 {
+        let _ = stack.poll();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let hit = build_dns_query_for_bench(2);
+    bencher.bench_local(|| {
+        let _ = divan::black_box(&mut stack).process_guest_frame(divan::black_box(&hit));
     });
 }
