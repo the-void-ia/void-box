@@ -21,10 +21,9 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::os::fd::FromRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use libc;
 
 use crate::network::NetworkBackend;
 
@@ -158,8 +157,6 @@ struct IcmpEchoEntry {
 // Called in the upcoming task 1.2 (handle_icmp_frame).
 #[allow(dead_code)]
 fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
-    use std::os::fd::FromRawFd;
-
     // SAFETY: socket(2) returns -1 on error; we check before wrapping.
     // IPPROTO_ICMP + SOCK_DGRAM is the unprivileged ICMP path: the kernel
     // handles ICMP framing, no CAP_NET_RAW required.
