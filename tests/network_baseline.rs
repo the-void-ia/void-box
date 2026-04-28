@@ -24,7 +24,9 @@ use smoltcp::wire::{
     EthernetRepr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
     TcpRepr, UdpPacket, UdpRepr,
 };
+use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
+use std::os::unix::io::AsRawFd;
 use void_box::network::slirp::{
     SlirpStack, GATEWAY_MAC, GUEST_MAC, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
@@ -202,7 +204,6 @@ fn tcp_handshake_emits_synack() {
 
 #[test]
 fn tcp_data_round_trip() {
-    use std::io::{Read, Write};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
@@ -309,7 +310,6 @@ fn tcp_to_host_buffer_drops_at_256kb() {
     // branch fires (slirp.rs:907), state → Closed, NAT entry removed.
     // No RST/FIN is sent; from the guest's perspective the connection
     // simply goes silent — pushed frames generate no ACKs.
-    use std::os::unix::io::AsRawFd;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     {
         let val: libc::c_int = 4096;
