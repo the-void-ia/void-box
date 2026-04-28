@@ -24,6 +24,8 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use libc;
+
 use crate::network::NetworkBackend;
 
 /// Cached DNS response with expiry.
@@ -117,6 +119,63 @@ struct TcpNatEntry {
     /// Guest sequence number to ACK once `to_host` is flushed
     to_host_pending_ack: Option<u32>,
     last_activity: Instant,
+}
+
+/// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
+///
+/// The host kernel rewrites the ICMP id when sending through a
+/// `SOCK_DGRAM IPPROTO_ICMP` socket; we keep the guest's original id here so
+/// the reply frame can be translated back before injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct IcmpEchoKey {
+    guest_id: u16,
+    dst_ip: Ipv4Address,
+}
+
+/// State for one in-flight ICMP echo request from the guest.
+// Fields are read in the upcoming task 1.2/1.3 (handle_icmp_frame / relay_icmp_echo).
+#[allow(dead_code)]
+struct IcmpEchoEntry {
+    /// Host-side socket: `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`.
+    /// Set non-blocking; the kernel handles ICMP framing — no
+    /// `CAP_NET_RAW` needed.
+    sock: std::net::UdpSocket,
+    /// The guest's original ICMP id from the echo request.  The host kernel
+    /// rewrites the id to a kernel-assigned value when the `SOCK_DGRAM`
+    /// ICMP socket sends; we translate back to `guest_id` when emitting the
+    /// reply frame.
+    guest_id: u16,
+    last_activity: Instant,
+}
+
+/// Open an unprivileged ICMP socket (`SOCK_DGRAM IPPROTO_ICMP`).
+///
+/// The kernel handles ICMP framing; `CAP_NET_RAW` is **not** required.
+/// The socket is set `SOCK_NONBLOCK | SOCK_CLOEXEC` at creation time.
+///
+/// Returns `Err` if the kernel rejects the call (e.g. the
+/// `net.ipv4.ping_group_range` sysctl excludes the current GID).
+// Called in the upcoming task 1.2 (handle_icmp_frame).
+#[allow(dead_code)]
+fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: socket(2) returns -1 on error; we check before wrapping.
+    // IPPROTO_ICMP + SOCK_DGRAM is the unprivileged ICMP path: the kernel
+    // handles ICMP framing, no CAP_NET_RAW required.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_ICMP,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a valid fd from socket(2); UdpSocket adopts
+    // ownership and closes on drop.
+    Ok(unsafe { std::net::UdpSocket::from_raw_fd(raw) })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -246,6 +305,10 @@ pub struct SlirpBackend {
     _device: VirtualDevice,
     /// TCP NAT table
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
+    /// ICMP echo NAT table (guest id + dst → host socket).
+    /// Populated in task 1.2 (handle_icmp_frame).
+    #[allow(dead_code)]
+    icmp_echo: HashMap<IcmpEchoKey, IcmpEchoEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
     /// Maximum concurrent TCP connections allowed
@@ -323,6 +386,7 @@ impl SlirpBackend {
             sockets,
             _device: device,
             tcp_nat: HashMap::new(),
+            icmp_echo: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
             max_connections_per_second,
