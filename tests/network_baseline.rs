@@ -814,14 +814,14 @@ fn dns_cache_keys_by_question_not_xid() {
     }
 }
 
-/// BROKEN_ON_PURPOSE — flips in Phase 2.
+/// Phase 2 (Task 2.2) flipped the BROKEN_ON_PURPOSE assertion: non-DNS UDP
+/// datagrams are now forwarded to the host via a per-flow connected socket.
 ///
-/// Today: UDP datagrams to any port other than 53 are silently
-/// dropped (`slirp.rs:637` "drop silently"). A bound host UDP socket
-/// receives nothing.
+/// A host UDP socket bound on loopback receives the datagram that the guest
+/// sent to the SLIRP gateway IP (translated to 127.0.0.1 by `handle_udp_frame`).
 #[test]
 fn udp_non_dns_silently_dropped() {
-    // Bind a host UDP socket; we'll prove nothing arrives.
+    // Bind a host UDP socket; we'll prove the datagram arrives.
     let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let host_port = host_sock.local_addr().unwrap().port();
     host_sock
@@ -842,9 +842,8 @@ fn udp_non_dns_silently_dropped() {
     let mut buf = [0u8; 32];
     let received = host_sock.recv(&mut buf).is_ok();
     assert!(
-        !received,
-        "BROKEN_ON_PURPOSE: today UDP-to-non-53 is dropped. \
-         If this fires, Phase 2 likely landed — flip to assert!(received)."
+        received,
+        "non-DNS UDP should reach the host socket via per-flow NAT"
     );
 }
 

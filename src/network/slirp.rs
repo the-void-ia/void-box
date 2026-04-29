@@ -166,12 +166,13 @@ struct UdpFlowKey {
 }
 
 /// State for one active UDP flow from the guest.
-#[allow(dead_code)]
 struct UdpFlowEntry {
     /// Connected `UdpSocket`. The host kernel handles source-port
     /// preservation and reply demux; we just `send` and `recv`.
     /// Set non-blocking.
     sock: std::net::UdpSocket,
+    /// Last frame timestamp; read by Task 2.4 idle-timeout reaper.
+    #[allow(dead_code)]
     last_activity: Instant,
 }
 
@@ -232,7 +233,6 @@ fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
 ///   per-flow demux without an additional dispatch table.
 ///
 /// No `CAP_NET_RAW` required — `SOCK_DGRAM` UDP is fully unprivileged.
-#[allow(dead_code)]
 fn open_udp_flow_socket(dst: std::net::SocketAddr) -> io::Result<std::net::UdpSocket> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
     sock.set_nonblocking(true)?;
@@ -370,7 +370,6 @@ pub struct SlirpBackend {
     /// ICMP echo NAT table (guest id + dst → host socket).
     icmp_echo: HashMap<IcmpEchoKey, IcmpEchoEntry>,
     /// UDP flow NAT table (guest src port + dst → connected host socket).
-    #[allow(dead_code)]
     udp_flows: HashMap<UdpFlowKey, UdpFlowEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
@@ -769,9 +768,13 @@ impl SlirpBackend {
         let dst_ip = ipv4.dst_addr();
         let protocol = ipv4.next_header();
 
-        // DNS (UDP to 10.0.2.3:53) – handle specially
-        if dst_ip == SLIRP_DNS_IP && protocol == IpProtocol::Udp {
-            return self.handle_dns_frame(&ipv4);
+        // UDP — DNS keeps its dedicated cache+forward handler; everything
+        // else goes through the per-flow connected-socket NAT.
+        if protocol == IpProtocol::Udp {
+            if dst_ip == SLIRP_DNS_IP {
+                return self.handle_dns_frame(&ipv4);
+            }
+            return self.handle_udp_frame(&ipv4);
         }
 
         // TCP to any external IP (not gateway) – NAT proxy
@@ -834,6 +837,63 @@ impl SlirpBackend {
             query: query.to_vec(),
             guest_src_port: src_port,
         });
+        Ok(())
+    }
+
+    // ── Non-DNS UDP forwarding ────────────────────────────────────────
+
+    /// Forward a non-DNS guest UDP datagram to the host via a per-flow connected socket.
+    ///
+    /// Each unique (guest source port, destination IP, destination port) 3-tuple maps to
+    /// one connected `UdpSocket`. On the first frame for a flow the socket is created via
+    /// [`open_udp_flow_socket`] and stored in [`udp_flows`](Self). Subsequent frames reuse
+    /// the existing socket, updating `last_activity` for idle-timeout reaping (Task 2.4).
+    ///
+    /// The SLIRP gateway address (`10.0.2.2`) is translated to `127.0.0.1` before
+    /// connecting, mirroring the same translation used on the TCP NAT path.
+    ///
+    /// Reply delivery back to the guest is handled by Task 2.3 (`relay_udp_flows`).
+    fn handle_udp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
+        let udp = match UdpPacket::new_checked(ipv4.payload()) {
+            Ok(u) => u,
+            Err(_) => return Ok(()),
+        };
+        let payload = udp.payload().to_vec();
+        let key = UdpFlowKey {
+            guest_src_port: udp.src_port(),
+            dst_ip: ipv4.dst_addr(),
+            dst_port: udp.dst_port(),
+        };
+
+        // SLIRP gateway translation: 10.0.2.2 → 127.0.0.1 (matches TCP path).
+        let dst_ip_for_socket = if key.dst_ip == SLIRP_GATEWAY_IP {
+            std::net::Ipv4Addr::LOCALHOST
+        } else {
+            std::net::Ipv4Addr::from(key.dst_ip.0)
+        };
+        let dst = std::net::SocketAddr::from((dst_ip_for_socket, key.dst_port));
+
+        let entry = match self.udp_flows.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let sock = match open_udp_flow_socket(dst) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        trace!("SLIRP UDP: open flow socket failed: {e}");
+                        return Ok(());
+                    }
+                };
+                v.insert(UdpFlowEntry {
+                    sock,
+                    last_activity: Instant::now(),
+                })
+            }
+        };
+        entry.last_activity = Instant::now();
+
+        if let Err(e) = entry.sock.send(&payload) {
+            trace!("SLIRP UDP: send failed: {e}");
+        }
         Ok(())
     }
 
