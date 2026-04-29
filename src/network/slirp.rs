@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -120,7 +120,10 @@ struct TcpNatEntry {
     our_seq: u32,
     /// Last acknowledged guest sequence number
     guest_ack: u32,
-    /// Data received from host, pending delivery to guest
+    /// Data received from host, pending delivery to guest.
+    /// Retained for Task 3.6 cleanup; superseded by the peek-based send
+    /// path added in Task 3.3.
+    #[allow(dead_code)]
     to_guest: Vec<u8>,
     /// Data received from guest, pending write to host (buffered on EAGAIN)
     to_host: Vec<u8>,
@@ -136,7 +139,6 @@ struct TcpNatEntry {
     /// 3.4 (ACK-driven consume from kernel socket). For now it's
     /// initialized to 0 and never read; the `#[allow(dead_code)]`
     /// attribute comes off in 3.3.
-    #[allow(dead_code)]
     bytes_in_flight: u32,
 }
 
@@ -264,7 +266,6 @@ fn open_udp_flow_socket(dst: std::net::SocketAddr) -> io::Result<std::net::UdpSo
 /// what's in the kernel buffer, send the un-ACK'd portion to the
 /// guest. Bytes stay in the kernel until the guest ACKs and Task
 /// 3.4's ACK-driven `read()` consumes them.
-#[allow(dead_code)] // consumed in Task 3.3
 fn recv_peek(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `stream` outlives the syscall; `buf` is uniquely
     // borrowed and `len` matches the slice length.
@@ -1321,40 +1322,64 @@ impl SlirpBackend {
                 }
             }
 
-            // Read from host
-            let mut buf = [0u8; 16384];
-            match entry.host_stream.read(&mut buf) {
+            // Phase 3 host→guest path: peek what's in the kernel recv buffer
+            // without consuming. Send only the un-ACK'd portion (bytes past
+            // what we've already sent). The kernel's socket buffer holds the
+            // outstanding data; Task 3.4's ACK-driven `read()` consumes it
+            // once the guest ACKs.
+            let mut peek_buf = [0u8; 65536];
+            match recv_peek(&entry.host_stream, &mut peek_buf) {
                 Ok(0) => {
-                    debug!("SLIRP TCP: host closed for {}:{}", key.dst_ip, key.dst_port);
+                    // Host closed the connection. Send FIN to guest below.
+                    debug!(
+                        "SLIRP TCP: host EOF on flow guest_port={}, marking Closed",
+                        key.guest_src_port
+                    );
                     entry.state = TcpNatState::Closed;
                 }
-                Ok(n) => {
-                    entry.to_guest.extend_from_slice(&buf[..n]);
-                    entry.last_activity = Instant::now();
+                Ok(peek_n) => {
+                    let in_flight = entry.bytes_in_flight as usize;
+                    if peek_n > in_flight {
+                        let new_bytes = &peek_buf[in_flight..peek_n];
+                        let mut sent_total: usize = 0;
+                        for chunk in new_bytes.chunks(MTU - 54) {
+                            let frame = build_tcp_packet_static(
+                                key.dst_ip,
+                                SLIRP_GUEST_IP,
+                                key.dst_port,
+                                key.guest_src_port,
+                                entry.our_seq,
+                                entry.guest_ack,
+                                TcpControl::None,
+                                chunk,
+                            );
+                            frames_to_inject.push(frame);
+                            entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
+                            entry.bytes_in_flight =
+                                entry.bytes_in_flight.wrapping_add(chunk.len() as u32);
+                            sent_total += chunk.len();
+                        }
+                        entry.last_activity = Instant::now();
+                        trace!(
+                            "SLIRP TCP relay: peeked {} bytes (in_flight before={}, sent now={})",
+                            peek_n,
+                            in_flight,
+                            sent_total
+                        );
+                    }
+                    // else: kernel buffer holds only already-in-flight bytes.
+                    // Wait for guest ACK before sending more (Task 3.4).
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Kernel recv buffer empty; nothing to do this poll.
+                }
                 Err(e) => {
-                    trace!("SLIRP TCP: host read error: {}", e);
+                    warn!(
+                        "SLIRP TCP: recv_peek failed on flow guest_port={}, marking Closed: {}",
+                        key.guest_src_port, e
+                    );
                     entry.state = TcpNatState::Closed;
                 }
-            }
-
-            // Build data frames for guest
-            while !entry.to_guest.is_empty() && entry.state == TcpNatState::Established {
-                let chunk_size = entry.to_guest.len().min(MTU - 54);
-                let chunk: Vec<u8> = entry.to_guest.drain(..chunk_size).collect();
-                let frame = build_tcp_packet_static(
-                    key.dst_ip,
-                    SLIRP_GUEST_IP,
-                    key.dst_port,
-                    key.guest_src_port,
-                    entry.our_seq,
-                    entry.guest_ack,
-                    TcpControl::None,
-                    &chunk,
-                );
-                entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
-                frames_to_inject.push(frame);
             }
 
             // FIN if host closed
