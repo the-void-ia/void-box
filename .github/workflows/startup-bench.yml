@@ -186,14 +186,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run wall-clock harness (informational)
-        # No threshold gate — Azure nested-virt is slower than the
-        # bare-metal targets the verify-skill thresholds were tuned for.
-        # `continue-on-error` keeps the workflow green even if the
-        # harness fails outright (e.g. missing /dev/vhost-vsock on a
-        # future runner image change). The artifact preserves the log
-        # either way.
-        continue-on-error: true
+      - name: Run wall-clock harness (strict)
+        # NO `continue-on-error` — was previously silently masking the
+        # vhost/userspace vsock backend mismatch on warm restore (root
+        # cause: `capture_snapshot` was building a Sandbox without
+        # `.enable_snapshots(true)` so vhost-vsock was selected, but
+        # `from_snapshot` always restores into userspace vsock; vring
+        # state lives in the kernel's vhost-vsock module and isn't part
+        # of our snapshot, so the restored userspace device couldn't
+        # accept connections and every host connect timed out).
+        # Threshold gate stays informal — Azure nested-virt is slower
+        # than the bare-metal Fedora 43 / KVM targets the verify-skill
+        # thresholds were tuned for, but the harness MUST exit 0.
         env:
           ITERS: ${{ inputs.iters || '20' }}
           VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
