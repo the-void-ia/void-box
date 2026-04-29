@@ -229,7 +229,7 @@ detailed task lists for later ones.
 |---|---|---|---|
 | **0** | Baseline tests + benches + `NetworkBackend` trait extraction + `SlirpStack → SlirpBackend` rename. **Zero user-visible behavior change.** | Low | [`2026-04-27-smoltcp-passt-port-phase0.md`](2026-04-27-smoltcp-passt-port-phase0.md) |
 | **1** | ICMP echo via unprivileged `SOCK_DGRAM IPPROTO_ICMP`, with sysctl-fallback to drop. | Low | [`2026-04-27-smoltcp-passt-port-phase1.md`](2026-04-27-smoltcp-passt-port-phase1.md) |
-| **2** | Generalize UDP: per-flow connected sockets, drop port-53 limit, keep DNS fast-path/cache. | Low–medium | TBD when 1 lands |
+| **2** | Generalize UDP: per-flow connected sockets, drop port-53 limit, keep DNS fast-path/cache. | Low–medium | [`2026-04-27-smoltcp-passt-port-phase2.md`](2026-04-27-smoltcp-passt-port-phase2.md) |
 | **3** | TCP relay rewrite using `MSG_PEEK` + sequence mirroring. Drop `to_guest: Vec<u8>` and 256 KB cap. | **High** — gnarliest of the lot. Snapshot integration tests are the gate. | TBD when 2 lands |
 | **4** | Unified flow table refactor (no behavior change). Side-indexed entries, SipHash lookup. | Medium | TBD when 3 lands |
 | **5** | Stateless NAT translation refactor + port-forwarding configurability. | Low | TBD when 4 lands |
