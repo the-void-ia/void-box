@@ -80,6 +80,7 @@ const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
 const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// ICMP unprivileged probe state.
 ///
@@ -1448,6 +1449,17 @@ impl SlirpBackend {
     /// `key.guest_src_port`.
     fn relay_udp_flows(&mut self) {
         let now = Instant::now();
+        // Reap idle flows; the per-flow connected socket is closed by Drop.
+        let stale: Vec<UdpFlowKey> = self
+            .udp_flows
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.last_activity) > UDP_IDLE_TIMEOUT)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            self.udp_flows.remove(&k);
+        }
+
         let keys: Vec<UdpFlowKey> = self.udp_flows.keys().copied().collect();
         for key in keys {
             let frame = {
