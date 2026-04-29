@@ -53,7 +53,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, Icmpv4Packet,
     Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
-    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
+    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 use tracing::{debug, trace, warn};
@@ -172,7 +172,6 @@ struct UdpFlowEntry {
     /// Set non-blocking.
     sock: std::net::UdpSocket,
     /// Last frame timestamp; read by Task 2.4 idle-timeout reaper.
-    #[allow(dead_code)]
     last_activity: Instant,
 }
 
@@ -542,7 +541,10 @@ impl SlirpBackend {
         // 4. Relay ICMP echo replies from host sockets back to the guest.
         self.relay_icmp_echo();
 
-        // 5. Collect frames: smoltcp ARP responses + our NAT-built frames.
+        // 5. Relay UDP flow replies from host sockets back to the guest.
+        self.relay_udp_flows();
+
+        // 6. Collect frames: smoltcp ARP responses + our NAT-built frames.
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
@@ -1430,6 +1432,93 @@ impl SlirpBackend {
         ip_repr.emit(&mut ip, &Default::default());
         let mut icmp_out = Icmpv4Packet::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
         reply.emit(&mut icmp_out, &Default::default());
+        Some(buf)
+    }
+
+    /// Drain replies from each active UDP flow socket and emit UDP frames to
+    /// the guest.
+    ///
+    /// Called on every [`drain_to_guest`] tick.  Each connected socket is
+    /// polled non-blocking; `WouldBlock` and other errors are silently skipped
+    /// so a stale or unreachable flow never stalls the relay loop.
+    ///
+    /// Reply addressing mirrors the original guest datagram in reverse: the
+    /// frame's IP source is the original destination (`key.dst_ip`) and UDP
+    /// source port is `key.dst_port`; the destination is the guest IP and
+    /// `key.guest_src_port`.
+    fn relay_udp_flows(&mut self) {
+        let now = Instant::now();
+        let keys: Vec<UdpFlowKey> = self.udp_flows.keys().copied().collect();
+        for key in keys {
+            let frame = {
+                let Some(entry) = self.udp_flows.get_mut(&key) else {
+                    continue;
+                };
+                let mut buf = [0u8; 1500];
+                match entry.sock.recv(&mut buf) {
+                    Ok(n) => {
+                        entry.last_activity = now;
+                        Self::build_udp_reply_to_guest(
+                            key.dst_ip,
+                            key.dst_port,
+                            key.guest_src_port,
+                            &buf[..n],
+                        )
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => continue,
+                }
+            };
+            if let Some(frame_bytes) = frame {
+                self.inject_to_guest.push(frame_bytes);
+            }
+        }
+    }
+
+    /// Build an Ethernet/IPv4/UDP frame addressed to the guest, carrying a
+    /// reply from a host-side UDP flow socket.
+    ///
+    /// - `src_ip` — original destination IP (becomes the reply source address).
+    /// - `src_port` — original destination port (becomes the reply source port).
+    /// - `dst_port` — guest's ephemeral source port (becomes the reply destination).
+    /// - `payload` — raw UDP payload received from the host socket.
+    ///
+    /// Returns `Some(frame)` on success.  Currently infallible, but wrapped in
+    /// `Option` for symmetry with [`build_icmp_echo_reply_to_guest`].
+    fn build_udp_reply_to_guest(
+        src_ip: Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let udp_repr = UdpRepr { src_port, dst_port };
+        let ip_repr = Ipv4Repr {
+            src_addr: src_ip,
+            dst_addr: SLIRP_GUEST_IP,
+            next_header: IpProtocol::Udp,
+            payload_len: 8 + payload.len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GATEWAY_MAC),
+            dst_addr: EthernetAddress(GUEST_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + 8 + payload.len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut udp = UdpPacket::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        udp_repr.emit(
+            &mut udp,
+            &IpAddress::Ipv4(src_ip),
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            payload.len(),
+            |b| b.copy_from_slice(payload),
+            &Default::default(),
+        );
         Some(buf)
     }
 
