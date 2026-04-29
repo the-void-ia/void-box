@@ -127,6 +127,17 @@ struct TcpNatEntry {
     /// Guest sequence number to ACK once `to_host` is flushed
     to_host_pending_ack: Option<u32>,
     last_activity: Instant,
+    /// passt-style sequence mirroring: bytes sent to the guest but
+    /// not yet ACK'd. Equivalent to `our_seq - last_acked_seq`, but
+    /// stored explicitly so the relay can decide how much new
+    /// payload to peek+send each poll.
+    ///
+    /// Consumed by Task 3.3 (host→guest peek-based send) and Task
+    /// 3.4 (ACK-driven consume from kernel socket). For now it's
+    /// initialized to 0 and never read; the `#[allow(dead_code)]`
+    /// attribute comes off in 3.3.
+    #[allow(dead_code)]
+    bytes_in_flight: u32,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -1087,6 +1098,7 @@ impl SlirpBackend {
                         to_host: Vec::new(),
                         to_host_pending_ack: None,
                         last_activity: Instant::now(),
+                        bytes_in_flight: 0,
                     };
                     self.tcp_nat.insert(key.clone(), entry);
 
@@ -1750,6 +1762,7 @@ mod tests {
             to_host: Vec::new(),
             to_host_pending_ack: None,
             last_activity: Instant::now(),
+            bytes_in_flight: 0,
         };
 
         assert!(entry.to_host.is_empty());
