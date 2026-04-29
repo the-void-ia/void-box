@@ -12,7 +12,7 @@
 //! Three tests assert *broken* behavior on purpose. Each is marked
 //! `BROKEN_ON_PURPOSE` and flips in the phase that fixes it:
 //!
-//! - `tcp_to_host_buffer_drops_at_256kb` — flips in Phase 3
+//! - `tcp_writes_more_than_256kb_succeed` — flipped in Phase 3 (was `tcp_to_host_buffer_drops_at_256kb`)
 //! - `udp_non_dns_round_trips` — flipped in Phase 2 (was `udp_non_dns_silently_dropped`)
 //! - `icmp_echo_returns_reply` — flipped in Phase 1 (was `icmp_echo_silently_dropped`)
 //!
@@ -292,33 +292,23 @@ fn tcp_data_round_trip() {
     );
 }
 
-/// BROKEN_ON_PURPOSE — flips in Phase 3.
-///
-/// Today: when guest writes >256 KB to host before host reads,
-/// `to_host` buffer overflows and the connection is closed
-/// (`slirp.rs:903–910`). The stack silently removes the NAT entry
-/// (no RST, no FIN to guest); subsequent frames from the guest are
-/// dropped without acknowledgement.
-///
-/// After Phase 3 (MSG_PEEK + sequence mirroring): the host kernel's
-/// socket buffer absorbs the write; no userspace cap, no drop.
-/// All data is eventually acknowledged.
+/// Phase 3 flipped this BROKEN_ON_PURPOSE pin: passt-style sequence
+/// mirroring + don't-ACK-on-WouldBlock backpressure replaces the
+/// 256 KB userspace cliff. Pushing >1 MB through the relay now
+/// succeeds — the kernel's socket buffer holds outstanding bytes,
+/// the guest retransmits unacked segments, and the connection stays
+/// alive instead of being reset.
 #[test]
-fn tcp_to_host_buffer_drops_at_256kb() {
-    // Pin the listener's SO_RCVBUF to 4 096 bytes. The kernel doubles
-    // it to 8 192 B (its enforced minimum) and propagates that to the
-    // accepted socket. This constrains how much data the kernel buffers;
-    // combined with the sender's default SO_SNDBUF (~208 KB), writes to
-    // `host_stream` return WouldBlock after ~1 751 KB.
-    //
-    // Once the first WouldBlock occurs (slirp.rs:893), payload goes into
-    // `to_host`. Each subsequent poll() calls relay_tcp_nat_data() which
-    // tries to flush `to_host` but keeps getting WouldBlock (OS still
-    // full), so `to_host` grows. After 256 KB accumulates the `else`
-    // branch fires (slirp.rs:907), state → Closed, NAT entry removed.
-    // No RST/FIN is sent; from the guest's perspective the connection
-    // simply goes silent — pushed frames generate no ACKs.
+fn tcp_writes_more_than_256kb_succeed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    // Constrain the listener's recv buffer (small but reasonable —
+    // ensures TCP backpressure kicks in at a point we can observe
+    // without a multi-megabyte memory footprint).
     {
         let val: libc::c_int = 4096;
         unsafe {
@@ -331,14 +321,22 @@ fn tcp_to_host_buffer_drops_at_256kb() {
             );
         }
     }
-    let host_port = listener.local_addr().unwrap().port();
 
-    // Server thread: accept and sleep without reading. The constrained
-    // receive buffer fills quickly; TCP flow-control stalls slirp's
-    // host_stream writes with WouldBlock.
-    let _server = std::thread::spawn(move || {
-        let (_sock, _) = listener.accept().unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(10));
+    // Server: accept and drain everything we get.
+    let bytes_received = Arc::new(AtomicUsize::new(0));
+    let bytes_received_thr = Arc::clone(&bytes_received);
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => break, // EOF from guest side
+                Ok(n) => {
+                    bytes_received_thr.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
     });
 
     let mut stack = SlirpBackend::new().expect("stack");
@@ -372,67 +370,85 @@ fn tcp_to_host_buffer_drops_at_256kb() {
         ))
         .unwrap();
 
-    // Push 2 500 × 1 KB chunks in batches of 500, draining after each
-    // batch. The drain lets relay_tcp_nat_data() attempt to flush the
-    // `to_host` buffer; while the OS receive buffer is full it gets
-    // WouldBlock and the buffer keeps growing.
-    //
-    // Expected timeline (observed on this host):
-    //   Chunks   0–1751: direct writes succeed; OS absorbs ~1 751 KB.
-    //   Chunks 1752–2007: WouldBlock; payloads go into `to_host`.
-    //   Chunk  ~2007: `to_host` exceeds 256 KB → state = Closed.
-    //   Chunks 2008–2500: NAT entry gone; no ACKs returned.
-    //
-    // We detect the connection drop by tracking whether the last batch's
-    // poll returned any frame to the guest. After the drop, batches
-    // return 0 frames (no ACKs, no FIN, no RST).
+    // Push 1 MB in 1 KB chunks. Drain after every batch so the
+    // host's read thread can drain the kernel buffer and ACKs flow
+    // back to the guest. The new TCP-backpressure path means some
+    // chunks won't be ACK'd immediately; we re-send those (TCP-style
+    // retransmit) until they go through.
+    const TOTAL: usize = 1024 * 1024;
+    const CHUNK: usize = 1024;
+    let chunk = vec![b'x'; CHUNK];
     let mut seq = 1001u32;
-    let chunk = vec![b'x'; 1024];
+    let mut acked_seq = 1001u32;
     let mut saw_close = false;
-    const BATCH: usize = 500;
-    const TOTAL: usize = 2500;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
-    for batch_start in (0..TOTAL).step_by(BATCH) {
-        for _ in batch_start..batch_start + BATCH {
-            let _ = stack.process_guest_frame(&build_tcp_frame(
-                SLIRP_GATEWAY_IP,
-                GUEST_EPHEMERAL_PORT,
-                host_port,
-                seq,
-                our_seq + 1,
-                TcpControl::Psh,
-                &chunk,
-            ));
-            seq = seq.wrapping_add(1024);
-        }
-        let frames = stack.poll();
-        // After the cliff the connection is silently removed:
-        // no ACKs, no FIN, no RST — exactly 0 frames returned for a full
-        // batch of pushed data. We require the connection to have been
-        // alive for at least the first batch before declaring it dead.
-        if batch_start >= BATCH && frames.is_empty() {
-            saw_close = true;
-            break;
-        }
-        // Also check for RST/FIN for completeness (not emitted today).
-        for f in &frames {
-            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(f) {
+    while bytes_received.load(Ordering::Relaxed) < TOTAL && std::time::Instant::now() < deadline {
+        // Send a chunk; advance our seq.
+        let _ = stack.process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            seq,
+            our_seq + 1,
+            TcpControl::Psh,
+            &chunk,
+        ));
+        seq = seq.wrapping_add(CHUNK as u32);
+
+        // Drain frames; track the highest ACK we've seen and watch
+        // for RST/FIN that would indicate a Phase-2 era close.
+        for f in drain_n(&mut stack, 4) {
+            if let Some((_, ack, ctrl, _)) = parse_tcp_to_guest(&f) {
                 if matches!(ctrl, TcpControl::Rst | TcpControl::Fin) {
                     saw_close = true;
                 }
+                if ack > acked_seq {
+                    acked_seq = ack;
+                }
             }
         }
+
         if saw_close {
             break;
         }
+
+        // If we've out-paced the kernel's recv buffer, sleep briefly
+        // so the server thread can drain it.
+        if seq.wrapping_sub(acked_seq) > 256 * 1024 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
+
+    // Close the connection cleanly so the server's read loop exits.
+    let _ = stack.process_guest_frame(&build_tcp_frame(
+        SLIRP_GATEWAY_IP,
+        GUEST_EPHEMERAL_PORT,
+        host_port,
+        seq,
+        our_seq + 1,
+        TcpControl::Fin,
+        &[],
+    ));
+    for _ in 0..40 {
+        let _ = drain_n(&mut stack, 1);
+        if server.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = server.join();
+
+    let received = bytes_received.load(Ordering::Relaxed);
     assert!(
-        saw_close,
-        "BROKEN_ON_PURPOSE: today the 256 KB to_host cliff silently drops \
-         the connection (slirp.rs:907–910) — no RST/FIN sent, subsequent \
-         chunks receive no ACK. If this assertion fails, Phase 3 may have \
-         already landed — flip the assertion to `assert!(!saw_close)` and \
-         verify all 2 500 chunks are eventually acknowledged."
+        !saw_close,
+        "Phase 3 contract: connection must NOT be reset/FIN'd mid-stream \
+         (was the 256 KB cliff bug). Saw RST or FIN."
+    );
+    assert!(
+        received >= TOTAL * 95 / 100,
+        "Phase 3 contract: server must receive ~all bytes pushed (got {received}/{TOTAL}); \
+         backpressure should retransmit until success, not silently drop."
     );
 }
 
