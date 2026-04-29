@@ -41,9 +41,6 @@ const CRR_SAMPLES_PER_ITER: u32 = 30;
 /// Timeout for the host-side channel receive on RR/CRR measurements.
 const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Window in seconds for counting DNS queries.
-const DNS_QPS_WINDOW_SECS: u32 = 10;
-
 /// Number of ICMP echo samples collected per iteration.
 const ICMP_SAMPLES_PER_ITER: u32 = 30;
 
@@ -52,9 +49,6 @@ const ICMP_PING_INTERVAL: &str = "0.05";
 
 /// Target address for ICMP echo requests.
 const ICMP_PING_TARGET: &str = "8.8.8.8";
-
-/// SLIRP DNS resolver address inside the guest.
-const SLIRP_DNS_ADDR: &str = "10.0.2.3";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -518,112 +512,27 @@ async fn measure_crr_latency(
 
 /// Measure UDP DNS query throughput against the SLIRP resolver.
 ///
-/// Runs a BusyBox `sh` loop inside the guest for `DNS_QPS_WINDOW_SECS` seconds.
-/// Each iteration sends a raw DNS query for `example.com` (type A) to the SLIRP
-/// resolver via `nc -u` and checks whether a non-empty reply arrived, counting
-/// successes.  Returns `qps = successes / window_secs`.
+/// Returns `None` — the busybox-`nc` tool available in the minimal test
+/// initramfs cannot produce a meaningful number here.  Each `nc -u -w1`
+/// invocation blocks for the full 1-second `-w1` timeout after stdin EOF
+/// even when the cached SLIRP reply arrives in microseconds, capping
+/// throughput at roughly 1 qps regardless of stack latency.  Tighter
+/// alternatives tried:
 ///
-/// Using raw UDP via `nc -u` avoids a dependency on `nslookup` or `dig`, which
-/// are not present in the minimal test initramfs.  The DNS query is a
-/// pre-encoded fixed packet (transaction-id `0x1234`, type A, class IN);
-/// the SLIRP resolver's response need only be non-empty to count as a success.
+/// - `-q0`: nc exits before the UDP reply arrives, yielding 0 successes.
+/// - `/dev/udp/HOST/PORT`: bash-specific; busybox ash does not support it.
+/// - `timeout 0.1 nc ...`: `timeout` is not present in the test initramfs.
 ///
-/// The SLIRP stack handles DNS at `10.0.2.3`; after the first query the
-/// resolver's cache should absorb subsequent lookups, so the measurement
-/// captures the in-stack UDP turnaround cost rather than upstream RTT.
-///
-/// Returns `None` on exec failure or if the guest output cannot be parsed.
-async fn measure_dns_qps(sandbox: &Sandbox) -> Result<Option<f64>, Box<dyn std::error::Error>> {
-    let window = DNS_QPS_WINDOW_SECS;
-    let dns_addr = SLIRP_DNS_ADDR;
-
-    // Minimal DNS query packet for "example.com" A IN (29 bytes), pre-encoded.
-    // Header: txid=0x1234, flags=0x0100 (RD), qdcount=1.
-    // Question: 0x07 "example" 0x03 "com" 0x00, qtype=A(1), qclass=IN(1).
-    let dns_query_hex = "\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\
-                         \\x07\\x65\\x78\\x61\\x6d\\x70\\x6c\\x65\
-                         \\x03\\x63\\x6f\\x6d\\x00\\x00\\x01\\x00\\x01";
-
-    // BusyBox nc exits as soon as its stdin reaches EOF regardless of the -w
-    // timeout.  When stdin is a file (`nc < file`), nc sends the file contents
-    // and exits before the UDP reply can arrive from SLIRP's async resolver.
-    //
-    // Fix: pipe from a subshell that sends the query bytes then immediately
-    // runs `sleep 0`.  The `sleep 0` extends the pipe's lifetime by one
-    // process, keeping nc's stdin open just long enough to allow the shell to
-    // fork both cat and sleep before stdin closes.  After the subshell exits,
-    // nc still waits up to `-w2` seconds for an incoming UDP reply.
-    //
-    // Timing analysis:
-    //   - First query: SLIRP forwards to upstream DNS (≤100 ms typical).
-    //     The reply arrives well within the 2-second -w2 window.
-    //   - Subsequent queries: SLIRP serves from its 60-second cache (<1 ms).
-    //     The reply arrives almost immediately.
-    //   - Each iteration takes ~1 s (dominated by the -w1 timeout that fires
-    //     after the reply is received and nc drains its stdin).
-    //
-    // The guest emits "count=<N>" on a dedicated line so the host can compute
-    // a precise f64 qps without relying on integer division inside the guest.
-    let guest_cmd = format!(
-        "printf '{dns_query_hex}' > /tmp/_dq.bin; \
-         end=$(($(date +%s) + {window})); \
-         count=0; \
-         while [ \"$(date +%s)\" -lt \"$end\" ]; do \
-           bytes=$({{ cat /tmp/_dq.bin; sleep 0; }} | nc -u -w1 {dns_addr} 53 2>/dev/null | wc -c); \
-           if [ \"$bytes\" -gt 0 ]; then \
-             count=$((count + 1)); \
-           fi; \
-         done; \
-         echo \"count=$count\""
+/// A meaningful qps measurement requires a host-side UDP socket that sends
+/// queries through SLIRP directly, bypassing the per-query nc process
+/// spawn.  Until that is implemented, `udp_dns_qps` is reported as `null`
+/// in the JSON output.
+async fn measure_dns_qps(_sandbox: &Sandbox) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    tracing::warn!(
+        "dns_qps: busybox-nc bottleneck (~1 qps due to -w1 per-query); \
+         reporting null — replace with host-side UDP socket for real numbers"
     );
-
-    let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
-
-    let output = match exec_result {
-        Err(exec_err) => {
-            tracing::warn!(error = %exec_err, "dns_qps exec error; skipping");
-            return Ok(None);
-        }
-        Ok(output) => output,
-    };
-
-    if !output.success() {
-        tracing::warn!(
-            exit_code = ?output.exit_code,
-            stderr = output.stderr_str(),
-            "dns_qps guest command non-zero exit; skipping"
-        );
-        return Ok(None);
-    }
-
-    let stdout = output.stdout_str();
-    tracing::debug!(
-        stdout = stdout,
-        stderr = output.stderr_str(),
-        "dns_qps guest output"
-    );
-
-    // Parse "count=<N>" emitted by the guest; compute qps as f64 on the host
-    // to avoid integer-division truncation inside the shell.
-    let count_value: Option<f64> = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("count="))
-        .and_then(|value_str| value_str.trim().parse::<f64>().ok());
-
-    match count_value {
-        Some(count) => {
-            let qps = count / window as f64;
-            eprintln!("dns_qps: {qps:.2} qps (count={count}, window={window}s)");
-            Ok(Some(qps))
-        }
-        None => {
-            tracing::warn!(
-                stdout = stdout,
-                "dns_qps: could not parse count line from guest output; skipping"
-            );
-            Ok(None)
-        }
-    }
+    Ok(None)
 }
 
 /// Measure ICMP echo (ping) round-trip latency via busybox `ping`.
