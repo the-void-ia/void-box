@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -1196,6 +1196,63 @@ impl SlirpBackend {
                 "SLIRP TCP: connection established for {}:{}",
                 dst_ip, dst_port
             );
+        }
+
+        // ACK-driven consume: when the guest acknowledges data we sent via
+        // peek-based relay (Task 3.3), read those bytes from the kernel recv
+        // buffer to advance the kernel's read pointer.  Without this step the
+        // kernel buffer fills up and recv_peek keeps returning the same bytes.
+        //
+        // Only runs in Established state — the SynReceived ACK above does not
+        // carry data acknowledgements from us yet (bytes_in_flight == 0 then).
+        if tcp.ack() && entry.state == TcpNatState::Established && entry.bytes_in_flight > 0 {
+            // segment_ack: what the guest is now confirming it has received
+            // from us (our send-side sequence space).
+            let segment_ack: u32 = tcp.ack_number().0 as u32;
+
+            // last_sent_acked: the highest our-seq the guest had already
+            // confirmed before this segment.  `our_seq` is the *next* byte we
+            // would send, so subtracting bytes_in_flight gives the start of the
+            // in-flight window.
+            // All arithmetic is wrapping — TCP sequence numbers wrap at 2^32.
+            let last_sent_acked: u32 = entry.our_seq.wrapping_sub(entry.bytes_in_flight);
+
+            // acked_bytes: how many new bytes the guest acknowledged in this
+            // segment.  Guards:
+            //   > 0   — ACK actually advances (not a duplicate or stale ACK)
+            //   <= bytes_in_flight — guest cannot ack more than we've sent
+            //   (defends against malformed / spoofed ACKs from a guest)
+            let acked_bytes: u32 = segment_ack.wrapping_sub(last_sent_acked);
+
+            if acked_bytes > 0 && acked_bytes <= entry.bytes_in_flight {
+                let mut sink = [0u8; 65536];
+                let mut to_drain = acked_bytes as usize;
+                let mut drained: u32 = 0;
+                while to_drain > 0 {
+                    let want = to_drain.min(sink.len());
+                    match entry.host_stream.read(&mut sink[..want]) {
+                        Ok(0) => break, // EOF — nothing more to drain
+                        Ok(n) => {
+                            to_drain -= n;
+                            drained = drained.wrapping_add(n as u32);
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            warn!(
+                                "SLIRP TCP: ACK-driven read failed on flow guest_port={}, marking Closed: {}",
+                                key.guest_src_port, e
+                            );
+                            entry.state = TcpNatState::Closed;
+                            break;
+                        }
+                    }
+                }
+                entry.bytes_in_flight = entry.bytes_in_flight.wrapping_sub(drained);
+                trace!(
+                    "SLIRP TCP: ACK consumed {} bytes from kernel (in_flight now={}, segment_ack={})",
+                    drained, entry.bytes_in_flight, segment_ack
+                );
+            }
         }
 
         let payload = tcp.payload();
