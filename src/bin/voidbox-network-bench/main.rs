@@ -44,6 +44,15 @@ const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 /// Window in seconds for counting DNS queries.
 const DNS_QPS_WINDOW_SECS: u32 = 10;
 
+/// Number of ICMP echo samples collected per iteration.
+const ICMP_SAMPLES_PER_ITER: u32 = 30;
+
+/// Inter-ping interval in seconds passed to busybox `ping -i`.
+const ICMP_PING_INTERVAL: &str = "0.05";
+
+/// Target address for ICMP echo requests.
+const ICMP_PING_TARGET: &str = "8.8.8.8";
+
 /// SLIRP DNS resolver address inside the guest.
 const SLIRP_DNS_ADDR: &str = "10.0.2.3";
 
@@ -115,7 +124,7 @@ struct Report {
     tcp_rr_latency_us_p99: Option<f64>,
     tcp_crr_latency_us_p50: Option<f64>,
     udp_dns_qps: Option<f64>,
-    icmp_rr_latency_us_p50: Option<f64>, // None today; populated post-Phase-1
+    icmp_rr_latency_us_p50: Option<f64>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -162,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.tcp_rr_latency_us_p99 = rr_p99;
     report.tcp_crr_latency_us_p50 = measure_crr_latency(&sandbox, cli.iterations).await?;
     report.udp_dns_qps = measure_dns_qps(&sandbox).await?;
+    report.icmp_rr_latency_us_p50 = measure_icmp_rr_latency(&sandbox, cli.iterations).await?;
 
     sandbox.stop().await?;
 
@@ -614,6 +624,79 @@ async fn measure_dns_qps(sandbox: &Sandbox) -> Result<Option<f64>, Box<dyn std::
             Ok(None)
         }
     }
+}
+
+/// Measure ICMP echo (ping) round-trip latency via busybox `ping`.
+///
+/// Runs `ping -c <count> -W 1 -i <interval> <target>` inside the guest and
+/// parses the `time=<ms> ms` fields from each reply line.  Samples are
+/// converted to microseconds and the p50 is returned.
+///
+/// Returns `None` if `ping` exits non-zero, if the network is unreachable, or
+/// if no `time=` lines were successfully parsed — in which case a `WARN` is
+/// emitted and the metric is left as `None` in the report.
+async fn measure_icmp_rr_latency(
+    sandbox: &Sandbox,
+    iterations: u32,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let count = iterations * ICMP_SAMPLES_PER_ITER;
+    let guest_cmd = format!(
+        "ping -c {count} -W 1 -i {interval} {target}",
+        interval = ICMP_PING_INTERVAL,
+        target = ICMP_PING_TARGET,
+    );
+
+    let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+
+    let output = match exec_result {
+        Err(exec_err) => {
+            tracing::warn!(error = %exec_err, "icmp ping exec error; skipping");
+            return Ok(None);
+        }
+        Ok(output) => output,
+    };
+
+    if !output.success() {
+        tracing::warn!(
+            exit_code = ?output.exit_code,
+            stderr = output.stderr_str(),
+            "icmp ping non-zero exit (unreachable or restricted); skipping"
+        );
+        return Ok(None);
+    }
+
+    let stdout = output.stdout_str();
+    tracing::debug!(stdout = stdout, "icmp ping output");
+
+    let mut samples_us: Vec<u64> = Vec::new();
+    for line in stdout.lines() {
+        let Some(time_offset) = line.find(" time=") else {
+            continue;
+        };
+        let rest = &line[time_offset + 6..];
+        let Some(space_offset) = rest.find(' ') else {
+            continue;
+        };
+        let Ok(ms) = rest[..space_offset].parse::<f64>() else {
+            continue;
+        };
+        samples_us.push((ms * 1000.0) as u64);
+    }
+
+    if samples_us.is_empty() {
+        tracing::warn!("icmp: no time= lines parsed; leaving metric None");
+        return Ok(None);
+    }
+
+    samples_us.sort_unstable();
+    let median_index = samples_us.len() / 2;
+    let p50_us = samples_us[median_index] as f64;
+    eprintln!(
+        "icmp: {} samples, p50={} µs",
+        samples_us.len(),
+        p50_us as u64
+    );
+    Ok(Some(p50_us))
 }
 
 /// Host-side echo server for CRR latency.

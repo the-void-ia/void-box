@@ -121,9 +121,14 @@ install_busybox() {
                ip ifconfig route sed grep awk env wget nc udhcpc \
                dd stat chmod wc touch head tail sort uniq \
                date df du find xargs which basename dirname \
-               readlink realpath sleep; do
+               readlink realpath sleep ping; do
       ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
+    # ping requires CAP_NET_RAW (SOCK_RAW IPPROTO_ICMP).  Set busybox
+    # setuid-root so the ping applet can open raw sockets without uid=0.
+    # This matches the standard /usr/bin/ping permission on most Linux
+    # distributions.
+    chmod u+s "$OUT_DIR/bin/busybox"
   else
     echo "[void-box] No BUSYBOX set; guest will have no /bin/sh (set BUSYBOX=/path/to/busybox for full shell support)."
   fi

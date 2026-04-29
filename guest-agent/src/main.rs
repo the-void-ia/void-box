@@ -411,6 +411,11 @@ fn main() {
     if std::process::id() == 1 {
         if network_enabled_from_cmdline() {
             setup_network();
+            // Allow unprivileged ICMP sockets for all GIDs so non-root
+            // processes (uid=1000 sandbox user) can call ping without
+            // CAP_NET_RAW.  Mirrors the default on most desktop Linux
+            // distributions (ping_group_range = 0 2147483647).
+            let _ = std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0\t2147483647\n");
             // Install the host-provided network deny list *once* at boot,
             // before any guest command can run. This closes the window
             // between network bring-up and the first exec call, and avoids
