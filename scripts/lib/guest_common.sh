@@ -121,14 +121,24 @@ install_busybox() {
                ip ifconfig route sed grep awk env wget nc udhcpc \
                dd stat chmod wc touch head tail sort uniq \
                date df du find xargs which basename dirname \
-               readlink realpath sleep ping; do
+               readlink realpath sleep; do
       ln -sf busybox "$OUT_DIR/bin/$cmd" 2>/dev/null || true
     done
-    # ping requires CAP_NET_RAW (SOCK_RAW IPPROTO_ICMP).  Set busybox
-    # setuid-root so the ping applet can open raw sockets without uid=0.
-    # This matches the standard /usr/bin/ping permission on most Linux
-    # distributions.
-    chmod u+s "$OUT_DIR/bin/busybox"
+    # NOTE: do NOT `chmod u+s busybox`. The cpio is packed as the build user
+    # (uid 1000), so a setuid bit makes the kernel drop euid to 1000 on
+    # every execve from PID 1 (uid=0) → setup_network()'s `ip link up`,
+    # `ip addr replace`, and `udhcpc` all silently fail with EPERM
+    # (no CAP_NET_ADMIN), the static-fallback loop wastes 10s of boot
+    # time, and the host's 30s control-channel handshake deadline
+    # expires before the vsock listener is bound. Symptom: ECONNRESET
+    # on every connect in `voidbox-network-bench` and any test that
+    # uses `network(true)`. See guest-agent::setup_network and
+    # control_channel::connect_with_handshake_sync.
+    #
+    # `ping` is intentionally omitted from the symlink list above — busybox
+    # `ping` uses SOCK_RAW which needs root, and busybox-static on Fedora
+    # is not built with CONFIG_FEATURE_PING_TYPE_DGRAM. Tools that want
+    # ICMP-from-guest should drive it through SLIRP from the host instead.
   else
     echo "[void-box] No BUSYBOX set; guest will have no /bin/sh (set BUSYBOX=/path/to/busybox for full shell support)."
   fi
