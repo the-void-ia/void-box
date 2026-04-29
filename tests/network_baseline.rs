@@ -13,7 +13,7 @@
 //! `BROKEN_ON_PURPOSE` and flips in the phase that fixes it:
 //!
 //! - `tcp_to_host_buffer_drops_at_256kb` — flips in Phase 3
-//! - `udp_non_dns_silently_dropped` — flips in Phase 2
+//! - `udp_non_dns_round_trips` — flipped in Phase 2 (was `udp_non_dns_silently_dropped`)
 //! - `icmp_echo_returns_reply` — flipped in Phase 1 (was `icmp_echo_silently_dropped`)
 //!
 //! Run with: `cargo test --test network_baseline`
@@ -814,21 +814,20 @@ fn dns_cache_keys_by_question_not_xid() {
     }
 }
 
-/// Phase 2 (Task 2.2) flipped the BROKEN_ON_PURPOSE assertion: non-DNS UDP
-/// datagrams are now forwarded to the host via a per-flow connected socket.
-///
-/// A host UDP socket bound on loopback receives the datagram that the guest
-/// sent to the SLIRP gateway IP (translated to 127.0.0.1 by `handle_udp_frame`).
+/// Phase 2 flipped this BROKEN_ON_PURPOSE pin: arbitrary UDP (any
+/// destination port, not just 53) now round-trips through the per-flow
+/// connected-socket NAT introduced in Tasks 2.1–2.4.
 #[test]
-fn udp_non_dns_silently_dropped() {
-    // Bind a host UDP socket; we'll prove the datagram arrives.
+fn udp_non_dns_round_trips() {
     let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let host_port = host_sock.local_addr().unwrap().port();
     host_sock
-        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
         .unwrap();
 
     let mut stack = SlirpBackend::new().unwrap();
+
+    // Guest → gateway:host_port (translated to 127.0.0.1:host_port).
     stack
         .process_guest_frame(&build_udp_frame(
             SLIRP_GATEWAY_IP,
@@ -839,12 +838,46 @@ fn udp_non_dns_silently_dropped() {
         .unwrap();
     let _ = drain_n(&mut stack, 4);
 
+    // Host receives the datagram.
     let mut buf = [0u8; 32];
-    let received = host_sock.recv(&mut buf).is_ok();
-    assert!(
-        received,
-        "non-DNS UDP should reach the host socket via per-flow NAT"
-    );
+    let (n, peer) = host_sock
+        .recv_from(&mut buf)
+        .expect("host receives guest UDP");
+    assert_eq!(&buf[..n], b"hello");
+
+    // Host echoes back.
+    host_sock.send_to(&buf[..n], peer).unwrap();
+
+    // Drain — guest should see the reply on its source port.
+    let mut saw_reply = false;
+    for _ in 0..20 {
+        for f in drain_n(&mut stack, 1) {
+            let Some(eth) = EthernetFrame::new_checked(f.as_slice()).ok() else {
+                continue;
+            };
+            if eth.ethertype() != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let Some(ip) = Ipv4Packet::new_checked(eth.payload()).ok() else {
+                continue;
+            };
+            if ip.next_header() != IpProtocol::Udp {
+                continue;
+            }
+            let Some(udp_pkt) = UdpPacket::new_checked(ip.payload()).ok() else {
+                continue;
+            };
+            if udp_pkt.dst_port() == GUEST_EPHEMERAL_PORT && udp_pkt.payload() == b"hello" {
+                saw_reply = true;
+                break;
+            }
+        }
+        if saw_reply {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(saw_reply, "guest must receive UDP reply via per-flow NAT");
 }
 
 /// Phase 1 flipped the BROKEN_ON_PURPOSE assertion: the guest now
