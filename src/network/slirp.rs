@@ -79,7 +79,6 @@ pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x01];
 const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
-const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// ICMP unprivileged probe state.
@@ -125,9 +124,14 @@ struct TcpNatEntry {
     /// path added in Task 3.3.
     #[allow(dead_code)]
     to_guest: Vec<u8>,
-    /// Data received from guest, pending write to host (buffered on EAGAIN)
+    /// Data received from guest, pending write to host (buffered on EAGAIN).
+    /// Retained for Task 3.6 cleanup; superseded by the don't-ACK-on-EAGAIN
+    /// backpressure path added in Task 3.5.
+    #[allow(dead_code)]
     to_host: Vec<u8>,
-    /// Guest sequence number to ACK once `to_host` is flushed
+    /// Guest sequence number to ACK once `to_host` is flushed.
+    /// Retained for Task 3.6 cleanup; superseded by Task 3.5.
+    #[allow(dead_code)]
     to_host_pending_ack: Option<u32>,
     last_activity: Instant,
     /// passt-style sequence mirroring: bytes sent to the guest but
@@ -1257,48 +1261,47 @@ impl SlirpBackend {
 
         let payload = tcp.payload();
         if !payload.is_empty() && entry.state == TcpNatState::Established {
-            let new_ack = seq.wrapping_add(payload.len() as u32);
-
-            if entry.to_host.is_empty() {
-                match entry.host_stream.write(payload) {
-                    Ok(n) if n == payload.len() => {
-                        entry.guest_ack = new_ack;
-                        let ack_frame = build_tcp_packet_static(
-                            dst_ip,
-                            SLIRP_GUEST_IP,
-                            dst_port,
-                            src_port,
-                            entry.our_seq,
-                            entry.guest_ack,
-                            TcpControl::None,
-                            &[],
-                        );
-                        self.inject_to_guest.push(ack_frame);
-                    }
-                    Ok(n) => {
-                        entry.to_host.extend_from_slice(&payload[n..]);
-                        entry.to_host_pending_ack = Some(new_ack);
-                        entry.guest_ack = seq.wrapping_add(n as u32);
-                        entry.last_activity = Instant::now();
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        entry.to_host.extend_from_slice(payload);
-                        entry.to_host_pending_ack = Some(new_ack);
-                        entry.last_activity = Instant::now();
-                    }
-                    Err(e) => {
-                        warn!("SLIRP TCP: write to host failed: {}", e);
-                        entry.state = TcpNatState::Closed;
-                    }
+            // Phase 3 guest→host: rely on the kernel's send buffer + TCP
+            // retransmit for backpressure.  ACK only the bytes the kernel
+            // accepted right now; on WouldBlock, don't ACK at all and let
+            // the guest retransmit.  No userspace buffering, no 256 KB cap.
+            let payload_seq = seq;
+            let n_written = match entry.host_stream.write(payload) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                Err(e) => {
+                    warn!(
+                        "SLIRP TCP: write to host failed on flow guest_port={}, marking Closed: {}",
+                        key.guest_src_port, e
+                    );
+                    entry.state = TcpNatState::Closed;
+                    return Ok(());
                 }
-            } else if entry.to_host.len() + payload.len() <= MAX_TO_HOST_BUFFER {
-                entry.to_host.extend_from_slice(payload);
-                entry.to_host_pending_ack = Some(new_ack);
-                entry.last_activity = Instant::now();
-            } else {
-                warn!("SLIRP TCP: to_host buffer full, dropping connection");
-                entry.state = TcpNatState::Closed;
+            };
+
+            if n_written > 0 {
+                let ack_seq = payload_seq.wrapping_add(n_written as u32);
+                entry.guest_ack = ack_seq;
+                let ack_frame = build_tcp_packet_static(
+                    dst_ip,
+                    SLIRP_GUEST_IP,
+                    dst_port,
+                    src_port,
+                    entry.our_seq,
+                    entry.guest_ack,
+                    TcpControl::None,
+                    &[],
+                );
+                self.inject_to_guest.push(ack_frame);
+                trace!(
+                    "SLIRP TCP guest→host: wrote {}/{} bytes, ACK={}",
+                    n_written,
+                    payload.len(),
+                    ack_seq
+                );
             }
+            // else: kernel send buffer full (WouldBlock) — don't ACK.
+            // Guest TCP will retransmit; kernel buffer drains over time.
         }
 
         // FIN from guest
@@ -1346,37 +1349,6 @@ impl SlirpBackend {
             }
             if entry.state != TcpNatState::Established {
                 continue;
-            }
-
-            if !entry.to_host.is_empty() {
-                match entry.host_stream.write(&entry.to_host) {
-                    Ok(n) => {
-                        entry.to_host.drain(..n);
-                        entry.last_activity = Instant::now();
-                        if entry.to_host.is_empty() {
-                            if let Some(ack) = entry.to_host_pending_ack.take() {
-                                entry.guest_ack = ack;
-                                let ack_frame = build_tcp_packet_static(
-                                    key.dst_ip,
-                                    SLIRP_GUEST_IP,
-                                    key.dst_port,
-                                    key.guest_src_port,
-                                    entry.our_seq,
-                                    entry.guest_ack,
-                                    TcpControl::None,
-                                    &[],
-                                );
-                                frames_to_inject.push(ack_frame);
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        warn!("SLIRP TCP: buffered write to host failed: {}", e);
-                        entry.state = TcpNatState::Closed;
-                        continue;
-                    }
-                }
             }
 
             // Phase 3 host→guest path: peek what's in the kernel recv buffer
@@ -1852,47 +1824,5 @@ mod tests {
         header[0] = 0x45;
         let cksum = ipv4_checksum(&header);
         assert_ne!(cksum, 0);
-    }
-
-    #[test]
-    fn test_to_host_buffer_limit() {
-        assert_eq!(MAX_TO_HOST_BUFFER, 256 * 1024);
-    }
-
-    #[test]
-    fn test_tcp_nat_entry_has_write_buffer() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
-        stream.set_nonblocking(true).ok();
-
-        let entry = TcpNatEntry {
-            host_stream: stream,
-            state: TcpNatState::Established,
-            our_seq: 1000,
-            guest_ack: 2000,
-            to_guest: Vec::new(),
-            to_host: Vec::new(),
-            to_host_pending_ack: None,
-            last_activity: Instant::now(),
-            bytes_in_flight: 0,
-        };
-
-        assert!(entry.to_host.is_empty());
-        assert!(entry.to_host_pending_ack.is_none());
-    }
-
-    #[test]
-    fn test_to_host_buffer_rejects_over_limit() {
-        let existing = vec![0u8; MAX_TO_HOST_BUFFER];
-        let new_payload = [0u8; 1];
-        assert!(existing.len() + new_payload.len() > MAX_TO_HOST_BUFFER);
-
-        let small_existing = vec![0u8; MAX_TO_HOST_BUFFER - 10];
-        let fits = [0u8; 10];
-        assert!(small_existing.len() + fits.len() <= MAX_TO_HOST_BUFFER);
-
-        let overflows = [0u8; 11];
-        assert!(small_existing.len() + overflows.len() > MAX_TO_HOST_BUFFER);
     }
 }
