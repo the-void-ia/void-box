@@ -111,7 +111,7 @@ enum TcpNatState {
 }
 
 /// Key for NAT table: (guest_src_port, dst_ip, dst_port)
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct NatKey {
     guest_src_port: u16,
     dst_ip: Ipv4Address,
@@ -178,6 +178,27 @@ struct UdpFlowEntry {
     sock: std::net::UdpSocket,
     /// Last frame timestamp; read by Task 2.4 idle-timeout reaper.
     last_activity: Instant,
+}
+
+/// Unified flow-table key. Each variant wraps the protocol-specific
+/// key already defined elsewhere in this module — no field changes,
+/// just one type the unified `flow_table` `HashMap` (added in Task 4.2)
+/// can store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // consumed in 4.2
+enum FlowKey {
+    Tcp(NatKey),
+    Udp(UdpFlowKey),
+    IcmpEcho(IcmpEchoKey),
+}
+
+/// Unified flow-table value. Each variant wraps the protocol's existing
+/// entry struct.
+#[allow(dead_code)] // consumed in 4.2
+enum FlowEntry {
+    Tcp(TcpNatEntry),
+    Udp(UdpFlowEntry),
+    IcmpEcho(IcmpEchoEntry),
 }
 
 /// Open an unprivileged ICMP socket (`SOCK_DGRAM IPPROTO_ICMP`).
@@ -1120,7 +1141,7 @@ impl SlirpBackend {
                         last_activity: Instant::now(),
                         bytes_in_flight: 0,
                     };
-                    self.tcp_nat.insert(key.clone(), entry);
+                    self.tcp_nat.insert(key, entry);
 
                     // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
@@ -1324,11 +1345,11 @@ impl SlirpBackend {
 
         for (key, entry) in self.tcp_nat.iter_mut() {
             if entry.state == TcpNatState::Closed {
-                to_remove.push(key.clone());
+                to_remove.push(*key);
                 continue;
             }
             if entry.last_activity.elapsed() > Duration::from_secs(300) {
-                to_remove.push(key.clone());
+                to_remove.push(*key);
                 continue;
             }
             if entry.state != TcpNatState::Established {
