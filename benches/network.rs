@@ -9,7 +9,7 @@
 #![allow(deprecated)]
 #![cfg(target_os = "linux")]
 
-use divan::Bencher;
+use divan::{counter::BytesCount, Bencher};
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
@@ -218,4 +218,252 @@ fn dns_cache_hit(bencher: Bencher) {
     bencher.bench_local(|| {
         let _ = divan::black_box(&mut stack).process_guest_frame(divan::black_box(&hit));
     });
+}
+
+/// Measures TCP bulk throughput through the SLIRP relay under backpressure.
+///
+/// Pushes 1 MiB through the relay in 1 KiB chunks with a constrained host
+/// receiver (`SO_RCVBUF=4096`) so the post-Phase-3 backpressure path is
+/// exercised every iteration. Divan reports throughput in MB/s alongside
+/// per-iteration latency, giving a numerical regression signal for the
+/// passt-style sequence-mirroring + don't-ACK-on-EAGAIN backpressure path.
+///
+/// The 95% delivery threshold mirrors `tcp_writes_more_than_256kb_succeed`
+/// — the binary contract test for Phase 3.
+#[divan::bench(sample_count = 10)]
+fn tcp_bulk_throughput_1mb(bencher: Bencher) {
+    use smoltcp::wire::TcpControl;
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const TOTAL_BYTES: usize = 1024 * 1024;
+    const CHUNK_BYTES: usize = 1024;
+    const WINDOW_MAX: u32 = 256 * 1024;
+    const DEADLINE_SECS: u64 = 5;
+    const GUEST_SRC_PORT: u16 = 49200;
+    const INITIAL_GUEST_SEQ: u32 = 1000;
+
+    bencher
+        .counter(BytesCount::new(TOTAL_BYTES as u64))
+        .bench_local(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let host_port = listener.local_addr().unwrap().port();
+
+            unsafe {
+                let rcvbuf: libc::c_int = 4096;
+                libc::setsockopt(
+                    listener.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &rcvbuf as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+
+            let bytes_received = Arc::new(AtomicUsize::new(0));
+            let bytes_received_thr = Arc::clone(&bytes_received);
+            let server = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(bytes_read) => {
+                            bytes_received_thr.fetch_add(bytes_read, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let mut stack = SlirpBackend::new().unwrap();
+
+            let syn = build_tcp_data_frame(
+                SLIRP_GATEWAY_IP,
+                GUEST_SRC_PORT,
+                host_port,
+                INITIAL_GUEST_SEQ,
+                0,
+                TcpControl::Syn,
+                &[],
+            );
+            stack.process_guest_frame(&syn).unwrap();
+
+            let synack_frames: Vec<Vec<u8>> = {
+                let mut frames = Vec::new();
+                for _ in 0..4 {
+                    frames.extend(stack.poll());
+                }
+                frames
+            };
+            let (gateway_seq, _, _, _) = synack_frames
+                .iter()
+                .find_map(|frame| parse_tcp_to_guest_frame(frame))
+                .expect("synack");
+
+            let ack_frame = build_tcp_data_frame(
+                SLIRP_GATEWAY_IP,
+                GUEST_SRC_PORT,
+                host_port,
+                INITIAL_GUEST_SEQ + 1,
+                gateway_seq + 1,
+                TcpControl::None,
+                &[],
+            );
+            stack.process_guest_frame(&ack_frame).unwrap();
+
+            let chunk = vec![b'x'; CHUNK_BYTES];
+            let mut guest_seq = INITIAL_GUEST_SEQ + 1;
+            let mut acked_seq = INITIAL_GUEST_SEQ + 1;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECS);
+
+            while bytes_received.load(Ordering::Relaxed) < TOTAL_BYTES * 95 / 100
+                && std::time::Instant::now() < deadline
+            {
+                let data_frame = build_tcp_data_frame(
+                    SLIRP_GATEWAY_IP,
+                    GUEST_SRC_PORT,
+                    host_port,
+                    guest_seq,
+                    gateway_seq + 1,
+                    TcpControl::Psh,
+                    &chunk,
+                );
+                let _ = stack.process_guest_frame(&data_frame);
+                guest_seq = guest_seq.wrapping_add(CHUNK_BYTES as u32);
+
+                for frame in {
+                    let mut frames = Vec::new();
+                    for _ in 0..4 {
+                        frames.extend(stack.poll());
+                    }
+                    frames
+                } {
+                    if let Some((_, ack, _, _)) = parse_tcp_to_guest_frame(&frame) {
+                        if ack > acked_seq {
+                            acked_seq = ack;
+                        }
+                    }
+                }
+
+                if guest_seq.wrapping_sub(acked_seq) > WINDOW_MAX {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+
+            let fin_frame = build_tcp_data_frame(
+                SLIRP_GATEWAY_IP,
+                GUEST_SRC_PORT,
+                host_port,
+                guest_seq,
+                gateway_seq + 1,
+                TcpControl::Fin,
+                &[],
+            );
+            let _ = stack.process_guest_frame(&fin_frame);
+            for _ in 0..40 {
+                let _ = stack.poll();
+                if server.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = server.join();
+
+            divan::black_box(bytes_received.load(Ordering::Relaxed));
+        });
+}
+
+/// Builds a minimal IPv4-over-Ethernet TCP segment from guest to gateway.
+///
+/// Returns the full Ethernet frame bytes. Mirrors the `build_tcp_frame`
+/// helper from `tests/network_baseline.rs` inline so the bench compiles
+/// as a standalone binary without a shared helper crate.
+fn build_tcp_data_frame(
+    dst_ip: smoltcp::wire::Ipv4Address,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    control: TcpControl,
+    payload: &[u8],
+) -> Vec<u8> {
+    use smoltcp::wire::{IpAddress, TcpSeqNumber};
+
+    let tcp_repr = TcpRepr {
+        src_port,
+        dst_port,
+        control,
+        seq_number: TcpSeqNumber(seq as i32),
+        ack_number: if ack == 0 {
+            None
+        } else {
+            Some(TcpSeqNumber(ack as i32))
+        },
+        window_len: 65535,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        payload,
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: SLIRP_GUEST_IP,
+        dst_addr: dst_ip,
+        next_header: IpProtocol::Tcp,
+        payload_len: tcp_repr.buffer_len(),
+        hop_limit: 64,
+    };
+    let eth_repr = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress(GATEWAY_MAC),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let eth_hdr_len = 14usize;
+    let total = eth_hdr_len + ip_repr.buffer_len() + tcp_repr.buffer_len();
+    let mut buf = vec![0u8; total];
+    let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth_repr.emit(&mut eth);
+    let mut ip = Ipv4Packet::new_unchecked(&mut buf[eth_hdr_len..]);
+    ip_repr.emit(&mut ip, &Default::default());
+    let mut tcp = TcpPacket::new_unchecked(&mut buf[eth_hdr_len + ip_repr.buffer_len()..]);
+    tcp_repr.emit(
+        &mut tcp,
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(dst_ip),
+        &Default::default(),
+    );
+    buf
+}
+
+/// Parses one frame emitted by the stack as a TCP segment directed to the guest.
+///
+/// Returns `(seq, ack, control, payload_len)` on success, `None` otherwise.
+fn parse_tcp_to_guest_frame(frame: &[u8]) -> Option<(u32, u32, TcpControl, usize)> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Tcp || ip.dst_addr() != SLIRP_GUEST_IP {
+        return None;
+    }
+    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+    let control = match (tcp.syn(), tcp.fin(), tcp.rst(), tcp.psh()) {
+        (false, false, false, false) => TcpControl::None,
+        (false, false, false, true) => TcpControl::Psh,
+        (true, false, false, _) => TcpControl::Syn,
+        (false, true, false, _) => TcpControl::Fin,
+        (false, false, true, _) => TcpControl::Rst,
+        _ => return None,
+    };
+    Some((
+        tcp.seq_number().0 as u32,
+        tcp.ack_number().0 as u32,
+        control,
+        tcp.payload().len(),
+    ))
 }
