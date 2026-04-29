@@ -47,6 +47,41 @@ the 256 KB `to_host` cliff and drop 100s of LOC of fragile state.
 **Branch:** `smoltcp-passt-port-phase0` (continuing on the same branch
 through all phases — user instruction).
 
+## Non-negotiable invariants
+
+These are MUSTs across every task in this phase. A task that violates
+any of them is rejected at code review, regardless of test status.
+
+1. **Full observability is preserved.** The whole reason we lift
+   passt's *patterns* instead of running passt as a process is to
+   keep our debugging surface. Every task MUST:
+   - Keep all existing `tracing::trace!`/`debug!`/`warn!`/`error!`
+     calls in the TCP relay path. If a removed code path's trace
+     lines no longer fire because the path is gone, that's fine.
+     But a NEW path missing equivalent tracing is a bug.
+   - Add new `tracing` events for the new state — at minimum:
+     - `trace!` on each peek that yields N bytes,
+     - `trace!` on each ACK-driven consume,
+     - `debug!` on connection close with `bytes_in_flight` snapshot
+       (helps post-mortem the unusual-close case),
+     - `warn!` on unexpected protocol errors (RST during ESTABLISHED,
+       seq number going backwards, etc.).
+   - Stay all-Rust, no FFI boundary, no opaque process. `libc::recv`
+     for MSG_PEEK is fine — that's a syscall, not an opaque process;
+     it doesn't cross a debugger boundary.
+2. **`cargo test`-driveable.** Every behavior change is exercised by
+   a test in `tests/network_baseline.rs` that drives `SlirpBackend`
+   directly (no VM). The pin tests are the contract.
+3. **`tracing-subscriber` pipeline integrity.** Don't introduce
+   anything that bypasses the existing `tracing` filter chain
+   (`VOIDBOX_LOG_LEVEL` / `RUST_LOG` env vars, `LogConfig`
+   structured logger). If a new diagnostic needs a backchannel,
+   route it through `tracing` events with structured fields.
+4. **Profiler keeps working.** No syscalls in tight loops without an
+   observable wrapper (e.g. don't call `libc::recv` from a hot path
+   without a `tracing::trace!` annotation that flame-graph-able
+   tools can attribute the time to).
+
 ---
 
 ## Task structure

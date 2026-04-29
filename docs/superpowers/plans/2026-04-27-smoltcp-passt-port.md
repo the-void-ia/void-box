@@ -88,6 +88,28 @@ keeping the work in-tree:
   backend (the path that actually moves throughput numbers, per the
   prior plan's appendix) can land cleanly.
 
+## Hard invariant — observability
+
+**Full observability is a non-negotiable differentiator** of this
+codebase vs. running passt as a process. Every phase MUST preserve:
+
+- All-Rust, no opaque process boundary in the data path. Syscalls
+  via `libc` are fine; spawning passt is not.
+- The existing `tracing` integration end-to-end — every state
+  transition (connection accept/establish/RST/FIN, peek, ACK-driven
+  consume) emits a structured event. The `tracing-subscriber`
+  pipeline at `src/observe/logs.rs` continues to receive everything.
+- `cargo test`-driveable behavior — every change exercised by tests
+  that drive `SlirpBackend` directly without a VM
+  (`tests/network_baseline.rs`).
+- Standard Rust tooling — LSP, `cargo clippy`, sanitizers, profiler.
+
+Per-phase plans MUST encode this as task-level acceptance criteria
+(see Phase 3's "Non-negotiable invariants" section for the
+canonical wording). A task that lifts a passt pattern but
+silently bypasses our observability stack — even one that "works"
+end-to-end — is rejected.
+
 ## Non-goals
 
 - **Adopting passt as a binary backend.** Explicitly rejected per the
