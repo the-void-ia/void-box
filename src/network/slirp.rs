@@ -154,6 +154,27 @@ struct IcmpEchoEntry {
     last_activity: Instant,
 }
 
+/// Key for the UDP flow NAT table: (guest source port, destination IP, destination port).
+///
+/// Each unique 3-tuple maps to its own connected `UdpSocket` on the host,
+/// mirroring passt's `udp_flow_from_tap` per-flow design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct UdpFlowKey {
+    guest_src_port: u16,
+    dst_ip: Ipv4Address,
+    dst_port: u16,
+}
+
+/// State for one active UDP flow from the guest.
+#[allow(dead_code)]
+struct UdpFlowEntry {
+    /// Connected `UdpSocket`. The host kernel handles source-port
+    /// preservation and reply demux; we just `send` and `recv`.
+    /// Set non-blocking.
+    sock: std::net::UdpSocket,
+    last_activity: Instant,
+}
+
 /// Open an unprivileged ICMP socket (`SOCK_DGRAM IPPROTO_ICMP`).
 ///
 /// The kernel handles ICMP framing; `CAP_NET_RAW` is **not** required.
@@ -200,6 +221,23 @@ fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
     // SAFETY: `raw` is a valid fd from socket(2); UdpSocket adopts
     // ownership and closes on drop.
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(raw) })
+}
+
+/// Open a connected UDP socket for one guest→host flow.
+///
+/// Binds to an ephemeral port on `0.0.0.0`, sets non-blocking mode,
+/// then calls `connect(dst)` so that:
+/// - `send` delivers datagrams to `dst` without specifying the address each time.
+/// - Incoming datagrams are filtered to replies from `dst` only, enabling
+///   per-flow demux without an additional dispatch table.
+///
+/// No `CAP_NET_RAW` required — `SOCK_DGRAM` UDP is fully unprivileged.
+#[allow(dead_code)]
+fn open_udp_flow_socket(dst: std::net::SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_nonblocking(true)?;
+    sock.connect(dst)?;
+    Ok(sock)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -331,6 +369,9 @@ pub struct SlirpBackend {
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
     /// ICMP echo NAT table (guest id + dst → host socket).
     icmp_echo: HashMap<IcmpEchoKey, IcmpEchoEntry>,
+    /// UDP flow NAT table (guest src port + dst → connected host socket).
+    #[allow(dead_code)]
+    udp_flows: HashMap<UdpFlowKey, UdpFlowEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
     /// Maximum concurrent TCP connections allowed
@@ -409,6 +450,7 @@ impl SlirpBackend {
             _device: device,
             tcp_nat: HashMap::new(),
             icmp_echo: HashMap::new(),
+            udp_flows: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
             max_connections_per_second,
