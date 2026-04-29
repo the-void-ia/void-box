@@ -219,10 +219,51 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build voidbox-network-bench (release)
+        # Network wall-clock harness: boots one VM with `network(true)`,
+        # measures TCP throughput, RR/CRR latency, UDP DNS qps, and ICMP
+        # RR latency. Mirror the startup harness build step.
+        run: cargo build --release --bin voidbox-network-bench
+
+      - name: Run voidbox-network-bench (network wall-clock harness)
+        # NO `continue-on-error` here — unlike the startup-bench warm
+        # phase, this harness has well-defined failure modes that we
+        # want to surface in CI. A regression like the setuid-busybox
+        # bug fixed at 77dfc67 (Phase 1.6 → ECONNRESET on every
+        # connect for `network(true)` VMs) would otherwise hide behind
+        # `continue-on-error`. If this step is genuinely flaky on the
+        # runner image, fix the runner image — don't mask the signal.
+        env:
+          VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          if [ ! -e /dev/vhost-vsock ]; then
+            echo "::warning::/dev/vhost-vsock not available; skipping voidbox-network-bench"
+            exit 0
+          fi
+          ls -la "$VOID_BOX_KERNEL" "$VOID_BOX_INITRAMFS"
+          ./target/release/voidbox-network-bench --iterations 3 \
+            --output target/tmp/network-bench.json 2>&1 \
+            | tee target/tmp/network-bench.log
+
+          {
+            echo
+            echo "## Network wall-clock harness (voidbox-network-bench --iterations 3)"
+            echo
+            echo "Metric names mirror passt's published table (passt.top/passt) so a"
+            echo "future side-by-side comparison run on the same host is plug-compatible."
+            echo
+            echo '```json'
+            cat target/tmp/network-bench.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload bench logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: startup-bench-${{ github.run_id }}
-          path: target/tmp/*.log
+          path: |
+            target/tmp/*.log
+            target/tmp/*.json
           retention-days: 30
