@@ -253,7 +253,7 @@ detailed task lists for later ones.
 | **1** | ICMP echo via unprivileged `SOCK_DGRAM IPPROTO_ICMP`, with sysctl-fallback to drop. | Low | [`2026-04-27-smoltcp-passt-port-phase1.md`](2026-04-27-smoltcp-passt-port-phase1.md) |
 | **2** | Generalize UDP: per-flow connected sockets, drop port-53 limit, keep DNS fast-path/cache. | Low–medium | [`2026-04-27-smoltcp-passt-port-phase2.md`](2026-04-27-smoltcp-passt-port-phase2.md) |
 | **3** | TCP relay rewrite using `MSG_PEEK` + sequence mirroring. Drop `to_guest: Vec<u8>` and 256 KB cap. | **High** — gnarliest of the lot. Snapshot integration tests are the gate. | [`2026-04-27-smoltcp-passt-port-phase3.md`](2026-04-27-smoltcp-passt-port-phase3.md) |
-| **4** | Unified flow table refactor (no behavior change). Side-indexed entries, SipHash lookup. | Medium | TBD when 3 lands |
+| **4** | Unified flow table refactor (no behavior change). Single `flow_table: HashMap<FlowKey, FlowEntry>` replacing the three per-protocol maps. | Medium | [`2026-04-27-smoltcp-passt-port-phase4.md`](2026-04-27-smoltcp-passt-port-phase4.md) |
 | **5** | Stateless NAT translation refactor + port-forwarding configurability. | Low | TBD when 4 lands |
 | **6** *(optional)* | IPv6 dual-stack (DHCPv6, NDP, RA, NAT). | High | TBD; may be split further |
 
