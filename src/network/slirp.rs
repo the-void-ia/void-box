@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -249,6 +249,37 @@ fn open_udp_flow_socket(dst: std::net::SocketAddr) -> io::Result<std::net::UdpSo
     sock.set_nonblocking(true)?;
     sock.connect(dst)?;
     Ok(sock)
+}
+
+/// Non-blocking `recv(MSG_PEEK)` on a `TcpStream`, returning the
+/// number of bytes available without consuming them from the
+/// kernel's recv queue.
+///
+/// `std::net::TcpStream` does not expose `MSG_PEEK`; we go through
+/// `libc::recv` directly. `MSG_DONTWAIT` keeps the call non-blocking
+/// even if the underlying stream's `set_nonblocking` flag was
+/// dropped at some intermediate point.
+///
+/// Used by the passt-style host→guest TCP relay (Task 3.3): peek
+/// what's in the kernel buffer, send the un-ACK'd portion to the
+/// guest. Bytes stay in the kernel until the guest ACKs and Task
+/// 3.4's ACK-driven `read()` consumes them.
+#[allow(dead_code)] // consumed in Task 3.3
+fn recv_peek(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `stream` outlives the syscall; `buf` is uniquely
+    // borrowed and `len` matches the slice length.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize)
 }
 
 // ──────────────────────────────────────────────────────────────────────
