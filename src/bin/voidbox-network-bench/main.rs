@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -101,10 +102,26 @@ struct Cli {
     /// Skip throughput measurements (useful for fast smoke runs).
     #[arg(long, default_value_t = false)]
     no_throughput: bool,
+
+    /// Push N MB through the SLIRP relay against a slow-receiving host
+    /// (`SO_RCVBUF = 4096`). Forces the post-Phase-3 backpressure path to
+    /// actually engage — the small-payload throughput numbers don't
+    /// exercise it because the host drains too fast.
+    ///
+    /// 0 (default) skips the measurement. 10 MiB is a reasonable smoke
+    /// value; larger N produces more stable numbers but takes longer.
+    #[arg(long, default_value_t = 0)]
+    bulk_mb: u32,
 }
 
 #[derive(Serialize, Debug, Default)]
 struct Report {
+    /// Sustained guest→host throughput against a slow-receiving host
+    /// (`SO_RCVBUF = 4096`). Probes the post-Phase-3 TCP backpressure path
+    /// — pre-Phase-3 this would be the 256 KB cliff (connection RST mid-
+    /// transfer); post-Phase-3 it's a real number bounded by the kernel
+    /// recv buffer's drain rate. Populated only when `--bulk-mb > 0`.
+    tcp_bulk_throughput_g2h_mbps: Option<f64>,
     tcp_throughput_g2h_mbps: Option<f64>,
     // TODO(h2g): host→guest requires either a guest-side `nc -l` listener
     // or an inverse data-push loop.  The current harness only supports
@@ -157,6 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.no_throughput {
         report.tcp_throughput_g2h_mbps =
             measure_tcp_throughput_g2h(&sandbox, cli.iterations).await?;
+    }
+
+    if cli.bulk_mb > 0 {
+        report.tcp_bulk_throughput_g2h_mbps =
+            measure_bulk_throughput_g2h(&sandbox, cli.iterations, cli.bulk_mb).await?;
     }
 
     // Latency measurements always run (--no-throughput only skips throughput).
@@ -272,6 +294,126 @@ async fn measure_tcp_throughput_g2h(
         total_mbps += sample;
     }
     let mean_mbps = total_mbps / mbps_samples.len() as f64;
+    Ok(Some(mean_mbps))
+}
+
+/// Sustained guest→host throughput against a constrained receiver.
+///
+/// Same shape as [`measure_tcp_throughput_g2h`] but with `SO_RCVBUF = 4096`
+/// pinned on the listener socket. The small recv buffer forces TCP-level
+/// backpressure: the kernel send buffer fills, our `host_stream.write`
+/// returns `WouldBlock`, the SLIRP relay declines to ACK the guest's
+/// segment, and the guest retransmits. Pre-Phase-3 this same scenario hit
+/// the 256 KB userspace cliff (`MAX_TO_HOST_BUFFER`) and got the connection
+/// reset; post-Phase-3 the relay holds the line and the bytes go through.
+///
+/// Returned value is the mean Mbps across `iterations` iterations of pushing
+/// `bulk_mb` MiB. Effective throughput is much lower than
+/// [`measure_tcp_throughput_g2h`]'s number because the constrained receiver
+/// is the bottleneck — that's the point.
+async fn measure_bulk_throughput_g2h(
+    sandbox: &Sandbox,
+    iterations: u32,
+    bulk_mb: u32,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let mut mbps_samples: Vec<f64> = Vec::new();
+
+    for iteration_index in 0..iterations {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        // Constrain the receiver: 4 KiB request, kernel rounds up to the
+        // configured minimum (~8 KiB on Linux) — still small enough that
+        // the SLIRP send buffer fills quickly and backpressure engages.
+        let val: libc::c_int = 4096;
+        // SAFETY: listener.as_raw_fd() outlives the syscall; the int is
+        // stack-local and pointer-sized.
+        let rc = unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &val as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::warn!(
+                iteration = iteration_index,
+                "bulk-g2h: SO_RCVBUF setsockopt failed; skipping"
+            );
+            continue;
+        }
+        let host_port = listener.local_addr()?.port();
+
+        let (drain_tx, drain_rx) = mpsc::channel::<(u64, Duration)>();
+        std::thread::spawn(move || {
+            let drain_result = drain_one_connection(&listener);
+            let _ = drain_tx.send(drain_result);
+        });
+
+        let guest_cmd = format!(
+            "dd if=/dev/zero bs=1M count={bulk_mb} 2>/dev/null | nc {SLIRP_HOST_ADDR} {host_port}",
+        );
+        let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+        match exec_result {
+            Err(exec_err) => {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %exec_err,
+                    "bulk-g2h iteration exec error; skipping"
+                );
+                continue;
+            }
+            Ok(output) => {
+                if !output.success() {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        exit_code = ?output.exit_code,
+                        stderr = output.stderr_str(),
+                        "bulk-g2h iteration non-zero exit; the connection may have \
+                         been reset (pre-Phase-3 cliff regression?). skipping"
+                    );
+                }
+            }
+        }
+
+        match drain_rx.recv_timeout(Duration::from_secs(300)) {
+            Err(recv_err) => {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %recv_err,
+                    "bulk-g2h drain channel receive error; skipping"
+                );
+            }
+            Ok((bytes_received, elapsed)) => {
+                let elapsed_secs = elapsed.as_secs_f64();
+                if elapsed_secs < 0.01 {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        elapsed_secs,
+                        "bulk-g2h elapsed too small to measure reliably; skipping"
+                    );
+                    continue;
+                }
+                let mbps = (bytes_received as f64 * 8.0) / elapsed_secs / BYTES_PER_MEGABIT;
+                tracing::info!(
+                    iteration = iteration_index,
+                    bytes_received,
+                    elapsed_secs,
+                    mbps,
+                    "bulk-g2h iteration complete"
+                );
+                eprintln!(
+                    "bulk-g2h[{iteration_index:>2}]: {bytes_received} B in {elapsed_secs:.3}s = {mbps:.1} Mbps (constrained receiver)"
+                );
+                mbps_samples.push(mbps);
+            }
+        }
+    }
+
+    if mbps_samples.is_empty() {
+        return Ok(None);
+    }
+    let mean_mbps: f64 = mbps_samples.iter().sum::<f64>() / mbps_samples.len() as f64;
     Ok(Some(mean_mbps))
 }
 
