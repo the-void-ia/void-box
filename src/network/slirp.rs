@@ -10,8 +10,14 @@
 //!
 //! Architecture:
 //! - ARP: custom handler responds as gateway for all 10.0.2.x IPs
-//! - TCP: NAT proxy (raw packet parsing + host TCP sockets)
-//! - UDP port 53 (DNS): forwarded to host resolver
+//! - TCP: passt-style sequence-mirroring NAT (host→guest via
+//!   `recv(MSG_PEEK)` + ACK-driven consume; guest→host via direct
+//!   write + don't-ACK-on-WouldBlock TCP backpressure). No userspace
+//!   per-connection buffers — the host kernel's socket buffer holds
+//!   outstanding data.
+//! - ICMP echo: relayed via unprivileged `SOCK_DGRAM IPPROTO_ICMP`
+//! - UDP: per-flow connected sockets; DNS to 10.0.2.3:53 takes a
+//!   cached fast-path
 //! - Other: silently dropped
 //!
 //! The smoltcp library is used for its Ethernet/IPv4/TCP/UDP wire types
@@ -119,30 +125,11 @@ struct TcpNatEntry {
     our_seq: u32,
     /// Last acknowledged guest sequence number
     guest_ack: u32,
-    /// Data received from host, pending delivery to guest.
-    /// Retained for Task 3.6 cleanup; superseded by the peek-based send
-    /// path added in Task 3.3.
-    #[allow(dead_code)]
-    to_guest: Vec<u8>,
-    /// Data received from guest, pending write to host (buffered on EAGAIN).
-    /// Retained for Task 3.6 cleanup; superseded by the don't-ACK-on-EAGAIN
-    /// backpressure path added in Task 3.5.
-    #[allow(dead_code)]
-    to_host: Vec<u8>,
-    /// Guest sequence number to ACK once `to_host` is flushed.
-    /// Retained for Task 3.6 cleanup; superseded by Task 3.5.
-    #[allow(dead_code)]
-    to_host_pending_ack: Option<u32>,
     last_activity: Instant,
-    /// passt-style sequence mirroring: bytes sent to the guest but
-    /// not yet ACK'd. Equivalent to `our_seq - last_acked_seq`, but
-    /// stored explicitly so the relay can decide how much new
-    /// payload to peek+send each poll.
-    ///
-    /// Consumed by Task 3.3 (host→guest peek-based send) and Task
-    /// 3.4 (ACK-driven consume from kernel socket). For now it's
-    /// initialized to 0 and never read; the `#[allow(dead_code)]`
-    /// attribute comes off in 3.3.
+    /// Bytes sent to the guest but not yet ACK'd by the guest.
+    /// Equivalent to `our_seq - last_acked_seq`, stored explicitly so
+    /// the relay can decide how much new payload to peek+send each poll.
+    /// The ACK-driven consume path decrements this as the guest ACKs data.
     bytes_in_flight: u32,
 }
 
@@ -1130,9 +1117,6 @@ impl SlirpBackend {
                         state: TcpNatState::SynReceived,
                         our_seq,
                         guest_ack: seq + 1,
-                        to_guest: Vec::new(),
-                        to_host: Vec::new(),
-                        to_host_pending_ack: None,
                         last_activity: Instant::now(),
                         bytes_in_flight: 0,
                     };
