@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::network::NetworkBackend;
+use crate::network::{nat, NetworkBackend};
 
 /// Cached DNS response with expiry.
 struct DnsCacheEntry {
@@ -431,6 +431,12 @@ pub struct SlirpBackend {
     connection_timestamps: VecDeque<Instant>,
     /// Network deny list (CIDR ranges that the guest cannot reach)
     deny_list: Vec<Ipv4Net>,
+    /// Stateless outbound translation rules. Phase 5 staging — populated
+    /// alongside the existing `deny_list` field; tasks 5.3 and 5.4 migrate
+    /// the TCP and UDP relays to consume `nat::translate_outbound(&self.nat, ...)`,
+    /// and 5.4 drops the redundant `deny_list` field.
+    #[allow(dead_code)]
+    nat: nat::Rules,
     /// Host DNS servers (parsed from /etc/resolv.conf, fallback to public)
     dns_servers: Vec<String>,
     /// DNS response cache keyed by the raw query bytes (question section)
@@ -491,6 +497,12 @@ impl SlirpBackend {
             })
             .collect();
 
+        let nat = nat::Rules {
+            gateway_loopback: true,
+            deny_cidrs: deny_list.clone(),
+            port_forwards: Vec::new(),
+        };
+
         let dns_servers = parse_resolv_conf();
         debug!(
             "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, dns_servers: {:?}",
@@ -507,6 +519,7 @@ impl SlirpBackend {
             max_connections_per_second,
             connection_timestamps: VecDeque::new(),
             deny_list,
+            nat,
             dns_servers,
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
