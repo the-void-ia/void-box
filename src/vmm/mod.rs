@@ -320,6 +320,9 @@ impl MicroVm {
                     config.security.max_concurrent_connections,
                     config.security.max_connections_per_second,
                     &config.security.network_deny_list,
+                    // TODO(5.5b): wire port_forwards from NetworkConfig once VoidBoxConfig
+                    // carries the field; for now no host listeners are spawned.
+                    &[],
                 )?));
             let mut net_device = VirtioNetDevice::new(slirp)?;
             net_device.set_mmio_base(0xd000_0000);

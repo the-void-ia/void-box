@@ -455,7 +455,7 @@ fn tcp_writes_more_than_256kb_succeed() {
 #[test]
 fn tcp_rate_limit_emits_rst() {
     // 5 conn/s allowance; 10 attempts.
-    let mut stack = SlirpBackend::with_security(64, 5, &[]).unwrap();
+    let mut stack = SlirpBackend::with_security(64, 5, &[], &[]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
@@ -486,7 +486,7 @@ fn tcp_rate_limit_emits_rst() {
 
 #[test]
 fn tcp_max_concurrent_emits_rst() {
-    let mut stack = SlirpBackend::with_security(2, 1000, &[]).unwrap();
+    let mut stack = SlirpBackend::with_security(2, 1000, &[], &[]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
 
@@ -522,7 +522,7 @@ fn tcp_deny_list_emits_rst() {
     // CIDR at compile-check time, then convert to the expected string form.
     let deny_cidr: Ipv4Net = "169.254.169.254/32".parse().unwrap();
     let deny_strings = [deny_cidr.to_string()];
-    let mut stack = SlirpBackend::with_security(64, 1000, &deny_strings).unwrap();
+    let mut stack = SlirpBackend::with_security(64, 1000, &deny_strings, &[]).unwrap();
 
     stack
         .process_guest_frame(&build_tcp_frame(

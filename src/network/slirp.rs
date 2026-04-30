@@ -446,14 +446,19 @@ pub struct SlirpBackend {
 
 impl SlirpBackend {
     pub fn new() -> Result<Self> {
-        Self::with_security(64, 50, &["169.254.0.0/16".to_string()])
+        Self::with_security(64, 50, &["169.254.0.0/16".to_string()], &[])
     }
 
     /// Create a SLIRP stack with security parameters.
+    ///
+    /// `port_forwards` maps host ports to guest ports as `(host_port, guest_port)` pairs.
+    /// Each entry is stored in [`nat::Rules`] as a TCP forward rule; host listeners are
+    /// spawned in sub-task B (5.5b) and not yet active.
     pub fn with_security(
         max_concurrent_connections: usize,
         max_connections_per_second: u32,
         deny_list_cidrs: &[String],
+        port_forwards: &[(u16, u16)],
     ) -> Result<Self> {
         debug!("Creating SLIRP stack");
         let queue = Arc::new(Mutex::new(PacketQueue::new()));
@@ -490,16 +495,26 @@ impl SlirpBackend {
             })
             .collect();
 
+        let nat_port_forwards: Vec<nat::PortForward> = port_forwards
+            .iter()
+            .map(|&(host_port, guest_port)| nat::PortForward {
+                proto: nat::ForwardProto::Tcp,
+                host_port,
+                guest_port,
+            })
+            .collect();
+
         let nat = nat::Rules {
             gateway_loopback: true,
             deny_cidrs,
-            port_forwards: Vec::new(),
+            port_forwards: nat_port_forwards,
         };
 
         let dns_servers = parse_resolv_conf();
         debug!(
-            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, dns_servers: {:?}",
-            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, nat.deny_cidrs.len(), dns_servers
+            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, port_forwards: {}, dns_servers: {:?}",
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second,
+            nat.deny_cidrs.len(), nat.port_forwards.len(), dns_servers
         );
 
         Ok(Self {
