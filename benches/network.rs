@@ -774,4 +774,28 @@ mod linux_benches {
             let _ = divan::black_box(&mut stack).process_guest_frame(divan::black_box(&frame));
         });
     }
+
+    /// Pure-compute cost of synthesizing an inbound SYN frame for
+    /// port-forwarding (Phase 5.5b.2). No stack allocation or guest frame
+    /// processing — just the `build_tcp_packet_static` wire encoding.
+    ///
+    /// Expected magnitude: sub-microsecond (pure packet construction).
+    ///
+    /// Requires the `bench-helpers` feature (compile with
+    /// `cargo bench --features bench-helpers`).
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench]
+    fn synthesize_inbound_syn(bencher: Bencher) {
+        const HIGH_PORT: u16 = 49152;
+        const GUEST_PORT: u16 = 8080;
+        const OUR_SEQ: u32 = 1000;
+
+        bencher.bench_local(|| {
+            divan::black_box(void_box::network::slirp::synthesize_inbound_syn(
+                divan::black_box(HIGH_PORT),
+                divan::black_box(GUEST_PORT),
+                divan::black_box(OUR_SEQ),
+            ));
+        });
+    }
 } // mod linux_benches

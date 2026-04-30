@@ -1886,6 +1886,21 @@ fn build_tcp_packet_static(
 /// kernel sees an inbound TCP SYN, routes it to whatever's bound at
 /// `guest_port`, and emits a SYN-ACK that `handle_tcp_frame` matches
 /// to the seeded `SynSent` flow_table entry (5.5b.1).
+#[cfg(any(test, feature = "bench-helpers"))]
+pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
+    build_tcp_packet_static(
+        SLIRP_GATEWAY_IP,
+        SLIRP_GUEST_IP,
+        high_port,
+        guest_port,
+        our_seq,
+        0,
+        TcpControl::Syn,
+        &[],
+    )
+}
+
+#[cfg(not(any(test, feature = "bench-helpers")))]
 #[allow(dead_code)] // consumed in 5.5b.3
 fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
     build_tcp_packet_static(
