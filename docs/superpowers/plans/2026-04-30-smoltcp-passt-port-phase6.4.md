@@ -219,12 +219,27 @@ Phase 6.4 RX-latency work:
 
 ---
 
-### Task 2: Failing pin — `tcp_rx_latency_sub_5ms`
+### Task 2: ~~Failing pin — `tcp_rx_latency_sub_5ms`~~ **DROPPED**
 
-**Files:**
-- Modify: `tests/network_baseline.rs` (append after the existing TCP pins, before `nat_*` block)
+**Status:** Dropped during execution. Original intent was a unit-level BROKEN_ON_PURPOSE pin asserting host→guest delivery in < 5 ms. **The 5 ms floor lives in `net_poll_thread` (`src/vmm/mod.rs:1609`), not in `SlirpBackend::drain_to_guest`** — the relay is synchronous when called from a test harness, so a unit-level latency assertion can't measure what we actually care about.
 
-- [ ] **Step 1: Write the failing test**
+**Where the contract moved:** Task 13's wall-clock `tcp_rx_latency_us_p50` metric in `voidbox-network-bench`. That harness boots a real VM, drives the actual `net_poll_thread`, and observes the latency floor end-to-end. The hard-perf-gate requirement at the top of this plan (`tcp_rx_latency_us_p50 < 5 ms`) is the BROKEN_ON_PURPOSE replacement.
+
+**No code lands for Task 2.** Skip directly to Task 3.
+
+<details>
+<summary>Original Task 2 body (kept for context)</summary>
+
+The original plan attempted a unit-level pin that called `drain_to_guest` synchronously and timed the host-write → guest-receive interval. Implementation revealed:
+
+- `drain_to_guest` is synchronous; the 5 ms `sleep` in `net_poll_thread` is what bounds VMM-level RX latency, not anything inside `SlirpBackend`.
+- The test would have measured "spawn-thread + accept + write" minus "drain-loop find time", which underflowed in debug mode and was meaningless in release mode.
+
+The contract — Phase 6.4 must deliver host→guest data in < 5 ms when data is available — is preserved as a VM-level requirement in Task 13.
+
+</details>
+
+- [ ] **Step 1: ~~Write the failing test~~ Skipped — see "DROPPED" note above. Original body kept below for context only.**
 
 ```rust
 /// Phase 6.4 pin: host→guest RX latency must be sub-5 ms when data
