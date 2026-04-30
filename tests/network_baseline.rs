@@ -909,6 +909,21 @@ fn udp_non_dns_round_trips() {
 fn icmp_echo_returns_reply() {
     use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
 
+    // Probe whether unprivileged ICMP is permitted on this host. If not,
+    // skip gracefully — the SLIRP stack falls back to silently dropping
+    // ICMP in that environment (see slirp.rs::ICMP_PROBE).
+    let probe_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+    if probe_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        if raw == libc::EPERM || raw == libc::EACCES {
+            eprintln!("skip: unprivileged ICMP forbidden ({err}); see net.ipv4.ping_group_range");
+            return;
+        }
+        panic!("unexpected ICMP probe error: {err}");
+    }
+    unsafe { libc::close(probe_fd) };
+
     let icmp_repr = Icmpv4Repr::EchoRequest {
         ident: 0xbeef,
         seq_no: 1,
@@ -972,14 +987,10 @@ fn icmp_echo_returns_reply() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    if !saw_reply {
-        // Sysctl may forbid unprivileged ICMP on this host. Skip rather
-        // than fail — the warn-once log explains why.
-        eprintln!(
-            "skip: no ICMP reply received within 1s; \
-             sysctl net.ipv4.ping_group_range may forbid unprivileged ICMP"
-        );
-    }
+    assert!(
+        saw_reply,
+        "guest must receive ICMP echo reply via host IPPROTO_ICMP socket"
+    );
 }
 
 #[test]
