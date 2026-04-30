@@ -188,7 +188,6 @@ struct UdpFlowEntry {
 enum FlowKey {
     #[allow(dead_code)] // consumed in 4.5
     Tcp(NatKey),
-    #[allow(dead_code)] // consumed in 4.4
     Udp(UdpFlowKey),
     IcmpEcho(IcmpEchoKey),
 }
@@ -198,7 +197,6 @@ enum FlowKey {
 enum FlowEntry {
     #[allow(dead_code)] // consumed in 4.5
     Tcp(TcpNatEntry),
-    #[allow(dead_code)] // consumed in 4.4
     Udp(UdpFlowEntry),
     IcmpEcho(IcmpEchoEntry),
 }
@@ -424,8 +422,6 @@ pub struct SlirpBackend {
     _device: VirtualDevice,
     /// TCP NAT table
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
-    /// UDP flow NAT table (guest src port + dst → connected host socket).
-    udp_flows: HashMap<UdpFlowKey, UdpFlowEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
     /// Maximum concurrent TCP connections allowed
@@ -445,8 +441,8 @@ pub struct SlirpBackend {
     /// Unified flow table — Phase 4 staging.
     ///
     /// During Phase 4, per-protocol paths migrate to this map one at a time.
-    /// ICMP is migrated (Task 4.3); UDP and TCP follow in 4.4 and 4.5.
-    /// Task 4.6 drops the remaining per-protocol maps (`tcp_nat`, `udp_flows`).
+    /// ICMP migrated in Task 4.3; UDP migrated in Task 4.4; TCP follows in 4.5.
+    /// Task 4.6 drops the remaining per-protocol map (`tcp_nat`).
     flow_table: HashMap<FlowKey, FlowEntry>,
 }
 
@@ -509,7 +505,6 @@ impl SlirpBackend {
             sockets,
             _device: device,
             tcp_nat: HashMap::new(),
-            udp_flows: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
             max_connections_per_second,
@@ -910,8 +905,8 @@ impl SlirpBackend {
     ///
     /// Each unique (guest source port, destination IP, destination port) 3-tuple maps to
     /// one connected `UdpSocket`. On the first frame for a flow the socket is created via
-    /// [`open_udp_flow_socket`] and stored in [`udp_flows`](Self). Subsequent frames reuse
-    /// the existing socket, updating `last_activity` for idle-timeout reaping (Task 2.4).
+    /// [`open_udp_flow_socket`] and stored in `flow_table` under `FlowKey::Udp`. Subsequent
+    /// frames reuse the existing socket, updating `last_activity` for idle-timeout reaping (Task 2.4).
     ///
     /// The SLIRP gateway address (`10.0.2.2`) is translated to `127.0.0.1` before
     /// connecting, mirroring the same translation used on the TCP NAT path.
@@ -937,8 +932,12 @@ impl SlirpBackend {
         };
         let dst = std::net::SocketAddr::from((dst_ip_for_socket, key.dst_port));
 
-        let entry = match self.udp_flows.entry(key) {
-            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        let flow_key = FlowKey::Udp(key);
+        let entry: &mut UdpFlowEntry = match self.flow_table.entry(flow_key) {
+            std::collections::hash_map::Entry::Occupied(o) => match o.into_mut() {
+                FlowEntry::Udp(e) => e,
+                _ => unreachable!("FlowKey::Udp must map to FlowEntry::Udp"),
+            },
             std::collections::hash_map::Entry::Vacant(v) => {
                 let sock = match open_udp_flow_socket(dst) {
                     Ok(s) => s,
@@ -947,10 +946,13 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
-                v.insert(UdpFlowEntry {
+                match v.insert(FlowEntry::Udp(UdpFlowEntry {
                     sock,
                     last_activity: Instant::now(),
-                })
+                })) {
+                    FlowEntry::Udp(e) => e,
+                    _ => unreachable!(),
+                }
             }
         };
         entry.last_activity = Instant::now();
@@ -1573,20 +1575,36 @@ impl SlirpBackend {
     fn relay_udp_flows(&mut self) {
         let now = Instant::now();
         // Reap idle flows; the per-flow connected socket is closed by Drop.
-        let stale: Vec<UdpFlowKey> = self
-            .udp_flows
+        let stale: Vec<FlowKey> = self
+            .flow_table
             .iter()
-            .filter(|(_, e)| now.duration_since(e.last_activity) > UDP_IDLE_TIMEOUT)
+            .filter(|(k, e)| {
+                matches!(k, FlowKey::Udp(_))
+                    && match e {
+                        FlowEntry::Udp(entry) => {
+                            now.duration_since(entry.last_activity) > UDP_IDLE_TIMEOUT
+                        }
+                        _ => false,
+                    }
+            })
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
-            self.udp_flows.remove(&k);
+            self.flow_table.remove(&k);
         }
 
-        let keys: Vec<UdpFlowKey> = self.udp_flows.keys().copied().collect();
-        for key in keys {
+        let flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::Udp(_)))
+            .collect();
+        for flow_key in flow_keys {
+            let FlowKey::Udp(key) = flow_key else {
+                continue;
+            };
             let frame = {
-                let Some(entry) = self.udp_flows.get_mut(&key) else {
+                let Some(FlowEntry::Udp(entry)) = self.flow_table.get_mut(&flow_key) else {
                     continue;
                 };
                 let mut buf = [0u8; 1500];
