@@ -28,8 +28,9 @@ use smoltcp::wire::{
     Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
+use std::time::Instant;
 use void_box::network::nat::{translate_outbound, Rules};
 use void_box::network::slirp::{
     SlirpBackend, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
@@ -550,6 +551,118 @@ fn tcp_deny_list_emits_rst() {
         .find_map(|f| parse_tcp_to_guest(&f))
         .map(|(_, _, ctrl, _)| ctrl == TcpControl::Rst);
     assert_eq!(rst, Some(true), "deny-list IP must get RST");
+}
+
+/// Phase 6.4 pin: host→guest RX latency must be sub-5 ms when data
+/// is available. Pre-Phase-6.4 the floor was 5 ms (the
+/// `net_poll_thread` `sleep(5ms)` cycle); post-Phase-6.4 the
+/// epoll dispatch should deliver in < 1 ms on a quiet system.
+///
+/// Test harness: open a TCP flow guest→host, wait for ESTABLISHED,
+/// have the host write 64 bytes, measure the time from `write()`
+/// returning to the guest seeing the bytes in `drain_to_guest`'s
+/// output. Pre-Phase-6.4 this measures ≈ 5 ms ± jitter; post-
+/// Phase-6.4 it should be sub-millisecond on the same host.
+#[test]
+fn tcp_rx_latency_sub_5ms() {
+    // Bind a host listener; the SLIRP rewrite of 10.0.2.2 → 127.0.0.1
+    // routes our SYN to it.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host_port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || -> Option<std::time::Duration> {
+        let (mut sock, _) = listener.accept().ok()?;
+        // Wait for the guest to send something so we know the relay
+        // is established and bidirectional.
+        let mut probe = [0u8; 1];
+        let _ = std::io::Read::read(&mut sock, &mut probe);
+
+        // Stamp T0 just before write returns.
+        let t0 = Instant::now();
+        sock.write_all(&[0x42; 64]).ok()?;
+        Some(t0.elapsed())
+    });
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    // Drive the 3-way handshake.
+    let our_seq = 1000u32;
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    let mut gateway_seq = 0u32;
+    for f in drain_n(&mut stack, 4) {
+        if let Some((s, _ack, ctrl, _)) = parse_tcp_to_guest(&f) {
+            if matches!(ctrl, TcpControl::Syn) {
+                gateway_seq = s;
+                break;
+            }
+        }
+    }
+
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+        ))
+        .unwrap();
+
+    // Send a probe byte so the host server thread proceeds to write.
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::Psh,
+            &[0xAA],
+        ))
+        .unwrap();
+
+    // Now the host writes and stamps T0. We measure from "host write
+    // completes" to "guest sees data in drain output."
+    let host_t0 = server.join().expect("server").expect("write succeeded");
+    let drain_start = Instant::now();
+    let mut saw_payload = false;
+    while drain_start.elapsed() < std::time::Duration::from_secs(1) {
+        let frames: Vec<Vec<u8>> = drain_n(&mut stack, 1);
+        for f in &frames {
+            if let Some((_, _, _, payload_len)) = parse_tcp_to_guest(f) {
+                if payload_len >= 64 {
+                    saw_payload = true;
+                    break;
+                }
+            }
+        }
+        if saw_payload {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let host_to_guest_us = drain_start.elapsed().as_micros() as u64 - host_t0.as_micros() as u64;
+
+    assert!(saw_payload, "host payload never reached the guest");
+
+    // The contract: epoll dispatch delivers in < 5 ms.
+    assert!(
+        host_to_guest_us < 5_000,
+        "Phase 6.4 contract: host→guest RX latency must be sub-5 ms \
+         (was bounded below by 5 ms net_poll_thread cycle); got {host_to_guest_us} µs"
+    );
 }
 
 /// Builds an ARP request Ethernet frame from the guest asking "who has
