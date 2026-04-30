@@ -67,6 +67,13 @@ mod linux_main {
     /// Timeout for the host-side channel receive on RR/CRR measurements.
     const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
+    /// Accept-side deadline for spawned echo/drain threads.  Set slightly longer
+    /// than `LATENCY_RECV_TIMEOUT` (the channel-side wait) so the channel times
+    /// out first when the iteration is genuinely stuck — the accept thread then
+    /// exits on its own deadline shortly after, releasing the listener FD before
+    /// the next iteration.
+    const ACCEPT_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+
     #[derive(Parser, Debug)]
     #[command(
         version,
@@ -235,8 +242,9 @@ FAST SMOKE RUN\n\
 
             let (drain_tx, drain_rx) = mpsc::channel::<(u64, Duration)>();
 
+            let drain_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
             std::thread::spawn(move || {
-                let drain_result = drain_one_connection(&listener);
+                let drain_result = drain_one_connection(&listener, drain_deadline);
                 let _ = drain_tx.send(drain_result);
             });
 
@@ -362,8 +370,9 @@ FAST SMOKE RUN\n\
             let host_port = listener.local_addr()?.port();
 
             let (drain_tx, drain_rx) = mpsc::channel::<(u64, Duration)>();
+            let drain_deadline = Instant::now() + Duration::from_secs(300) + ACCEPT_DEADLINE_SLACK;
             std::thread::spawn(move || {
-                let drain_result = drain_one_connection(&listener);
+                let drain_result = drain_one_connection(&listener, drain_deadline);
                 let _ = drain_tx.send(drain_result);
             });
 
@@ -435,11 +444,38 @@ FAST SMOKE RUN\n\
         Ok(Some(mean_mbps))
     }
 
+    /// Accept one connection on `listener` with a deadline. Returns `None` if the
+    /// deadline lapses before any connection arrives (the spawning iteration has
+    /// likely failed and the thread should exit cleanly so the listener FD is
+    /// released for the next iteration).
+    fn accept_with_deadline(
+        listener: &TcpListener,
+        deadline: Instant,
+    ) -> Option<(TcpStream, std::net::SocketAddr)> {
+        listener.set_nonblocking(true).ok()?;
+        loop {
+            match listener.accept() {
+                Ok(pair) => {
+                    let _ = pair.0.set_nonblocking(false);
+                    return Some(pair);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Accept exactly one TCP connection on `listener`, drain it to EOF, and
     /// return `(bytes_received, elapsed)`.  Intended to run in a background thread.
-    fn drain_one_connection(listener: &TcpListener) -> (u64, Duration) {
-        let accept_result = listener.accept();
-        let Ok((mut stream, _peer_addr)) = accept_result else {
+    ///
+    /// Returns `(0, Duration::ZERO)` if no connection arrives before `deadline`.
+    fn drain_one_connection(listener: &TcpListener, deadline: Instant) -> (u64, Duration) {
+        let Some((mut stream, _peer_addr)) = accept_with_deadline(listener, deadline) else {
             return (0, Duration::ZERO);
         };
 
@@ -496,8 +532,9 @@ FAST SMOKE RUN\n\
 
             let (echo_tx, echo_rx) = mpsc::channel::<Vec<Duration>>();
 
+            let echo_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
             std::thread::spawn(move || {
-                let samples = rr_echo_server(&listener, RR_SAMPLES_PER_ITER);
+                let samples = rr_echo_server(&listener, RR_SAMPLES_PER_ITER, echo_deadline);
                 let _ = echo_tx.send(samples);
             });
 
@@ -566,8 +603,8 @@ FAST SMOKE RUN\n\
     /// interval from "host waiting for a byte" to "host has written the echo",
     /// which is approximately the guest-side send→receive latency plus the
     /// network stack overhead on both sides.
-    fn rr_echo_server(listener: &TcpListener, count: u32) -> Vec<Duration> {
-        let Ok((mut stream, _)) = listener.accept() else {
+    fn rr_echo_server(listener: &TcpListener, count: u32, deadline: Instant) -> Vec<Duration> {
+        let Some((mut stream, _)) = accept_with_deadline(listener, deadline) else {
             return Vec::new();
         };
 
@@ -617,8 +654,9 @@ FAST SMOKE RUN\n\
             let (crr_tx, crr_rx) = mpsc::channel::<Vec<Duration>>();
             let sample_count = CRR_SAMPLES_PER_ITER;
 
+            let crr_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
             std::thread::spawn(move || {
-                let samples = crr_echo_server(&listener, sample_count);
+                let samples = crr_echo_server(&listener, sample_count, crr_deadline);
                 let _ = crr_tx.send(samples);
             });
 
@@ -722,13 +760,13 @@ FAST SMOKE RUN\n\
     /// Accepts `count` independent connections in sequence.  For each: starts the
     /// timer on `accept`, reads one byte, writes it back, closes the connection,
     /// and stops the timer.  Returns all per-connection durations.
-    fn crr_echo_server(listener: &TcpListener, count: u32) -> Vec<Duration> {
+    fn crr_echo_server(listener: &TcpListener, count: u32, deadline: Instant) -> Vec<Duration> {
         let mut samples = Vec::with_capacity(count as usize);
         let mut buf = [0u8; 1];
 
         for _ in 0..count {
             let start = Instant::now();
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Some((mut stream, _)) = accept_with_deadline(listener, deadline) else {
                 break;
             };
             // Read the request byte and echo it back.
