@@ -563,7 +563,10 @@ impl SlirpBackend {
             nat.deny_cidrs.len(), nat.port_forwards.len(), dns_servers
         );
 
-        let (accept_sender, pending_inbound_accepts) = mpsc::channel::<InboundAccept>();
+        // Spawn listener threads for port-forwards (Phase 5.5b).
+        let port_forward_shutdown = Arc::new(AtomicBool::new(false));
+        let (port_forward_listeners, pending_inbound_accepts, accept_sender) =
+            spawn_port_forward_listeners(&nat, &port_forward_shutdown);
 
         Ok(Self {
             queue,
@@ -579,8 +582,8 @@ impl SlirpBackend {
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
             flow_table: HashMap::new(),
-            port_forward_listeners: Vec::new(),
-            port_forward_shutdown: Arc::new(AtomicBool::new(false)),
+            port_forward_listeners,
+            port_forward_shutdown,
             pending_inbound_accepts,
             accept_sender,
         })
@@ -2044,17 +2047,23 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 }
 
 /// Spawn one listener thread per TCP port-forward rule and return the join
-/// handles and the receiver end of the accept channel.
+/// handles, the receiver end of the accept channel, and the sender end.
 ///
-/// The caller stores the handles in `SlirpBackend::port_forward_listeners` and
-/// the receiver in `SlirpBackend::pending_inbound_accepts`.  This function is
-/// intentionally **not** called in [`SlirpBackend::with_security`] yet — task
-/// 5.5b.4 wires that.
-#[allow(dead_code)]
+/// The caller stores the handles in `SlirpBackend::port_forward_listeners`,
+/// the receiver in `SlirpBackend::pending_inbound_accepts`, and the sender in
+/// `SlirpBackend::accept_sender` (so the channel stays open when zero listener
+/// threads are running, e.g. in tests).
+///
+/// When `nat.port_forwards` contains no TCP rules the returned `Vec` is empty
+/// and no background threads are spawned.
 pub(crate) fn spawn_port_forward_listeners(
     nat: &nat::Rules,
     shutdown: &Arc<AtomicBool>,
-) -> (Vec<JoinHandle<()>>, mpsc::Receiver<InboundAccept>) {
+) -> (
+    Vec<JoinHandle<()>>,
+    mpsc::Receiver<InboundAccept>,
+    mpsc::Sender<InboundAccept>,
+) {
     let (accept_tx, accept_rx) = mpsc::channel::<InboundAccept>();
     let mut handles = Vec::new();
     for port_forward in &nat.port_forwards {
@@ -2073,7 +2082,7 @@ pub(crate) fn spawn_port_forward_listeners(
             .expect("spawn port-forward listener thread");
         handles.push(handle);
     }
-    (handles, accept_rx)
+    (handles, accept_rx, accept_tx)
 }
 
 /// Main loop for a port-forward listener thread.
@@ -2085,7 +2094,6 @@ pub(crate) fn spawn_port_forward_listeners(
 ///
 /// The thread exits when `shutdown` is `true` or when `accept_tx.send`
 /// fails (receiver dropped — backend is shutting down).
-#[allow(dead_code)]
 fn run_port_forward_listener(
     host_port: u16,
     guest_port: u16,
@@ -2492,5 +2500,29 @@ mod tests {
             })
             .count();
         assert_eq!(syn_count, 1, "exactly one SYN must be queued for the guest");
+    }
+
+    /// Verify that `with_security` spawns exactly one listener thread when
+    /// given one TCP port-forward rule, and zero threads when given none.
+    #[test]
+    fn with_security_spawns_listener_per_tcp_port_forward() {
+        // Empty port-forwards: no listener threads.
+        let empty = SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[])
+            .expect("SlirpBackend::with_security (empty)");
+        assert_eq!(
+            empty.port_forward_listeners.len(),
+            0,
+            "zero listener threads for empty port_forwards"
+        );
+
+        // One TCP port-forward: exactly one listener thread.
+        let one =
+            SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[(18080, 80)])
+                .expect("SlirpBackend::with_security (one forward)");
+        assert_eq!(
+            one.port_forward_listeners.len(),
+            1,
+            "one listener thread for one TCP port-forward rule"
+        );
     }
 }
