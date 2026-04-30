@@ -186,7 +186,6 @@ struct UdpFlowEntry {
 /// can store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FlowKey {
-    #[allow(dead_code)] // consumed in 4.5
     Tcp(NatKey),
     Udp(UdpFlowKey),
     IcmpEcho(IcmpEchoKey),
@@ -195,7 +194,6 @@ enum FlowKey {
 /// Unified flow-table value. Each variant wraps the protocol's existing
 /// entry struct.
 enum FlowEntry {
-    #[allow(dead_code)] // consumed in 4.5
     Tcp(TcpNatEntry),
     Udp(UdpFlowEntry),
     IcmpEcho(IcmpEchoEntry),
@@ -420,8 +418,6 @@ pub struct SlirpBackend {
     iface: Interface,
     sockets: SocketSet<'static>,
     _device: VirtualDevice,
-    /// TCP NAT table
-    tcp_nat: HashMap<NatKey, TcpNatEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
     /// Maximum concurrent TCP connections allowed
@@ -438,11 +434,10 @@ pub struct SlirpBackend {
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
     /// DNS queries waiting to be resolved on the net-poll thread.
     pending_dns: Vec<PendingDnsQuery>,
-    /// Unified flow table — Phase 4 staging.
+    /// Unified flow table — Phase 4.
     ///
-    /// During Phase 4, per-protocol paths migrate to this map one at a time.
-    /// ICMP migrated in Task 4.3; UDP migrated in Task 4.4; TCP follows in 4.5.
-    /// Task 4.6 drops the remaining per-protocol map (`tcp_nat`).
+    /// All three protocols (TCP, UDP, ICMP echo) are keyed here after Task 4.5.
+    /// ICMP migrated in 4.3; UDP in 4.4; TCP in 4.5.
     flow_table: HashMap<FlowKey, FlowEntry>,
 }
 
@@ -504,7 +499,6 @@ impl SlirpBackend {
             iface,
             sockets,
             _device: device,
-            tcp_nat: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
             max_connections_per_second,
@@ -1092,7 +1086,12 @@ impl SlirpBackend {
             }
 
             // Check max concurrent connections
-            if self.tcp_nat.len() >= self.max_concurrent_connections {
+            let tcp_flow_count = self
+                .flow_table
+                .keys()
+                .filter(|k| matches!(k, FlowKey::Tcp(_)))
+                .count();
+            if tcp_flow_count >= self.max_concurrent_connections {
                 warn!(
                     "SLIRP TCP: max concurrent connections ({}) reached, rejecting SYN to {}:{}",
                     self.max_concurrent_connections, dst_ip, dst_port
@@ -1132,7 +1131,7 @@ impl SlirpBackend {
             }
 
             // Remove any stale entry with the same key
-            self.tcp_nat.remove(&key);
+            self.flow_table.remove(&FlowKey::Tcp(key));
 
             // Create host TCP connection.
             // Map the SLIRP gateway IP (10.0.2.2) to localhost so the guest
@@ -1156,7 +1155,8 @@ impl SlirpBackend {
                         last_activity: Instant::now(),
                         bytes_in_flight: 0,
                     };
-                    self.tcp_nat.insert(key, entry);
+                    self.flow_table
+                        .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
 
                     // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
@@ -1195,18 +1195,16 @@ impl SlirpBackend {
         }
 
         // Look up existing connection
-        let entry = match self.tcp_nat.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                trace!(
-                    "SLIRP TCP: no NAT entry for {}:{} -> {}:{}",
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port
-                );
-                return Ok(());
-            }
+        let flow_key = FlowKey::Tcp(key);
+        let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
+            trace!(
+                "SLIRP TCP: no NAT entry for {}:{} -> {}:{}",
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port
+            );
+            return Ok(());
         };
 
         entry.last_activity = Instant::now();
@@ -1354,17 +1352,31 @@ impl SlirpBackend {
 
     /// Relay data from host TCP connections to guest
     fn relay_tcp_nat_data(&mut self) {
-        let mut to_remove = Vec::new();
+        let mut to_remove: Vec<FlowKey> = Vec::new();
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        for (key, entry) in self.tcp_nat.iter_mut() {
+        let tcp_flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::Tcp(_)))
+            .collect();
+
+        for flow_key in tcp_flow_keys {
+            let FlowKey::Tcp(key) = flow_key else {
+                continue;
+            };
+            let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
+                continue;
+            };
+
             if entry.state == TcpNatState::Closed {
-                to_remove.push(*key);
+                to_remove.push(flow_key);
                 continue;
             }
             if entry.last_activity.elapsed() > Duration::from_secs(300) {
-                to_remove.push(*key);
+                to_remove.push(flow_key);
                 continue;
             }
             if entry.state != TcpNatState::Established {
@@ -1449,8 +1461,8 @@ impl SlirpBackend {
 
         self.inject_to_guest.append(&mut frames_to_inject);
 
-        for key in to_remove {
-            self.tcp_nat.remove(&key);
+        for flow_key in to_remove {
+            self.flow_table.remove(&flow_key);
         }
     }
 
