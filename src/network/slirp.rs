@@ -29,10 +29,11 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::network::{nat, NetworkBackend};
@@ -90,12 +91,36 @@ const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Sleep interval for the port-forward listener thread between non-blocking
+/// accept polls. Short enough to keep accept latency low; long enough to
+/// avoid busy-waiting the host CPU.
+#[allow(dead_code)]
+const PORT_FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// ICMP unprivileged probe state.
 ///
 /// `0` = unknown (not yet probed), `1` = available, `2` = unavailable
 /// (kernel returned `EACCES` or `EPERM` — typically `net.ipv4.ping_group_range`
 /// excludes the calling GID). Once set to `2`, `open_icmp_socket` short-circuits.
 static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
+
+// ──────────────────────────────────────────────────────────────────────
+//  Inbound port-forward accept channel (Phase 5.5b)
+// ──────────────────────────────────────────────────────────────────────
+
+/// One accepted host-side TCP connection waiting to be forwarded into the guest.
+///
+/// Produced by [`run_port_forward_listener`] and consumed by
+/// [`SlirpBackend::process_pending_inbound_accepts`] on the net-poll thread.
+pub(crate) struct InboundAccept {
+    /// The accepted host-side TCP stream (non-blocking after accept).
+    host_stream: TcpStream,
+    /// Ephemeral port used as the synthesized SYN source port on the gateway side.
+    /// Derived from the peer's remote port so it is unique per connection.
+    high_port: u16,
+    /// Guest-side destination port (the service the guest is listening on).
+    guest_port: u16,
+}
 
 // ──────────────────────────────────────────────────────────────────────
 //  TCP NAT connection tracking
@@ -447,6 +472,22 @@ pub struct SlirpBackend {
     /// All three protocols (TCP, UDP, ICMP echo) are keyed here after Task 4.5.
     /// ICMP migrated in 4.3; UDP in 4.4; TCP in 4.5.
     flow_table: HashMap<FlowKey, FlowEntry>,
+    /// Background threads bound to host TCP ports for inbound port
+    /// forwarding (Phase 5.5b). Each handle corresponds to one
+    /// `nat::PortForward` rule. Joined on `Drop`.
+    port_forward_listeners: Vec<JoinHandle<()>>,
+    /// Shutdown signal for `port_forward_listeners`. Set true on Drop;
+    /// each listener thread checks it after every accept and exits cleanly.
+    port_forward_shutdown: Arc<AtomicBool>,
+    /// Receiver end of the accept channel fed by [`run_port_forward_listener`]
+    /// threads. Processed on the net-poll thread in
+    /// [`SlirpBackend::process_pending_inbound_accepts`].
+    pending_inbound_accepts: mpsc::Receiver<InboundAccept>,
+    /// Sender end of `pending_inbound_accepts`. Kept alive so the channel
+    /// stays open when no listener threads are running (e.g. in tests) and
+    /// so test helpers can inject [`InboundAccept`] values directly.
+    #[allow(dead_code)]
+    accept_sender: mpsc::Sender<InboundAccept>,
 }
 
 impl SlirpBackend {
@@ -522,6 +563,8 @@ impl SlirpBackend {
             nat.deny_cidrs.len(), nat.port_forwards.len(), dns_servers
         );
 
+        let (accept_sender, pending_inbound_accepts) = mpsc::channel::<InboundAccept>();
+
         Ok(Self {
             queue,
             iface,
@@ -536,6 +579,10 @@ impl SlirpBackend {
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
             flow_table: HashMap::new(),
+            port_forward_listeners: Vec::new(),
+            port_forward_shutdown: Arc::new(AtomicBool::new(false)),
+            pending_inbound_accepts,
+            accept_sender,
         })
     }
 
@@ -560,6 +607,52 @@ impl SlirpBackend {
 
         self.connection_timestamps.push_back(now);
         true
+    }
+
+    /// Drain the inbound-accept channel and seed a `SynSent` flow-table entry
+    /// plus a synthesized SYN frame for each accepted connection.
+    ///
+    /// Called at the top of [`drain_to_guest`] so all `SlirpBackend` mutation
+    /// stays on the net-poll thread — same single-writer lock model as the rest
+    /// of the relay pipeline. The listener threads only enqueue via the mpsc
+    /// channel; they never touch `flow_table` or `inject_to_guest` directly.
+    fn process_pending_inbound_accepts(&mut self) {
+        loop {
+            let accepted = match self.pending_inbound_accepts.try_recv() {
+                Ok(accepted) => accepted,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            let InboundAccept {
+                host_stream,
+                high_port,
+                guest_port,
+            } = accepted;
+            let our_isn = rand_seq();
+            let key = NatKey {
+                guest_src_port: guest_port,
+                dst_ip: SLIRP_GATEWAY_IP,
+                dst_port: high_port,
+            };
+            let entry = TcpNatEntry {
+                host_stream,
+                state: TcpNatState::SynSent,
+                our_seq: our_isn,
+                guest_ack: 0,
+                last_activity: Instant::now(),
+                bytes_in_flight: 0,
+            };
+            self.flow_table
+                .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+            let syn_frame = synthesize_inbound_syn(high_port, guest_port, our_isn);
+            self.inject_to_guest.push(syn_frame);
+            trace!(
+                host_port = high_port,
+                guest_port,
+                our_isn,
+                "SLIRP port-forward: seeded SynSent entry"
+            );
+        }
     }
 
     // ── Public API ──────────────────────────────────────────────────
@@ -594,6 +687,9 @@ impl SlirpBackend {
     ///
     /// See [`crate::network::NetworkBackend::drain_to_guest`].
     pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        // 0. Process any accepted host-side connections from port-forward listeners.
+        self.process_pending_inbound_accepts();
+
         // Check rx_queue size before polling.
         let rx_count = {
             let q = self.queue.lock().unwrap();
@@ -1947,9 +2043,141 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
     !sum as u16
 }
 
+/// Spawn one listener thread per TCP port-forward rule and return the join
+/// handles and the receiver end of the accept channel.
+///
+/// The caller stores the handles in `SlirpBackend::port_forward_listeners` and
+/// the receiver in `SlirpBackend::pending_inbound_accepts`.  This function is
+/// intentionally **not** called in [`SlirpBackend::with_security`] yet — task
+/// 5.5b.4 wires that.
+#[allow(dead_code)]
+pub(crate) fn spawn_port_forward_listeners(
+    nat: &nat::Rules,
+    shutdown: &Arc<AtomicBool>,
+) -> (Vec<JoinHandle<()>>, mpsc::Receiver<InboundAccept>) {
+    let (accept_tx, accept_rx) = mpsc::channel::<InboundAccept>();
+    let mut handles = Vec::new();
+    for port_forward in &nat.port_forwards {
+        if port_forward.proto != nat::ForwardProto::Tcp {
+            continue;
+        }
+        let host_port = port_forward.host_port;
+        let guest_port = port_forward.guest_port;
+        let tx = accept_tx.clone();
+        let shutdown = Arc::clone(shutdown);
+        let handle = std::thread::Builder::new()
+            .name(format!("slirp-pf-{host_port}-{guest_port}"))
+            .spawn(move || {
+                run_port_forward_listener(host_port, guest_port, tx, shutdown);
+            })
+            .expect("spawn port-forward listener thread");
+        handles.push(handle);
+    }
+    (handles, accept_rx)
+}
+
+/// Main loop for a port-forward listener thread.
+///
+/// Binds `127.0.0.1:host_port`, accepts connections in non-blocking mode,
+/// and forwards each accepted [`TcpStream`] to the net-poll thread via
+/// `accept_tx`.  The peer's remote port is used as `high_port` — it is
+/// unique per connection and requires no extra allocation.
+///
+/// The thread exits when `shutdown` is `true` or when `accept_tx.send`
+/// fails (receiver dropped — backend is shutting down).
+#[allow(dead_code)]
+fn run_port_forward_listener(
+    host_port: u16,
+    guest_port: u16,
+    accept_tx: mpsc::Sender<InboundAccept>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let listener = match TcpListener::bind(("127.0.0.1", host_port)) {
+        Ok(listener) => listener,
+        Err(bind_error) => {
+            warn!(
+                host_port,
+                error = %bind_error,
+                "SLIRP port-forward: bind failed, port-forward disabled"
+            );
+            return;
+        }
+    };
+    if let Err(nb_error) = listener.set_nonblocking(true) {
+        warn!(
+            host_port,
+            error = %nb_error,
+            "SLIRP port-forward: set_nonblocking failed, port-forward disabled"
+        );
+        return;
+    }
+    debug!(
+        host_port,
+        guest_port, "SLIRP port-forward: listening on 127.0.0.1"
+    );
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                let high_port = peer_addr.port();
+                if let Err(nb_error) = stream.set_nonblocking(true) {
+                    warn!(
+                        host_port,
+                        guest_port,
+                        high_port,
+                        error = %nb_error,
+                        "SLIRP port-forward: accepted stream set_nonblocking failed, dropping"
+                    );
+                    continue;
+                }
+                trace!(
+                    host_port,
+                    guest_port,
+                    high_port,
+                    peer = %peer_addr,
+                    "SLIRP port-forward: accepted connection"
+                );
+                let accepted = InboundAccept {
+                    host_stream: stream,
+                    high_port,
+                    guest_port,
+                };
+                if accept_tx.send(accepted).is_err() {
+                    debug!(
+                        host_port,
+                        "SLIRP port-forward: backend gone, listener exiting"
+                    );
+                    return;
+                }
+            }
+            Err(ref would_block) if would_block.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(PORT_FORWARD_POLL_INTERVAL);
+            }
+            Err(accept_error) => {
+                warn!(
+                    host_port,
+                    error = %accept_error,
+                    "SLIRP port-forward: accept error"
+                );
+                std::thread::sleep(PORT_FORWARD_POLL_INTERVAL);
+            }
+        }
+    }
+    debug!(host_port, "SLIRP port-forward: listener shutting down");
+}
+
 impl Default for SlirpBackend {
     fn default() -> Self {
         Self::new().expect("Failed to create default SlirpBackend")
+    }
+}
+
+impl Drop for SlirpBackend {
+    fn drop(&mut self) {
+        self.port_forward_shutdown.store(true, Ordering::Relaxed);
+        for handle in std::mem::take(&mut self.port_forward_listeners) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -2018,21 +2246,30 @@ impl SlirpBackend {
     /// `ack` flag is set and the `syn` flag is clear (i.e. a plain ACK).
     #[allow(dead_code)]
     pub(crate) fn injected_plain_ack_count(&self) -> usize {
-        self.inject_to_guest
-            .iter()
-            .filter(|frame| {
-                // Ethernet(14) + IPv4(≥20) + TCP(≥20) = ≥54 bytes.
-                if frame.len() < 54 {
-                    return false;
-                }
-                // Parse TCP flags from the fixed-offset byte: ETH(14) + IP(20) + flags@13
-                let tcp_offset = 14 + 20;
-                let flags_byte = frame[tcp_offset + 13];
-                let ack = flags_byte & 0x10 != 0;
-                let syn = flags_byte & 0x02 != 0;
-                ack && !syn
-            })
-            .count()
+        let mut count = 0;
+        for frame in &self.inject_to_guest {
+            if frame.len() < 54 {
+                continue;
+            }
+            let tcp_offset = 14 + 20;
+            let flags_byte = frame[tcp_offset + 13];
+            let ack = flags_byte & 0x10 != 0;
+            let syn = flags_byte & 0x02 != 0;
+            if ack && !syn {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Inject an [`InboundAccept`] directly into the accept channel, bypassing
+    /// the listener thread. Used by unit tests to drive
+    /// `process_pending_inbound_accepts` without a real listener.
+    #[allow(dead_code)]
+    pub(crate) fn push_inbound_accept(&self, accepted: InboundAccept) {
+        self.accept_sender
+            .send(accepted)
+            .expect("accept channel must be open");
     }
 }
 
@@ -2192,5 +2429,68 @@ mod tests {
             1,
             "exactly one plain ACK must be queued for the guest"
         );
+    }
+
+    /// Verify that `process_pending_inbound_accepts` drains one `InboundAccept`
+    /// from the channel, inserts a `SynSent` flow-table entry, and queues a
+    /// synthesized SYN frame for injection to the guest.
+    ///
+    /// This pins the contract for task 5.5b.3.  The test is white-box: it uses
+    /// `push_inbound_accept` (a `#[cfg(test)]` helper that injects into the
+    /// internal channel) so we don't need a real listener thread.
+    #[test]
+    fn process_pending_inbound_accepts_seeds_synsent_and_queues_syn() {
+        use std::net::TcpListener;
+
+        let guest_port: u16 = 9000;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let local_addr = listener.local_addr().unwrap();
+        let host_stream = TcpStream::connect(local_addr).expect("connect loopback");
+        let high_port = host_stream.local_addr().unwrap().port();
+        host_stream.set_nonblocking(true).ok();
+
+        let mut backend = SlirpBackend::new().expect("SlirpBackend::new");
+
+        // Inject an InboundAccept without a real listener thread.
+        backend.push_inbound_accept(InboundAccept {
+            host_stream,
+            high_port,
+            guest_port,
+        });
+
+        // Before processing, no flow entry should exist.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            None,
+            "no flow entry before processing"
+        );
+
+        // Drive process_pending_inbound_accepts.
+        backend.process_pending_inbound_accepts();
+
+        // After processing, a SynSent entry must exist.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::SynSent),
+            "SynSent entry must be present after processing"
+        );
+
+        // Exactly one SYN frame must have been queued for injection.
+        // Note: build_tcp_packet_static sets ack_number=Some(0) which also
+        // sets the ACK flag bit; we detect the SYN by checking just the SYN bit.
+        let syn_count = backend
+            .inject_to_guest
+            .iter()
+            .filter(|frame| {
+                if frame.len() < 54 {
+                    return false;
+                }
+                let tcp_offset = 14 + 20;
+                let flags_byte = frame[tcp_offset + 13];
+                flags_byte & 0x02 != 0
+            })
+            .count();
+        assert_eq!(syn_count, 1, "exactly one SYN must be queued for the guest");
     }
 }
