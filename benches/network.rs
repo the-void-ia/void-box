@@ -41,6 +41,9 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux_benches {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     fn build_syn(src_port: u16, dst_port: u16) -> Vec<u8> {
         let tcp = TcpRepr {
@@ -796,6 +799,97 @@ mod linux_benches {
                 divan::black_box(GUEST_PORT),
                 divan::black_box(OUR_SEQ),
             ));
+        });
+    }
+
+    /// Returns `true` if `frame` is an Ethernet/IPv4/TCP packet with the SYN
+    /// flag set, addressed to `dst_port`.
+    ///
+    /// The synthesized inbound SYN produced by `synthesize_inbound_syn` uses
+    /// `TcpControl::Syn` but smoltcp sets the ACK bit whenever `ack_number`
+    /// is `Some(...)`, even when the value is zero.  Checking only `tcp.syn()`
+    /// + `dst_port` is therefore correct here.
+    fn is_tcp_syn_to_port(frame: &[u8], dst_port: u16) -> bool {
+        // Minimum: 14 (Eth) + 20 (IPv4) + 20 (TCP) = 54 bytes.
+        if frame.len() < 54 {
+            return false;
+        }
+        let eth = EthernetFrame::new_unchecked(frame);
+        if eth.ethertype() != EthernetProtocol::Ipv4 {
+            return false;
+        }
+        let ip = Ipv4Packet::new_unchecked(eth.payload());
+        if ip.next_header() != IpProtocol::Tcp {
+            return false;
+        }
+        let ip_header_len = ip.header_len() as usize;
+        let tcp = TcpPacket::new_unchecked(&eth.payload()[ip_header_len..]);
+        tcp.syn() && tcp.dst_port() == dst_port
+    }
+
+    /// Wall-clock latency of the full inbound port-forward path: host
+    /// `TcpStream::connect` → listener thread `accept()` (polled every
+    /// `PORT_FORWARD_POLL_INTERVAL = 50 ms`) → mpsc channel push →
+    /// `process_pending_inbound_accepts` → `synthesize_inbound_syn` →
+    /// first SYN frame visible in `drain_to_guest` output.
+    ///
+    /// The 50 ms polling ceiling means the distribution will be roughly
+    /// uniform on [0, 50 ms] — a median around 25 ms is expected and normal,
+    /// not a bug. Regressions in the inbound state machine or the listener
+    /// poll loop will shift the distribution upward beyond 50 ms.
+    ///
+    /// Phase 5.5b baseline. Regressions in the inbound state machine or
+    /// listener-poll loop will surface numerically against this measurement.
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn port_forward_accept_latency(bencher: Bencher) {
+        const GUEST_PORT: u16 = 8080;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+        const DRAIN_POLL: Duration = Duration::from_micros(100);
+
+        // Probe-bind to grab an ephemeral host port, then release the listener
+        // so SlirpBackend can bind it.  There is an inherent TOCTOU race
+        // between the drop and the SlirpBackend bind — acceptable for benches
+        // running on a loopback interface under controlled conditions.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind for host port");
+        let host_port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let mut stack = SlirpBackend::with_security(
+            64,
+            50,
+            &["169.254.0.0/16".to_string()],
+            &[(host_port, GUEST_PORT)],
+        )
+        .expect("SlirpBackend::with_security");
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+
+        bencher.bench_local(|| {
+            // Spawn a worker thread that connects to the host listener port.
+            // The listener thread inside SlirpBackend will accept() it on the
+            // next poll (within PORT_FORWARD_POLL_INTERVAL = 50ms) and push
+            // the accepted stream onto the mpsc channel.
+            let connect_addr = format!("127.0.0.1:{host_port}");
+            let worker = thread::spawn(move || {
+                let addr: std::net::SocketAddr = connect_addr.parse().expect("parse connect addr");
+                std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+                    .expect("connect to listener");
+            });
+
+            // Poll drain_to_guest until a SYN frame appears in the output.
+            loop {
+                out.clear();
+                stack.drain_to_guest(&mut out);
+                if out
+                    .iter()
+                    .any(|frame| is_tcp_syn_to_port(frame, GUEST_PORT))
+                {
+                    break;
+                }
+                thread::sleep(DRAIN_POLL);
+            }
+
+            worker.join().expect("worker thread panicked");
         });
     }
 } // mod linux_benches
