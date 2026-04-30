@@ -429,13 +429,15 @@ pub struct SlirpBackend {
     max_connections_per_second: u32,
     /// Sliding window of recent connection timestamps for rate limiting
     connection_timestamps: VecDeque<Instant>,
-    /// Network deny list (CIDR ranges that the guest cannot reach)
+    /// Network deny list (CIDR ranges that the guest cannot reach).
+    /// Kept until task 5.4 migrates the UDP relay to `nat::translate_outbound`
+    /// and drops this field.
+    #[allow(dead_code)]
     deny_list: Vec<Ipv4Net>,
     /// Stateless outbound translation rules. Phase 5 staging — populated
-    /// alongside the existing `deny_list` field; tasks 5.3 and 5.4 migrate
-    /// the TCP and UDP relays to consume `nat::translate_outbound(&self.nat, ...)`,
-    /// and 5.4 drops the redundant `deny_list` field.
-    #[allow(dead_code)]
+    /// alongside the existing `deny_list` field; task 5.4 migrates the UDP
+    /// relay to consume `nat::translate_outbound(&self.nat, ...)` and drops
+    /// the redundant `deny_list` field.
     nat: nat::Rules,
     /// Host DNS servers (parsed from /etc/resolv.conf, fallback to public)
     dns_servers: Vec<String>,
@@ -525,12 +527,6 @@ impl SlirpBackend {
             pending_dns: Vec::new(),
             flow_table: HashMap::new(),
         })
-    }
-
-    /// Check if a destination IP is blocked by the deny list.
-    fn is_denied(&self, ip: &Ipv4Address) -> bool {
-        let addr = std::net::Ipv4Addr::new(ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
-        self.deny_list.iter().any(|net| net.contains(&addr))
     }
 
     /// Check if a new connection is allowed by the rate limiter.
@@ -1081,25 +1077,32 @@ impl SlirpBackend {
                 src_ip, src_port, dst_ip, dst_port
             );
 
-            // Check deny list before connecting
-            if self.is_denied(&dst_ip) {
-                warn!(
-                    "SLIRP TCP: connection to {}:{} denied by network deny list",
-                    dst_ip, dst_port
-                );
-                let rst = build_tcp_packet_static(
-                    dst_ip,
-                    SLIRP_GUEST_IP,
-                    dst_port,
-                    src_port,
-                    0,
-                    seq + 1,
-                    TcpControl::Rst,
-                    &[],
-                );
-                self.inject_to_guest.push(rst);
-                return Ok(());
-            }
+            // Phase 5 unified outbound translation: combines the gateway-loopback
+            // rewrite + deny-list check in one pure-function call. Returns None if
+            // the dst is denied; on Some, the SocketAddr already has the right
+            // host IP (loopback for the gateway, original for everything else).
+            let dst_addr =
+                match nat::translate_outbound(&self.nat, dst_ip, dst_port, SLIRP_GATEWAY_IP) {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "SLIRP TCP: connection to {}:{} denied by network deny list",
+                            dst_ip, dst_port
+                        );
+                        let rst = build_tcp_packet_static(
+                            dst_ip,
+                            SLIRP_GUEST_IP,
+                            dst_port,
+                            src_port,
+                            0,
+                            seq + 1,
+                            TcpControl::Rst,
+                            &[],
+                        );
+                        self.inject_to_guest.push(rst);
+                        return Ok(());
+                    }
+                };
 
             // Check max concurrent connections
             let tcp_flow_count = self
@@ -1149,17 +1152,8 @@ impl SlirpBackend {
             // Remove any stale entry with the same key
             self.flow_table.remove(&FlowKey::Tcp(key));
 
-            // Create host TCP connection.
-            // Map the SLIRP gateway IP (10.0.2.2) to localhost so the guest
-            // can reach host services (e.g. Ollama at localhost:11434).
-            let host_ip = if dst_ip == SLIRP_GATEWAY_IP {
-                std::net::Ipv4Addr::new(127, 0, 0, 1)
-            } else {
-                std::net::Ipv4Addr::new(dst_ip.0[0], dst_ip.0[1], dst_ip.0[2], dst_ip.0[3])
-            };
-            let addr = SocketAddr::new(std::net::IpAddr::V4(host_ip), dst_port);
-
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            // Connect to the host address resolved by translate_outbound above.
+            match TcpStream::connect_timeout(&dst_addr, Duration::from_secs(3)) {
                 Ok(stream) => {
                     stream.set_nonblocking(true).ok();
                     let our_seq: u32 = rand_seq();
