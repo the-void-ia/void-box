@@ -103,8 +103,13 @@ static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
-enum TcpNatState {
+pub(crate) enum TcpNatState {
+    /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
+    /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
+    /// We synthesized a SYN to the guest (port-forwarding); waiting
+    /// for the guest's SYN-ACK to advance to Established.
+    SynSent,
     Established,
     FinWait1,
     FinWait2,
@@ -1230,6 +1235,39 @@ impl SlirpBackend {
 
         entry.last_activity = Instant::now();
 
+        // Inbound port-forward: guest's SYN-ACK completing the host-initiated
+        // 3-way handshake.  We synthesized a SYN to the guest (5.5b.2/5.5b.3);
+        // the guest's kernel accepted it and replied with SYN+ACK.  Send an ACK
+        // back so the guest's TCP stack transitions to Established on its side,
+        // then record our state as Established too.
+        //
+        // NatKey for the inbound flow: guest_src_port = guest service port,
+        // dst_ip = SLIRP_GATEWAY_IP, dst_port = the ephemeral high port we
+        // used as the SYN's source port.  The ACK frame therefore flows
+        // src=SLIRP_GATEWAY_IP:dst_port → dst=SLIRP_GUEST_IP:guest_src_port.
+        if entry.state == TcpNatState::SynSent && tcp.syn() && tcp.ack() {
+            let ack_frame = build_tcp_packet_static(
+                SLIRP_GATEWAY_IP,              // src_ip  — the "host" side of the forward
+                SLIRP_GUEST_IP,                // dst_ip  — the guest
+                key.dst_port, // src_port — high ephemeral port we sent the SYN from
+                key.guest_src_port, // dst_port — the guest's service port
+                entry.our_seq.wrapping_add(1), // seq — our ISN + 1 (SYN consumed one)
+                tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
+                TcpControl::None,
+                &[],
+            );
+            self.inject_to_guest.push(ack_frame);
+            entry.our_seq = entry.our_seq.wrapping_add(1);
+            entry.guest_ack = tcp.seq_number().0.wrapping_add(1) as u32;
+            entry.state = TcpNatState::Established;
+            trace!(
+                "SLIRP TCP: inbound 3WH complete for guest_port={} high_port={}, → Established",
+                key.guest_src_port,
+                key.dst_port
+            );
+            return Ok(());
+        }
+
         // ACK (completing handshake or acknowledging data)
         if tcp.ack() && entry.state == TcpNatState::SynReceived {
             entry.state = TcpNatState::Established;
@@ -1872,6 +1910,86 @@ impl Default for SlirpBackend {
     }
 }
 
+/// Test-only helpers — not compiled into production builds.
+///
+/// These are `#[cfg(test)]` methods on `SlirpBackend` that allow unit tests to
+/// insert synthetic flow entries without widening the visibility of private types.
+/// The full behavioral contract for the SynSent → Established transition is
+/// pinned in the E2E test `tcp_inbound_syn_ack_completes_handshake` below and
+/// will be further exercised end-to-end in task 5.5b.5
+/// (`tcp_port_forward_inbound` in `tests/network_baseline.rs`).
+#[cfg(test)]
+impl SlirpBackend {
+    /// Insert a synthetic `SynSent` entry into the flow table.
+    ///
+    /// Used by `tcp_inbound_syn_ack_completes_handshake` to pre-seed the state
+    /// that would normally be created by `synthesize_inbound_syn` (5.5b.2).
+    ///
+    /// `guest_port`: the guest's listening service port (e.g. 8080).
+    /// `high_port`:  the ephemeral source port we used for the synthesized SYN.
+    /// `our_isn`:    the ISN we put in the synthesized SYN.
+    /// `host_stream`: a `TcpStream` representing the accepted host-side connection.
+    pub(crate) fn insert_synthetic_synsent_entry(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        our_isn: u32,
+        host_stream: TcpStream,
+    ) {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        let entry = TcpNatEntry {
+            host_stream,
+            state: TcpNatState::SynSent,
+            our_seq: our_isn,
+            guest_ack: 0,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+        };
+        self.flow_table
+            .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+    }
+
+    /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,
+    /// or `None` if no such entry exists in the flow table.
+    pub(crate) fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        match self.flow_table.get(&FlowKey::Tcp(key))? {
+            FlowEntry::Tcp(entry) => Some(entry.state),
+            _ => None,
+        }
+    }
+
+    /// Count how many frames queued for injection carry the given TCP flags.
+    ///
+    /// Checks `inject_to_guest` for Ethernet/IPv4/TCP frames where the TCP
+    /// `ack` flag is set and the `syn` flag is clear (i.e. a plain ACK).
+    pub(crate) fn injected_plain_ack_count(&self) -> usize {
+        self.inject_to_guest
+            .iter()
+            .filter(|frame| {
+                // Ethernet(14) + IPv4(≥20) + TCP(≥20) = ≥54 bytes.
+                if frame.len() < 54 {
+                    return false;
+                }
+                // Parse TCP flags from the fixed-offset byte: ETH(14) + IP(20) + flags@13
+                let tcp_offset = 14 + 20;
+                let flags_byte = frame[tcp_offset + 13];
+                let ack = flags_byte & 0x10 != 0;
+                let syn = flags_byte & 0x02 != 0;
+                ack && !syn
+            })
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,5 +2019,132 @@ mod tests {
         header[0] = 0x45;
         let cksum = ipv4_checksum(&header);
         assert_ne!(cksum, 0);
+    }
+
+    /// Build a TCP frame from the guest (SLIRP_GUEST_IP) to a given destination.
+    ///
+    /// Used by `tcp_inbound_syn_ack_completes_handshake` to synthesize the
+    /// guest's SYN-ACK reply to our port-forward SYN.
+    fn build_guest_tcp_frame(
+        dst_ip: Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack_number: u32,
+        control: TcpControl,
+        set_ack_flag: bool,
+    ) -> Vec<u8> {
+        use smoltcp::wire::{
+            EthernetAddress, EthernetFrame, EthernetRepr, IpAddress, Ipv4Packet, Ipv4Repr,
+            TcpPacket, TcpRepr, TcpSeqNumber,
+        };
+        let tcp_repr = TcpRepr {
+            src_port,
+            dst_port,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: if set_ack_flag {
+                Some(TcpSeqNumber(ack_number as i32))
+            } else {
+                None
+            },
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            payload: &[],
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: dst_ip,
+            next_header: smoltcp::wire::IpProtocol::Tcp,
+            payload_len: tcp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: smoltcp::wire::EthernetProtocol::Ipv4,
+        };
+        let checksums = smoltcp::phy::ChecksumCapabilities::default();
+        let total = eth_repr.buffer_len() + ip_repr.buffer_len() + tcp_repr.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(eth.payload_mut());
+        ip_repr.emit(&mut ip, &checksums);
+        let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+        tcp_repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            &IpAddress::Ipv4(dst_ip),
+            &checksums,
+        );
+        buf
+    }
+
+    /// Verify that a guest SYN-ACK frame on a SynSent entry:
+    ///   (a) transitions the flow state to Established, and
+    ///   (b) queues exactly one plain ACK frame towards the guest.
+    ///
+    /// The full E2E behavioral contract (including host-listener wiring) will be
+    /// pinned in `tests/network_baseline.rs::tcp_port_forward_inbound` (task 5.5b.5).
+    #[test]
+    fn tcp_inbound_syn_ack_completes_handshake() {
+        use std::net::TcpListener;
+
+        let guest_port: u16 = 8080;
+        let high_port: u16 = 44000;
+        let our_isn: u32 = 0x0000_1000;
+        let guest_isn: u32 = 0xDEAD_BEEF;
+
+        // Create a loopback TcpStream pair for the host_stream field.
+        // The stream is never read/written in this unit test — we only
+        // exercise the TCP state machine.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let host_stream =
+            TcpStream::connect(listener.local_addr().unwrap()).expect("connect loopback");
+        host_stream.set_nonblocking(true).ok();
+
+        let mut backend = SlirpBackend::new().expect("SlirpBackend::new");
+        backend.insert_synthetic_synsent_entry(guest_port, high_port, our_isn, host_stream);
+
+        // Confirm state is SynSent before feeding the SYN-ACK.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::SynSent),
+            "entry must start as SynSent"
+        );
+
+        // Build the guest's SYN-ACK: src=GUEST:guest_port, dst=GATEWAY:high_port,
+        // SYN+ACK, seq=guest_isn, ack=our_isn+1.
+        let syn_ack = build_guest_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            guest_port,
+            high_port,
+            guest_isn,
+            our_isn.wrapping_add(1),
+            TcpControl::Syn, // SYN flag — combined with ACK flag via ack_number=Some(...)
+            true,            // set ACK flag
+        );
+
+        backend
+            .process_guest_frame(&syn_ack)
+            .expect("process SYN-ACK");
+
+        // (a) state must be Established now.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::Established),
+            "state must be Established after SYN-ACK"
+        );
+
+        // (b) exactly one plain ACK must have been queued for injection to the guest.
+        assert_eq!(
+            backend.injected_plain_ack_count(),
+            1,
+            "exactly one plain ACK must be queued for the guest"
+        );
     }
 }
