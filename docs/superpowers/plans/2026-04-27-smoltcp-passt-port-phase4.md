@@ -80,7 +80,11 @@ branch — user instruction).
 
 ## Task structure
 
-7 tasks across two workstreams.
+10 tasks across three workstreams. The bench tasks (4.6a–4.6c) land
+**after** the migration so they exercise the unified `flow_table`,
+not the old per-protocol maps. The validation gate (4.7) compares
+the new bench numbers against Phase 3 numbers to verify no
+regression from enum dispatch.
 
 | ID | Workstream | Scope |
 |---|---|---|
@@ -90,7 +94,10 @@ branch — user instruction).
 | 4.4 | impl | Migrate UDP path to `flow_table`; drop `udp_flows` HashMap |
 | 4.5 | impl | Migrate TCP path to `flow_table`; drop `tcp_nat` HashMap |
 | 4.6 | impl | Cleanup: remove dead helpers, update doc comments |
-| 4.7 | gate | Phase 4 validation gate |
+| **4.6a** | **bench** | **`poll_with_n_mixed_flows` — n/3 TCP + n/3 UDP + n/3 ICMP entries, time `poll()`. Catches enum-dispatch regression at scale.** |
+| **4.6b** | **bench** | **`process_udp_frame` + `process_icmp_echo_request` — per-protocol hot-path parity vs the existing `process_syn`.** |
+| **4.6c** | **bench** | **`flow_table_insert_remove` — pure-compute HashMap op throughput on the unified table; Phase 4 reference for future Phase 5+ work.** |
+| 4.7 | gate | Phase 4 validation gate (incl. new benches no-regression) |
 
 ---
 
