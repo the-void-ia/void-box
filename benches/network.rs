@@ -5,9 +5,6 @@
 //!
 //! Run with: `cargo bench --bench network`
 
-// TODO(0D.5): migrate poll() → drain_to_guest() and remove this allowance.
-#![allow(deprecated)]
-
 #[cfg(target_os = "linux")]
 use divan::{counter::BytesCount, Bencher};
 #[cfg(target_os = "linux")]
@@ -130,8 +127,10 @@ mod linux_benches {
     #[divan::bench]
     fn poll_idle(bencher: Bencher) {
         let mut stack = SlirpBackend::new().unwrap();
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
         bencher.bench_local(|| {
-            let _ = divan::black_box(&mut stack).poll();
+            out.clear();
+            divan::black_box(&mut stack).drain_to_guest(&mut out);
         });
     }
 
@@ -180,8 +179,10 @@ mod linux_benches {
             let frame = build_syn(49152u16.wrapping_add(i as u16), 1);
             let _ = stack.process_guest_frame(&frame);
         }
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
         bencher.bench_local(|| {
-            let _ = divan::black_box(&mut stack).poll();
+            out.clear();
+            divan::black_box(&mut stack).drain_to_guest(&mut out);
         });
     }
 
@@ -263,8 +264,10 @@ mod linux_benches {
         let mut stack = SlirpBackend::new().unwrap();
         let warm = build_dns_query_for_bench(1);
         let _ = stack.process_guest_frame(&warm);
+        let mut out: Vec<Vec<u8>> = Vec::new();
         for _ in 0..20 {
-            let _ = stack.poll();
+            out.clear();
+            stack.drain_to_guest(&mut out);
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let hit = build_dns_query_for_bench(2);
@@ -373,7 +376,7 @@ mod linux_benches {
                 let synack_frames: Vec<Vec<u8>> = {
                     let mut frames = Vec::new();
                     for _ in 0..4 {
-                        frames.extend(stack.poll());
+                        stack.drain_to_guest(&mut frames);
                     }
                     frames
                 };
@@ -414,13 +417,11 @@ mod linux_benches {
                     let _ = stack.process_guest_frame(&data_frame);
                     guest_seq = guest_seq.wrapping_add(CHUNK_BYTES as u32);
 
-                    for frame in {
-                        let mut frames = Vec::new();
-                        for _ in 0..4 {
-                            frames.extend(stack.poll());
-                        }
-                        frames
-                    } {
+                    let mut frames = Vec::new();
+                    for _ in 0..4 {
+                        stack.drain_to_guest(&mut frames);
+                    }
+                    for frame in frames {
                         if let Some((_, ack, _, _)) = parse_tcp_to_guest_frame(&frame) {
                             if ack > acked_seq {
                                 acked_seq = ack;
@@ -443,8 +444,10 @@ mod linux_benches {
                     &[],
                 );
                 let _ = stack.process_guest_frame(&fin_frame);
+                let mut fin_drain: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..40 {
-                    let _ = stack.poll();
+                    fin_drain.clear();
+                    stack.drain_to_guest(&mut fin_drain);
                     if server.is_finished() {
                         break;
                     }
@@ -637,8 +640,10 @@ mod linux_benches {
             let _ = stack.process_guest_frame(&frame);
         }
 
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
         bencher.bench_local(|| {
-            let _ = divan::black_box(&mut stack).poll();
+            out.clear();
+            divan::black_box(&mut stack).drain_to_guest(&mut out);
         });
     }
 
