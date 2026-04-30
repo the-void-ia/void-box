@@ -9,6 +9,9 @@
 //! - DNS:      10.0.2.3
 //!
 //! Architecture:
+//! - Unified flow table: All TCP/UDP/ICMP echo flows live in a single
+//!   `flow_table: HashMap<FlowKey, FlowEntry>` (Phase 4). Per-protocol
+//!   relay logic dispatches on the FlowEntry variant.
 //! - ARP: custom handler responds as gateway for all 10.0.2.x IPs
 //! - TCP: passt-style sequence-mirroring NAT (host→guest via
 //!   `recv(MSG_PEEK)` + ACK-driven consume; guest→host via direct
