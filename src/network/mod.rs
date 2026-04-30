@@ -6,6 +6,7 @@
 //! - virtio-net configuration
 //! - Network isolation and NAT
 
+pub mod nat;
 pub mod slirp;
 
 use std::ffi::CString;
