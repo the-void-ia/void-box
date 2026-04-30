@@ -67,15 +67,6 @@ mod linux_main {
     /// Timeout for the host-side channel receive on RR/CRR measurements.
     const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
 
-    /// Number of ICMP echo samples collected per iteration.
-    const ICMP_SAMPLES_PER_ITER: u32 = 30;
-
-    /// Inter-ping interval in seconds passed to busybox `ping -i`.
-    const ICMP_PING_INTERVAL: &str = "0.05";
-
-    /// Target address for ICMP echo requests.
-    const ICMP_PING_TARGET: &str = "8.8.8.8";
-
     #[derive(Parser, Debug)]
     #[command(
         version,
@@ -272,6 +263,7 @@ FAST SMOKE RUN\n\
                             stderr = output.stderr_str(),
                             "g2h iteration non-zero exit; skipping"
                         );
+                        continue;
                     }
                 }
             }
@@ -397,6 +389,7 @@ FAST SMOKE RUN\n\
                             "bulk-g2h iteration non-zero exit; the connection may have \
                              been reset (pre-Phase-3 cliff regression?). skipping"
                         );
+                        continue;
                     }
                 }
             }
@@ -704,77 +697,24 @@ FAST SMOKE RUN\n\
         Ok(None)
     }
 
-    /// Measure ICMP echo (ping) round-trip latency via busybox `ping`.
+    /// Measure ICMP echo round-trip latency.
     ///
-    /// Runs `ping -c <count> -W 1 -i <interval> <target>` inside the guest and
-    /// parses the `time=<ms> ms` fields from each reply line.  Samples are
-    /// converted to microseconds and the p50 is returned.
-    ///
-    /// Returns `None` if `ping` exits non-zero, if the network is unreachable, or
-    /// if no `time=` lines were successfully parsed — in which case a `WARN` is
-    /// emitted and the metric is left as `None` in the report.
+    /// Currently a stub that returns `None`: the guest images intentionally
+    /// omit `/bin/ping` (busybox-static on Fedora lacks
+    /// `CONFIG_FEATURE_PING_TYPE_DGRAM`, and SOCK_RAW would require root in
+    /// the guest). A proper measurement path needs either a guest-agent RPC
+    /// or a custom static ICMP binary in the test image — tracked as a
+    /// follow-up.
     async fn measure_icmp_rr_latency(
-        sandbox: &Sandbox,
-        iterations: u32,
+        _sandbox: &Sandbox,
+        _iterations: u32,
     ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
-        let count = iterations * ICMP_SAMPLES_PER_ITER;
-        let guest_cmd = format!(
-            "ping -c {count} -W 1 -i {interval} {target}",
-            interval = ICMP_PING_INTERVAL,
-            target = ICMP_PING_TARGET,
+        tracing::warn!(
+            "icmp_rr_latency: guest-side ping unavailable (no /bin/ping symlink, \
+             busybox-static lacks CONFIG_FEATURE_PING_TYPE_DGRAM); reporting null. \
+             A host-driven ICMP measurement path is tracked as a follow-up."
         );
-
-        let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
-
-        let output = match exec_result {
-            Err(exec_err) => {
-                tracing::warn!(error = %exec_err, "icmp ping exec error; skipping");
-                return Ok(None);
-            }
-            Ok(output) => output,
-        };
-
-        if !output.success() {
-            tracing::warn!(
-                exit_code = ?output.exit_code,
-                stderr = output.stderr_str(),
-                "icmp ping non-zero exit (unreachable or restricted); skipping"
-            );
-            return Ok(None);
-        }
-
-        let stdout = output.stdout_str();
-        tracing::debug!(stdout = stdout, "icmp ping output");
-
-        let mut samples_us: Vec<u64> = Vec::new();
-        for line in stdout.lines() {
-            let Some(time_offset) = line.find(" time=") else {
-                continue;
-            };
-            let rest = &line[time_offset + 6..];
-            let Some(space_offset) = rest.find(' ') else {
-                continue;
-            };
-            let Ok(ms) = rest[..space_offset].parse::<f64>() else {
-                continue;
-            };
-            samples_us.push((ms * 1000.0) as u64);
-        }
-
-        if samples_us.is_empty() {
-            tracing::warn!("icmp: no time= lines parsed; leaving metric None");
-            return Ok(None);
-        }
-
-        samples_us.sort_unstable();
-        let median_index = samples_us.len() / 2;
-        let p50_us = samples_us[median_index] as f64;
-        eprintln!(
-            "icmp: {} samples, p50={} µs",
-            samples_us.len(),
-            p50_us as u64
-        );
-        Ok(Some(p50_us))
+        Ok(None)
     }
 
     /// Host-side echo server for CRR latency.
