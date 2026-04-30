@@ -612,4 +612,47 @@ mod linux_benches {
             let _ = divan::black_box(&mut stack).poll();
         });
     }
+
+    /// Insert + remove `n` flow-table entries using synthetic data.
+    ///
+    /// Pure-compute baseline for the unified `HashMap<FlowKey, FlowEntry>`
+    /// in Phase 4. Phase 5+ reference number for hasher experiments
+    /// (foldhash, ahash, SipHash) or container-shape changes (e.g.
+    /// hashbrown raw API). Uses synthetic `u32` values instead of real
+    /// `TcpNatEntry` (which requires TcpStream) to isolate HashMap
+    /// mechanics from socket cloning overhead — the real cost is
+    /// HashMap insert/remove, not socket ops.
+    ///
+    /// Pre-builds N unique keys with different `guest_src_port` values
+    /// (maintaining the same semantic as real flows), then times one
+    /// iteration of insert all + remove all.
+    #[divan::bench(args = [10, 100, 1000])]
+    fn flow_table_insert_remove(bencher: Bencher, n: usize) {
+        use std::collections::HashMap;
+
+        // Build keys outside the timed loop.
+        // Each key has a unique guest_src_port to simulate distinct flows.
+        let keys: Vec<_> = (0..n)
+            .map(|i| {
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+                    10,
+                    0,
+                    2,
+                    2 + (i % 254) as u8,
+                ))
+            })
+            .collect();
+
+        bencher.bench_local(|| {
+            let mut table: HashMap<usize, u32> = HashMap::with_capacity(n);
+            // Insert phase
+            for (i, _key) in keys.iter().enumerate() {
+                table.insert(i, i as u32);
+            }
+            // Remove phase
+            for i in 0..n {
+                divan::black_box(table.remove(&i));
+            }
+        });
+    }
 } // mod linux_benches
