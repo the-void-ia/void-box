@@ -168,12 +168,13 @@ fn parse_tcp_to_guest(frame: &[u8]) -> Option<(u32, u32, TcpControl, usize)> {
     ))
 }
 
-/// Drains frames the stack wants to send to the guest, calling `poll`
-/// up to `n` times.
+/// Drains frames the stack wants to send to the guest, calling
+/// `drain_to_guest` up to `n` times.  Returns all frames produced
+/// across the calls (caller may not care about per-call boundaries).
 fn drain_n(stack: &mut SlirpBackend, n: usize) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for _ in 0..n {
-        out.extend(stack.poll());
+        stack.drain_to_guest(&mut out);
     }
     out
 }
@@ -385,7 +386,11 @@ fn tcp_writes_more_than_256kb_succeed() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
     while bytes_received.load(Ordering::Relaxed) < TOTAL && std::time::Instant::now() < deadline {
-        // Send a chunk; advance our seq.
+        // Retransmit semantics: only advance the send cursor once the
+        // previous chunk has been ACK'd. If the stack stops ACKing
+        // (Phase 3 backpressure), we re-send the same seq/payload until
+        // it's acknowledged. This matches the comment above and the
+        // production guest-TCP behavior we're emulating.
         let _ = stack.process_guest_frame(&build_tcp_frame(
             SLIRP_GATEWAY_IP,
             GUEST_EPHEMERAL_PORT,
@@ -395,7 +400,6 @@ fn tcp_writes_more_than_256kb_succeed() {
             TcpControl::Psh,
             &chunk,
         ));
-        seq = seq.wrapping_add(CHUNK as u32);
 
         // Drain frames; track the highest ACK we've seen and watch
         // for RST/FIN that would indicate a Phase-2 era close.
@@ -414,9 +418,14 @@ fn tcp_writes_more_than_256kb_succeed() {
             break;
         }
 
-        // If we've out-paced the kernel's recv buffer, sleep briefly
-        // so the server thread can drain it.
-        if seq.wrapping_sub(acked_seq) > 256 * 1024 {
+        // Advance our send cursor only past ACK'd data.  If the stack
+        // didn't ACK this chunk, the next loop iteration re-sends the
+        // same seq/payload (true TCP retransmit semantics).
+        if acked_seq >= seq.wrapping_add(CHUNK as u32) {
+            seq = seq.wrapping_add(CHUNK as u32);
+        } else if seq.wrapping_sub(acked_seq) > 256 * 1024 {
+            // Out-paced kernel recv buffer; sleep briefly so the host
+            // server thread can drain.
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
