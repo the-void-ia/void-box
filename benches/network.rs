@@ -93,6 +93,37 @@ mod linux_benches {
         });
     }
 
+    /// Time `SlirpBackend::process_guest_frame` for a single UDP datagram.
+    ///
+    /// Mirrors `process_syn` shape: build the frame once outside the timed
+    /// loop, fresh stack per iteration. Establishes UDP per-frame cost
+    /// for cross-phase regression detection.
+    #[divan::bench]
+    fn process_udp_frame(bencher: Bencher) {
+        let frame = build_udp_frame_for_bench(49152, 8080, b"x");
+        bencher.bench_local(|| {
+            let mut stack = SlirpBackend::new().unwrap();
+            let _ = stack.process_guest_frame(divan::black_box(&frame));
+        });
+    }
+
+    /// Time `SlirpBackend::process_guest_frame` for a single ICMP echo
+    /// request. Note: a fresh stack means the unprivileged ICMP socket is
+    /// opened on every iteration, so this measures the full
+    /// `open_icmp_socket + insert + send_to` path. If the host's
+    /// `net.ipv4.ping_group_range` excludes the calling GID, the underlying
+    /// `socket()` call returns EACCES and `process_guest_frame` returns Ok
+    /// without touching `flow_table` — divan's measurement still completes
+    /// but `flow_table` stays empty. That's fine for regression detection.
+    #[divan::bench]
+    fn process_icmp_echo_request(bencher: Bencher) {
+        let frame = build_icmp_echo_for_bench(0xbeef, 1);
+        bencher.bench_local(|| {
+            let mut stack = SlirpBackend::new().unwrap();
+            let _ = stack.process_guest_frame(divan::black_box(&frame));
+        });
+    }
+
     #[divan::bench]
     fn poll_idle(bencher: Bencher) {
         let mut stack = SlirpBackend::new().unwrap();
