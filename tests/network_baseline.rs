@@ -1021,6 +1021,185 @@ fn nat_translate_outbound_unmodified_external_ip() {
     );
 }
 
+/// E2E contract for Phase 5.5b inbound port-forwarding.
+///
+/// Builds a `SlirpBackend` with one TCP port-forward rule
+/// (`HOST_PORT` → `GUEST_PORT`), has a host thread connect to
+/// `127.0.0.1:HOST_PORT`, then drives `drain_to_guest` and
+/// synthesizes a guest TCP listener by responding with SYN-ACK to
+/// the synthesized SYN the stack emits.
+///
+/// The test asserts **three** contract points, each covering a distinct
+/// 5.5b sub-task:
+///
+/// 1. `host TcpStream::connect` **succeeds** — the listener thread
+///    (5.5b.3) is bound and accepts incoming connections.
+/// 2. `drain_to_guest` **emits a synthesized SYN** to `GUEST_PORT` —
+///    `process_pending_inbound_accepts` (5.5b.3) dequeues the
+///    `InboundAccept` and `synthesize_inbound_syn` (5.5b.2) emits the
+///    SYN frame; `with_security` (5.5b.4) wired the channel.
+/// 3. After the synthetic guest replies with SYN-ACK, `drain_to_guest`
+///    **emits an ACK frame** — the `SynSent → Established` arm (5.5b.1)
+///    fired and the handshake completed end-to-end.
+///
+/// Byte-level round-trip is deferred — connect + full 3WH completion
+/// is the minimum contract for the listener implementation.
+#[test]
+fn tcp_port_forward_inbound_connect_succeeds() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const HOST_PORT: u16 = 18080;
+    const GUEST_PORT: u16 = 8080;
+    const GUEST_ISN: u32 = 5000;
+
+    let mut stack = SlirpBackend::with_security(64, 1000, &[], &[(HOST_PORT, GUEST_PORT)])
+        .expect("build stack with port-forward rule");
+
+    // ── Contract 1: listener thread is bound and accepts connections ─────
+    // Spawn the host connector in a background thread so it doesn't block
+    // the test thread. The OS-level SYN/SYN-ACK/ACK between host connector
+    // and the listener socket is handled by the kernel; the SLIRP stack
+    // is not involved in that handshake.
+    let (tx, rx) = mpsc::channel::<std::io::Result<std::net::TcpStream>>();
+    std::thread::spawn(move || {
+        let result = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{HOST_PORT}").parse().unwrap(),
+            Duration::from_secs(5),
+        );
+        let _ = tx.send(result);
+    });
+
+    // ── Contract 2 + 3: drain until we see the synthesized SYN (2) and ──
+    // then the ACK that completes the inbound 3WH (3).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_synthesized_syn = false;
+    let mut saw_ack_after_synack = false;
+    let mut connect_result: Option<std::io::Result<std::net::TcpStream>> = None;
+
+    while Instant::now() < deadline
+        && (!saw_synthesized_syn || !saw_ack_after_synack || connect_result.is_none())
+    {
+        let mut out = Vec::new();
+        stack.drain_to_guest(&mut out);
+
+        let mut high_port_for_ack: Option<u16> = None;
+
+        for frame in &out {
+            let Some((syn_seq, _ack, src_port, dst_port, ctrl)) = parse_tcp_to_guest_full(frame)
+            else {
+                continue;
+            };
+
+            // Contract 2: synthesized SYN arriving at the guest.
+            if ctrl == TcpControl::Syn && dst_port == GUEST_PORT && !saw_synthesized_syn {
+                saw_synthesized_syn = true;
+                high_port_for_ack = Some(src_port);
+
+                // Synthetic guest listener replies with SYN-ACK.
+                // build_tcp_frame: src=SLIRP_GUEST_IP, dst=SLIRP_GATEWAY_IP
+                let syn_ack = build_tcp_frame(
+                    SLIRP_GATEWAY_IP, // dst from guest's perspective
+                    GUEST_PORT,       // guest service port (src_port in frame)
+                    src_port,         // high_port (dst_port in frame)
+                    GUEST_ISN,        // guest's own ISN
+                    syn_seq + 1,      // ack = their SYN seq + 1
+                    TcpControl::Syn,  // SYN+ACK: ack_number is non-zero
+                    &[],
+                );
+                stack
+                    .process_guest_frame(&syn_ack)
+                    .expect("process synthetic SYN-ACK");
+            }
+
+            // Contract 3: ACK back to the guest completing the inbound 3WH.
+            // After processing our SYN-ACK, the stack emits a plain ACK
+            // (ctrl=None, ack set) directed at GUEST_PORT.
+            if ctrl == TcpControl::None
+                && dst_port == GUEST_PORT
+                && high_port_for_ack == Some(src_port)
+            {
+                saw_ack_after_synack = true;
+            }
+        }
+
+        // A second drain pass so the stack processes the SYN-ACK we just
+        // injected and emits its ACK in the same iteration.
+        let mut ack_out = Vec::new();
+        stack.drain_to_guest(&mut ack_out);
+        for frame in &ack_out {
+            let Some((_seq, _ack, src_port, dst_port, ctrl)) = parse_tcp_to_guest_full(frame)
+            else {
+                continue;
+            };
+            if ctrl == TcpControl::None
+                && dst_port == GUEST_PORT
+                && high_port_for_ack == Some(src_port)
+            {
+                saw_ack_after_synack = true;
+            }
+        }
+
+        if let Ok(r) = rx.try_recv() {
+            connect_result = Some(r);
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Contract 1.
+    let connect_result =
+        connect_result.expect("host TcpStream::connect did not complete within 5 s");
+    let _stream = connect_result.expect("host TcpStream::connect failed");
+
+    // Contract 2.
+    assert!(
+        saw_synthesized_syn,
+        "drain_to_guest must emit a synthesized SYN to GUEST_PORT \
+         after drain_to_guest processes the InboundAccept (5.5b.2/5.5b.3)"
+    );
+
+    // Contract 3.
+    assert!(
+        saw_ack_after_synack,
+        "drain_to_guest must emit an ACK completing the inbound 3-way handshake \
+         after the synthetic guest SYN-ACK is processed (5.5b.1)"
+    );
+}
+
+/// Richer TCP-to-guest frame parser that also returns src/dst ports.
+///
+/// Returns `(seq, ack, src_port, dst_port, control)` for any IPv4/TCP
+/// frame whose destination is `SLIRP_GUEST_IP`, or `None` for anything
+/// else.  Used by `tcp_port_forward_inbound_connect_succeeds` to identify
+/// the synthesized SYN and extract the ephemeral `high_port`.
+fn parse_tcp_to_guest_full(frame: &[u8]) -> Option<(u32, u32, u16, u16, TcpControl)> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Tcp || ip.dst_addr() != SLIRP_GUEST_IP {
+        return None;
+    }
+    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+    let control = match (tcp.syn(), tcp.fin(), tcp.rst(), tcp.psh()) {
+        (false, false, false, false) => TcpControl::None,
+        (false, false, false, true) => TcpControl::Psh,
+        (true, false, false, _) => TcpControl::Syn,
+        (false, true, false, _) => TcpControl::Fin,
+        (false, false, true, _) => TcpControl::Rst,
+        _ => return None,
+    };
+    Some((
+        tcp.seq_number().0 as u32,
+        tcp.ack_number().0 as u32,
+        tcp.src_port(),
+        tcp.dst_port(),
+        control,
+    ))
+}
+
 #[test]
 fn nat_translate_outbound_deny_list() {
     let rules = Rules {
