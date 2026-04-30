@@ -6,6 +6,7 @@
 //! - virtio-net configuration
 //! - Network isolation and NAT
 
+pub(crate) mod epoll_dispatch;
 pub mod nat;
 pub mod slirp;
 
