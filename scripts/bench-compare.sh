@@ -244,20 +244,41 @@ parse_divan() {
 if [[ "$SKIP_DIVAN" -eq 0 ]]; then
   info "--- divan harness ---"
 
+  # Run divan bench in $1 (cwd), writing TSV-parseable stdout to $2.
+  # $3 is a human-readable label used in log lines.
+  # Tries --features bench-helpers first; falls back to no features if the
+  # feature isn't recognized at that ref.
+  run_divan_at() {
+    local cwd="$1"
+    local out="$2"
+    local label="$3"
+    local err
+    err="$(mktemp)"
+    if (cd "$cwd" && cargo bench --bench network --features bench-helpers >"$out" 2>"$err"); then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE 'does not have feature|does not contain this feature|unknown feature' "$err"; then
+      info "  ${label} lacks bench-helpers feature, retrying without"
+      rm -f "$err"
+      if (cd "$cwd" && cargo bench --bench network >"$out" 2>/dev/null); then
+        return 0
+      fi
+    fi
+    rm -f "$err"
+    return 1
+  }
+
   DIVAN_TMP_BASELINE="$(mktemp)"
   DIVAN_TMP_HEAD="$(mktemp)"
 
   info "Running divan benches on baseline (${BASELINE_SHORT}) ..."
   # cargo's build progress goes to stderr; bench table goes to stdout.
-  (cd "$WORKTREE_DIR" && \
-    cargo bench --bench network --features bench-helpers 2>/dev/null) \
-    > "$DIVAN_TMP_BASELINE" \
+  run_divan_at "$WORKTREE_DIR" "$DIVAN_TMP_BASELINE" "baseline" \
     || info "WARN: divan baseline bench failed; divan section will be incomplete"
 
   info "Running divan benches on HEAD (${HEAD_SHORT}) ..."
-  (cd "$REPO_ROOT" && \
-    cargo bench --bench network --features bench-helpers 2>/dev/null) \
-    > "$DIVAN_TMP_HEAD" \
+  run_divan_at "$REPO_ROOT" "$DIVAN_TMP_HEAD" "HEAD" \
     || info "WARN: divan HEAD bench failed; divan section will be incomplete"
 
   DIVAN_BASELINE_TSV="$(parse_divan "$DIVAN_TMP_BASELINE")"
