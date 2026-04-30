@@ -429,15 +429,7 @@ pub struct SlirpBackend {
     max_connections_per_second: u32,
     /// Sliding window of recent connection timestamps for rate limiting
     connection_timestamps: VecDeque<Instant>,
-    /// Network deny list (CIDR ranges that the guest cannot reach).
-    /// Kept until task 5.4 migrates the UDP relay to `nat::translate_outbound`
-    /// and drops this field.
-    #[allow(dead_code)]
-    deny_list: Vec<Ipv4Net>,
-    /// Stateless outbound translation rules. Phase 5 staging — populated
-    /// alongside the existing `deny_list` field; task 5.4 migrates the UDP
-    /// relay to consume `nat::translate_outbound(&self.nat, ...)` and drops
-    /// the redundant `deny_list` field.
+    /// Stateless outbound translation rules (deny-list, gateway loopback, port forwards).
     nat: nat::Rules,
     /// Host DNS servers (parsed from /etc/resolv.conf, fallback to public)
     dns_servers: Vec<String>,
@@ -486,8 +478,7 @@ impl SlirpBackend {
 
         let sockets = SocketSet::new(vec![]);
 
-        // Parse deny list CIDRs
-        let deny_list: Vec<Ipv4Net> = deny_list_cidrs
+        let deny_cidrs: Vec<Ipv4Net> = deny_list_cidrs
             .iter()
             .filter_map(|cidr| {
                 cidr.parse::<Ipv4Net>()
@@ -501,14 +492,14 @@ impl SlirpBackend {
 
         let nat = nat::Rules {
             gateway_loopback: true,
-            deny_cidrs: deny_list.clone(),
+            deny_cidrs,
             port_forwards: Vec::new(),
         };
 
         let dns_servers = parse_resolv_conf();
         debug!(
             "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, dns_servers: {:?}",
-            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, deny_list.len(), dns_servers
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, nat.deny_cidrs.len(), dns_servers
         );
 
         Ok(Self {
@@ -520,7 +511,6 @@ impl SlirpBackend {
             max_concurrent_connections,
             max_connections_per_second,
             connection_timestamps: VecDeque::new(),
-            deny_list,
             nat,
             dns_servers,
             dns_cache: HashMap::new(),
@@ -930,13 +920,19 @@ impl SlirpBackend {
             dst_port: udp.dst_port(),
         };
 
-        // SLIRP gateway translation: 10.0.2.2 → 127.0.0.1 (matches TCP path).
-        let dst_ip_for_socket = if key.dst_ip == SLIRP_GATEWAY_IP {
-            std::net::Ipv4Addr::LOCALHOST
-        } else {
-            std::net::Ipv4Addr::from(key.dst_ip.0)
-        };
-        let dst = std::net::SocketAddr::from((dst_ip_for_socket, key.dst_port));
+        let dst =
+            match nat::translate_outbound(&self.nat, key.dst_ip, key.dst_port, SLIRP_GATEWAY_IP) {
+                Some(addr) => addr,
+                None => {
+                    trace!(
+                        "SLIRP UDP: deny-list reject dst={}:{} from guest_port={}",
+                        key.dst_ip,
+                        key.dst_port,
+                        key.guest_src_port
+                    );
+                    return Ok(());
+                }
+            };
 
         let flow_key = FlowKey::Udp(key);
         let entry: &mut UdpFlowEntry = match self.flow_table.entry(flow_key) {
