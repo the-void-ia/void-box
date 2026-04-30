@@ -442,6 +442,14 @@ pub struct SlirpBackend {
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
     /// DNS queries waiting to be resolved on the net-poll thread.
     pending_dns: Vec<PendingDnsQuery>,
+    /// Unified flow table — Phase 4 staging.
+    ///
+    /// During Phase 4, populated in parallel with the per-protocol maps
+    /// (`tcp_nat`, `udp_flows`, `icmp_echo`). Tasks 4.3, 4.4, 4.5 migrate
+    /// each per-protocol code path to consume this map; Task 4.6 deletes
+    /// the per-protocol maps.
+    #[allow(dead_code)] // consumed in 4.3+
+    flow_table: HashMap<FlowKey, FlowEntry>,
 }
 
 impl SlirpBackend {
@@ -513,6 +521,7 @@ impl SlirpBackend {
             dns_servers,
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
+            flow_table: HashMap::new(),
         })
     }
 
