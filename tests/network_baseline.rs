@@ -28,8 +28,9 @@ use smoltcp::wire::{
     Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 use std::io::{Read, Write};
-use std::net::{TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::io::AsRawFd;
+use void_box::network::nat::{translate_outbound, Rules};
 use void_box::network::slirp::{
     SlirpBackend, GATEWAY_MAC, GUEST_MAC, SLIRP_DNS_IP, SLIRP_GATEWAY_IP, SLIRP_GUEST_IP,
 };
@@ -987,4 +988,56 @@ fn slirp_backend_implements_network_backend() {
     fn assert_backend<T: NetworkBackend>() {}
     assert_send::<SlirpBackend>();
     assert_backend::<SlirpBackend>();
+}
+
+#[test]
+fn nat_translate_outbound_loopback_rewrite() {
+    let rules = Rules {
+        gateway_loopback: true,
+        deny_cidrs: vec![],
+        port_forwards: vec![],
+    };
+    let result = translate_outbound(&rules, SLIRP_GATEWAY_IP, 80, SLIRP_GATEWAY_IP).unwrap();
+    assert_eq!(
+        result,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+        "gateway IP must be rewritten to 127.0.0.1 when gateway_loopback=true"
+    );
+}
+
+#[test]
+fn nat_translate_outbound_unmodified_external_ip() {
+    let rules = Rules {
+        gateway_loopback: true,
+        deny_cidrs: vec![],
+        port_forwards: vec![],
+    };
+    let external = Ipv4Address::new(8, 8, 8, 8);
+    let result = translate_outbound(&rules, external, 53, SLIRP_GATEWAY_IP).unwrap();
+    assert_eq!(
+        result,
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        "non-gateway IPs must pass through unchanged"
+    );
+}
+
+#[test]
+fn nat_translate_outbound_deny_list() {
+    let rules = Rules {
+        gateway_loopback: true,
+        deny_cidrs: vec!["169.254.0.0/16".parse::<Ipv4Net>().unwrap()],
+        port_forwards: vec![],
+    };
+    let metadata = Ipv4Address::new(169, 254, 169, 254);
+    assert!(
+        translate_outbound(&rules, metadata, 80, SLIRP_GATEWAY_IP).is_none(),
+        "deny-listed IP must return None"
+    );
+
+    // Adjacent (non-denied) IP still passes.
+    let public = Ipv4Address::new(169, 253, 0, 1);
+    assert!(
+        translate_outbound(&rules, public, 80, SLIRP_GATEWAY_IP).is_some(),
+        "IPs outside deny CIDR must pass"
+    );
 }
