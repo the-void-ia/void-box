@@ -270,6 +270,32 @@ mod linux_benches {
         });
     }
 
+    /// Pure-compute bench for `nat::translate_outbound`. Phase 5 baseline
+    /// for future hasher / data-structure changes (e.g. moving deny_cidrs
+    /// from `Vec<Ipv4Net>` to a longest-prefix trie). Tens of nanoseconds
+    /// expected; microseconds would indicate an allocation in the hot path.
+    #[divan::bench]
+    fn nat_translate_outbound_hot_path(bencher: Bencher) {
+        use void_box::network::nat::{translate_outbound, Rules};
+
+        let rules = Rules {
+            gateway_loopback: true,
+            deny_cidrs: vec!["169.254.0.0/16".parse().unwrap()],
+            port_forwards: vec![],
+        };
+        let dst = SLIRP_GATEWAY_IP;
+        let gateway = SLIRP_GATEWAY_IP;
+
+        bencher.bench_local(|| {
+            divan::black_box(translate_outbound(
+                divan::black_box(&rules),
+                divan::black_box(dst),
+                divan::black_box(80),
+                divan::black_box(gateway),
+            ));
+        });
+    }
+
     /// Measures TCP bulk throughput through the SLIRP relay under backpressure.
     ///
     /// Pushes 1 MiB through the relay in 1 KiB chunks with a constrained host
