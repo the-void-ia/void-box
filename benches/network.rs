@@ -13,8 +13,8 @@ use divan::{counter::BytesCount, Bencher};
 #[cfg(target_os = "linux")]
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
-    UdpPacket, UdpRepr,
+    EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
+    TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 #[cfg(target_os = "linux")]
 use void_box::network::slirp::{
@@ -485,5 +485,100 @@ mod linux_benches {
             control,
             tcp.payload().len(),
         ))
+    }
+    fn build_udp_frame_for_bench(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp_repr = UdpRepr { src_port, dst_port };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: SLIRP_GATEWAY_IP,
+            next_header: IpProtocol::Udp,
+            payload_len: 8 + payload.len(),
+            hop_limit: 64,
+        };
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + 8 + payload.len();
+        let mut buf = vec![0u8; total];
+        let mut e = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth.emit(&mut e);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut udp = UdpPacket::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        udp_repr.emit(
+            &mut udp,
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            &IpAddress::Ipv4(SLIRP_GATEWAY_IP),
+            payload.len(),
+            |b| b.copy_from_slice(payload),
+            &Default::default(),
+        );
+        buf
+    }
+
+    fn build_icmp_echo_for_bench(ident: u16, seq_no: u16) -> Vec<u8> {
+        let icmp_repr = Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data: b"bench",
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: smoltcp::wire::Ipv4Address::new(8, 8, 8, 8),
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + icmp_repr.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut e = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth.emit(&mut e);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut icmp = Icmpv4Packet::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        icmp_repr.emit(&mut icmp, &Default::default());
+        buf
+    }
+
+    /// Open `n/3` TCP + `n/3` UDP + `n/3` ICMP-echo flows, then time `poll()`.
+    ///
+    /// Mirrors `poll_with_n_flows` (TCP-only) but exercises Phase 4's
+    /// unified `flow_table` with all three protocols populated. Catches
+    /// enum-dispatch + filter regressions at scale: each `relay_*_data`
+    /// loop now `filter(|k| matches!(k, FlowKey::Foo(_)))` over the unified
+    /// table, so per-protocol scan cost is `O(total_flows)` not
+    /// `O(this_protocol's_flows)`. This bench is the regression gate for
+    /// that change.
+    #[divan::bench(args = [3, 99, 999])]
+    fn poll_with_n_mixed_flows(bencher: Bencher, n: usize) {
+        let mut stack = SlirpBackend::new().unwrap();
+        let third = n / 3;
+
+        // n/3 TCP SYNs.
+        for i in 0..third {
+            let frame = build_syn(49152u16.wrapping_add(i as u16), 1);
+            let _ = stack.process_guest_frame(&frame);
+        }
+        // n/3 UDP datagrams (any non-DNS port; one byte payload).
+        for i in 0..third {
+            let frame = build_udp_frame_for_bench(50152u16.wrapping_add(i as u16), 8080, b"x");
+            let _ = stack.process_guest_frame(&frame);
+        }
+        // n/3 ICMP echoes (unique guest_id per flow).
+        for i in 0..third {
+            let frame = build_icmp_echo_for_bench(0x1000 + i as u16, 1);
+            let _ = stack.process_guest_frame(&frame);
+        }
+
+        bencher.bench_local(|| {
+            let _ = divan::black_box(&mut stack).poll();
+        });
     }
 } // mod linux_benches
