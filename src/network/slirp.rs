@@ -185,18 +185,20 @@ struct UdpFlowEntry {
 /// just one type the unified `flow_table` `HashMap` (added in Task 4.2)
 /// can store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // consumed in 4.2
 enum FlowKey {
+    #[allow(dead_code)] // consumed in 4.5
     Tcp(NatKey),
+    #[allow(dead_code)] // consumed in 4.4
     Udp(UdpFlowKey),
     IcmpEcho(IcmpEchoKey),
 }
 
 /// Unified flow-table value. Each variant wraps the protocol's existing
 /// entry struct.
-#[allow(dead_code)] // consumed in 4.2
 enum FlowEntry {
+    #[allow(dead_code)] // consumed in 4.5
     Tcp(TcpNatEntry),
+    #[allow(dead_code)] // consumed in 4.4
     Udp(UdpFlowEntry),
     IcmpEcho(IcmpEchoEntry),
 }
@@ -422,8 +424,6 @@ pub struct SlirpBackend {
     _device: VirtualDevice,
     /// TCP NAT table
     tcp_nat: HashMap<NatKey, TcpNatEntry>,
-    /// ICMP echo NAT table (guest id + dst → host socket).
-    icmp_echo: HashMap<IcmpEchoKey, IcmpEchoEntry>,
     /// UDP flow NAT table (guest src port + dst → connected host socket).
     udp_flows: HashMap<UdpFlowKey, UdpFlowEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
@@ -444,11 +444,9 @@ pub struct SlirpBackend {
     pending_dns: Vec<PendingDnsQuery>,
     /// Unified flow table — Phase 4 staging.
     ///
-    /// During Phase 4, populated in parallel with the per-protocol maps
-    /// (`tcp_nat`, `udp_flows`, `icmp_echo`). Tasks 4.3, 4.4, 4.5 migrate
-    /// each per-protocol code path to consume this map; Task 4.6 deletes
-    /// the per-protocol maps.
-    #[allow(dead_code)] // consumed in 4.3+
+    /// During Phase 4, per-protocol paths migrate to this map one at a time.
+    /// ICMP is migrated (Task 4.3); UDP and TCP follow in 4.4 and 4.5.
+    /// Task 4.6 drops the remaining per-protocol maps (`tcp_nat`, `udp_flows`).
     flow_table: HashMap<FlowKey, FlowEntry>,
 }
 
@@ -511,7 +509,6 @@ impl SlirpBackend {
             sockets,
             _device: device,
             tcp_nat: HashMap::new(),
-            icmp_echo: HashMap::new(),
             udp_flows: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
@@ -990,15 +987,19 @@ impl SlirpBackend {
             _ => return Ok(()), // only echo request handled today
         };
 
-        // Copy data before the mutable borrow of self.icmp_echo below.
+        // Copy data before the mutable borrow of self.flow_table below.
         let data_owned: Vec<u8> = data.to_vec();
 
         let key = IcmpEchoKey {
             guest_id: ident,
             dst_ip: ipv4.dst_addr(),
         };
-        let entry = match self.icmp_echo.entry(key) {
-            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+        let flow_key = FlowKey::IcmpEcho(key);
+        let entry: &mut IcmpEchoEntry = match self.flow_table.entry(flow_key) {
+            std::collections::hash_map::Entry::Occupied(occupied) => match occupied.into_mut() {
+                FlowEntry::IcmpEcho(e) => e,
+                _ => unreachable!("FlowKey::IcmpEcho must map to FlowEntry::IcmpEcho"),
+            },
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 let sock = match open_icmp_socket() {
                     Ok(s) => s,
@@ -1008,11 +1009,14 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
-                vacant.insert(IcmpEchoEntry {
+                match vacant.insert(FlowEntry::IcmpEcho(IcmpEchoEntry {
                     sock,
                     guest_id: ident,
                     last_activity: Instant::now(),
-                })
+                })) {
+                    FlowEntry::IcmpEcho(e) => e,
+                    _ => unreachable!(),
+                }
             }
         };
         entry.last_activity = Instant::now();
@@ -1457,10 +1461,18 @@ impl SlirpBackend {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
-        let keys: Vec<IcmpEchoKey> = self.icmp_echo.keys().copied().collect();
-        for key in keys {
+        let flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::IcmpEcho(_)))
+            .collect();
+        for flow_key in flow_keys {
+            let FlowKey::IcmpEcho(key) = flow_key else {
+                continue;
+            };
             let frame = {
-                let Some(entry) = self.icmp_echo.get_mut(&key) else {
+                let Some(FlowEntry::IcmpEcho(entry)) = self.flow_table.get_mut(&flow_key) else {
                     continue;
                 };
                 if now.duration_since(entry.last_activity) > ICMP_IDLE_TIMEOUT {
@@ -1486,7 +1498,7 @@ impl SlirpBackend {
             match frame {
                 None => {
                     // Idle timeout — evict entry.
-                    self.icmp_echo.remove(&key);
+                    self.flow_table.remove(&FlowKey::IcmpEcho(key));
                 }
                 Some(Some(frame_bytes)) => self.inject_to_guest.push(frame_bytes),
                 Some(None) => {} // build failed; drop silently
