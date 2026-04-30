@@ -1872,6 +1872,34 @@ fn build_tcp_packet_static(
     buf
 }
 
+/// Build a synthetic TCP SYN frame from the SLIRP gateway to the guest,
+/// used for inbound port-forwarding (Phase 5.5b).
+///
+/// The frame mirrors what the guest would see from a real TCP client:
+/// - src: `SLIRP_GATEWAY_IP:high_port`
+/// - dst: `SLIRP_GUEST_IP:guest_port`
+/// - control: `TcpControl::Syn`
+/// - seq: caller-supplied `our_seq` (the host's chosen ISN for this flow)
+/// - ack: 0 (no piggybacked ACK on the initial SYN)
+///
+/// Caller pushes the returned bytes into `inject_to_guest`. The guest's
+/// kernel sees an inbound TCP SYN, routes it to whatever's bound at
+/// `guest_port`, and emits a SYN-ACK that `handle_tcp_frame` matches
+/// to the seeded `SynSent` flow_table entry (5.5b.1).
+#[allow(dead_code)] // consumed in 5.5b.3
+fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
+    build_tcp_packet_static(
+        SLIRP_GATEWAY_IP,
+        SLIRP_GUEST_IP,
+        high_port,
+        guest_port,
+        our_seq,
+        0,
+        TcpControl::Syn,
+        &[],
+    )
+}
+
 // ── Utility functions ────────────────────────────────────────────────
 
 fn rand_seq() -> u32 {
