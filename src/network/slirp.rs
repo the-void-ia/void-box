@@ -1912,13 +1912,14 @@ impl Default for SlirpBackend {
 
 /// Test-only helpers — not compiled into production builds.
 ///
-/// These are `#[cfg(test)]` methods on `SlirpBackend` that allow unit tests to
-/// insert synthetic flow entries without widening the visibility of private types.
+/// These are `#[cfg(test)]`/`#[cfg(feature = "bench-helpers")]` methods on
+/// `SlirpBackend` that allow unit tests and divan benches to insert synthetic
+/// flow entries without widening the visibility of private types.
 /// The full behavioral contract for the SynSent → Established transition is
 /// pinned in the E2E test `tcp_inbound_syn_ack_completes_handshake` below and
 /// will be further exercised end-to-end in task 5.5b.5
 /// (`tcp_port_forward_inbound` in `tests/network_baseline.rs`).
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-helpers"))]
 impl SlirpBackend {
     /// Insert a synthetic `SynSent` entry into the flow table.
     ///
@@ -1929,7 +1930,7 @@ impl SlirpBackend {
     /// `high_port`:  the ephemeral source port we used for the synthesized SYN.
     /// `our_isn`:    the ISN we put in the synthesized SYN.
     /// `host_stream`: a `TcpStream` representing the accepted host-side connection.
-    pub(crate) fn insert_synthetic_synsent_entry(
+    pub fn insert_synthetic_synsent_entry(
         &mut self,
         guest_port: u16,
         high_port: u16,
@@ -1955,6 +1956,7 @@ impl SlirpBackend {
 
     /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,
     /// or `None` if no such entry exists in the flow table.
+    #[allow(dead_code)]
     pub(crate) fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
         let key = NatKey {
             guest_src_port: guest_port,
@@ -1971,6 +1973,7 @@ impl SlirpBackend {
     ///
     /// Checks `inject_to_guest` for Ethernet/IPv4/TCP frames where the TCP
     /// `ack` flag is set and the `syn` flag is clear (i.e. a plain ACK).
+    #[allow(dead_code)]
     pub(crate) fn injected_plain_ack_count(&self) -> usize {
         self.inject_to_guest
             .iter()

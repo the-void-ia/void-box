@@ -681,4 +681,97 @@ mod linux_benches {
             }
         });
     }
+    /// Build a SYN-ACK Ethernet frame from the guest toward the gateway.
+    ///
+    /// src = GUEST_IP:guest_port, dst = GATEWAY_IP:high_port
+    /// control = Syn, ack_number = Some(our_seq + 1) → produces SYN+ACK on wire.
+    #[cfg(feature = "bench-helpers")]
+    fn build_inbound_syn_ack_frame(
+        guest_port: u16,
+        high_port: u16,
+        our_seq: u32,
+        guest_seq: u32,
+    ) -> Vec<u8> {
+        use smoltcp::wire::TcpSeqNumber;
+
+        let tcp_repr = TcpRepr {
+            src_port: guest_port,
+            dst_port: high_port,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(guest_seq as i32),
+            ack_number: Some(TcpSeqNumber(our_seq.wrapping_add(1) as i32)),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            payload: &[],
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: SLIRP_GATEWAY_IP,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + tcp_repr.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut tcp = TcpPacket::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        tcp_repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            &IpAddress::Ipv4(SLIRP_GATEWAY_IP),
+            &Default::default(),
+        );
+        buf
+    }
+
+    /// Seed a `SynSent` entry into `stack`'s flow table.
+    ///
+    /// Replicates `SlirpBackend::insert_synthetic_synsent_entry` inline.
+    /// Requires the `bench-helpers` feature (compile with
+    /// `cargo bench --features bench-helpers`).
+    #[cfg(feature = "bench-helpers")]
+    fn seed_synsent_entry(stack: &mut SlirpBackend, guest_port: u16, high_port: u16, our_seq: u32) {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let host_stream =
+            TcpStream::connect(listener.local_addr().unwrap()).expect("connect loopback");
+        host_stream.set_nonblocking(true).ok();
+        stack.insert_synthetic_synsent_entry(guest_port, high_port, our_seq, host_stream);
+    }
+
+    /// Microbench for the inbound SYN-ACK state-machine transition added in
+    /// 5.5b.1 (`TcpNatState::SynSent` → `Established`). Each iteration
+    /// (re)builds a `SlirpBackend`, seeds one `SynSent` entry, feeds a
+    /// synthetic guest SYN-ACK frame to `process_guest_frame`, and lets
+    /// the bench timer capture the `process_guest_frame` cost.
+    ///
+    /// Expected magnitude: tens of µs (same order as `process_syn`, which
+    /// also rebuilds a fresh stack per iteration).
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench]
+    fn tcp_inbound_syn_ack_transition(bencher: Bencher) {
+        const GUEST_PORT: u16 = 8080;
+        const HIGH_PORT: u16 = 49152;
+        const OUR_SEQ: u32 = 1000;
+        const GUEST_SEQ: u32 = 42;
+
+        let frame = build_inbound_syn_ack_frame(GUEST_PORT, HIGH_PORT, OUR_SEQ, GUEST_SEQ);
+
+        bencher.bench_local(|| {
+            let mut stack = SlirpBackend::new().unwrap();
+            seed_synsent_entry(&mut stack, GUEST_PORT, HIGH_PORT, OUR_SEQ);
+            let _ = divan::black_box(&mut stack).process_guest_frame(divan::black_box(&frame));
+        });
+    }
 } // mod linux_benches

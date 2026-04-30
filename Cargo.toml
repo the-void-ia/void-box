@@ -120,6 +120,9 @@ divan = "0.1"
 default = []
 # Enable full OpenTelemetry integration (OTLP export, trace context propagation)
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# Expose internal SlirpBackend helpers (insert_synthetic_synsent_entry, etc.)
+# for use in benches/. Never enable in production builds.
+bench-helpers = []
 
 [[bin]]
 name = "voidbox"
