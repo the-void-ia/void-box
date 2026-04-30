@@ -17,6 +17,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Opaque per-FD identifier the caller uses to look up which flow a
@@ -31,9 +32,15 @@ pub struct EpollEvent {
     pub writable: bool,
 }
 
+/// Sentinel token reserved for the self-pipe wakeup mechanism.
+/// Never returned to callers.
+const SELF_PIPE_TOKEN: FlowToken = u64::MAX;
+
 #[derive(Debug)]
 pub struct EpollDispatch {
     epoll_fd: OwnedFd,
+    read_end: Option<OwnedFd>,
+    waker_handle: Option<Arc<OwnedFd>>,
 }
 
 impl EpollDispatch {
@@ -46,7 +53,11 @@ impl EpollDispatch {
             return Err(io::Error::last_os_error());
         }
         let epoll_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        Ok(Self { epoll_fd })
+        Ok(Self {
+            epoll_fd,
+            read_end: None,
+            waker_handle: None,
+        })
     }
 
     /// Register `fd` with the dispatcher.  `readable`/`writable`
@@ -146,13 +157,77 @@ impl EpollDispatch {
                 writable: (raw.events & libc::EPOLLOUT as u32) != 0,
             });
         }
-        Ok(n as usize)
+
+        // Drain self-pipe events from the returned set + the pipe itself.
+        let mut filtered: Vec<EpollEvent> = Vec::with_capacity(out.len());
+        for ev in out.drain(..) {
+            if ev.token == SELF_PIPE_TOKEN {
+                if let Some(read_end) = &self.read_end {
+                    let mut scratch = [0u8; 64];
+                    // SAFETY: non-blocking read; ignored result.
+                    unsafe {
+                        libc::read(
+                            read_end.as_raw_fd(),
+                            scratch.as_mut_ptr() as *mut _,
+                            scratch.len(),
+                        );
+                    }
+                }
+                continue;
+            }
+            filtered.push(ev);
+        }
+        *out = filtered;
+        let observable_n = out.len();
+        Ok(observable_n)
+    }
+
+    /// Returns a `Waker` that, when called, unblocks any thread
+    /// currently inside `wait_with_timeout`.
+    pub fn waker(&mut self) -> Waker {
+        if self.waker_handle.is_none() {
+            let (read_fd, write_fd) = create_pipe2_nonblock_cloexec();
+            self.register(read_fd.as_raw_fd(), SELF_PIPE_TOKEN, true, false)
+                .expect("register self-pipe");
+            self.read_end = Some(read_fd);
+            self.waker_handle = Some(Arc::new(write_fd));
+        }
+        Waker {
+            write_end: self.waker_handle.as_ref().unwrap().clone(),
+        }
     }
 
     #[cfg(test)]
     fn epoll_fd_for_test(&self) -> RawFd {
         self.epoll_fd.as_raw_fd()
     }
+}
+
+/// Cloneable wakeup handle for `EpollDispatch`.  Writing one byte to
+/// the underlying pipe wakes a thread blocked in `wait_with_timeout`.
+#[derive(Debug, Clone)]
+pub struct Waker {
+    write_end: Arc<OwnedFd>,
+}
+
+impl Waker {
+    pub fn wake(&self) {
+        let buf = [0u8; 1];
+        // SAFETY: write to a non-blocking pipe never blocks.  We
+        // ignore EAGAIN — the pipe already has bytes pending, which
+        // means a wakeup is already queued.
+        let _ = unsafe { libc::write(self.write_end.as_raw_fd(), buf.as_ptr() as *const _, 1) };
+    }
+}
+
+fn create_pipe2_nonblock_cloexec() -> (OwnedFd, OwnedFd) {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe2 with O_NONBLOCK | O_CLOEXEC writes two fds into fds.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    assert!(rc == 0, "pipe2 failed: {}", io::Error::last_os_error());
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    (read_end, write_end)
 }
 
 #[cfg(test)]
@@ -212,5 +287,31 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(events[0].token, 0xCAFE);
         assert!(events[0].readable);
+    }
+
+    #[test]
+    fn wakeup_unblocks_wait_immediately() {
+        use std::time::Instant;
+        let mut dispatch = EpollDispatch::new().expect("new");
+        let waker = dispatch.waker();
+
+        // Start the wait in another thread with a long timeout.
+        let wait_thread = std::thread::spawn(move || -> std::time::Duration {
+            let mut events: Vec<EpollEvent> = Vec::new();
+            let start = Instant::now();
+            let _ = dispatch.wait_with_timeout(&mut events, Duration::from_secs(5));
+            start.elapsed()
+        });
+
+        // Wake immediately.
+        std::thread::sleep(Duration::from_millis(10));
+        waker.wake();
+
+        let elapsed = wait_thread.join().expect("wait thread");
+        // Wait thread should return well under the 5 s timeout.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wait did not return on wakeup: {elapsed:?}"
+        );
     }
 }
