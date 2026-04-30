@@ -17,6 +17,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 /// Opaque per-FD identifier the caller uses to look up which flow a
 /// readiness event belongs to.  Encoded into `epoll_data.u64`.
@@ -100,6 +101,54 @@ impl EpollDispatch {
         Ok(())
     }
 
+    /// Block up to `timeout` for any registered FD to become ready.
+    /// Drains ready events into `out` (cleared first).  Returns the
+    /// number of events drained.
+    ///
+    /// `timeout = Duration::ZERO` is non-blocking poll;
+    /// `timeout = Duration::from_secs(...)` waits up to that long.
+    pub fn wait_with_timeout(
+        &self,
+        out: &mut Vec<EpollEvent>,
+        timeout: Duration,
+    ) -> io::Result<usize> {
+        out.clear();
+
+        // Pre-allocate a fixed-size event buffer.  64 ready FDs per
+        // wait is more than enough for our flow counts; events not
+        // returned this round will surface on the next wait.
+        let mut raw_events: [libc::epoll_event; 64] = [libc::epoll_event { events: 0, u64: 0 }; 64];
+
+        let timeout_ms: i32 = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+        // SAFETY: epoll_wait writes up to raw_events.len() entries;
+        // returns -1 on error, 0 on timeout, n>0 on events.
+        let n = unsafe {
+            libc::epoll_wait(
+                self.epoll_fd.as_raw_fd(),
+                raw_events.as_mut_ptr(),
+                raw_events.len() as i32,
+                timeout_ms,
+            )
+        };
+        if n < 0 {
+            // EINTR is non-fatal — caller can retry on next tick.
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        for raw in &raw_events[..n as usize] {
+            out.push(EpollEvent {
+                token: raw.u64,
+                readable: (raw.events & libc::EPOLLIN as u32) != 0,
+                writable: (raw.events & libc::EPOLLOUT as u32) != 0,
+            });
+        }
+        Ok(n as usize)
+    }
+
     #[cfg(test)]
     fn epoll_fd_for_test(&self) -> RawFd {
         self.epoll_fd.as_raw_fd()
@@ -136,5 +185,32 @@ mod tests {
         let mut dispatch = EpollDispatch::new().expect("EpollDispatch::new");
         let result = dispatch.register(-1, 0, true, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wait_returns_event_when_socket_becomes_readable() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"hi").unwrap();
+        });
+        let stream = TcpStream::connect(addr).expect("connect");
+        server.join().unwrap();
+
+        let mut dispatch = EpollDispatch::new().expect("new");
+        dispatch
+            .register(stream.as_raw_fd(), 0xCAFE, true, false)
+            .expect("register");
+
+        let mut events: Vec<EpollEvent> = Vec::new();
+        let n = dispatch
+            .wait_with_timeout(&mut events, Duration::from_secs(1))
+            .expect("wait");
+        assert_eq!(n, 1);
+        assert_eq!(events[0].token, 0xCAFE);
+        assert!(events[0].readable);
     }
 }
