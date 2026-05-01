@@ -36,6 +36,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::network::epoll_dispatch::{EpollDispatch, Waker};
 use crate::network::{nat, NetworkBackend};
 
 /// Cached DNS response with expiry.
@@ -488,6 +489,18 @@ pub struct SlirpBackend {
     /// so test helpers can inject [`InboundAccept`] values directly.
     #[allow(dead_code)]
     accept_sender: mpsc::Sender<InboundAccept>,
+    /// Epoll dispatcher for host socket readiness.  Task 10 will drive the
+    /// relay loop from `wait_with_timeout` events; Tasks 7-9 wire up the
+    /// registration side.  Wrapped in `Arc<Mutex<>>` so Task 11 can hand the
+    /// same instance to the net-poll thread without an additional refactor.
+    // Tasks 8-9 register/unregister flows; suppress dead_code until Task 8.
+    #[allow(dead_code)]
+    epoll: Arc<Mutex<EpollDispatch>>,
+    /// Cloneable waker that interrupts `EpollDispatch::wait_with_timeout`.
+    /// Used after flow-table mutations to unblock the poll thread immediately.
+    // Tasks 8-9 call wake() after insertions; suppress dead_code until Task 8.
+    #[allow(dead_code)]
+    epoll_waker: Waker,
 }
 
 impl SlirpBackend {
@@ -568,6 +581,10 @@ impl SlirpBackend {
         let (port_forward_listeners, pending_inbound_accepts, accept_sender) =
             spawn_port_forward_listeners(&nat, &port_forward_shutdown);
 
+        let mut epoll_inner = EpollDispatch::new()?;
+        let epoll_waker = epoll_inner.waker();
+        let epoll = Arc::new(Mutex::new(epoll_inner));
+
         Ok(Self {
             queue,
             iface,
@@ -586,6 +603,8 @@ impl SlirpBackend {
             port_forward_shutdown,
             pending_inbound_accepts,
             accept_sender,
+            epoll,
+            epoll_waker,
         })
     }
 

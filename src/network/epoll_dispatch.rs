@@ -12,9 +12,6 @@
 //! lines.  See plan 2026-04-30-smoltcp-passt-port-phase6.4.md
 //! "Architecture notes" for the rationale.
 
-// Task 7 will wire these types into SlirpBackend; allow dead_code until then.
-#![allow(dead_code)]
-
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
@@ -25,6 +22,9 @@ use std::time::Duration;
 pub type FlowToken = u64;
 
 /// One readiness event, mapped from `libc::epoll_event`.
+// Task 10 drives the relay loop from wait_with_timeout; suppress dead_code
+// until then.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct EpollEvent {
     pub token: FlowToken,
@@ -94,6 +94,8 @@ impl EpollDispatch {
         Ok(())
     }
 
+    // Tasks 8-9 call unregister on flow removal; suppress dead_code until Task 8.
+    #[allow(dead_code)]
     pub fn unregister(&mut self, fd: RawFd) -> io::Result<()> {
         // SAFETY: epoll_ctl ignores the event pointer for DEL but
         // still requires it to be non-null on older kernels.
@@ -118,6 +120,8 @@ impl EpollDispatch {
     ///
     /// `timeout = Duration::ZERO` is non-blocking poll;
     /// `timeout = Duration::from_secs(...)` waits up to that long.
+    // Task 10 drives the relay loop from this method; suppress dead_code until then.
+    #[allow(dead_code)]
     pub fn wait_with_timeout(
         &self,
         out: &mut Vec<EpollEvent>,
@@ -207,10 +211,14 @@ impl EpollDispatch {
 /// the underlying pipe wakes a thread blocked in `wait_with_timeout`.
 #[derive(Debug, Clone)]
 pub struct Waker {
+    // Tasks 8-9 call wake() after flow insertions; suppress dead_code until Task 8.
+    #[allow(dead_code)]
     write_end: Arc<OwnedFd>,
 }
 
 impl Waker {
+    // Tasks 8-9 call wake() after flow insertions; suppress dead_code until Task 8.
+    #[allow(dead_code)]
     pub fn wake(&self) {
         let buf = [0u8; 1];
         // SAFETY: write to a non-blocking pipe never blocks.  We
