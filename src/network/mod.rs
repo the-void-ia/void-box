@@ -94,6 +94,17 @@ pub trait NetworkBackend: Send {
     fn is_healthy(&self) -> bool {
         true
     }
+
+    /// Return the epoll dispatch instance shared by this backend, if any.
+    ///
+    /// Only `SlirpBackend` returns `Some`; other backends (mock, future
+    /// alternatives) return `None`.  `net_poll_thread` uses this to block on
+    /// `epoll_wait` instead of sleeping, reducing host CPU burn between
+    /// network events.
+    #[cfg(target_os = "linux")]
+    fn epoll_arc(&self) -> Option<std::sync::Arc<std::sync::Mutex<epoll_dispatch::EpollDispatch>>> {
+        None
+    }
 }
 
 /// TAP device handle

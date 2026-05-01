@@ -36,7 +36,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::network::epoll_dispatch::{EpollDispatch, Waker};
+use crate::network::epoll_dispatch::{EpollDispatch, EpollEvent, Waker};
 use crate::network::{nat, NetworkBackend};
 
 /// Cached DNS response with expiry.
@@ -772,16 +772,25 @@ impl SlirpBackend {
         // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
 
-        // 3. Process TCP NAT data relay.
-        self.relay_tcp_nat_data();
+        // 3. Poll epoll for ready host sockets (non-blocking) and relay only
+        //    those flows.  A zero-timeout poll avoids any wait here; the
+        //    caller (net_poll_thread) blocks on epoll_wait(50 ms) instead.
+        let mut ready: Vec<EpollEvent> = Vec::new();
+        {
+            let ep = self.epoll.lock().unwrap();
+            let _ = ep.wait_with_timeout(&mut ready, std::time::Duration::ZERO);
+        }
 
-        // 4. Relay ICMP echo replies from host sockets back to the guest.
-        self.relay_icmp_echo();
+        // 4. Process TCP NAT data relay.
+        self.relay_tcp_nat_data(&ready);
 
-        // 5. Relay UDP flow replies from host sockets back to the guest.
-        self.relay_udp_flows();
+        // 5. Relay ICMP echo replies from host sockets back to the guest.
+        self.relay_icmp_echo(&ready);
 
-        // 6. Collect frames: smoltcp ARP responses + our NAT-built frames.
+        // 6. Relay UDP flow replies from host sockets back to the guest.
+        self.relay_udp_flows(&ready);
+
+        // 7. Collect frames: smoltcp ARP responses + our NAT-built frames.
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
@@ -1615,17 +1624,56 @@ impl SlirpBackend {
         Ok(())
     }
 
-    /// Relay data from host TCP connections to guest
-    fn relay_tcp_nat_data(&mut self) {
+    /// Relay data from host TCP connections to guest, driven by epoll readiness.
+    ///
+    /// The cleanup sweep (Closed state and idle timeout) runs over ALL TCP
+    /// entries on every tick — checking state is cheap and must not wait for a
+    /// readiness event.  Only the data relay (peek + send) is restricted to
+    /// flows with an EPOLLIN event in `ready`.
+    fn relay_tcp_nat_data(&mut self, ready: &[EpollEvent]) {
         let mut to_remove: Vec<FlowKey> = Vec::new();
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        let tcp_flow_keys: Vec<FlowKey> = self
+        // Pass 1: sweep all TCP entries for Closed state and idle timeout.
+        // This must run unconditionally so that a guest FIN (which marks the
+        // entry Closed in handle_tcp_frame) causes the host TcpStream to be
+        // dropped promptly — the server-side read loop sees EOF as soon as the
+        // stream is dropped, not only when an epoll event arrives.
+        let all_tcp_keys: Vec<FlowKey> = self
             .flow_table
             .keys()
             .copied()
             .filter(|k| matches!(k, FlowKey::Tcp(_)))
+            .collect();
+        for flow_key in all_tcp_keys {
+            let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) else {
+                continue;
+            };
+            if entry.state == TcpNatState::Closed
+                || entry.last_activity.elapsed() > Duration::from_secs(300)
+            {
+                to_remove.push(flow_key);
+            }
+        }
+
+        // Pass 2: data relay — only for flows with an EPOLLIN readiness event.
+        // Linear scan per event is acceptable: readiness events are rare relative
+        // to flow count, and the flow table is small for typical workloads.
+        let tcp_flow_keys: Vec<FlowKey> = ready
+            .iter()
+            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
+            .filter_map(|ev| {
+                self.flow_table.keys().copied().find(|fk| {
+                    if let FlowKey::Tcp(nat_key) = fk {
+                        flow_token_for_tcp(nat_key) == ev.token
+                    } else {
+                        false
+                    }
+                })
+            })
+            // Skip entries already marked for removal.
+            .filter(|fk| !to_remove.contains(fk))
             .collect();
 
         for flow_key in tcp_flow_keys {
@@ -1636,14 +1684,6 @@ impl SlirpBackend {
                 continue;
             };
 
-            if entry.state == TcpNatState::Closed {
-                to_remove.push(flow_key);
-                continue;
-            }
-            if entry.last_activity.elapsed() > Duration::from_secs(300) {
-                to_remove.push(flow_key);
-                continue;
-            }
             if entry.state != TcpNatState::Established {
                 continue;
             }
@@ -1739,19 +1779,27 @@ impl SlirpBackend {
     }
 
     /// Drain replies from each active ICMP echo socket and emit echo-reply
-    /// frames to the guest.
+    /// frames to the guest, driven by epoll readiness.
     ///
-    /// Called on every [`drain_to_guest`] tick.  Entries idle longer than
-    /// `ICMP_IDLE_TIMEOUT` are evicted.
-    fn relay_icmp_echo(&mut self) {
+    /// Only flows whose token appears in `ready` with EPOLLIN set are visited.
+    /// Entries idle longer than `ICMP_IDLE_TIMEOUT` are still evicted on any
+    /// readiness event for that flow.
+    fn relay_icmp_echo(&mut self, ready: &[EpollEvent]) {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
-        let flow_keys: Vec<FlowKey> = self
-            .flow_table
-            .keys()
-            .copied()
-            .filter(|k| matches!(k, FlowKey::IcmpEcho(_)))
+        let flow_keys: Vec<FlowKey> = ready
+            .iter()
+            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_ICMP)
+            .filter_map(|ev| {
+                self.flow_table.keys().copied().find(|fk| {
+                    if let FlowKey::IcmpEcho(icmp_key) = fk {
+                        flow_token_for_icmp(icmp_key) == ev.token
+                    } else {
+                        false
+                    }
+                })
+            })
             .collect();
         for flow_key in flow_keys {
             let FlowKey::IcmpEcho(key) = flow_key else {
@@ -1855,17 +1903,18 @@ impl SlirpBackend {
     }
 
     /// Drain replies from each active UDP flow socket and emit UDP frames to
-    /// the guest.
+    /// the guest, driven by epoll readiness.
     ///
-    /// Called on every [`drain_to_guest`] tick.  Each connected socket is
-    /// polled non-blocking; `WouldBlock` and other errors are silently skipped
-    /// so a stale or unreachable flow never stalls the relay loop.
+    /// Only flows whose token appears in `ready` with EPOLLIN set are visited.
+    /// Idle-timeout reaping still runs every call: the reap scan is cheap
+    /// (skips flows not in `ready`) and ensures stale entries are eventually
+    /// evicted even when no new data arrives.
     ///
     /// Reply addressing mirrors the original guest datagram in reverse: the
     /// frame's IP source is the original destination (`key.dst_ip`) and UDP
     /// source port is `key.dst_port`; the destination is the guest IP and
     /// `key.guest_src_port`.
-    fn relay_udp_flows(&mut self) {
+    fn relay_udp_flows(&mut self, ready: &[EpollEvent]) {
         let now = Instant::now();
         // Reap idle flows; the per-flow connected socket is closed by Drop.
         let stale: Vec<FlowKey> = self
@@ -1893,11 +1942,18 @@ impl SlirpBackend {
             self.flow_table.remove(&k);
         }
 
-        let flow_keys: Vec<FlowKey> = self
-            .flow_table
-            .keys()
-            .copied()
-            .filter(|k| matches!(k, FlowKey::Udp(_)))
+        let flow_keys: Vec<FlowKey> = ready
+            .iter()
+            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_UDP)
+            .filter_map(|ev| {
+                self.flow_table.keys().copied().find(|fk| {
+                    if let FlowKey::Udp(udp_key) = fk {
+                        flow_token_for_udp(udp_key) == ev.token
+                    } else {
+                        false
+                    }
+                })
+            })
             .collect();
         for flow_key in flow_keys {
             let FlowKey::Udp(key) = flow_key else {
@@ -2034,6 +2090,14 @@ impl NetworkBackend for SlirpBackend {
 
     fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
         SlirpBackend::drain_to_guest(self, out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn epoll_arc(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::network::epoll_dispatch::EpollDispatch>>>
+    {
+        Some(std::sync::Arc::clone(&self.epoll))
     }
 }
 
