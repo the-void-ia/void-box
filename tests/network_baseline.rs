@@ -1240,3 +1240,49 @@ fn nat_translate_outbound_deny_list() {
         "IPs outside deny CIDR must pass"
     );
 }
+
+/// Phase 6.4 contract: snapshot/restore must rebuild the epoll dispatch from
+/// `flow_table` contents.  The `epoll_fd` is a kernel handle that does not
+/// survive snapshot; a fresh dispatcher starts with zero registered FDs even
+/// though `flow_table` may contain entries with live host sockets.
+///
+/// This smoke test verifies the rebuild path end-to-end:
+/// 1. Insert a synthetic TCP flow into the flow table.
+/// 2. Reset the epoll dispatcher to a fresh empty one (simulating what
+///    snapshot restore does: the kernel handle is gone, a new one is created).
+/// 3. Confirm the pre-rebuild count is zero.
+/// 4. Call `rebuild_epoll_from_flow_table`.
+/// 5. Confirm the post-rebuild count is one.
+#[test]
+fn epoll_set_rebuilt_from_flow_table_smoke() {
+    use std::net::TcpListener;
+
+    let mut backend = SlirpBackend::new().expect("backend");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host_stream =
+        std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    host_stream.set_nonblocking(true).ok();
+
+    // Insert a synthetic flow (may or may not register with epoll depending on
+    // cfg context).  Then reset the epoll dispatcher to a fresh empty one —
+    // this is the key step that simulates what happens after snapshot restore:
+    // the kernel-side `epoll_fd` does not survive, so a new one is created
+    // with zero registrations even though `flow_table` has live entries.
+    backend.insert_synthetic_synsent_entry(8080, 49152, 1000, host_stream);
+    backend.reset_epoll_for_snapshot_test();
+
+    let before = backend.registered_fd_count();
+    assert_eq!(
+        before, 0,
+        "after reset, epoll must have zero registered FDs (simulates post-snapshot state)"
+    );
+
+    backend.rebuild_epoll_from_flow_table();
+
+    let after = backend.registered_fd_count();
+    assert_eq!(
+        after, 1,
+        "rebuild_epoll_from_flow_table must register all live flow FDs"
+    );
+}

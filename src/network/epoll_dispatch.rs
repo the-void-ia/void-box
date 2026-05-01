@@ -41,6 +41,8 @@ pub struct EpollDispatch {
     epoll_fd: OwnedFd,
     read_end: Option<OwnedFd>,
     waker_handle: Option<Arc<OwnedFd>>,
+    /// Number of user-registered FDs (excludes the self-pipe).
+    registered_count: usize,
 }
 
 impl EpollDispatch {
@@ -57,6 +59,7 @@ impl EpollDispatch {
             epoll_fd,
             read_end: None,
             waker_handle: None,
+            registered_count: 0,
         })
     }
 
@@ -91,6 +94,10 @@ impl EpollDispatch {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Only count user-registered FDs; the self-pipe uses SELF_PIPE_TOKEN.
+        if token != SELF_PIPE_TOKEN {
+            self.registered_count += 1;
+        }
         Ok(())
     }
 
@@ -109,7 +116,14 @@ impl EpollDispatch {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
+        self.registered_count = self.registered_count.saturating_sub(1);
         Ok(())
+    }
+
+    /// Returns the number of user-registered FDs (excludes the self-pipe).
+    #[cfg(any(test, feature = "bench-helpers"))]
+    pub(crate) fn registered_fd_count(&self) -> usize {
+        self.registered_count
     }
 
     /// Block up to `timeout` for any registered FD to become ready.

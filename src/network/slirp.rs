@@ -2383,6 +2383,48 @@ impl Drop for SlirpBackend {
     }
 }
 
+impl SlirpBackend {
+    /// Re-register every live host FD in `flow_table` with the current epoll
+    /// dispatcher.  Called from snapshot restore: `epoll_fd` is a kernel
+    /// handle that does not survive snapshot, so a fresh dispatcher starts
+    /// empty even though `flow_table` deserialized correctly with new FDs.
+    ///
+    /// The current snapshot path does not reconstruct `flow_table` — the
+    /// backend always starts empty after restore and new flows form naturally.
+    /// This method is therefore a no-op today but is wired in advance so
+    /// Phase 6.1's half-close work (which will persist restored flows) has a
+    /// ready call site.
+    pub fn rebuild_epoll_from_flow_table(&mut self) {
+        use std::os::fd::AsRawFd;
+        let mut ep = self.epoll.lock().unwrap();
+        for (key, entry) in &self.flow_table {
+            match (key, entry) {
+                (FlowKey::Tcp(nat_key), FlowEntry::Tcp(e)) => {
+                    let _ = ep.register(
+                        e.host_stream.as_raw_fd(),
+                        flow_token_for_tcp(nat_key),
+                        true,
+                        false,
+                    );
+                }
+                (FlowKey::Udp(udp_key), FlowEntry::Udp(e)) => {
+                    let _ =
+                        ep.register(e.sock.as_raw_fd(), flow_token_for_udp(udp_key), true, false);
+                }
+                (FlowKey::IcmpEcho(icmp_key), FlowEntry::IcmpEcho(e)) => {
+                    let _ = ep.register(
+                        e.sock.as_raw_fd(),
+                        flow_token_for_icmp(icmp_key),
+                        true,
+                        false,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Test-only helpers — not compiled into production builds.
 ///
 /// These are `#[cfg(test)]`/`#[cfg(feature = "bench-helpers")]` methods on
@@ -2488,6 +2530,24 @@ impl SlirpBackend {
         self.accept_sender
             .send(accepted)
             .expect("accept channel must be open");
+    }
+
+    /// Returns the number of user-registered FDs in the epoll set
+    /// (excludes the self-pipe).
+    pub fn registered_fd_count(&self) -> usize {
+        self.epoll.lock().unwrap().registered_fd_count()
+    }
+
+    /// Replace the epoll dispatcher with a fresh empty one, discarding all
+    /// existing registrations.  Simulates the post-snapshot state where the
+    /// kernel-side `epoll_fd` handle does not survive and a new one is
+    /// created.  Used by `epoll_set_rebuilt_from_flow_table_smoke` to set up
+    /// the precondition that `rebuild_epoll_from_flow_table` must fix.
+    pub fn reset_epoll_for_snapshot_test(&mut self) {
+        let mut new_epoll_inner = EpollDispatch::new().expect("EpollDispatch::new");
+        let new_waker = new_epoll_inner.waker();
+        self.epoll = Arc::new(Mutex::new(new_epoll_inner));
+        self.epoll_waker = new_waker;
     }
 }
 
