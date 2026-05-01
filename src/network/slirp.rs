@@ -106,6 +106,55 @@ const PORT_FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
 
 // ──────────────────────────────────────────────────────────────────────
+//  EpollDispatch flow tokens (Tasks 8-9)
+// ──────────────────────────────────────────────────────────────────────
+
+/// High-byte protocol tag embedded in the upper 8 bits of a `FlowToken`.
+/// The lower 56 bits carry per-flow addressing bits for debugging; the tag
+/// lets the relay loop in Task 10 distinguish protocol families without a
+/// separate lookup.
+// Task 10 uses PROTO_TAG_MASK for protocol demux; suppress dead_code until then.
+#[allow(dead_code)]
+const PROTO_TAG_MASK: u64 = 0xFF00_0000_0000_0000;
+const PROTO_TAG_TCP: u64 = 0x0100_0000_0000_0000;
+// Task 9 uses PROTO_TAG_UDP and PROTO_TAG_ICMP; suppress dead_code until Task 9.
+#[allow(dead_code)]
+const PROTO_TAG_UDP: u64 = 0x0200_0000_0000_0000;
+#[allow(dead_code)]
+const PROTO_TAG_ICMP: u64 = 0x0300_0000_0000_0000;
+
+/// Build an epoll token for a TCP NAT flow.
+///
+/// Encodes the guest source port, destination port, and low 16 bits of the
+/// destination IPv4 address into a 64-bit token so the poll thread can
+/// correlate readiness events back to flows without a separate map lookup.
+fn flow_token_for_tcp(key: &NatKey) -> u64 {
+    let dst_ip_low = u64::from(u32::from_be_bytes(key.dst_ip.0)) & 0xFFFF_FFFF;
+    PROTO_TAG_TCP
+        | (u64::from(key.guest_src_port) << 32)
+        | (u64::from(key.dst_port) << 16)
+        | (dst_ip_low & 0xFFFF)
+}
+
+/// Build an epoll token for a UDP flow.
+// Task 9 wires UDP registration; suppress dead_code until Task 9.
+#[allow(dead_code)]
+fn flow_token_for_udp(key: &UdpFlowKey) -> u64 {
+    let dst_ip_low = u64::from(u32::from_be_bytes(key.dst_ip.0)) & 0xFFFF_FFFF;
+    PROTO_TAG_UDP
+        | (u64::from(key.guest_src_port) << 32)
+        | (u64::from(key.dst_port) << 16)
+        | (dst_ip_low & 0xFFFF)
+}
+
+/// Build an epoll token for an ICMP echo flow.
+// Task 9 wires ICMP registration; suppress dead_code until Task 9.
+#[allow(dead_code)]
+fn flow_token_for_icmp(key: &IcmpEchoKey) -> u64 {
+    PROTO_TAG_ICMP | (u64::from(key.guest_id) << 32)
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  Inbound port-forward accept channel (Phase 5.5b)
 // ──────────────────────────────────────────────────────────────────────
 
@@ -493,13 +542,9 @@ pub struct SlirpBackend {
     /// relay loop from `wait_with_timeout` events; Tasks 7-9 wire up the
     /// registration side.  Wrapped in `Arc<Mutex<>>` so Task 11 can hand the
     /// same instance to the net-poll thread without an additional refactor.
-    // Tasks 8-9 register/unregister flows; suppress dead_code until Task 8.
-    #[allow(dead_code)]
     epoll: Arc<Mutex<EpollDispatch>>,
     /// Cloneable waker that interrupts `EpollDispatch::wait_with_timeout`.
     /// Used after flow-table mutations to unblock the poll thread immediately.
-    // Tasks 8-9 call wake() after insertions; suppress dead_code until Task 8.
-    #[allow(dead_code)]
     epoll_waker: Waker,
 }
 
@@ -664,8 +709,16 @@ impl SlirpBackend {
                 last_activity: Instant::now(),
                 bytes_in_flight: 0,
             };
+            let host_fd = entry.host_stream.as_raw_fd();
             self.flow_table
                 .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+            let token = flow_token_for_tcp(&key);
+            self.epoll
+                .lock()
+                .unwrap()
+                .register(host_fd, token, true, false)
+                .ok();
+            self.epoll_waker.wake();
             let syn_frame = synthesize_inbound_syn(high_port, guest_port, our_isn);
             self.inject_to_guest.push(syn_frame);
             trace!(
@@ -1283,13 +1336,22 @@ impl SlirpBackend {
                 return Ok(());
             }
 
-            // Remove any stale entry with the same key
+            // Remove any stale entry with the same key, unregistering its FD
+            // from the epoll set to avoid a dangling registration.
+            if let Some(FlowEntry::Tcp(stale)) = self.flow_table.get(&FlowKey::Tcp(key)) {
+                self.epoll
+                    .lock()
+                    .unwrap()
+                    .unregister(stale.host_stream.as_raw_fd())
+                    .ok();
+            }
             self.flow_table.remove(&FlowKey::Tcp(key));
 
             // Connect to the host address resolved by translate_outbound above.
             match TcpStream::connect_timeout(&dst_addr, Duration::from_secs(3)) {
                 Ok(stream) => {
                     stream.set_nonblocking(true).ok();
+                    let host_fd = stream.as_raw_fd();
                     let our_seq: u32 = rand_seq();
                     let entry = TcpNatEntry {
                         host_stream: stream,
@@ -1301,6 +1363,13 @@ impl SlirpBackend {
                     };
                     self.flow_table
                         .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+                    let token = flow_token_for_tcp(&key);
+                    self.epoll
+                        .lock()
+                        .unwrap()
+                        .register(host_fd, token, true, false)
+                        .ok();
+                    self.epoll_waker.wake();
 
                     // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
@@ -1639,6 +1708,13 @@ impl SlirpBackend {
         self.inject_to_guest.append(&mut frames_to_inject);
 
         for flow_key in to_remove {
+            if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
+                self.epoll
+                    .lock()
+                    .unwrap()
+                    .unregister(entry.host_stream.as_raw_fd())
+                    .ok();
+            }
             self.flow_table.remove(&flow_key);
         }
     }
@@ -2240,6 +2316,7 @@ impl SlirpBackend {
             dst_ip: SLIRP_GATEWAY_IP,
             dst_port: high_port,
         };
+        let host_fd = host_stream.as_raw_fd();
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::SynSent,
@@ -2250,6 +2327,21 @@ impl SlirpBackend {
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+        // Skip epoll registration in test/bench contexts: the synthetic
+        // stream is already non-blocking but test harnesses check specific
+        // state transitions, not readiness events.
+        #[cfg(not(test))]
+        {
+            let token = flow_token_for_tcp(&key);
+            self.epoll
+                .lock()
+                .unwrap()
+                .register(host_fd, token, true, false)
+                .ok();
+            self.epoll_waker.wake();
+        }
+        #[cfg(test)]
+        let _ = host_fd;
     }
 
     /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,

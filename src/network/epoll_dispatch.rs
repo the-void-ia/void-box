@@ -94,8 +94,6 @@ impl EpollDispatch {
         Ok(())
     }
 
-    // Tasks 8-9 call unregister on flow removal; suppress dead_code until Task 8.
-    #[allow(dead_code)]
     pub fn unregister(&mut self, fd: RawFd) -> io::Result<()> {
         // SAFETY: epoll_ctl ignores the event pointer for DEL but
         // still requires it to be non-null on older kernels.
@@ -211,14 +209,10 @@ impl EpollDispatch {
 /// the underlying pipe wakes a thread blocked in `wait_with_timeout`.
 #[derive(Debug, Clone)]
 pub struct Waker {
-    // Tasks 8-9 call wake() after flow insertions; suppress dead_code until Task 8.
-    #[allow(dead_code)]
     write_end: Arc<OwnedFd>,
 }
 
 impl Waker {
-    // Tasks 8-9 call wake() after flow insertions; suppress dead_code until Task 8.
-    #[allow(dead_code)]
     pub fn wake(&self) {
         let buf = [0u8; 1];
         // SAFETY: write to a non-blocking pipe never blocks.  We
