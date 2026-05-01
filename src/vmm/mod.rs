@@ -1594,8 +1594,12 @@ fn vsock_irq_thread(
 /// from host TCP sockets accumulates unread, causing TLS handshakes and
 /// API calls to time out.
 ///
-/// This thread wakes every 5 ms, reads any pending host data via
-/// `try_inject_rx`, and fires IRQ 10 to notify the guest.
+/// This thread blocks on `EpollDispatch::wait_with_timeout(50 ms)` so it
+/// wakes immediately when any host socket becomes readable, rather than
+/// polling on a fixed 5 ms sleep.  The 50 ms cap serves as a housekeeping
+/// interval for idle UDP/ICMP flow reaping.  When the network backend does
+/// not provide an epoll instance (non-SlirpBackend), the thread falls back
+/// to the original 5 ms sleep.
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
@@ -1603,10 +1607,40 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         level: u32,
     }
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+    const EPOLL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+    const FALLBACK_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
     let vm_fd = vm.vm_fd().as_raw_fd();
     let guest_memory = vm.guest_memory();
+
+    // Obtain the epoll Arc from the backend without holding the device lock
+    // across the blocking wait.  Falls back to None if the backend is not
+    // a SlirpBackend (e.g. in unit tests or future alternative backends).
+    let epoll_arc = {
+        match net_dev.lock() {
+            Ok(guard) => guard.epoll_arc(),
+            Err(_) => None,
+        }
+    };
+
+    let mut epoll_events: Vec<crate::network::epoll_dispatch::EpollEvent> = Vec::new();
+
     while running.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Block outside the device lock: either on epoll readiness or a short
+        // sleep.  This lets the vCPU thread acquire the device lock without
+        // contention during the wait phase.
+        if let Some(ref ep_arc) = epoll_arc {
+            match ep_arc.lock() {
+                Ok(ep) => {
+                    let _ = ep.wait_with_timeout(&mut epoll_events, EPOLL_WAIT_TIMEOUT);
+                }
+                Err(_) => {
+                    std::thread::sleep(FALLBACK_SLEEP);
+                }
+            }
+        } else {
+            std::thread::sleep(FALLBACK_SLEEP);
+        }
 
         let has_interrupt = {
             let mut guard = match net_dev.lock() {
@@ -1621,6 +1655,9 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // an earlier edge was missed by the guest.
         if has_interrupt {
             let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
+            // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
+            // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
+            // for the lifetime of `vm`.
             unsafe {
                 libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
             }
