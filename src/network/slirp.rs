@@ -117,10 +117,7 @@ static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
 #[allow(dead_code)]
 const PROTO_TAG_MASK: u64 = 0xFF00_0000_0000_0000;
 const PROTO_TAG_TCP: u64 = 0x0100_0000_0000_0000;
-// Task 9 uses PROTO_TAG_UDP and PROTO_TAG_ICMP; suppress dead_code until Task 9.
-#[allow(dead_code)]
 const PROTO_TAG_UDP: u64 = 0x0200_0000_0000_0000;
-#[allow(dead_code)]
 const PROTO_TAG_ICMP: u64 = 0x0300_0000_0000_0000;
 
 /// Build an epoll token for a TCP NAT flow.
@@ -137,8 +134,6 @@ fn flow_token_for_tcp(key: &NatKey) -> u64 {
 }
 
 /// Build an epoll token for a UDP flow.
-// Task 9 wires UDP registration; suppress dead_code until Task 9.
-#[allow(dead_code)]
 fn flow_token_for_udp(key: &UdpFlowKey) -> u64 {
     let dst_ip_low = u64::from(u32::from_be_bytes(key.dst_ip.0)) & 0xFFFF_FFFF;
     PROTO_TAG_UDP
@@ -148,8 +143,6 @@ fn flow_token_for_udp(key: &UdpFlowKey) -> u64 {
 }
 
 /// Build an epoll token for an ICMP echo flow.
-// Task 9 wires ICMP registration; suppress dead_code until Task 9.
-#[allow(dead_code)]
 fn flow_token_for_icmp(key: &IcmpEchoKey) -> u64 {
     PROTO_TAG_ICMP | (u64::from(key.guest_id) << 32)
 }
@@ -1126,6 +1119,8 @@ impl SlirpBackend {
             };
 
         let flow_key = FlowKey::Udp(key);
+        // Track whether this is a new entry so we can register it with epoll.
+        let mut new_host_fd: Option<std::os::fd::RawFd> = None;
         let entry: &mut UdpFlowEntry = match self.flow_table.entry(flow_key) {
             std::collections::hash_map::Entry::Occupied(o) => match o.into_mut() {
                 FlowEntry::Udp(e) => e,
@@ -1139,6 +1134,7 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
+                new_host_fd = Some(sock.as_raw_fd());
                 match v.insert(FlowEntry::Udp(UdpFlowEntry {
                     sock,
                     last_activity: Instant::now(),
@@ -1149,6 +1145,16 @@ impl SlirpBackend {
             }
         };
         entry.last_activity = Instant::now();
+
+        if let Some(host_fd) = new_host_fd {
+            let token = flow_token_for_udp(&key);
+            self.epoll
+                .lock()
+                .unwrap()
+                .register(host_fd, token, true, false)
+                .ok();
+            self.epoll_waker.wake();
+        }
 
         if let Err(e) = entry.sock.send(&payload) {
             trace!("SLIRP UDP: send failed: {e}");
@@ -1190,6 +1196,8 @@ impl SlirpBackend {
             dst_ip: ipv4.dst_addr(),
         };
         let flow_key = FlowKey::IcmpEcho(key);
+        // Track whether this is a new entry so we can register it with epoll.
+        let mut new_icmp_fd: Option<std::os::fd::RawFd> = None;
         let entry: &mut IcmpEchoEntry = match self.flow_table.entry(flow_key) {
             std::collections::hash_map::Entry::Occupied(occupied) => match occupied.into_mut() {
                 FlowEntry::IcmpEcho(e) => e,
@@ -1204,6 +1212,7 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
+                new_icmp_fd = Some(sock.as_raw_fd());
                 match vacant.insert(FlowEntry::IcmpEcho(IcmpEchoEntry {
                     sock,
                     guest_id: ident,
@@ -1215,6 +1224,16 @@ impl SlirpBackend {
             }
         };
         entry.last_activity = Instant::now();
+
+        if let Some(host_fd) = new_icmp_fd {
+            let token = flow_token_for_icmp(&key);
+            self.epoll
+                .lock()
+                .unwrap()
+                .register(host_fd, token, true, false)
+                .ok();
+            self.epoll_waker.wake();
+        }
 
         // Build a wire ICMP echo packet with seq + data; the kernel will
         // rewrite the ident on send_to.
@@ -1764,7 +1783,16 @@ impl SlirpBackend {
             };
             match frame {
                 None => {
-                    // Idle timeout — evict entry.
+                    // Idle timeout — unregister then evict entry.
+                    if let Some(FlowEntry::IcmpEcho(e)) =
+                        self.flow_table.get(&FlowKey::IcmpEcho(key))
+                    {
+                        self.epoll
+                            .lock()
+                            .unwrap()
+                            .unregister(e.sock.as_raw_fd())
+                            .ok();
+                    }
                     self.flow_table.remove(&FlowKey::IcmpEcho(key));
                 }
                 Some(Some(frame_bytes)) => self.inject_to_guest.push(frame_bytes),
@@ -1855,6 +1883,13 @@ impl SlirpBackend {
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
+            if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&k) {
+                self.epoll
+                    .lock()
+                    .unwrap()
+                    .unregister(entry.sock.as_raw_fd())
+                    .ok();
+            }
             self.flow_table.remove(&k);
         }
 
