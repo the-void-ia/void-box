@@ -1253,6 +1253,13 @@ fn nat_translate_outbound_deny_list() {
 /// 3. Confirm the pre-rebuild count is zero.
 /// 4. Call `rebuild_epoll_from_flow_table`.
 /// 5. Confirm the post-rebuild count is one.
+///
+/// Gated on `bench-helpers` because it consumes synthetic-injection helpers
+/// (`insert_synthetic_synsent_entry`, `reset_epoll_for_snapshot_test`,
+/// `registered_fd_count`) that are only visible to external test/bench
+/// consumers when that feature is enabled.  Default `cargo test` skips this
+/// pin; CI runs it via `cargo test --features bench-helpers`.
+#[cfg(feature = "bench-helpers")]
 #[test]
 fn epoll_set_rebuilt_from_flow_table_smoke() {
     use std::net::TcpListener;
