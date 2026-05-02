@@ -159,6 +159,17 @@ FAST SMOKE RUN\n\
         tcp_crr_latency_us_p50: Option<f64>,
         udp_dns_qps: Option<f64>,
         icmp_rr_latency_us_p50: Option<f64>,
+        /// p50 host→guest RX latency: "host write completes" → "SLIRP relay
+        /// delivers frame to drain_to_guest output".  Measured at the VMM
+        /// layer against a live guest TCP flow via `nc -l`.
+        ///
+        /// Deferred in Phase 6.4: wiring a guest-side listener and synchronizing
+        /// on first-byte arrival requires either a guest daemon or an additional
+        /// RPC, both out of scope for this phase.  The divan microbench
+        /// `tcp_rx_latency_one_packet` captures the SLIRP-layer dispatch cost
+        /// directly (epoll_wait + peek + frame build); this wall-clock field
+        /// will complement it once the guest-listener infrastructure is in place.
+        tcp_rx_latency_us_p50: Option<f64>,
     }
 
     #[tokio::main(flavor = "multi_thread")]

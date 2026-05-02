@@ -897,4 +897,144 @@ mod linux_benches {
             worker.join().expect("worker thread panicked");
         });
     }
+
+    /// Phase 6.4 baseline: cost of one `drain_to_guest` call when one TCP flow
+    /// is `Established` and the host kernel has data ready to relay.
+    ///
+    /// Captures the per-packet SLIRP dispatch overhead post-epoll: epoll_wait
+    /// (non-blocking, zero-timeout), readiness scan, peek, and Ethernet frame
+    /// construction.  Pre-6.4 this path iterated every flow unconditionally;
+    /// post-6.4 it dispatches only the ready flow.
+    ///
+    /// This bench cannot exercise the `net_poll_thread` 50 ms epoll cycle
+    /// (that thread does not run inside divan).  The wall-clock latency floor
+    /// is captured separately by `voidbox-network-bench`'s `tcp_rx_latency_us_p50`
+    /// field; see that binary's `Report` struct for the measurement shape.
+    ///
+    /// Requires the `bench-helpers` feature (compile with
+    /// `cargo bench --features bench-helpers`).
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn tcp_rx_latency_one_packet(bencher: Bencher) {
+        use smoltcp::wire::TcpControl;
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        const GUEST_SRC_PORT: u16 = 49155;
+        const INITIAL_GUEST_SEQ: u32 = 5000;
+        const PAYLOAD: &[u8] = &[0xAB; 64];
+
+        // Build a fresh stack with one Established TCP flow.  Setup happens
+        // outside the timed loop so divan only measures the relay dispatch.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = listener.local_addr().unwrap().port();
+        let server_thread = thread::spawn(move || listener.accept().unwrap());
+
+        let mut stack = SlirpBackend::new().unwrap();
+
+        // 3-way handshake: guest sends SYN → stack produces SYN-ACK → guest
+        // sends ACK.  This mirrors `tcp_bulk_throughput_1mb` setup.
+        let syn = build_tcp_syn_for_latency_bench(GUEST_SRC_PORT, host_port, INITIAL_GUEST_SEQ);
+        stack.process_guest_frame(&syn).unwrap();
+
+        // Drain for up to 200 ms to collect the SYN-ACK.
+        let mut drain_frames: Vec<Vec<u8>> = Vec::new();
+        let gateway_seq = {
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            loop {
+                drain_frames.clear();
+                stack.drain_to_guest(&mut drain_frames);
+                if let Some((seq, _, _, _)) = drain_frames
+                    .iter()
+                    .find_map(|f| parse_tcp_to_guest_frame(f))
+                {
+                    break seq;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("no SYN-ACK within deadline");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Complete the handshake: guest sends ACK.
+        let ack = build_tcp_data_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_SRC_PORT,
+            host_port,
+            INITIAL_GUEST_SEQ + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+        );
+        stack.process_guest_frame(&ack).unwrap();
+
+        // The server thread accepted the connection; grab the socket.
+        let (mut server_sock, _) = server_thread.join().unwrap();
+        server_sock
+            .set_nonblocking(true)
+            .expect("server non-blocking");
+
+        // Set up state for the timed loop.
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
+        let guest_seq = INITIAL_GUEST_SEQ + 1;
+
+        // Prime: put one payload in the kernel buffer before the first
+        // iteration begins so the first measured call sees a ready event.
+        let _ = server_sock.write(PAYLOAD);
+
+        bencher.bench_local(|| {
+            out.clear();
+            // Refill the kernel buffer from the previous iteration's drain.
+            // write() may return EAGAIN if the buffer is full; that is fine —
+            // the previous iteration's peek left data in place.
+            let _ = server_sock.write(divan::black_box(PAYLOAD));
+
+            // The cost we are measuring: one non-blocking epoll_wait + relay.
+            divan::black_box(&mut stack).drain_to_guest(&mut out);
+
+            // Consume the relay output so inject_to_guest doesn't grow
+            // unboundedly across iterations.
+            divan::black_box(&out);
+
+            // Keep the TCP stream happy: send an ACK for any data the relay
+            // fed into inject_to_guest (frame content doesn't matter for the
+            // bench; we just need the host stream not to stall).
+            for frame in &out {
+                if let Some((data_seq, _, _, plen)) = parse_tcp_to_guest_frame(frame) {
+                    if plen > 0 {
+                        let ack_back = build_tcp_data_frame(
+                            SLIRP_GATEWAY_IP,
+                            GUEST_SRC_PORT,
+                            host_port,
+                            guest_seq,
+                            data_seq.wrapping_add(plen as u32),
+                            TcpControl::None,
+                            &[],
+                        );
+                        let _ = stack.process_guest_frame(&ack_back);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Build a SYN frame from the guest toward the host for the latency bench.
+    ///
+    /// Identical to `build_tcp_data_frame` with `TcpControl::Syn` and zero
+    /// `ack`.  Kept as a separate function to document intent: this is the
+    /// opening segment of the 3-way handshake used by
+    /// `tcp_rx_latency_one_packet`.
+    #[cfg(feature = "bench-helpers")]
+    fn build_tcp_syn_for_latency_bench(src_port: u16, dst_port: u16, seq: u32) -> Vec<u8> {
+        build_tcp_data_frame(
+            SLIRP_GATEWAY_IP,
+            src_port,
+            dst_port,
+            seq,
+            0,
+            smoltcp::wire::TcpControl::Syn,
+            &[],
+        )
+    }
 } // mod linux_benches
