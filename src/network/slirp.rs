@@ -786,31 +786,27 @@ impl SlirpBackend {
 
         // 3. Collect ready events.
         //
-        // Primary source: events fed by net_poll_thread via push_ready_events.
-        // net_poll_thread holds the EpollDispatch mutex for up to 50 ms during
-        // its blocking wait; contending on it here from the vCPU path would
-        // serialize this call behind that 50 ms hold and collapse throughput.
+        // Fast path: try to acquire EpollDispatch without blocking. When
+        // net_poll_thread is idle (between waits) or there is no net_poll_thread
+        // (unit tests, benches), this succeeds immediately and we run the
+        // non-blocking poll ourselves — same as Phase 6.3 behaviour, zero
+        // extra overhead.
         //
-        // Fallback: if the primary queue is empty (e.g. in unit tests where
-        // no net_poll_thread runs), attempt a non-blocking epoll poll using
-        // try_lock so we never block on the mutex.
+        // Slow path: net_poll_thread holds the EpollDispatch mutex for the
+        // full 50 ms of its blocking wait. try_lock returns Err; we drain the
+        // pending_events queue that net_poll_thread fills via push_ready_events
+        // instead of blocking on the mutex. Mutex contention eliminated.
         let ready: Vec<EpollEvent> = {
-            let taken: Vec<EpollEvent> = {
-                let mut queue = self.pending_events.lock().unwrap();
-                std::mem::take(&mut *queue)
-            };
-            if taken.is_empty() {
-                // Fallback: try to acquire epoll without blocking. Skip the poll
-                // entirely if net_poll_thread holds the mutex — it will push events
-                // via push_ready_events on the next iteration.
-                let mut fallback: Vec<EpollEvent> = Vec::new();
-                if let Ok(ep) = self.epoll.try_lock() {
-                    let _ = ep.wait_with_timeout(&mut fallback, std::time::Duration::ZERO);
-                }
-                fallback
+            let mut events: Vec<EpollEvent> = Vec::new();
+            if let Ok(ep) = self.epoll.try_lock() {
+                // Epoll available: non-blocking poll (zero-timeout).
+                let _ = ep.wait_with_timeout(&mut events, std::time::Duration::ZERO);
             } else {
-                taken
+                // Epoll held by net_poll_thread: consume events it pushed.
+                let mut queue = self.pending_events.lock().unwrap();
+                events = std::mem::take(&mut *queue);
             }
+            events
         };
 
         // 4. Process TCP NAT data relay.
