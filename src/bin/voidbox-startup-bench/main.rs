@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if !warm_only {
-        eprintln!("\n-- Phase 1: cold boot --");
+        eprintln!("\n-- cold boot --");
         let mut cold: Vec<Sample> = Vec::with_capacity(iters);
         for i in 0..iters {
             // Route console to a file only on the very first iteration so we
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if !cold_only {
-        eprintln!("\n-- Phase 2: warm (snapshot-restore) --");
+        eprintln!("\n-- warm (snapshot-restore) --");
         let tmp = tempfile::tempdir()?;
         let snap_path = capture_snapshot(memory_mb, tmp.path()).await?;
         eprintln!("captured snapshot at: {}", snap_path.display());

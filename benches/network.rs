@@ -170,8 +170,8 @@ mod linux_benches {
     ///
     /// The timed section is a single `poll()` call on the pre-populated stack,
     /// so the measurement reflects the NAT-walk cost at that table size.
-    /// Today the walk is `O(n)`; the unified flow table planned for Phase 4
-    /// should keep the same asymptotic complexity but with smaller constants.
+    /// Today the walk is `O(n)`; the unified flow table keeps the same
+    /// asymptotic complexity but with smaller per-entry constants.
     #[divan::bench(args = [1, 100, 1000])]
     fn poll_with_n_flows(bencher: Bencher, n: usize) {
         let mut stack = SlirpBackend::new().unwrap();
@@ -276,9 +276,9 @@ mod linux_benches {
         });
     }
 
-    /// Pure-compute bench for `nat::translate_outbound`. Phase 5 baseline
-    /// for future hasher / data-structure changes (e.g. moving deny_cidrs
-    /// from `Vec<Ipv4Net>` to a longest-prefix trie). Tens of nanoseconds
+    /// Pure-compute bench for `nat::translate_outbound`. Baseline for future
+    /// hasher / data-structure changes (e.g. moving deny_cidrs from
+    /// `Vec<Ipv4Net>` to a longest-prefix trie). Tens of nanoseconds
     /// expected; microseconds would indicate an allocation in the hot path.
     #[divan::bench]
     fn nat_translate_outbound_hot_path(bencher: Bencher) {
@@ -305,13 +305,13 @@ mod linux_benches {
     /// Measures TCP bulk throughput through the SLIRP relay under backpressure.
     ///
     /// Pushes 1 MiB through the relay in 1 KiB chunks with a constrained host
-    /// receiver (`SO_RCVBUF=4096`) so the post-Phase-3 backpressure path is
-    /// exercised every iteration. Divan reports throughput in MB/s alongside
-    /// per-iteration latency, giving a numerical regression signal for the
-    /// passt-style sequence-mirroring + don't-ACK-on-EAGAIN backpressure path.
+    /// receiver (`SO_RCVBUF=4096`) so the backpressure path is exercised every
+    /// iteration. Divan reports throughput in MB/s alongside per-iteration
+    /// latency, giving a numerical regression signal for the passt-style
+    /// sequence-mirroring + don't-ACK-on-EAGAIN backpressure path.
     ///
     /// The 95% delivery threshold mirrors `tcp_writes_more_than_256kb_succeed`
-    /// — the binary contract test for Phase 3.
+    /// — the binary contract test for TCP backpressure correctness.
     #[divan::bench(sample_count = 10)]
     fn tcp_bulk_throughput_1mb(bencher: Bencher) {
         use smoltcp::wire::TcpControl;
@@ -612,13 +612,12 @@ mod linux_benches {
 
     /// Open `n/3` TCP + `n/3` UDP + `n/3` ICMP-echo flows, then time `poll()`.
     ///
-    /// Mirrors `poll_with_n_flows` (TCP-only) but exercises Phase 4's
-    /// unified `flow_table` with all three protocols populated. Catches
-    /// enum-dispatch + filter regressions at scale: each `relay_*_data`
-    /// loop now `filter(|k| matches!(k, FlowKey::Foo(_)))` over the unified
-    /// table, so per-protocol scan cost is `O(total_flows)` not
-    /// `O(this_protocol's_flows)`. This bench is the regression gate for
-    /// that change.
+    /// Mirrors `poll_with_n_flows` (TCP-only) but exercises the unified
+    /// `flow_table` with all three protocols populated. Catches enum-dispatch
+    /// and filter regressions at scale: each `relay_*_data` loop filters
+    /// by `FlowKey` variant over the unified table, so per-protocol scan cost
+    /// is `O(total_flows)` not `O(this_protocol's_flows)`. This bench is the
+    /// regression gate for that property.
     #[divan::bench(args = [3, 99, 999])]
     fn poll_with_n_mixed_flows(bencher: Bencher, n: usize) {
         let mut stack = SlirpBackend::new().unwrap();
@@ -649,10 +648,10 @@ mod linux_benches {
 
     /// Insert + remove `n` flow-table entries using synthetic data.
     ///
-    /// Pure-compute baseline for the unified `HashMap<FlowKey, FlowEntry>`
-    /// in Phase 4. Phase 5+ reference number for hasher experiments
-    /// (foldhash, ahash, SipHash) or container-shape changes (e.g.
-    /// hashbrown raw API). Uses synthetic `u32` values instead of real
+    /// Pure-compute baseline for the unified `HashMap<FlowKey, FlowEntry>`.
+    /// Reference number for hasher experiments (foldhash, ahash, SipHash)
+    /// or container-shape changes (e.g. hashbrown raw API). Uses synthetic
+    /// `u32` values instead of real
     /// `TcpNatEntry` (which requires TcpStream) to isolate HashMap
     /// mechanics from socket cloning overhead — the real cost is
     /// HashMap insert/remove, not socket ops.
@@ -784,8 +783,8 @@ mod linux_benches {
     }
 
     /// Pure-compute cost of synthesizing an inbound SYN frame for
-    /// port-forwarding (Phase 5.5b.2). No stack allocation or guest frame
-    /// processing — just the `build_tcp_packet_static` wire encoding.
+    /// port-forwarding. No stack allocation or guest frame processing —
+    /// just the `build_tcp_packet_static` wire encoding.
     ///
     /// Expected magnitude: sub-microsecond (pure packet construction).
     ///
@@ -843,8 +842,8 @@ mod linux_benches {
     /// not a bug. Regressions in the inbound state machine or the listener
     /// poll loop will shift the distribution upward beyond 50 ms.
     ///
-    /// Phase 5.5b baseline. Regressions in the inbound state machine or
-    /// listener-poll loop will surface numerically against this measurement.
+    /// Regressions in the inbound state machine or listener-poll loop will
+    /// surface numerically against this measurement.
     #[divan::bench(sample_count = 20, sample_size = 1)]
     fn port_forward_accept_latency(bencher: Bencher) {
         const GUEST_PORT: u16 = 8080;
@@ -898,13 +897,13 @@ mod linux_benches {
         });
     }
 
-    /// Phase 6.4 baseline: cost of one `drain_to_guest` call when one TCP flow
-    /// is `Established` and the host kernel has data ready to relay.
+    /// Cost of one `drain_to_guest` call when one TCP flow is `Established`
+    /// and the host kernel has data ready to relay.
     ///
-    /// Captures the per-packet SLIRP dispatch overhead post-epoll: epoll_wait
+    /// Captures the per-packet SLIRP dispatch overhead via epoll: epoll_wait
     /// (non-blocking, zero-timeout), readiness scan, peek, and Ethernet frame
-    /// construction.  Pre-6.4 this path iterated every flow unconditionally;
-    /// post-6.4 it dispatches only the ready flow.
+    /// construction. Only the flows with data ready are dispatched — flows
+    /// with nothing to relay are skipped.
     ///
     /// This bench cannot exercise the `net_poll_thread` 50 ms epoll cycle
     /// (that thread does not run inside divan).  The wall-clock latency floor

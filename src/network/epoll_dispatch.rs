@@ -7,10 +7,9 @@
 //! the events into a caller-owned buffer.
 //!
 //! Why no crate? The standard `mio`/`tokio` story would pull in a
-//! reactor + a runtime — Phase 6.4 needs neither.  `libc::epoll_*`
-//! is two syscalls, fully observable, and the surface fits in ~150
-//! lines.  See plan 2026-04-30-smoltcp-passt-port-phase6.4.md
-//! "Architecture notes" for the rationale.
+//! reactor + a runtime that the SLIRP poll loop does not need.
+//! `libc::epoll_*` is two syscalls, fully observable, and the surface
+//! fits in ~150 lines.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

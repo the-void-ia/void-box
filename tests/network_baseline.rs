@@ -10,11 +10,11 @@
 #![allow(deprecated)]
 //!
 //! Three tests assert *broken* behavior on purpose. Each is marked
-//! `BROKEN_ON_PURPOSE` and flips in the phase that fixes it:
+//! `BROKEN_ON_PURPOSE` and flips when the corresponding fix lands:
 //!
-//! - `tcp_writes_more_than_256kb_succeed` — flipped in Phase 3 (was `tcp_to_host_buffer_drops_at_256kb`)
-//! - `udp_non_dns_round_trips` — flipped in Phase 2 (was `udp_non_dns_silently_dropped`)
-//! - `icmp_echo_returns_reply` — flipped in Phase 1 (was `icmp_echo_silently_dropped`)
+//! - `tcp_writes_more_than_256kb_succeed` (was `tcp_to_host_buffer_drops_at_256kb`)
+//! - `udp_non_dns_round_trips` (was `udp_non_dns_silently_dropped`)
+//! - `icmp_echo_returns_reply` (was `icmp_echo_silently_dropped`)
 //!
 //! Run with: `cargo test --test network_baseline`
 
@@ -294,12 +294,11 @@ fn tcp_data_round_trip() {
     );
 }
 
-/// Phase 3 flipped this BROKEN_ON_PURPOSE pin: passt-style sequence
-/// mirroring + don't-ACK-on-WouldBlock backpressure replaces the
-/// 256 KB userspace cliff. Pushing >1 MB through the relay now
-/// succeeds — the kernel's socket buffer holds outstanding bytes,
-/// the guest retransmits unacked segments, and the connection stays
-/// alive instead of being reset.
+/// BROKEN_ON_PURPOSE pin (now passing): passt-style sequence mirroring and
+/// don't-ACK-on-WouldBlock backpressure replace the 256 KB userspace cliff.
+/// Pushing >1 MB through the relay succeeds — the kernel's socket buffer
+/// holds outstanding bytes, the guest retransmits unacked segments, and the
+/// connection stays alive instead of being reset.
 #[test]
 fn tcp_writes_more_than_256kb_succeed() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -388,9 +387,9 @@ fn tcp_writes_more_than_256kb_succeed() {
     while bytes_received.load(Ordering::Relaxed) < TOTAL && std::time::Instant::now() < deadline {
         // Retransmit semantics: only advance the send cursor once the
         // previous chunk has been ACK'd. If the stack stops ACKing
-        // (Phase 3 backpressure), we re-send the same seq/payload until
-        // it's acknowledged. This matches the comment above and the
-        // production guest-TCP behavior we're emulating.
+        // (backpressure engaged), we re-send the same seq/payload until
+        // it's acknowledged. This matches production guest-TCP retransmit
+        // behavior.
         let _ = stack.process_guest_frame(&build_tcp_frame(
             SLIRP_GATEWAY_IP,
             GUEST_EPHEMERAL_PORT,
@@ -402,7 +401,7 @@ fn tcp_writes_more_than_256kb_succeed() {
         ));
 
         // Drain frames; track the highest ACK we've seen and watch
-        // for RST/FIN that would indicate a Phase-2 era close.
+        // for RST/FIN that would indicate a premature close.
         for f in drain_n(&mut stack, 4) {
             if let Some((_, ack, ctrl, _)) = parse_tcp_to_guest(&f) {
                 if matches!(ctrl, TcpControl::Rst | TcpControl::Fin) {
@@ -452,13 +451,13 @@ fn tcp_writes_more_than_256kb_succeed() {
     let received = bytes_received.load(Ordering::Relaxed);
     assert!(
         !saw_close,
-        "Phase 3 contract: connection must NOT be reset/FIN'd mid-stream \
-         (was the 256 KB cliff bug). Saw RST or FIN."
+        "TCP backpressure must not RST/FIN mid-stream — the relay must hold \
+         the line while the kernel drains. Saw RST or FIN."
     );
     assert!(
         received >= TOTAL * 95 / 100,
-        "Phase 3 contract: server must receive ~all bytes pushed (got {received}/{TOTAL}); \
-         backpressure should retransmit until success, not silently drop."
+        "server must receive ~all bytes pushed (got {received}/{TOTAL}); \
+         backpressure must retransmit until success, not silently drop."
     );
 }
 
@@ -840,9 +839,9 @@ fn dns_cache_keys_by_question_not_xid() {
     }
 }
 
-/// Phase 2 flipped this BROKEN_ON_PURPOSE pin: arbitrary UDP (any
-/// destination port, not just 53) now round-trips through the per-flow
-/// connected-socket NAT introduced in Tasks 2.1–2.4.
+/// BROKEN_ON_PURPOSE pin (now passing): arbitrary UDP (any destination
+/// port, not just 53) round-trips through the per-flow connected-socket
+/// NAT.
 #[test]
 fn udp_non_dns_round_trips() {
     let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -906,9 +905,8 @@ fn udp_non_dns_round_trips() {
     assert!(saw_reply, "guest must receive UDP reply via per-flow NAT");
 }
 
-/// Phase 1 flipped the BROKEN_ON_PURPOSE assertion: the guest now
-/// receives an ICMP echo reply via the host's unprivileged
-/// `IPPROTO_ICMP SOCK_DGRAM` socket.
+/// BROKEN_ON_PURPOSE pin (now passing): the guest receives an ICMP echo
+/// reply via the host's unprivileged `IPPROTO_ICMP SOCK_DGRAM` socket.
 ///
 /// Skips gracefully if `net.ipv4.ping_group_range` forbids unprivileged
 /// ICMP for the calling GID — in that environment the warn-once log
@@ -1041,7 +1039,7 @@ fn nat_translate_outbound_unmodified_external_ip() {
     );
 }
 
-/// E2E contract for Phase 5.5b inbound port-forwarding.
+/// E2E contract for inbound port-forwarding.
 ///
 /// Builds a `SlirpBackend` with one TCP port-forward rule
 /// (`HOST_PORT` → `GUEST_PORT`), has a host thread connect to
@@ -1241,9 +1239,9 @@ fn nat_translate_outbound_deny_list() {
     );
 }
 
-/// Phase 6.4 contract: snapshot/restore must rebuild the epoll dispatch from
-/// `flow_table` contents.  The `epoll_fd` is a kernel handle that does not
-/// survive snapshot; a fresh dispatcher starts with zero registered FDs even
+/// Snapshot/restore must rebuild the epoll dispatch from `flow_table`
+/// contents.  The `epoll_fd` is a kernel handle that does not survive
+/// snapshot; a fresh dispatcher starts with zero registered FDs even
 /// though `flow_table` may contain entries with live host sockets.
 ///
 /// This smoke test verifies the rebuild path end-to-end:

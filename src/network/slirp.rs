@@ -10,8 +10,8 @@
 //!
 //! Architecture:
 //! - Unified flow table: All TCP/UDP/ICMP echo flows live in a single
-//!   `flow_table: HashMap<FlowKey, FlowEntry>` (Phase 4). Per-protocol
-//!   relay logic dispatches on the FlowEntry variant.
+//!   `flow_table: HashMap<FlowKey, FlowEntry>`. Per-protocol relay logic
+//!   dispatches on the FlowEntry variant.
 //! - ARP: custom handler responds as gateway for all 10.0.2.x IPs
 //! - TCP: passt-style sequence-mirroring NAT (host→guest via
 //!   `recv(MSG_PEEK)` + ACK-driven consume; guest→host via direct
@@ -148,7 +148,7 @@ fn flow_token_for_icmp(key: &IcmpEchoKey) -> u64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-//  Inbound port-forward accept channel (Phase 5.5b)
+//  Inbound port-forward accept channel
 // ──────────────────────────────────────────────────────────────────────
 
 /// One accepted host-side TCP connection waiting to be forwarded into the guest.
@@ -510,14 +510,14 @@ pub struct SlirpBackend {
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
     /// DNS queries waiting to be resolved on the net-poll thread.
     pending_dns: Vec<PendingDnsQuery>,
-    /// Unified flow table — Phase 4.
+    /// Unified flow table keyed by protocol + port tuple.
     ///
-    /// All three protocols (TCP, UDP, ICMP echo) are keyed here after Task 4.5.
-    /// ICMP migrated in 4.3; UDP in 4.4; TCP in 4.5.
+    /// All three protocols (TCP, UDP, ICMP echo) share this table so a single
+    /// dispatch loop handles all active flows.
     flow_table: HashMap<FlowKey, FlowEntry>,
     /// Background threads bound to host TCP ports for inbound port
-    /// forwarding (Phase 5.5b). Each handle corresponds to one
-    /// `nat::PortForward` rule. Joined on `Drop`.
+    /// forwarding. Each handle corresponds to one `nat::PortForward` rule.
+    /// Joined on `Drop`.
     port_forward_listeners: Vec<JoinHandle<()>>,
     /// Shutdown signal for `port_forward_listeners`. Set true on Drop;
     /// each listener thread checks it after every accept and exits cleanly.
@@ -549,6 +549,15 @@ pub struct SlirpBackend {
     /// handle_tcp_frame). Drained at the bottom of relay_tcp_nat_data
     /// without scanning the full flow_table.
     pending_close: Vec<FlowKey>,
+    /// Set to `true` the first time `push_ready_events` is called —
+    /// signals "an external poller (net_poll_thread) is feeding us
+    /// readiness events." When true, `drain_to_guest` skips its
+    /// non-blocking-poll fallback (one mutex op + one epoll_wait
+    /// syscall per call, ~310 ns overhead) and only consumes
+    /// `pending_events`. Tests/benches without a net_poll_thread
+    /// keep the fallback so synthetic harnesses still observe
+    /// readiness.
+    has_external_poller: AtomicBool,
 }
 
 impl SlirpBackend {
@@ -624,7 +633,7 @@ impl SlirpBackend {
             nat.deny_cidrs.len(), nat.port_forwards.len(), dns_servers
         );
 
-        // Spawn listener threads for port-forwards (Phase 5.5b).
+        // Spawn listener threads for port-forwards.
         let port_forward_shutdown = Arc::new(AtomicBool::new(false));
         let (port_forward_listeners, pending_inbound_accepts, accept_sender) =
             spawn_port_forward_listeners(&nat, &port_forward_shutdown);
@@ -655,6 +664,7 @@ impl SlirpBackend {
             epoll_waker,
             pending_events: Mutex::new(Vec::new()),
             pending_close: Vec::new(),
+            has_external_poller: AtomicBool::new(false),
         })
     }
 
@@ -749,15 +759,12 @@ impl SlirpBackend {
         };
 
         // Track inject_to_guest growth so we can wake the net-poll
-        // thread if this call queued any frames. Pre-Phase-6.4 the
-        // poll thread woke unconditionally every 5 ms, which masked
-        // the absence of an explicit wake — every queued ACK got
-        // flushed within 5 ms. With epoll_wait(50ms) waiting on FD
-        // readiness, an ACK queued during guest TX has no FD-side
-        // signal (the guest is the writer, not the reader on the
-        // SLIRP-side socket), so without an explicit wake the ACK
-        // sits 50 ms before being flushed — TCP send window stalls,
-        // throughput drops 10×.
+        // thread if this call queued any frames. The poll thread blocks
+        // in epoll_wait waiting on FD readiness; an ACK queued during
+        // guest TX has no FD-side signal (the guest is the writer, not
+        // the reader on the SLIRP-side socket). Without an explicit
+        // wake the ACK sits up to epoll_wait's timeout before being
+        // flushed — TCP send window stalls, throughput drops 10×.
         let inject_len_before = self.inject_to_guest.len();
 
         match eth.ethertype() {
@@ -821,7 +828,13 @@ impl SlirpBackend {
                 let mut queue = self.pending_events.lock().unwrap();
                 std::mem::take(&mut *queue)
             };
-            if events.is_empty() {
+            // Fallback non-blocking poll only when no external poller
+            // (net_poll_thread) is feeding us events — otherwise we'd
+            // pay one mutex op + one epoll_wait syscall per call
+            // (~310 ns) for nothing. The flag is one-way: set by the
+            // first push_ready_events and stays set for the backend's
+            // lifetime.
+            if events.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
                 if let Ok(ep) = self.epoll.try_lock() {
                     let _ = ep.wait_with_timeout(&mut events, std::time::Duration::ZERO);
                 }
@@ -1340,7 +1353,7 @@ impl SlirpBackend {
                 src_ip, src_port, dst_ip, dst_port
             );
 
-            // Phase 5 unified outbound translation: combines the gateway-loopback
+            // Unified outbound translation: combines the gateway-loopback
             // rewrite + deny-list check in one pure-function call. Returns None if
             // the dst is denied; on Some, the SocketAddr already has the right
             // host IP (loopback for the gateway, original for everything else).
@@ -1608,10 +1621,10 @@ impl SlirpBackend {
 
         let payload = tcp.payload();
         if !payload.is_empty() && entry.state == TcpNatState::Established {
-            // Phase 3 guest→host: rely on the kernel's send buffer + TCP
-            // retransmit for backpressure.  ACK only the bytes the kernel
-            // accepted right now; on WouldBlock, don't ACK at all and let
-            // the guest retransmit.  No userspace buffering, no 256 KB cap.
+            // Guest→host backpressure: rely on the kernel's send buffer + TCP
+            // retransmit.  ACK only the bytes the kernel accepted right now;
+            // on WouldBlock, don't ACK at all and let the guest retransmit.
+            // No userspace buffering, no fixed byte-cap on in-flight data.
             let payload_seq = seq;
             let n_written = match entry.host_stream.write(payload) {
                 Ok(n) => n,
@@ -1758,11 +1771,11 @@ impl SlirpBackend {
                     continue;
                 }
 
-                // Phase 3 host→guest path: peek what's in the kernel recv buffer
+                // Host→guest path: peek what's in the kernel recv buffer
                 // without consuming. Send only the un-ACK'd portion (bytes past
                 // what we've already sent). The kernel's socket buffer holds the
-                // outstanding data; Task 3.4's ACK-driven `read()` consumes it
-                // once the guest ACKs.
+                // outstanding data; ACK-driven `read()` consumes it once the
+                // guest ACKs.
                 let mut peek_buf = [0u8; 65536];
                 match recv_peek(&entry.host_stream, &mut peek_buf) {
                     Ok(0) => {
@@ -2170,6 +2183,10 @@ impl SlirpBackend {
     /// instead of re-entering EpollDispatch (which the net-poll thread
     /// holds for the full 50 ms of the blocking wait).
     pub fn push_ready_events(&self, events: &[EpollEvent]) {
+        // First push from net_poll_thread flips the flag so drain_to_guest
+        // skips its non-blocking-poll fallback.  Stays set for the
+        // backend's lifetime — net_poll_thread doesn't disappear mid-run.
+        self.has_external_poller.store(true, Ordering::Relaxed);
         if events.is_empty() {
             return;
         }
@@ -2266,7 +2283,7 @@ fn build_tcp_packet_static(
 }
 
 /// Build a synthetic TCP SYN frame from the SLIRP gateway to the guest,
-/// used for inbound port-forwarding (Phase 5.5b).
+/// used for inbound port-forwarding.
 ///
 /// The frame mirrors what the guest would see from a real TCP client:
 /// - src: `SLIRP_GATEWAY_IP:high_port`
@@ -2492,7 +2509,7 @@ impl SlirpBackend {
     /// The current snapshot path does not reconstruct `flow_table` — the
     /// backend always starts empty after restore and new flows form naturally.
     /// This method is therefore a no-op today but is wired in advance so
-    /// Phase 6.1's half-close work (which will persist restored flows) has a
+    /// future work that persists restored flows across snapshot/restore has a
     /// ready call site.
     pub fn rebuild_epoll_from_flow_table(&mut self) {
         use std::os::fd::AsRawFd;

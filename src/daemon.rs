@@ -1373,7 +1373,7 @@ async fn spawn_service_run(
     let mut published = false;
     let mut terminalized = false;
 
-    // Phase 1: Wait for output publication OR exit OR watchdog.
+    // Wait for output publication OR exit OR watchdog.
     tokio::select! {
         output_result = &mut output_rx => {
             if let Ok(publication) = output_result {
