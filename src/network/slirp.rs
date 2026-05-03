@@ -544,6 +544,11 @@ pub struct SlirpBackend {
     /// touching the EpollDispatch mutex (which the net-poll thread
     /// holds for up to 50 ms during its wait).
     pending_events: Mutex<Vec<EpollEvent>>,
+    /// Flow keys queued for removal because their state advanced to
+    /// Closed in a non-relay code path (e.g. guest FIN/RST in
+    /// handle_tcp_frame). Drained at the bottom of relay_tcp_nat_data
+    /// without scanning the full flow_table.
+    pending_close: Vec<FlowKey>,
 }
 
 impl SlirpBackend {
@@ -649,6 +654,7 @@ impl SlirpBackend {
             epoll,
             epoll_waker,
             pending_events: Mutex::new(Vec::new()),
+            pending_close: Vec::new(),
         })
     }
 
@@ -1474,6 +1480,12 @@ impl SlirpBackend {
             return Ok(());
         };
 
+        // Track whether this processing path sets state=Closed so we can
+        // enqueue the key in pending_close once the entry borrow ends.
+        // FIN/RST paths push to pending_close and return early; mid-function
+        // error paths (ACK-driven read failure, write failure) set this flag.
+        let mut closed_by_error = false;
+
         entry.last_activity = Instant::now();
 
         // Inbound port-forward: guest's SYN-ACK completing the host-initiated
@@ -1565,6 +1577,7 @@ impl SlirpBackend {
                                 key.guest_src_port, e
                             );
                             entry.state = TcpNatState::Closed;
+                            closed_by_error = true;
                             break;
                         }
                     }
@@ -1593,6 +1606,8 @@ impl SlirpBackend {
                         key.guest_src_port, e
                     );
                     entry.state = TcpNatState::Closed;
+                    // entry last used above; borrow ends here before pending_close push.
+                    self.pending_close.push(flow_key);
                     return Ok(());
                 }
             };
@@ -1639,12 +1654,25 @@ impl SlirpBackend {
             self.inject_to_guest.push(fin_ack_frame);
             entry.our_seq = entry.our_seq.wrapping_add(1);
             entry.state = TcpNatState::Closed;
+            // entry last used above; borrow ends before pending_close push.
+            self.pending_close.push(flow_key);
+            return Ok(());
         }
 
         // RST from guest
         if tcp.rst() {
             debug!("SLIRP TCP: RST from guest for {}:{}", dst_ip, dst_port);
             entry.state = TcpNatState::Closed;
+            // entry last used above; borrow ends before pending_close push.
+            self.pending_close.push(flow_key);
+            return Ok(());
+        }
+
+        // ACK-driven read failure marked the entry Closed but execution
+        // continues here (no early return). Push to pending_close so
+        // relay_tcp_nat_data removes the flow without an O(n) sweep.
+        if closed_by_error {
+            self.pending_close.push(flow_key);
         }
 
         Ok(())
@@ -1652,40 +1680,35 @@ impl SlirpBackend {
 
     /// Relay data from host TCP connections to guest, driven by epoll readiness.
     ///
-    /// The cleanup sweep (Closed state and idle timeout) runs over ALL TCP
-    /// entries on every tick — checking state is cheap and must not wait for a
-    /// readiness event.  Only the data relay (peek + send) is restricted to
-    /// flows with an EPOLLIN event in `ready`.
+    /// Closed flows enqueued by handle_tcp_frame (FIN/RST) are drained from
+    /// `pending_close` and removed promptly. Idle-timeout detection iterates
+    /// only the flow table entries directly, avoiding a separate Vec allocation.
+    /// Data relay is restricted to flows with an EPOLLIN event in `ready`.
     fn relay_tcp_nat_data(&mut self, ready: &[EpollEvent]) {
-        let mut to_remove: Vec<FlowKey> = Vec::new();
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        // Pass 1: sweep all TCP entries for Closed state and idle timeout.
-        // This must run unconditionally so that a guest FIN (which marks the
-        // entry Closed in handle_tcp_frame) causes the host TcpStream to be
-        // dropped promptly — the server-side read loop sees EOF as soon as the
-        // stream is dropped, not only when an epoll event arrives.
-        let all_tcp_keys: Vec<FlowKey> = self
-            .flow_table
-            .keys()
-            .copied()
-            .filter(|k| matches!(k, FlowKey::Tcp(_)))
-            .collect();
-        for flow_key in all_tcp_keys {
-            let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) else {
-                continue;
-            };
-            if entry.state == TcpNatState::Closed
-                || entry.last_activity.elapsed() > Duration::from_secs(300)
-            {
-                to_remove.push(flow_key);
+        // Seed removal list from flows already marked Closed by handle_tcp_frame
+        // (FIN/RST path) via the pending_close queue. No O(n) scan of the full
+        // flow table — each entry is pushed here exactly once when state=Closed.
+        let mut to_remove: Vec<FlowKey> = std::mem::take(&mut self.pending_close);
+
+        // Idle-timeout sweep: scan flow_table once without collecting a
+        // separate key Vec. 300-second inactivity applies regardless of epoll
+        // readiness; this is O(n) in the number of TCP flows but has no
+        // heap allocation overhead.
+        const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+        for (flow_key, entry) in &self.flow_table {
+            if let FlowEntry::Tcp(tcp_entry) = entry {
+                if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT
+                    && !to_remove.contains(flow_key)
+                {
+                    to_remove.push(*flow_key);
+                }
             }
         }
 
-        // Pass 2: data relay — only for flows with an EPOLLIN readiness event.
-        // Linear scan per event is acceptable: readiness events are rare relative
-        // to flow count, and the flow table is small for typical workloads.
+        // Data relay — only for flows with an EPOLLIN readiness event.
         let tcp_flow_keys: Vec<FlowKey> = ready
             .iter()
             .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
@@ -1698,7 +1721,7 @@ impl SlirpBackend {
                     }
                 })
             })
-            // Skip entries already marked for removal.
+            // Skip entries already queued for removal.
             .filter(|fk| !to_remove.contains(fk))
             .collect();
 
@@ -1706,87 +1729,102 @@ impl SlirpBackend {
             let FlowKey::Tcp(key) = flow_key else {
                 continue;
             };
-            let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
-                continue;
-            };
 
-            if entry.state != TcpNatState::Established {
-                continue;
-            }
+            let mut became_closed = false;
+            let mut fin_frame: Option<Vec<u8>> = None;
 
-            // Phase 3 host→guest path: peek what's in the kernel recv buffer
-            // without consuming. Send only the un-ACK'd portion (bytes past
-            // what we've already sent). The kernel's socket buffer holds the
-            // outstanding data; Task 3.4's ACK-driven `read()` consumes it
-            // once the guest ACKs.
-            let mut peek_buf = [0u8; 65536];
-            match recv_peek(&entry.host_stream, &mut peek_buf) {
-                Ok(0) => {
-                    // Host closed the connection. Send FIN to guest below.
-                    debug!(
-                        "SLIRP TCP: host EOF on flow guest_port={}, marking Closed",
-                        key.guest_src_port
-                    );
-                    entry.state = TcpNatState::Closed;
+            {
+                let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
+                    continue;
+                };
+
+                if entry.state != TcpNatState::Established {
+                    continue;
                 }
-                Ok(peek_n) => {
-                    let in_flight = entry.bytes_in_flight as usize;
-                    if peek_n > in_flight {
-                        let new_bytes = &peek_buf[in_flight..peek_n];
-                        let mut sent_total: usize = 0;
-                        for chunk in new_bytes.chunks(MTU - 54) {
-                            let frame = build_tcp_packet_static(
-                                key.dst_ip,
-                                SLIRP_GUEST_IP,
-                                key.dst_port,
-                                key.guest_src_port,
-                                entry.our_seq,
-                                entry.guest_ack,
-                                TcpControl::None,
-                                chunk,
-                            );
-                            frames_to_inject.push(frame);
-                            entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
-                            entry.bytes_in_flight =
-                                entry.bytes_in_flight.wrapping_add(chunk.len() as u32);
-                            sent_total += chunk.len();
-                        }
-                        entry.last_activity = Instant::now();
-                        trace!(
-                            "SLIRP TCP relay: peeked {} bytes (in_flight before={}, sent now={})",
-                            peek_n,
-                            in_flight,
-                            sent_total
+
+                // Phase 3 host→guest path: peek what's in the kernel recv buffer
+                // without consuming. Send only the un-ACK'd portion (bytes past
+                // what we've already sent). The kernel's socket buffer holds the
+                // outstanding data; Task 3.4's ACK-driven `read()` consumes it
+                // once the guest ACKs.
+                let mut peek_buf = [0u8; 65536];
+                match recv_peek(&entry.host_stream, &mut peek_buf) {
+                    Ok(0) => {
+                        // Host closed the connection. Send FIN to guest below.
+                        debug!(
+                            "SLIRP TCP: host EOF on flow guest_port={}, marking Closed",
+                            key.guest_src_port
                         );
+                        entry.state = TcpNatState::Closed;
+                        became_closed = true;
                     }
-                    // else: kernel buffer holds only already-in-flight bytes.
-                    // Wait for guest ACK before sending more (Task 3.4).
+                    Ok(peek_n) => {
+                        let in_flight = entry.bytes_in_flight as usize;
+                        if peek_n > in_flight {
+                            let new_bytes = &peek_buf[in_flight..peek_n];
+                            let mut sent_total: usize = 0;
+                            for chunk in new_bytes.chunks(MTU - 54) {
+                                let frame = build_tcp_packet_static(
+                                    key.dst_ip,
+                                    SLIRP_GUEST_IP,
+                                    key.dst_port,
+                                    key.guest_src_port,
+                                    entry.our_seq,
+                                    entry.guest_ack,
+                                    TcpControl::None,
+                                    chunk,
+                                );
+                                frames_to_inject.push(frame);
+                                entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
+                                entry.bytes_in_flight =
+                                    entry.bytes_in_flight.wrapping_add(chunk.len() as u32);
+                                sent_total += chunk.len();
+                            }
+                            entry.last_activity = Instant::now();
+                            trace!(
+                                "SLIRP TCP relay: peeked {} bytes (in_flight before={}, sent now={})",
+                                peek_n,
+                                in_flight,
+                                sent_total
+                            );
+                        }
+                        // else: kernel buffer holds only already-in-flight bytes.
+                        // Wait for guest ACK before sending more (Task 3.4).
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Kernel recv buffer empty; nothing to do this poll.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "SLIRP TCP: recv_peek failed on flow guest_port={}, marking Closed: {}",
+                            key.guest_src_port, e
+                        );
+                        entry.state = TcpNatState::Closed;
+                        became_closed = true;
+                    }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Kernel recv buffer empty; nothing to do this poll.
-                }
-                Err(e) => {
-                    warn!(
-                        "SLIRP TCP: recv_peek failed on flow guest_port={}, marking Closed: {}",
-                        key.guest_src_port, e
-                    );
-                    entry.state = TcpNatState::Closed;
-                }
-            }
 
-            // FIN if host closed
-            if entry.state == TcpNatState::Closed {
-                let fin = build_tcp_packet_static(
-                    key.dst_ip,
-                    SLIRP_GUEST_IP,
-                    key.dst_port,
-                    key.guest_src_port,
-                    entry.our_seq,
-                    entry.guest_ack,
-                    TcpControl::Fin,
-                    &[],
-                );
+                // FIN if host closed
+                if entry.state == TcpNatState::Closed {
+                    fin_frame = Some(build_tcp_packet_static(
+                        key.dst_ip,
+                        SLIRP_GUEST_IP,
+                        key.dst_port,
+                        key.guest_src_port,
+                        entry.our_seq,
+                        entry.guest_ack,
+                        TcpControl::Fin,
+                        &[],
+                    ));
+                }
+            } // entry borrow ends here
+
+            if let Some(fin) = fin_frame {
                 frames_to_inject.push(fin);
+            }
+            // Queue for removal so the cleanup loop below can unregister + drop.
+            if became_closed {
+                to_remove.push(flow_key);
             }
         }
 
