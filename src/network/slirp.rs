@@ -748,6 +748,18 @@ impl SlirpBackend {
             Err(_) => return Ok(()),
         };
 
+        // Track inject_to_guest growth so we can wake the net-poll
+        // thread if this call queued any frames. Pre-Phase-6.4 the
+        // poll thread woke unconditionally every 5 ms, which masked
+        // the absence of an explicit wake — every queued ACK got
+        // flushed within 5 ms. With epoll_wait(50ms) waiting on FD
+        // readiness, an ACK queued during guest TX has no FD-side
+        // signal (the guest is the writer, not the reader on the
+        // SLIRP-side socket), so without an explicit wake the ACK
+        // sits 50 ms before being flushed — TCP send window stalls,
+        // throughput drops 10×.
+        let inject_len_before = self.inject_to_guest.len();
+
         match eth.ethertype() {
             EthernetProtocol::Arp => {
                 self.handle_arp_frame(frame)?;
@@ -758,6 +770,10 @@ impl SlirpBackend {
             _ => {
                 trace!("SLIRP: ignoring ethertype {:?}", eth.ethertype());
             }
+        }
+
+        if self.inject_to_guest.len() > inject_len_before {
+            self.epoll_waker.wake();
         }
         Ok(())
     }
@@ -786,25 +802,29 @@ impl SlirpBackend {
 
         // 3. Collect ready events.
         //
-        // Fast path: try to acquire EpollDispatch without blocking. When
-        // net_poll_thread is idle (between waits) or there is no net_poll_thread
-        // (unit tests, benches), this succeeds immediately and we run the
-        // non-blocking poll ourselves — same as Phase 6.3 behaviour, zero
-        // extra overhead.
+        // Always drain `pending_events` first — that's the queue
+        // `net_poll_thread` fills via `push_ready_events` after every
+        // successful `epoll_wait`. If we skipped this and only polled
+        // epoll directly, we would lose every event the net-poll thread
+        // already drained: level-triggered EPOLLIN doesn't re-fire for
+        // data the kernel already reported, so the next non-blocking
+        // poll returns 0 events even when there's work to do. CRR
+        // connections then wait one full 50 ms epoll cycle for the NEXT
+        // data event before their first data is relayed.
         //
-        // Slow path: net_poll_thread holds the EpollDispatch mutex for the
-        // full 50 ms of its blocking wait. try_lock returns Err; we drain the
-        // pending_events queue that net_poll_thread fills via push_ready_events
-        // instead of blocking on the mutex. Mutex contention eliminated.
+        // Then, only if no net-poll thread has populated the queue
+        // (unit tests / benches), fall back to a non-blocking poll on
+        // the epoll FD ourselves. `try_lock` keeps that fallback safe
+        // under contention.
         let ready: Vec<EpollEvent> = {
-            let mut events: Vec<EpollEvent> = Vec::new();
-            if let Ok(ep) = self.epoll.try_lock() {
-                // Epoll available: non-blocking poll (zero-timeout).
-                let _ = ep.wait_with_timeout(&mut events, std::time::Duration::ZERO);
-            } else {
-                // Epoll held by net_poll_thread: consume events it pushed.
+            let mut events: Vec<EpollEvent> = {
                 let mut queue = self.pending_events.lock().unwrap();
-                events = std::mem::take(&mut *queue);
+                std::mem::take(&mut *queue)
+            };
+            if events.is_empty() {
+                if let Ok(ep) = self.epoll.try_lock() {
+                    let _ = ep.wait_with_timeout(&mut events, std::time::Duration::ZERO);
+                }
             }
             events
         };
