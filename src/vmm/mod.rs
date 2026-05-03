@@ -1629,6 +1629,7 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
         // contention during the wait phase.
+        epoll_events.clear();
         if let Some(ref ep_arc) = epoll_arc {
             match ep_arc.lock() {
                 Ok(ep) => {
@@ -1640,6 +1641,17 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
         } else {
             std::thread::sleep(FALLBACK_SLEEP);
+        }
+
+        // Push ready events into the backend's queue before acquiring the
+        // device lock for inject/IRQ work. drain_to_guest will consume them
+        // without re-locking EpollDispatch, eliminating mutex contention
+        // between the net-poll thread's 50 ms blocking wait and the vCPU
+        // thread's process_guest_frame → drain_to_guest path.
+        if !epoll_events.is_empty() {
+            if let Ok(guard) = net_dev.lock() {
+                guard.push_events_to_backend(&epoll_events);
+            }
         }
 
         let has_interrupt = {

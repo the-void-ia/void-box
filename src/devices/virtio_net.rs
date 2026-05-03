@@ -799,6 +799,16 @@ impl VirtioNetDevice {
         let backend = self.slirp.lock().unwrap();
         backend.epoll_arc()
     }
+
+    /// Forward ready epoll events into the network backend's per-tick queue.
+    ///
+    /// Called by net_poll_thread after each epoll_wait returns so that
+    /// drain_to_guest can process events without re-locking EpollDispatch.
+    #[cfg(target_os = "linux")]
+    pub fn push_events_to_backend(&self, events: &[crate::network::epoll_dispatch::EpollEvent]) {
+        let backend = self.slirp.lock().unwrap();
+        backend.push_ready_events(events);
+    }
 }
 
 #[cfg(test)]

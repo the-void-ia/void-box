@@ -105,6 +105,14 @@ pub trait NetworkBackend: Send {
     fn epoll_arc(&self) -> Option<std::sync::Arc<std::sync::Mutex<epoll_dispatch::EpollDispatch>>> {
         None
     }
+
+    /// Push ready epoll events into the backend's per-tick queue.
+    ///
+    /// Called by net_poll_thread after each epoll_wait returns, so
+    /// drain_to_guest can consume them without re-locking EpollDispatch.
+    /// The default is a no-op; `SlirpBackend` overrides this.
+    #[cfg(target_os = "linux")]
+    fn push_ready_events(&self, _events: &[epoll_dispatch::EpollEvent]) {}
 }
 
 /// TAP device handle

@@ -539,6 +539,11 @@ pub struct SlirpBackend {
     /// Cloneable waker that interrupts `EpollDispatch::wait_with_timeout`.
     /// Used after flow-table mutations to unblock the poll thread immediately.
     epoll_waker: Waker,
+    /// Ready events fed by the net-poll thread after each blocking
+    /// epoll_wait. drain_to_guest drains this on every call without
+    /// touching the EpollDispatch mutex (which the net-poll thread
+    /// holds for up to 50 ms during its wait).
+    pending_events: Mutex<Vec<EpollEvent>>,
 }
 
 impl SlirpBackend {
@@ -643,6 +648,7 @@ impl SlirpBackend {
             accept_sender,
             epoll,
             epoll_waker,
+            pending_events: Mutex::new(Vec::new()),
         })
     }
 
@@ -772,14 +778,34 @@ impl SlirpBackend {
         // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
 
-        // 3. Poll epoll for ready host sockets (non-blocking) and relay only
-        //    those flows.  A zero-timeout poll avoids any wait here; the
-        //    caller (net_poll_thread) blocks on epoll_wait(50 ms) instead.
-        let mut ready: Vec<EpollEvent> = Vec::new();
-        {
-            let ep = self.epoll.lock().unwrap();
-            let _ = ep.wait_with_timeout(&mut ready, std::time::Duration::ZERO);
-        }
+        // 3. Collect ready events.
+        //
+        // Primary source: events fed by net_poll_thread via push_ready_events.
+        // net_poll_thread holds the EpollDispatch mutex for up to 50 ms during
+        // its blocking wait; contending on it here from the vCPU path would
+        // serialize this call behind that 50 ms hold and collapse throughput.
+        //
+        // Fallback: if the primary queue is empty (e.g. in unit tests where
+        // no net_poll_thread runs), attempt a non-blocking epoll poll using
+        // try_lock so we never block on the mutex.
+        let ready: Vec<EpollEvent> = {
+            let taken: Vec<EpollEvent> = {
+                let mut queue = self.pending_events.lock().unwrap();
+                std::mem::take(&mut *queue)
+            };
+            if taken.is_empty() {
+                // Fallback: try to acquire epoll without blocking. Skip the poll
+                // entirely if net_poll_thread holds the mutex — it will push events
+                // via push_ready_events on the next iteration.
+                let mut fallback: Vec<EpollEvent> = Vec::new();
+                if let Ok(ep) = self.epoll.try_lock() {
+                    let _ = ep.wait_with_timeout(&mut fallback, std::time::Duration::ZERO);
+                }
+                fallback
+            } else {
+                taken
+            }
+        };
 
         // 4. Process TCP NAT data relay.
         self.relay_tcp_nat_data(&ready);
@@ -2081,6 +2107,21 @@ impl SlirpBackend {
 
         buf
     }
+
+    /// Push events from the net-poll thread into this backend's per-tick
+    /// event queue. Called from net_poll_thread after each successful
+    /// epoll_wait, while holding no other lock.
+    ///
+    /// drain_to_guest drains this queue with a brief uncontended lock
+    /// instead of re-entering EpollDispatch (which the net-poll thread
+    /// holds for the full 50 ms of the blocking wait).
+    pub fn push_ready_events(&self, events: &[EpollEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let mut queue = self.pending_events.lock().unwrap();
+        queue.extend_from_slice(events);
+    }
 }
 
 impl NetworkBackend for SlirpBackend {
@@ -2098,6 +2139,11 @@ impl NetworkBackend for SlirpBackend {
     ) -> Option<std::sync::Arc<std::sync::Mutex<crate::network::epoll_dispatch::EpollDispatch>>>
     {
         Some(std::sync::Arc::clone(&self.epoll))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_ready_events(&self, events: &[crate::network::epoll_dispatch::EpollEvent]) {
+        SlirpBackend::push_ready_events(self, events)
     }
 }
 
