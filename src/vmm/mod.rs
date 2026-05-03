@@ -1607,7 +1607,17 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         level: u32,
     }
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
-    const EPOLL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+    // 5 ms matches the pre-Phase-6.4 sleep cadence.  Reverted from 50 ms
+    // because the wider gap between IRQ re-assertions caused a +40 ms
+    // regression in CRR p50 — exactly Linux's delayed-ACK timer.  Theory:
+    // the guest spends most idle time in HLT and relies on regular vCPU
+    // schedule slots (driven by our IRQ pulses) to advance its TCP
+    // delayed-ACK timer.  At 50 ms cadence the guest's pure ACKs ride
+    // the next event-triggered IRQ, which can be 40+ ms away.  At 5 ms
+    // the housekeeping cadence mirrors pre-6.4; fast-path events still
+    // wake immediately via epoll readiness.  We lose the headline 10x
+    // idle-wakeup reduction but keep correctness.
+    const EPOLL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
     const FALLBACK_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
 
     let vm_fd = vm.vm_fd().as_raw_fd();
