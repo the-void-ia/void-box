@@ -37,6 +37,21 @@ pub struct EpollEvent {
     pub writable: bool,
 }
 
+/// Direction of interest for an `EpollDispatch::register` call.
+///
+/// Closed enum lets the type system reject impossible combinations (e.g.
+/// "neither read nor write") at compile time and gives a clear name to
+/// each mode rather than two opaque booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterMode {
+    /// Wake on EPOLLIN only.
+    Read,
+    /// Wake on EPOLLOUT only.
+    Write,
+    /// Wake on either EPOLLIN or EPOLLOUT.
+    ReadWrite,
+}
+
 /// Sentinel token reserved for the self-pipe wakeup mechanism.
 /// Never returned to callers.
 const SELF_PIPE_TOKEN: FlowToken = u64::MAX;
@@ -80,7 +95,7 @@ impl EpollDispatch {
             u64: SELF_PIPE_TOKEN,
         };
         // SAFETY: epoll_ctl ADD with a valid fd and event struct.
-        let rc = unsafe {
+        let epoll_ctl_result = unsafe {
             libc::epoll_ctl(
                 epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_ADD,
@@ -88,7 +103,7 @@ impl EpollDispatch {
                 &mut ev as *mut _,
             )
         };
-        if rc < 0 {
+        if epoll_ctl_result < 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -100,30 +115,22 @@ impl EpollDispatch {
         })
     }
 
-    /// Register `fd` with the dispatcher.  `readable`/`writable`
-    /// select EPOLLIN / EPOLLOUT.  `token` is opaque to the
-    /// dispatcher — returned verbatim on readiness events.
+    /// Register `fd` with the dispatcher under `token` for the requested
+    /// readiness `mode`.  `token` is opaque to the dispatcher — returned
+    /// verbatim on readiness events.
     ///
     /// Thread-safe: concurrent calls with `unregister` and
     /// `wait_with_timeout` are serialized by the kernel's per-epoll-fd lock.
-    pub fn register(
-        &self,
-        fd: RawFd,
-        token: FlowToken,
-        readable: bool,
-        writable: bool,
-    ) -> io::Result<()> {
-        let mut events: u32 = 0;
-        if readable {
-            events |= libc::EPOLLIN as u32;
-        }
-        if writable {
-            events |= libc::EPOLLOUT as u32;
-        }
+    pub fn register(&self, fd: RawFd, token: FlowToken, mode: RegisterMode) -> io::Result<()> {
+        let events: u32 = match mode {
+            RegisterMode::Read => libc::EPOLLIN as u32,
+            RegisterMode::Write => libc::EPOLLOUT as u32,
+            RegisterMode::ReadWrite => (libc::EPOLLIN | libc::EPOLLOUT) as u32,
+        };
         let mut ev = libc::epoll_event { events, u64: token };
         // SAFETY: epoll_ctl reads `ev` for ADD; we own `fd` for the
         // lifetime of the registration (caller's contract).
-        let rc = unsafe {
+        let epoll_ctl_result = unsafe {
             libc::epoll_ctl(
                 self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_ADD,
@@ -131,10 +138,9 @@ impl EpollDispatch {
                 &mut ev as *mut _,
             )
         };
-        if rc < 0 {
+        if epoll_ctl_result < 0 {
             return Err(io::Error::last_os_error());
         }
-        // Only count user-registered FDs; the self-pipe uses SELF_PIPE_TOKEN.
         if token != SELF_PIPE_TOKEN {
             self.registered_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -147,7 +153,7 @@ impl EpollDispatch {
         // SAFETY: epoll_ctl ignores the event pointer for DEL but
         // still requires it to be non-null on older kernels.
         let mut ev = libc::epoll_event { events: 0, u64: 0 };
-        let rc = unsafe {
+        let epoll_ctl_result = unsafe {
             libc::epoll_ctl(
                 self.epoll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_DEL,
@@ -155,7 +161,7 @@ impl EpollDispatch {
                 &mut ev as *mut _,
             )
         };
-        if rc < 0 {
+        if epoll_ctl_result < 0 {
             return Err(io::Error::last_os_error());
         }
         self.registered_count.fetch_sub(1, Ordering::Relaxed);
@@ -312,7 +318,7 @@ mod tests {
         let dispatch = EpollDispatch::new().expect("EpollDispatch::new");
         let token: FlowToken = 0xDEAD_BEEF;
         dispatch
-            .register(listener.as_raw_fd(), token, true, false)
+            .register(listener.as_raw_fd(), token, RegisterMode::Read)
             .expect("register");
         dispatch
             .unregister(listener.as_raw_fd())
@@ -322,7 +328,7 @@ mod tests {
     #[test]
     fn register_invalid_fd_returns_error() {
         let dispatch = EpollDispatch::new().expect("EpollDispatch::new");
-        let result = dispatch.register(-1, 0, true, false);
+        let result = dispatch.register(-1, 0, RegisterMode::Read);
         assert!(result.is_err());
     }
 
@@ -341,7 +347,7 @@ mod tests {
 
         let dispatch = EpollDispatch::new().expect("new");
         dispatch
-            .register(stream.as_raw_fd(), 0xCAFE, true, false)
+            .register(stream.as_raw_fd(), 0xCAFE, RegisterMode::Read)
             .expect("register");
 
         let mut events: Vec<EpollEvent> = Vec::new();

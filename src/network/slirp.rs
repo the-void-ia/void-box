@@ -36,7 +36,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::network::epoll_dispatch::{EpollDispatch, EpollEvent, Waker};
+use crate::network::epoll_dispatch::{EpollDispatch, EpollEvent, RegisterMode, Waker};
 use crate::network::{nat, NetworkBackend};
 
 /// Cached DNS response with expiry.
@@ -303,7 +303,9 @@ fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
     };
     if raw < 0 {
         let err = io::Error::last_os_error();
-        if matches!(err.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+        let errno = err.raw_os_error();
+        let unprivileged_icmp_forbidden = errno == Some(libc::EACCES) || errno == Some(libc::EPERM);
+        if unprivileged_icmp_forbidden {
             // First failure transitions 0 → 2 and emits the warn-once log.
             // swap returns the previous value; only log if we were the first
             // to set it.
@@ -735,7 +737,7 @@ impl SlirpBackend {
             let flow_key = FlowKey::Tcp(key);
             self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
             self.token_to_key.insert(token, flow_key);
-            if let Err(e) = self.epoll.register(host_fd, token, true, false) {
+            if let Err(e) = self.epoll.register(host_fd, token, RegisterMode::Read) {
                 warn!(
                     host_port = high_port,
                     guest_port,
@@ -1233,7 +1235,7 @@ impl SlirpBackend {
 
         if let Some(host_fd) = new_host_fd {
             self.token_to_key.insert(new_token, flow_key);
-            if let Err(e) = self.epoll.register(host_fd, new_token, true, false) {
+            if let Err(e) = self.epoll.register(host_fd, new_token, RegisterMode::Read) {
                 warn!(
                     guest_src_port = key.guest_src_port,
                     dst_ip = %key.dst_ip,
@@ -1321,7 +1323,7 @@ impl SlirpBackend {
 
         if let Some(host_fd) = new_icmp_fd {
             self.token_to_key.insert(new_token, flow_key);
-            if let Err(e) = self.epoll.register(host_fd, new_token, true, false) {
+            if let Err(e) = self.epoll.register(host_fd, new_token, RegisterMode::Read) {
                 warn!(
                     guest_id = key.guest_id,
                     dst_ip = %key.dst_ip,
@@ -1408,12 +1410,12 @@ impl SlirpBackend {
                     }
                 };
 
-            // Check max concurrent connections
-            let tcp_flow_count = self
-                .flow_table
-                .keys()
-                .filter(|k| matches!(k, FlowKey::Tcp(_)))
-                .count();
+            let mut tcp_flow_count = 0;
+            for flow_key in self.flow_table.keys() {
+                if let FlowKey::Tcp(_) = flow_key {
+                    tcp_flow_count += 1;
+                }
+            }
             if tcp_flow_count >= self.max_concurrent_connections {
                 warn!(
                     "SLIRP TCP: max concurrent connections ({}) reached, rejecting SYN to {}:{}",
@@ -1480,7 +1482,7 @@ impl SlirpBackend {
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
-                    if let Err(e) = self.epoll.register(host_fd, token, true, false) {
+                    if let Err(e) = self.epoll.register(host_fd, token, RegisterMode::Read) {
                         warn!(
                             guest_src_port = key.guest_src_port,
                             dst_ip = %key.dst_ip,
@@ -1770,14 +1772,19 @@ impl SlirpBackend {
             }
         }
 
-        // Data relay — only for flows with an EPOLLIN readiness event.
-        let tcp_flow_keys: Vec<FlowKey> = ready
-            .iter()
-            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
-            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
-            // Skip entries already queued for removal.
-            .filter(|fk| !to_remove_set.contains(fk))
-            .collect();
+        let mut tcp_flow_keys: Vec<FlowKey> = Vec::new();
+        for event in ready {
+            if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_TCP {
+                continue;
+            }
+            let Some(flow_key) = self.token_to_key.get(&event.token).copied() else {
+                continue;
+            };
+            if to_remove_set.contains(&flow_key) {
+                continue;
+            }
+            tcp_flow_keys.push(flow_key);
+        }
 
         for flow_key in tcp_flow_keys {
             let FlowKey::Tcp(key) = flow_key else {
@@ -1903,28 +1910,32 @@ impl SlirpBackend {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
-        // Collect ready ICMP flow keys via O(1) token_to_key lookup.
-        let ready_flow_keys: Vec<FlowKey> = ready
-            .iter()
-            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_ICMP)
-            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
-            .collect();
+        let mut ready_flow_keys: Vec<FlowKey> = Vec::new();
+        for event in ready {
+            if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_ICMP {
+                continue;
+            }
+            let Some(flow_key) = self.token_to_key.get(&event.token).copied() else {
+                continue;
+            };
+            ready_flow_keys.push(flow_key);
+        }
 
-        // Periodic idle-timeout sweep for flows not in the readiness set.
         // Mirrors the TCP idle-timeout sweep so ICMP sockets do not accumulate
         // indefinitely when the ping target goes silent.
-        let icmp_to_remove: std::collections::HashSet<FlowKey> = self
-            .flow_table
-            .iter()
-            .filter_map(|(fk, fe)| {
-                if let (FlowKey::IcmpEcho(_), FlowEntry::IcmpEcho(e)) = (fk, fe) {
-                    if now.duration_since(e.last_activity) > ICMP_IDLE_TIMEOUT {
-                        return Some(*fk);
-                    }
-                }
-                None
-            })
-            .collect();
+        let mut icmp_to_remove: std::collections::HashSet<FlowKey> =
+            std::collections::HashSet::new();
+        for (flow_key, entry) in &self.flow_table {
+            let FlowKey::IcmpEcho(_) = flow_key else {
+                continue;
+            };
+            let FlowEntry::IcmpEcho(icmp_entry) = entry else {
+                continue;
+            };
+            if now.duration_since(icmp_entry.last_activity) > ICMP_IDLE_TIMEOUT {
+                icmp_to_remove.insert(*flow_key);
+            }
+        }
 
         for flow_key in &ready_flow_keys {
             // Skip if already in remove set (idle-timeout caught it first).
@@ -2030,34 +2041,36 @@ impl SlirpBackend {
     /// `key.guest_src_port`.
     fn relay_udp_flows(&mut self, ready: &[EpollEvent]) {
         let now = Instant::now();
-        // Reap idle flows; the per-flow connected socket is closed by Drop.
-        let stale: Vec<FlowKey> = self
-            .flow_table
-            .iter()
-            .filter(|(k, e)| {
-                matches!(k, FlowKey::Udp(_))
-                    && match e {
-                        FlowEntry::Udp(entry) => {
-                            now.duration_since(entry.last_activity) > UDP_IDLE_TIMEOUT
-                        }
-                        _ => false,
-                    }
-            })
-            .map(|(k, _)| *k)
-            .collect();
-        for k in stale {
-            if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&k) {
+        // Per-flow connected sockets are closed by Drop when the entry leaves
+        // flow_table.
+        let mut stale: Vec<FlowKey> = Vec::new();
+        for (flow_key, entry) in &self.flow_table {
+            let FlowKey::Udp(_) = flow_key else { continue };
+            let FlowEntry::Udp(udp_entry) = entry else {
+                continue;
+            };
+            if now.duration_since(udp_entry.last_activity) > UDP_IDLE_TIMEOUT {
+                stale.push(*flow_key);
+            }
+        }
+        for flow_key in stale {
+            if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
                 self.epoll.unregister(entry.sock.as_raw_fd()).ok();
             }
-            self.flow_table.remove(&k);
+            self.flow_table.remove(&flow_key);
         }
 
-        let flow_keys: Vec<FlowKey> = ready
-            .iter()
-            .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_UDP)
-            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
-            .collect();
+        let mut flow_keys: Vec<FlowKey> = Vec::new();
+        for event in ready {
+            if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_UDP {
+                continue;
+            }
+            let Some(flow_key) = self.token_to_key.get(&event.token).copied() else {
+                continue;
+            };
+            flow_keys.push(flow_key);
+        }
         for flow_key in flow_keys {
             let FlowKey::Udp(key) = flow_key else {
                 continue;
@@ -2535,21 +2548,23 @@ impl SlirpBackend {
             match (flow_key, entry) {
                 (FlowKey::Tcp(_), FlowEntry::Tcp(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ =
-                        self.epoll
-                            .register(e.host_stream.as_raw_fd(), e.flow_token, true, false);
+                    let _ = self.epoll.register(
+                        e.host_stream.as_raw_fd(),
+                        e.flow_token,
+                        RegisterMode::Read,
+                    );
                 }
                 (FlowKey::Udp(_), FlowEntry::Udp(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ = self
-                        .epoll
-                        .register(e.sock.as_raw_fd(), e.flow_token, true, false);
+                    let _ =
+                        self.epoll
+                            .register(e.sock.as_raw_fd(), e.flow_token, RegisterMode::Read);
                 }
                 (FlowKey::IcmpEcho(_), FlowEntry::IcmpEcho(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ = self
-                        .epoll
-                        .register(e.sock.as_raw_fd(), e.flow_token, true, false);
+                    let _ =
+                        self.epoll
+                            .register(e.sock.as_raw_fd(), e.flow_token, RegisterMode::Read);
                 }
                 _ => {}
             }
@@ -2608,7 +2623,7 @@ impl SlirpBackend {
         // state transitions, not readiness events.
         #[cfg(not(any(test, feature = "bench-helpers")))]
         {
-            if let Err(e) = self.epoll.register(host_fd, token, true, false) {
+            if let Err(e) = self.epoll.register(host_fd, token, RegisterMode::Read) {
                 warn!(
                     guest_port,
                     high_port,
