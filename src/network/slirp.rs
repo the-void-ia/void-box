@@ -91,6 +91,11 @@ const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeout for TCP entries stuck in the LastAck state (i.e. we sent a FIN
+/// but the guest's final ACK never arrived). Two TCP MSLs (2 × 30 s = 60 s)
+/// matches the POSIX TIME_WAIT recommendation and prevents LastAck entries
+/// from leaking indefinitely when a guest drops the final ACK.
+const LAST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sleep interval for the port-forward listener thread between non-blocking
 /// accept polls. Short enough to keep accept latency low; long enough to
@@ -1859,13 +1864,33 @@ impl SlirpBackend {
                 .into_iter()
                 .collect();
 
-        // Idle-timeout sweep: scan flow_table once without collecting a
-        // separate key Vec. 300-second inactivity applies regardless of epoll
-        // readiness; this is O(n) in the number of TCP flows.
+        // Timeout sweep: one pass over the flow table handles two independent
+        // timeout conditions without a separate Vec or extra allocation.
+        // Uses to_remove_set (HashSet) for O(1) membership checks.
         const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
         for (flow_key, entry) in &self.flow_table {
             if let FlowEntry::Tcp(tcp_entry) = entry {
+                if to_remove_set.contains(flow_key) {
+                    continue;
+                }
+                // Standard idle-timeout: 300 s of inactivity in any state.
                 if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT {
+                    to_remove_set.insert(*flow_key);
+                    continue;
+                }
+                // LastAck-timeout: final guest ACK never arrived. Reap so a
+                // misbehaving or crashed guest doesn't leak entries forever.
+                if tcp_entry.state == TcpNatState::LastAck
+                    && tcp_entry.last_state_change.elapsed() > LAST_ACK_TIMEOUT
+                {
+                    warn!(
+                        "SLIRP TCP: LastAck timeout for guest_port={}, reaping",
+                        if let FlowKey::Tcp(k) = flow_key {
+                            k.guest_src_port
+                        } else {
+                            0
+                        }
+                    );
                     to_remove_set.insert(*flow_key);
                 }
             }
