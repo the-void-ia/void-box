@@ -162,8 +162,28 @@ pub(crate) struct InboundAccept {
 //  TCP NAT connection tracking
 // ──────────────────────────────────────────────────────────────────────
 
+/// TCP connection state for the SLIRP NAT relay.
+///
+/// The state machine models both guest-initiated and host-initiated half-close
+/// sequences. `FinWait2` is omitted: distinguishing it from `FinWait1` requires
+/// observing per-segment ACKs from the kernel, which the relay does not track.
+/// Instead, the relay stays in `FinWait1` until host EOF arrives, then jumps
+/// directly to `LastAck`.
+///
+/// State transitions:
+///
+/// ```text
+///   SynReceived ──ACK──► Established ──guest FIN──► FinWait1
+///   SynSent ──SYN+ACK──► Established               │  │
+///                              │                    │  └─ host EOF ──► LastAck
+///                              │ host EOF            │                     │
+///                              ▼                    │          guest ACK ──┘
+///                          CloseWait ◄──────────────┘            └──► Closed
+///                              │ guest FIN
+///                              ▼
+///                           LastAck ──── LAST_ACK_TIMEOUT ────► Closed
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum TcpNatState {
     /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
     /// final ACK to complete the outbound 3-way handshake.
@@ -171,11 +191,19 @@ pub enum TcpNatState {
     /// We synthesized a SYN to the guest (port-forwarding); waiting
     /// for the guest's SYN-ACK to advance to Established.
     SynSent,
+    /// Both sides exchanged handshake; data flows in both directions.
     Established,
+    /// Guest closed its write side (sent FIN); we ACKed and called
+    /// shutdown(Write) on the host socket. Host response data may still
+    /// be in-flight — relay continues until host EOF.
     FinWait1,
-    FinWait2,
+    /// Host closed its write side first (we saw EOF); we sent a FIN to
+    /// the guest. Guest may still send data, which the relay forwards.
     CloseWait,
+    /// We have sent our FIN to the guest; waiting for the guest's final
+    /// ACK. Reaped on ACK or after LAST_ACK_TIMEOUT.
     LastAck,
+    /// Connection fully closed; entry pending removal from the flow table.
     Closed,
 }
 
