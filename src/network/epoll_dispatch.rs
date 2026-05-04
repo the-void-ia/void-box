@@ -1,18 +1,26 @@
 //! Linux epoll-driven readiness dispatch for SLIRP host sockets.
 //!
-//! Owns one `epoll_fd` plus a self-pipe.  Callers register socket FDs
-//! with a `FlowToken` (a 64-bit identifier the dispatcher returns on
-//! readiness).  The poll thread calls `wait_with_timeout` to block
-//! until any registered FD is ready or the timeout fires, then drains
-//! the events into a caller-owned buffer.
+//! Owns one `epoll_fd` plus an eagerly-initialized self-pipe.  Callers
+//! register socket FDs with a `FlowToken` (a 64-bit identifier the
+//! dispatcher returns on readiness).  The poll thread calls
+//! `wait_with_timeout` to block until any registered FD is ready or the
+//! timeout fires, then drains the events into a caller-owned buffer.
+//!
+//! `EpollDispatch` is `Sync`: the Linux kernel serializes concurrent
+//! `epoll_ctl` and `epoll_wait` calls on the same epoll fd internally.
+//! Callers can therefore share one `Arc<EpollDispatch>` across threads
+//! and call `register`/`unregister` without an outer `Mutex`, eliminating
+//! the lock-contention between `wait_with_timeout` (net-poll thread) and
+//! `register` (vCPU thread handling new TCP SYNs).
 //!
 //! Why no crate? The standard `mio`/`tokio` story would pull in a
 //! reactor + a runtime that the SLIRP poll loop does not need.
 //! `libc::epoll_*` is two syscalls, fully observable, and the surface
-//! fits in ~150 lines.
+//! fits in ~200 lines.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +29,6 @@ use std::time::Duration;
 pub type FlowToken = u64;
 
 /// One readiness event, mapped from `libc::epoll_event`.
-// Task 10 drives the relay loop from wait_with_timeout; suppress dead_code
-// until then.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct EpollEvent {
@@ -35,17 +41,27 @@ pub struct EpollEvent {
 /// Never returned to callers.
 const SELF_PIPE_TOKEN: FlowToken = u64::MAX;
 
-#[derive(Debug)]
+/// `EpollDispatch` is `Sync`: concurrent `epoll_ctl` and `epoll_wait`
+/// on the same epoll fd are kernel-serialized and safe from multiple
+/// threads.  The only shared state beyond the fd is `registered_count`
+/// (an `AtomicUsize`) and the self-pipe (immutable after construction).
 pub struct EpollDispatch {
     epoll_fd: OwnedFd,
-    read_end: Option<OwnedFd>,
-    waker_handle: Option<Arc<OwnedFd>>,
+    /// Read end of the self-pipe; registered with EPOLLIN at construction.
+    read_end: OwnedFd,
+    /// Cloneable waker backed by the write end of the self-pipe.
+    waker_handle: Arc<OwnedFd>,
     /// Number of user-registered FDs (excludes the self-pipe).
-    registered_count: usize,
+    registered_count: AtomicUsize,
 }
 
+// SAFETY: All mutable state is either atomic or only accessed from one
+// thread at a time (epoll_ctl/epoll_wait are kernel-serialized on the fd).
+unsafe impl Sync for EpollDispatch {}
+
 impl EpollDispatch {
-    /// Create a new epoll instance with `EPOLL_CLOEXEC`.
+    /// Create a new epoll instance with `EPOLL_CLOEXEC` and eagerly
+    /// initialize the self-pipe so `waker()` is lock-free.
     pub fn new() -> io::Result<Self> {
         // SAFETY: `epoll_create1` returns -1 on error and a valid fd
         // otherwise.  We wrap into OwnedFd so Drop closes it.
@@ -54,19 +70,44 @@ impl EpollDispatch {
             return Err(io::Error::last_os_error());
         }
         let epoll_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // Eagerly create the self-pipe and register its read end.
+        // This avoids the lazy-init branch in the hot path and lets
+        // `waker()` take `&self` instead of `&mut self`.
+        let (read_fd, write_fd) = create_pipe2_nonblock_cloexec();
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: SELF_PIPE_TOKEN,
+        };
+        // SAFETY: epoll_ctl ADD with a valid fd and event struct.
+        let rc = unsafe {
+            libc::epoll_ctl(
+                epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                read_fd.as_raw_fd(),
+                &mut ev as *mut _,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         Ok(Self {
             epoll_fd,
-            read_end: None,
-            waker_handle: None,
-            registered_count: 0,
+            read_end: read_fd,
+            waker_handle: Arc::new(write_fd),
+            registered_count: AtomicUsize::new(0),
         })
     }
 
     /// Register `fd` with the dispatcher.  `readable`/`writable`
     /// select EPOLLIN / EPOLLOUT.  `token` is opaque to the
     /// dispatcher — returned verbatim on readiness events.
+    ///
+    /// Thread-safe: concurrent calls with `unregister` and
+    /// `wait_with_timeout` are serialized by the kernel's per-epoll-fd lock.
     pub fn register(
-        &mut self,
+        &self,
         fd: RawFd,
         token: FlowToken,
         readable: bool,
@@ -95,12 +136,14 @@ impl EpollDispatch {
         }
         // Only count user-registered FDs; the self-pipe uses SELF_PIPE_TOKEN.
         if token != SELF_PIPE_TOKEN {
-            self.registered_count += 1;
+            self.registered_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    pub fn unregister(&mut self, fd: RawFd) -> io::Result<()> {
+    /// Thread-safe: concurrent calls with `register` and `wait_with_timeout`
+    /// are serialized by the kernel's per-epoll-fd lock.
+    pub fn unregister(&self, fd: RawFd) -> io::Result<()> {
         // SAFETY: epoll_ctl ignores the event pointer for DEL but
         // still requires it to be non-null on older kernels.
         let mut ev = libc::epoll_event { events: 0, u64: 0 };
@@ -115,24 +158,24 @@ impl EpollDispatch {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.registered_count = self.registered_count.saturating_sub(1);
+        self.registered_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Returns the number of user-registered FDs (excludes the self-pipe).
     #[cfg(any(test, feature = "bench-helpers"))]
     pub(crate) fn registered_fd_count(&self) -> usize {
-        self.registered_count
+        self.registered_count.load(Ordering::Relaxed)
     }
 
     /// Block up to `timeout` for any registered FD to become ready.
     /// Drains ready events into `out` (cleared first).  Returns the
-    /// number of events drained.
+    /// number of raw kernel events (including self-pipe wakes) so callers
+    /// can use it for adaptive-timeout decisions.
     ///
-    /// `timeout = Duration::ZERO` is non-blocking poll;
-    /// `timeout = Duration::from_secs(...)` waits up to that long.
-    // Task 10 drives the relay loop from this method; suppress dead_code until then.
-    #[allow(dead_code)]
+    /// `timeout = Duration::ZERO` is a non-blocking poll.
+    ///
+    /// Self-pipe events are drained to EAGAIN in-place: no extra allocation.
     pub fn wait_with_timeout(
         &self,
         out: &mut Vec<EpollEvent>,
@@ -165,7 +208,40 @@ impl EpollDispatch {
             }
             return Err(err);
         }
-        for raw in &raw_events[..n as usize] {
+
+        let raw_count = n as usize;
+        let mut drained_pipe = false;
+
+        // Single pass: filter self-pipe events (draining the pipe to EAGAIN
+        // on first occurrence), push real events into `out`.
+        // No extra allocation: `out` was cleared at the top of this function.
+        for &raw in &raw_events[..raw_count] {
+            if raw.u64 == SELF_PIPE_TOKEN {
+                if !drained_pipe {
+                    // Drain the self-pipe to EAGAIN so EPOLLIN is not
+                    // re-asserted on the next wait.  A single read is
+                    // insufficient when wakes arrive faster than we drain
+                    // (burst connection setup), so loop until read returns
+                    // ≤ 0 or a partial fill (pipe empty).
+                    let mut scratch = [0u8; 64];
+                    loop {
+                        // SAFETY: read from O_NONBLOCK pipe;
+                        // EAGAIN / EOF terminates the loop.
+                        let r = unsafe {
+                            libc::read(
+                                self.read_end.as_raw_fd(),
+                                scratch.as_mut_ptr() as *mut _,
+                                scratch.len(),
+                            )
+                        };
+                        if r <= 0 || (r as usize) < scratch.len() {
+                            break;
+                        }
+                    }
+                    drained_pipe = true;
+                }
+                continue;
+            }
             out.push(EpollEvent {
                 token: raw.u64,
                 readable: (raw.events & libc::EPOLLIN as u32) != 0,
@@ -173,45 +249,15 @@ impl EpollDispatch {
             });
         }
 
-        // Drain self-pipe events from the returned set + the pipe itself.
-        // The raw kernel count is preserved in the return value so callers
-        // (e.g. net_poll_thread's adaptive timeout) can treat self-pipe
-        // wakes as activity even when no real readiness events fire.
-        let raw_count = n as usize;
-        let mut filtered: Vec<EpollEvent> = Vec::with_capacity(out.len());
-        for ev in out.drain(..) {
-            if ev.token == SELF_PIPE_TOKEN {
-                if let Some(read_end) = &self.read_end {
-                    let mut scratch = [0u8; 64];
-                    // SAFETY: non-blocking read; ignored result.
-                    unsafe {
-                        libc::read(
-                            read_end.as_raw_fd(),
-                            scratch.as_mut_ptr() as *mut _,
-                            scratch.len(),
-                        );
-                    }
-                }
-                continue;
-            }
-            filtered.push(ev);
-        }
-        *out = filtered;
         Ok(raw_count)
     }
 
     /// Returns a `Waker` that, when called, unblocks any thread
-    /// currently inside `wait_with_timeout`.
-    pub fn waker(&mut self) -> Waker {
-        if self.waker_handle.is_none() {
-            let (read_fd, write_fd) = create_pipe2_nonblock_cloexec();
-            self.register(read_fd.as_raw_fd(), SELF_PIPE_TOKEN, true, false)
-                .expect("register self-pipe");
-            self.read_end = Some(read_fd);
-            self.waker_handle = Some(Arc::new(write_fd));
-        }
+    /// currently inside `wait_with_timeout`.  The waker is cheap to
+    /// clone and may be stored across threads.
+    pub fn waker(&self) -> Waker {
         Waker {
-            write_end: self.waker_handle.as_ref().unwrap().clone(),
+            write_end: self.waker_handle.clone(),
         }
     }
 
@@ -263,7 +309,7 @@ mod tests {
     fn register_then_unregister_round_trip() {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let mut dispatch = EpollDispatch::new().expect("EpollDispatch::new");
+        let dispatch = EpollDispatch::new().expect("EpollDispatch::new");
         let token: FlowToken = 0xDEAD_BEEF;
         dispatch
             .register(listener.as_raw_fd(), token, true, false)
@@ -275,7 +321,7 @@ mod tests {
 
     #[test]
     fn register_invalid_fd_returns_error() {
-        let mut dispatch = EpollDispatch::new().expect("EpollDispatch::new");
+        let dispatch = EpollDispatch::new().expect("EpollDispatch::new");
         let result = dispatch.register(-1, 0, true, false);
         assert!(result.is_err());
     }
@@ -293,7 +339,7 @@ mod tests {
         let stream = TcpStream::connect(addr).expect("connect");
         server.join().unwrap();
 
-        let mut dispatch = EpollDispatch::new().expect("new");
+        let dispatch = EpollDispatch::new().expect("new");
         dispatch
             .register(stream.as_raw_fd(), 0xCAFE, true, false)
             .expect("register");
@@ -310,7 +356,7 @@ mod tests {
     #[test]
     fn wakeup_unblocks_wait_immediately() {
         use std::time::Instant;
-        let mut dispatch = EpollDispatch::new().expect("new");
+        let dispatch = EpollDispatch::new().expect("new");
         let waker = dispatch.waker();
 
         // Start the wait in another thread with a long timeout.

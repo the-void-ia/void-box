@@ -535,18 +535,18 @@ pub struct SlirpBackend {
     /// so test helpers can inject [`InboundAccept`] values directly.
     #[allow(dead_code)]
     accept_sender: mpsc::Sender<InboundAccept>,
-    /// Epoll dispatcher for host socket readiness.  Task 10 will drive the
-    /// relay loop from `wait_with_timeout` events; Tasks 7-9 wire up the
-    /// registration side.  Wrapped in `Arc<Mutex<>>` so Task 11 can hand the
-    /// same instance to the net-poll thread without an additional refactor.
-    epoll: Arc<Mutex<EpollDispatch>>,
+    /// Epoll dispatcher for host socket readiness.  `EpollDispatch` is
+    /// `Sync`: `register`/`unregister` and `wait_with_timeout` are
+    /// kernel-serialized on the same epoll fd, so no `Mutex` wrapper is
+    /// needed.  The `Arc` lets the net-poll thread share the dispatcher
+    /// without holding the device lock.
+    epoll: Arc<EpollDispatch>,
     /// Cloneable waker that interrupts `EpollDispatch::wait_with_timeout`.
     /// Used after flow-table mutations to unblock the poll thread immediately.
     epoll_waker: Waker,
     /// Ready events fed by the net-poll thread after each blocking
     /// epoll_wait. drain_to_guest drains this on every call without
-    /// touching the EpollDispatch mutex (which the net-poll thread
-    /// holds for up to 50 ms during its wait).
+    /// any EpollDispatch lock contention.
     pending_events: Mutex<Vec<EpollEvent>>,
     /// Flow keys queued for removal because their state advanced to
     /// Closed in a non-relay code path (e.g. guest FIN/RST in
@@ -642,9 +642,9 @@ impl SlirpBackend {
         let (port_forward_listeners, pending_inbound_accepts, accept_sender) =
             spawn_port_forward_listeners(&nat, &port_forward_shutdown);
 
-        let mut epoll_inner = EpollDispatch::new()?;
+        let epoll_inner = EpollDispatch::new()?;
         let epoll_waker = epoll_inner.waker();
-        let epoll = Arc::new(Mutex::new(epoll_inner));
+        let epoll = Arc::new(epoll_inner);
 
         Ok(Self {
             queue,
@@ -735,12 +735,7 @@ impl SlirpBackend {
             let flow_key = FlowKey::Tcp(key);
             self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
             self.token_to_key.insert(token, flow_key);
-            if let Err(e) = self
-                .epoll
-                .lock()
-                .unwrap()
-                .register(host_fd, token, true, false)
-            {
+            if let Err(e) = self.epoll.register(host_fd, token, true, false) {
                 warn!(
                     host_port = high_port,
                     guest_port,
@@ -851,9 +846,9 @@ impl SlirpBackend {
             // first push_ready_events and stays set for the backend's
             // lifetime.
             if events.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
-                if let Ok(ep) = self.epoll.try_lock() {
-                    let _ = ep.wait_with_timeout(&mut events, std::time::Duration::ZERO);
-                }
+                let _ = self
+                    .epoll
+                    .wait_with_timeout(&mut events, std::time::Duration::ZERO);
             }
             events
         };
@@ -1238,12 +1233,7 @@ impl SlirpBackend {
 
         if let Some(host_fd) = new_host_fd {
             self.token_to_key.insert(new_token, flow_key);
-            if let Err(e) = self
-                .epoll
-                .lock()
-                .unwrap()
-                .register(host_fd, new_token, true, false)
-            {
+            if let Err(e) = self.epoll.register(host_fd, new_token, true, false) {
                 warn!(
                     guest_src_port = key.guest_src_port,
                     dst_ip = %key.dst_ip,
@@ -1331,12 +1321,7 @@ impl SlirpBackend {
 
         if let Some(host_fd) = new_icmp_fd {
             self.token_to_key.insert(new_token, flow_key);
-            if let Err(e) = self
-                .epoll
-                .lock()
-                .unwrap()
-                .register(host_fd, new_token, true, false)
-            {
+            if let Err(e) = self.epoll.register(host_fd, new_token, true, false) {
                 warn!(
                     guest_id = key.guest_id,
                     dst_ip = %key.dst_ip,
@@ -1472,11 +1457,7 @@ impl SlirpBackend {
             // from the epoll set to avoid a dangling registration.
             if let Some(FlowEntry::Tcp(stale)) = self.flow_table.get(&FlowKey::Tcp(key)) {
                 self.token_to_key.remove(&stale.flow_token);
-                self.epoll
-                    .lock()
-                    .unwrap()
-                    .unregister(stale.host_stream.as_raw_fd())
-                    .ok();
+                self.epoll.unregister(stale.host_stream.as_raw_fd()).ok();
             }
             self.flow_table.remove(&FlowKey::Tcp(key));
 
@@ -1499,12 +1480,7 @@ impl SlirpBackend {
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
-                    if let Err(e) = self
-                        .epoll
-                        .lock()
-                        .unwrap()
-                        .register(host_fd, token, true, false)
-                    {
+                    if let Err(e) = self.epoll.register(host_fd, token, true, false) {
                         warn!(
                             guest_src_port = key.guest_src_port,
                             dst_ip = %key.dst_ip,
@@ -1910,11 +1886,7 @@ impl SlirpBackend {
         for flow_key in to_remove {
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
-                self.epoll
-                    .lock()
-                    .unwrap()
-                    .unregister(entry.host_stream.as_raw_fd())
-                    .ok();
+                self.epoll.unregister(entry.host_stream.as_raw_fd()).ok();
             }
             self.flow_table.remove(&flow_key);
         }
@@ -1983,11 +1955,7 @@ impl SlirpBackend {
         for flow_key in icmp_to_remove {
             if let Some(FlowEntry::IcmpEcho(e)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&e.flow_token);
-                self.epoll
-                    .lock()
-                    .unwrap()
-                    .unregister(e.sock.as_raw_fd())
-                    .ok();
+                self.epoll.unregister(e.sock.as_raw_fd()).ok();
             }
             self.flow_table.remove(&flow_key);
         }
@@ -2078,11 +2046,7 @@ impl SlirpBackend {
         for k in stale {
             if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&k) {
                 self.token_to_key.remove(&entry.flow_token);
-                self.epoll
-                    .lock()
-                    .unwrap()
-                    .unregister(entry.sock.as_raw_fd())
-                    .ok();
+                self.epoll.unregister(entry.sock.as_raw_fd()).ok();
             }
             self.flow_table.remove(&k);
         }
@@ -2249,10 +2213,7 @@ impl NetworkBackend for SlirpBackend {
     }
 
     #[cfg(target_os = "linux")]
-    fn epoll_arc(
-        &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::network::epoll_dispatch::EpollDispatch>>>
-    {
+    fn epoll_arc(&self) -> Option<std::sync::Arc<crate::network::epoll_dispatch::EpollDispatch>> {
         Some(std::sync::Arc::clone(&self.epoll))
     }
 
@@ -2568,20 +2529,25 @@ impl SlirpBackend {
     pub fn rebuild_epoll_from_flow_table(&mut self) {
         use std::os::fd::AsRawFd;
         self.token_to_key.clear();
-        let mut ep = self.epoll.lock().unwrap();
         for (flow_key, entry) in &self.flow_table {
             match (flow_key, entry) {
                 (FlowKey::Tcp(_), FlowEntry::Tcp(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ = ep.register(e.host_stream.as_raw_fd(), e.flow_token, true, false);
+                    let _ =
+                        self.epoll
+                            .register(e.host_stream.as_raw_fd(), e.flow_token, true, false);
                 }
                 (FlowKey::Udp(_), FlowEntry::Udp(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ = ep.register(e.sock.as_raw_fd(), e.flow_token, true, false);
+                    let _ = self
+                        .epoll
+                        .register(e.sock.as_raw_fd(), e.flow_token, true, false);
                 }
                 (FlowKey::IcmpEcho(_), FlowEntry::IcmpEcho(e)) => {
                     self.token_to_key.insert(e.flow_token, *flow_key);
-                    let _ = ep.register(e.sock.as_raw_fd(), e.flow_token, true, false);
+                    let _ = self
+                        .epoll
+                        .register(e.sock.as_raw_fd(), e.flow_token, true, false);
                 }
                 _ => {}
             }
@@ -2640,12 +2606,7 @@ impl SlirpBackend {
         // state transitions, not readiness events.
         #[cfg(not(any(test, feature = "bench-helpers")))]
         {
-            if let Err(e) = self
-                .epoll
-                .lock()
-                .unwrap()
-                .register(host_fd, token, true, false)
-            {
+            if let Err(e) = self.epoll.register(host_fd, token, true, false) {
                 warn!(
                     guest_port,
                     high_port,
@@ -2710,7 +2671,7 @@ impl SlirpBackend {
     /// Returns the number of user-registered FDs in the epoll set
     /// (excludes the self-pipe).
     pub fn registered_fd_count(&self) -> usize {
-        self.epoll.lock().unwrap().registered_fd_count()
+        self.epoll.registered_fd_count()
     }
 
     /// Replace the epoll dispatcher with a fresh empty one, discarding all
@@ -2719,9 +2680,9 @@ impl SlirpBackend {
     /// created.  Used by `epoll_set_rebuilt_from_flow_table_smoke` to set up
     /// the precondition that `rebuild_epoll_from_flow_table` must fix.
     pub fn reset_epoll_for_snapshot_test(&mut self) {
-        let mut new_epoll_inner = EpollDispatch::new().expect("EpollDispatch::new");
+        let new_epoll_inner = EpollDispatch::new().expect("EpollDispatch::new");
         let new_waker = new_epoll_inner.waker();
-        self.epoll = Arc::new(Mutex::new(new_epoll_inner));
+        self.epoll = Arc::new(new_epoll_inner);
         self.epoll_waker = new_waker;
     }
 }

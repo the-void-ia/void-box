@@ -102,7 +102,7 @@ pub trait NetworkBackend: Send {
     /// `epoll_wait` instead of sleeping, reducing host CPU burn between
     /// network events.
     #[cfg(target_os = "linux")]
-    fn epoll_arc(&self) -> Option<std::sync::Arc<std::sync::Mutex<epoll_dispatch::EpollDispatch>>> {
+    fn epoll_arc(&self) -> Option<std::sync::Arc<epoll_dispatch::EpollDispatch>> {
         None
     }
 

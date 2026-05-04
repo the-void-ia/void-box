@@ -794,8 +794,7 @@ impl VirtioNetDevice {
     #[cfg(target_os = "linux")]
     pub fn epoll_arc(
         &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::network::epoll_dispatch::EpollDispatch>>>
-    {
+    ) -> Option<std::sync::Arc<crate::network::epoll_dispatch::EpollDispatch>> {
         let backend = self.slirp.lock().unwrap();
         backend.epoll_arc()
     }

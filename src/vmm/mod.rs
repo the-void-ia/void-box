@@ -1655,16 +1655,9 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // `epoll_events.is_empty()`.
         let mut raw_kernel_events: usize = 0;
         if let Some(ref ep_arc) = epoll_arc {
-            match ep_arc.lock() {
-                Ok(ep) => {
-                    raw_kernel_events = ep
-                        .wait_with_timeout(&mut epoll_events, epoll_wait_timeout)
-                        .unwrap_or(0);
-                }
-                Err(_) => {
-                    std::thread::sleep(FALLBACK_SLEEP);
-                }
-            }
+            raw_kernel_events = ep_arc
+                .wait_with_timeout(&mut epoll_events, epoll_wait_timeout)
+                .unwrap_or(0);
         } else {
             std::thread::sleep(FALLBACK_SLEEP);
         }
