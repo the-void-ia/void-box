@@ -1685,7 +1685,15 @@ impl SlirpBackend {
         }
 
         let payload = tcp.payload();
-        if !payload.is_empty() && entry.state == TcpNatState::Established {
+        // Forward guest data in Established and CloseWait: in CloseWait the
+        // host closed its write side but can still read data the guest sends.
+        // FinWait1 is not included — in that state the guest already closed
+        // its write side (we called shutdown(Write) on the host socket).
+        let forward_data = matches!(
+            entry.state,
+            TcpNatState::Established | TcpNatState::CloseWait
+        );
+        if !payload.is_empty() && forward_data {
             // Guest→host backpressure: rely on the kernel's send buffer + TCP
             // retransmit.  ACK only the bytes the kernel accepted right now;
             // on WouldBlock, don't ACK at all and let the guest retransmit.
@@ -1775,8 +1783,12 @@ impl SlirpBackend {
                     return Ok(());
                 }
                 TcpNatState::CloseWait => {
-                    // Host already closed; guest just closed too. ACK the
-                    // guest's FIN and transition to LastAck.
+                    // Host already closed its write side; guest just closed
+                    // too. Shut down our write side of host_stream so the
+                    // host application's read sees EOF, ACK the guest's FIN,
+                    // and transition to LastAck waiting for guest's final ACK
+                    // of our FIN (which was already sent when we entered
+                    // CloseWait).
                     entry.guest_ack = seq.wrapping_add(1);
                     let ack_frame = build_tcp_packet_static(
                         dst_ip,
@@ -1789,6 +1801,11 @@ impl SlirpBackend {
                         &[],
                     );
                     self.inject_to_guest.push(ack_frame);
+                    if let Err(e) = entry.host_stream.shutdown(std::net::Shutdown::Write) {
+                        // Non-fatal: host already closed; ENOTCONN or similar
+                        // is expected in some cases.
+                        trace!("SLIRP TCP: shutdown(Write) in CloseWait (non-fatal): {}", e);
+                    }
                     entry.state = TcpNatState::LastAck;
                     entry.last_state_change = Instant::now();
                     trace!(
