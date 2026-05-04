@@ -1594,12 +1594,19 @@ fn vsock_irq_thread(
 /// from host TCP sockets accumulates unread, causing TLS handshakes and
 /// API calls to time out.
 ///
-/// This thread blocks on `EpollDispatch::wait_with_timeout(50 ms)` so it
-/// wakes immediately when any host socket becomes readable, rather than
-/// polling on a fixed 5 ms sleep.  The 50 ms cap serves as a housekeeping
-/// interval for idle UDP/ICMP flow reaping.  When the network backend does
-/// not provide an epoll instance (non-SlirpBackend), the thread falls back
-/// to the original 5 ms sleep.
+/// This thread uses an adaptive `EpollDispatch::wait_with_timeout`:
+/// - **Active** (5 ms): any kernel readiness event in the last cycle keeps
+///   the thread in the 5 ms cadence so the guest's TCP delayed-ACK timer
+///   fires on schedule.  Both real socket readiness events and self-pipe
+///   wakes (from `epoll_waker.wake()` after a new SYN or injected ACK)
+///   count as activity.
+/// - **Idle** (50 ms): a cycle with no kernel events backs off to 50 ms.
+///   New flows or incoming data wake the wait immediately via the epoll set
+///   or the waker, so the 50 ms cap only fires when the network is truly
+///   quiet.
+///
+/// When the network backend does not provide an epoll instance
+/// (non-SlirpBackend), the thread falls back to a fixed 5 ms sleep.
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
