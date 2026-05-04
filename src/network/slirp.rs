@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -106,45 +106,33 @@ const PORT_FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
 
 // ──────────────────────────────────────────────────────────────────────
-//  EpollDispatch flow tokens (Tasks 8-9)
+//  EpollDispatch flow tokens
 // ──────────────────────────────────────────────────────────────────────
 
 /// High-byte protocol tag embedded in the upper 8 bits of a `FlowToken`.
-/// The lower 56 bits carry per-flow addressing bits for debugging; the tag
-/// lets the relay loop in Task 10 distinguish protocol families without a
-/// separate lookup.
-// Task 10 uses PROTO_TAG_MASK for protocol demux; suppress dead_code until then.
-#[allow(dead_code)]
+/// The lower 56 bits are a monotonic per-flow counter (see `FLOW_TOKEN_COUNTER`).
+/// The tag lets the relay loop distinguish protocol families with a bitmask
+/// instead of a separate lookup; the counter guarantees global uniqueness
+/// even when two flows share the same port tuple.
 const PROTO_TAG_MASK: u64 = 0xFF00_0000_0000_0000;
 const PROTO_TAG_TCP: u64 = 0x0100_0000_0000_0000;
 const PROTO_TAG_UDP: u64 = 0x0200_0000_0000_0000;
 const PROTO_TAG_ICMP: u64 = 0x0300_0000_0000_0000;
 
-/// Build an epoll token for a TCP NAT flow.
+/// Monotonic counter for flow token allocation.  The lower 56 bits of each
+/// `FlowToken` are drawn from here; the upper 8 bits carry `PROTO_TAG_*`.
+/// 2^56 unique tokens are available before wrap — effectively infinite for
+/// any realistic process lifetime.
+static FLOW_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate a fresh, globally unique `FlowToken` tagged for the given protocol.
 ///
-/// Encodes the guest source port, destination port, and low 16 bits of the
-/// destination IPv4 address into a 64-bit token so the poll thread can
-/// correlate readiness events back to flows without a separate map lookup.
-fn flow_token_for_tcp(key: &NatKey) -> u64 {
-    let dst_ip_low = u64::from(u32::from_be_bytes(key.dst_ip.0)) & 0xFFFF_FFFF;
-    PROTO_TAG_TCP
-        | (u64::from(key.guest_src_port) << 32)
-        | (u64::from(key.dst_port) << 16)
-        | (dst_ip_low & 0xFFFF)
-}
-
-/// Build an epoll token for a UDP flow.
-fn flow_token_for_udp(key: &UdpFlowKey) -> u64 {
-    let dst_ip_low = u64::from(u32::from_be_bytes(key.dst_ip.0)) & 0xFFFF_FFFF;
-    PROTO_TAG_UDP
-        | (u64::from(key.guest_src_port) << 32)
-        | (u64::from(key.dst_port) << 16)
-        | (dst_ip_low & 0xFFFF)
-}
-
-/// Build an epoll token for an ICMP echo flow.
-fn flow_token_for_icmp(key: &IcmpEchoKey) -> u64 {
-    PROTO_TAG_ICMP | (u64::from(key.guest_id) << 32)
+/// The lower 56 bits are drawn from a relaxed monotonic counter shared across
+/// all `SlirpBackend` instances.  The upper 8 bits carry `proto_tag` so relay
+/// loops can demux by protocol without an additional map lookup.
+fn next_flow_token(proto_tag: u64) -> u64 {
+    let counter = FLOW_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF_FFFF_FFFF;
+    proto_tag | counter
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -207,6 +195,10 @@ struct TcpNatEntry {
     /// the relay can decide how much new payload to peek+send each poll.
     /// The ACK-driven consume path decrements this as the guest ACKs data.
     bytes_in_flight: u32,
+    /// Globally unique epoll token for this flow.  Allocated once on insert
+    /// via `next_flow_token(PROTO_TAG_TCP)` and stored here so unregister
+    /// sites never need to recompute it.
+    flow_token: u64,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -233,6 +225,10 @@ struct IcmpEchoEntry {
     // Read in `relay_icmp_echo` when translating the reply frame.
     guest_id: u16,
     last_activity: Instant,
+    /// Globally unique epoll token for this flow.  Allocated once on insert
+    /// via `next_flow_token(PROTO_TAG_ICMP)` and stored here so unregister
+    /// sites never need to recompute it.
+    flow_token: u64,
 }
 
 /// Key for the UDP flow NAT table: (guest source port, destination IP, destination port).
@@ -254,6 +250,10 @@ struct UdpFlowEntry {
     sock: std::net::UdpSocket,
     /// Last frame timestamp; read by Task 2.4 idle-timeout reaper.
     last_activity: Instant,
+    /// Globally unique epoll token for this flow.  Allocated once on insert
+    /// via `next_flow_token(PROTO_TAG_UDP)` and stored here so unregister
+    /// sites never need to recompute it.
+    flow_token: u64,
 }
 
 /// Unified flow-table key. Each variant wraps the protocol-specific
@@ -515,6 +515,10 @@ pub struct SlirpBackend {
     /// All three protocols (TCP, UDP, ICMP echo) share this table so a single
     /// dispatch loop handles all active flows.
     flow_table: HashMap<FlowKey, FlowEntry>,
+    /// Reverse map from `FlowToken` → `FlowKey` for O(1) readiness-event
+    /// dispatch.  Maintained in sync with `flow_table`: every insert adds an
+    /// entry; every remove clears it.
+    token_to_key: HashMap<u64, FlowKey>,
     /// Background threads bound to host TCP ports for inbound port
     /// forwarding. Each handle corresponds to one `nat::PortForward` rule.
     /// Joined on `Drop`.
@@ -656,6 +660,7 @@ impl SlirpBackend {
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
             flow_table: HashMap::new(),
+            token_to_key: HashMap::new(),
             port_forward_listeners,
             port_forward_shutdown,
             pending_inbound_accepts,
@@ -716,6 +721,7 @@ impl SlirpBackend {
                 dst_ip: SLIRP_GATEWAY_IP,
                 dst_port: high_port,
             };
+            let token = next_flow_token(PROTO_TAG_TCP);
             let entry = TcpNatEntry {
                 host_stream,
                 state: TcpNatState::SynSent,
@@ -723,16 +729,26 @@ impl SlirpBackend {
                 guest_ack: 0,
                 last_activity: Instant::now(),
                 bytes_in_flight: 0,
+                flow_token: token,
             };
             let host_fd = entry.host_stream.as_raw_fd();
-            self.flow_table
-                .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
-            let token = flow_token_for_tcp(&key);
-            self.epoll
+            let flow_key = FlowKey::Tcp(key);
+            self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+            self.token_to_key.insert(token, flow_key);
+            if let Err(e) = self
+                .epoll
                 .lock()
                 .unwrap()
                 .register(host_fd, token, true, false)
-                .ok();
+            {
+                warn!(
+                    host_port = high_port,
+                    guest_port,
+                    fd = host_fd,
+                    error = %e,
+                    "SLIRP port-forward: epoll register failed; flow present but readiness-driven relay disabled"
+                );
+            }
             self.epoll_waker.wake();
             let syn_frame = synthesize_inbound_syn(high_port, guest_port, our_isn);
             self.inject_to_guest.push(syn_frame);
@@ -1191,6 +1207,7 @@ impl SlirpBackend {
         let flow_key = FlowKey::Udp(key);
         // Track whether this is a new entry so we can register it with epoll.
         let mut new_host_fd: Option<std::os::fd::RawFd> = None;
+        let mut new_token: u64 = 0;
         let entry: &mut UdpFlowEntry = match self.flow_table.entry(flow_key) {
             std::collections::hash_map::Entry::Occupied(o) => match o.into_mut() {
                 FlowEntry::Udp(e) => e,
@@ -1204,10 +1221,13 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
+                let token = next_flow_token(PROTO_TAG_UDP);
                 new_host_fd = Some(sock.as_raw_fd());
+                new_token = token;
                 match v.insert(FlowEntry::Udp(UdpFlowEntry {
                     sock,
                     last_activity: Instant::now(),
+                    flow_token: token,
                 })) {
                     FlowEntry::Udp(e) => e,
                     _ => unreachable!(),
@@ -1217,12 +1237,22 @@ impl SlirpBackend {
         entry.last_activity = Instant::now();
 
         if let Some(host_fd) = new_host_fd {
-            let token = flow_token_for_udp(&key);
-            self.epoll
+            self.token_to_key.insert(new_token, flow_key);
+            if let Err(e) = self
+                .epoll
                 .lock()
                 .unwrap()
-                .register(host_fd, token, true, false)
-                .ok();
+                .register(host_fd, new_token, true, false)
+            {
+                warn!(
+                    guest_src_port = key.guest_src_port,
+                    dst_ip = %key.dst_ip,
+                    dst_port = key.dst_port,
+                    fd = host_fd,
+                    error = %e,
+                    "SLIRP UDP: epoll register failed; flow present but readiness-driven relay disabled"
+                );
+            }
             self.epoll_waker.wake();
         }
 
@@ -1268,6 +1298,7 @@ impl SlirpBackend {
         let flow_key = FlowKey::IcmpEcho(key);
         // Track whether this is a new entry so we can register it with epoll.
         let mut new_icmp_fd: Option<std::os::fd::RawFd> = None;
+        let mut new_token: u64 = 0;
         let entry: &mut IcmpEchoEntry = match self.flow_table.entry(flow_key) {
             std::collections::hash_map::Entry::Occupied(occupied) => match occupied.into_mut() {
                 FlowEntry::IcmpEcho(e) => e,
@@ -1282,11 +1313,14 @@ impl SlirpBackend {
                         return Ok(());
                     }
                 };
+                let token = next_flow_token(PROTO_TAG_ICMP);
                 new_icmp_fd = Some(sock.as_raw_fd());
+                new_token = token;
                 match vacant.insert(FlowEntry::IcmpEcho(IcmpEchoEntry {
                     sock,
                     guest_id: ident,
                     last_activity: Instant::now(),
+                    flow_token: token,
                 })) {
                     FlowEntry::IcmpEcho(e) => e,
                     _ => unreachable!(),
@@ -1296,12 +1330,21 @@ impl SlirpBackend {
         entry.last_activity = Instant::now();
 
         if let Some(host_fd) = new_icmp_fd {
-            let token = flow_token_for_icmp(&key);
-            self.epoll
+            self.token_to_key.insert(new_token, flow_key);
+            if let Err(e) = self
+                .epoll
                 .lock()
                 .unwrap()
-                .register(host_fd, token, true, false)
-                .ok();
+                .register(host_fd, new_token, true, false)
+            {
+                warn!(
+                    guest_id = key.guest_id,
+                    dst_ip = %key.dst_ip,
+                    fd = host_fd,
+                    error = %e,
+                    "SLIRP ICMP: epoll register failed; flow present but readiness-driven relay disabled"
+                );
+            }
             self.epoll_waker.wake();
         }
 
@@ -1428,6 +1471,7 @@ impl SlirpBackend {
             // Remove any stale entry with the same key, unregistering its FD
             // from the epoll set to avoid a dangling registration.
             if let Some(FlowEntry::Tcp(stale)) = self.flow_table.get(&FlowKey::Tcp(key)) {
+                self.token_to_key.remove(&stale.flow_token);
                 self.epoll
                     .lock()
                     .unwrap()
@@ -1442,6 +1486,8 @@ impl SlirpBackend {
                     stream.set_nonblocking(true).ok();
                     let host_fd = stream.as_raw_fd();
                     let our_seq: u32 = rand_seq();
+                    let token = next_flow_token(PROTO_TAG_TCP);
+                    let flow_key = FlowKey::Tcp(key);
                     let entry = TcpNatEntry {
                         host_stream: stream,
                         state: TcpNatState::SynReceived,
@@ -1449,15 +1495,25 @@ impl SlirpBackend {
                         guest_ack: seq + 1,
                         last_activity: Instant::now(),
                         bytes_in_flight: 0,
+                        flow_token: token,
                     };
-                    self.flow_table
-                        .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
-                    let token = flow_token_for_tcp(&key);
-                    self.epoll
+                    self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+                    self.token_to_key.insert(token, flow_key);
+                    if let Err(e) = self
+                        .epoll
                         .lock()
                         .unwrap()
                         .register(host_fd, token, true, false)
-                        .ok();
+                    {
+                        warn!(
+                            guest_src_port = key.guest_src_port,
+                            dst_ip = %key.dst_ip,
+                            dst_port = key.dst_port,
+                            fd = host_fd,
+                            error = %e,
+                            "SLIRP TCP: epoll register failed; flow present but readiness-driven relay disabled"
+                        );
+                    }
                     self.epoll_waker.wake();
 
                     // Send SYN-ACK back to guest
@@ -1741,15 +1797,7 @@ impl SlirpBackend {
         let tcp_flow_keys: Vec<FlowKey> = ready
             .iter()
             .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
-            .filter_map(|ev| {
-                self.flow_table.keys().copied().find(|fk| {
-                    if let FlowKey::Tcp(nat_key) = fk {
-                        flow_token_for_tcp(nat_key) == ev.token
-                    } else {
-                        false
-                    }
-                })
-            })
+            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
             // Skip entries already queued for removal.
             .filter(|fk| !to_remove.contains(fk))
             .collect();
@@ -1861,6 +1909,7 @@ impl SlirpBackend {
 
         for flow_key in to_remove {
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
+                self.token_to_key.remove(&entry.flow_token);
                 self.epoll
                     .lock()
                     .unwrap()
@@ -1881,64 +1930,66 @@ impl SlirpBackend {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
-        let flow_keys: Vec<FlowKey> = ready
+        // Collect ready ICMP flow keys via O(1) token_to_key lookup.
+        let ready_flow_keys: Vec<FlowKey> = ready
             .iter()
             .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_ICMP)
-            .filter_map(|ev| {
-                self.flow_table.keys().copied().find(|fk| {
-                    if let FlowKey::IcmpEcho(icmp_key) = fk {
-                        flow_token_for_icmp(icmp_key) == ev.token
-                    } else {
-                        false
+            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
+            .collect();
+
+        // Periodic idle-timeout sweep for flows not in the readiness set.
+        // Mirrors the TCP idle-timeout sweep so ICMP sockets do not accumulate
+        // indefinitely when the ping target goes silent.
+        let icmp_to_remove: Vec<FlowKey> = self
+            .flow_table
+            .iter()
+            .filter_map(|(fk, fe)| {
+                if let (FlowKey::IcmpEcho(_), FlowEntry::IcmpEcho(e)) = (fk, fe) {
+                    if now.duration_since(e.last_activity) > ICMP_IDLE_TIMEOUT {
+                        return Some(*fk);
                     }
-                })
+                }
+                None
             })
             .collect();
-        for flow_key in flow_keys {
-            let FlowKey::IcmpEcho(key) = flow_key else {
+
+        for flow_key in &ready_flow_keys {
+            // Skip if already in remove list (idle-timeout caught it first).
+            if icmp_to_remove.contains(flow_key) {
+                continue;
+            }
+            let FlowKey::IcmpEcho(key) = *flow_key else {
                 continue;
             };
             let frame = {
-                let Some(FlowEntry::IcmpEcho(entry)) = self.flow_table.get_mut(&flow_key) else {
+                let Some(FlowEntry::IcmpEcho(entry)) = self.flow_table.get_mut(flow_key) else {
                     continue;
                 };
-                if now.duration_since(entry.last_activity) > ICMP_IDLE_TIMEOUT {
-                    None // mark for removal below
-                } else {
-                    let mut buf = [0u8; 1500];
-                    match entry.sock.recv_from(&mut buf) {
-                        Ok((n, _addr)) => {
-                            entry.last_activity = now;
-                            // Wrap in Some to distinguish from the idle-timeout
-                            // None arm in the outer match.
-                            Some(Self::build_icmp_echo_reply_to_guest(
-                                key.dst_ip,
-                                entry.guest_id,
-                                &buf[..n],
-                            ))
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(_) => continue,
+                let mut buf = [0u8; 1500];
+                match entry.sock.recv_from(&mut buf) {
+                    Ok((n, _addr)) => {
+                        entry.last_activity = now;
+                        Self::build_icmp_echo_reply_to_guest(key.dst_ip, entry.guest_id, &buf[..n])
                     }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => continue,
                 }
             };
-            match frame {
-                None => {
-                    // Idle timeout — unregister then evict entry.
-                    if let Some(FlowEntry::IcmpEcho(e)) =
-                        self.flow_table.get(&FlowKey::IcmpEcho(key))
-                    {
-                        self.epoll
-                            .lock()
-                            .unwrap()
-                            .unregister(e.sock.as_raw_fd())
-                            .ok();
-                    }
-                    self.flow_table.remove(&FlowKey::IcmpEcho(key));
-                }
-                Some(Some(frame_bytes)) => self.inject_to_guest.push(frame_bytes),
-                Some(None) => {} // build failed; drop silently
+            if let Some(frame_bytes) = frame {
+                self.inject_to_guest.push(frame_bytes);
             }
+        }
+
+        for flow_key in icmp_to_remove {
+            if let Some(FlowEntry::IcmpEcho(e)) = self.flow_table.get(&flow_key) {
+                self.token_to_key.remove(&e.flow_token);
+                self.epoll
+                    .lock()
+                    .unwrap()
+                    .unregister(e.sock.as_raw_fd())
+                    .ok();
+            }
+            self.flow_table.remove(&flow_key);
         }
     }
 
@@ -2026,6 +2077,7 @@ impl SlirpBackend {
             .collect();
         for k in stale {
             if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&k) {
+                self.token_to_key.remove(&entry.flow_token);
                 self.epoll
                     .lock()
                     .unwrap()
@@ -2038,15 +2090,7 @@ impl SlirpBackend {
         let flow_keys: Vec<FlowKey> = ready
             .iter()
             .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_UDP)
-            .filter_map(|ev| {
-                self.flow_table.keys().copied().find(|fk| {
-                    if let FlowKey::Udp(udp_key) = fk {
-                        flow_token_for_udp(udp_key) == ev.token
-                    } else {
-                        false
-                    }
-                })
-            })
+            .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
             .collect();
         for flow_key in flow_keys {
             let FlowKey::Udp(key) = flow_key else {
@@ -2511,30 +2555,33 @@ impl SlirpBackend {
     /// This method is therefore a no-op today but is wired in advance so
     /// future work that persists restored flows across snapshot/restore has a
     /// ready call site.
+    /// Re-register every live host FD in `flow_table` with the current epoll
+    /// dispatcher and rebuild `token_to_key`.  Called from snapshot restore:
+    /// the `epoll_fd` is a kernel handle that does not survive snapshot, so a
+    /// fresh dispatcher starts empty even though `flow_table` deserialized
+    /// correctly with new FDs.
+    ///
+    /// Each existing flow keeps its stored `flow_token` so that any
+    /// already-queued readiness events (unlikely post-restore, but safe) still
+    /// resolve correctly.  The `token_to_key` map is rebuilt from scratch
+    /// because it is in-memory-only state; it does not need to be persisted.
     pub fn rebuild_epoll_from_flow_table(&mut self) {
         use std::os::fd::AsRawFd;
+        self.token_to_key.clear();
         let mut ep = self.epoll.lock().unwrap();
-        for (key, entry) in &self.flow_table {
-            match (key, entry) {
-                (FlowKey::Tcp(nat_key), FlowEntry::Tcp(e)) => {
-                    let _ = ep.register(
-                        e.host_stream.as_raw_fd(),
-                        flow_token_for_tcp(nat_key),
-                        true,
-                        false,
-                    );
+        for (flow_key, entry) in &self.flow_table {
+            match (flow_key, entry) {
+                (FlowKey::Tcp(_), FlowEntry::Tcp(e)) => {
+                    self.token_to_key.insert(e.flow_token, *flow_key);
+                    let _ = ep.register(e.host_stream.as_raw_fd(), e.flow_token, true, false);
                 }
-                (FlowKey::Udp(udp_key), FlowEntry::Udp(e)) => {
-                    let _ =
-                        ep.register(e.sock.as_raw_fd(), flow_token_for_udp(udp_key), true, false);
+                (FlowKey::Udp(_), FlowEntry::Udp(e)) => {
+                    self.token_to_key.insert(e.flow_token, *flow_key);
+                    let _ = ep.register(e.sock.as_raw_fd(), e.flow_token, true, false);
                 }
-                (FlowKey::IcmpEcho(icmp_key), FlowEntry::IcmpEcho(e)) => {
-                    let _ = ep.register(
-                        e.sock.as_raw_fd(),
-                        flow_token_for_icmp(icmp_key),
-                        true,
-                        false,
-                    );
+                (FlowKey::IcmpEcho(_), FlowEntry::IcmpEcho(e)) => {
+                    self.token_to_key.insert(e.flow_token, *flow_key);
+                    let _ = ep.register(e.sock.as_raw_fd(), e.flow_token, true, false);
                 }
                 _ => {}
             }
@@ -2575,6 +2622,8 @@ impl SlirpBackend {
             dst_port: high_port,
         };
         let host_fd = host_stream.as_raw_fd();
+        let token = next_flow_token(PROTO_TAG_TCP);
+        let flow_key = FlowKey::Tcp(key);
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::SynSent,
@@ -2582,23 +2631,32 @@ impl SlirpBackend {
             guest_ack: 0,
             last_activity: Instant::now(),
             bytes_in_flight: 0,
+            flow_token: token,
         };
-        self.flow_table
-            .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+        self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+        self.token_to_key.insert(token, flow_key);
         // Skip epoll registration in test/bench contexts: the synthetic
         // stream is already non-blocking but test harnesses check specific
         // state transitions, not readiness events.
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "bench-helpers")))]
         {
-            let token = flow_token_for_tcp(&key);
-            self.epoll
+            if let Err(e) = self
+                .epoll
                 .lock()
                 .unwrap()
                 .register(host_fd, token, true, false)
-                .ok();
+            {
+                warn!(
+                    guest_port,
+                    high_port,
+                    fd = host_fd,
+                    error = %e,
+                    "SLIRP: epoll register for synthetic SynSent failed"
+                );
+            }
             self.epoll_waker.wake();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "bench-helpers"))]
         let _ = host_fd;
     }
 
