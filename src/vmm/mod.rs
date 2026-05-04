@@ -1607,14 +1607,25 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         level: u32,
     }
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
-    // 5 ms IRQ cadence: the guest spends most idle time in HLT and relies
-    // on regular vCPU schedule slots (driven by our IRQ pulses) to advance
-    // its TCP delayed-ACK timer.  A wider gap (e.g. 50 ms) causes a +40 ms
-    // regression in CRR p50 — exactly Linux's delayed-ACK timer period.
-    // At 5 ms the housekeeping cadence keeps the guest's pure ACKs moving;
-    // fast-path events still wake immediately via epoll readiness.
-    const EPOLL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+    // Adaptive epoll_wait timeout.  Active periods need a 5 ms cadence so
+    // the guest's TCP delayed-ACK timer fires on schedule (the guest spends
+    // most idle time in HLT and relies on our IRQ pulses to advance vCPU
+    // schedule slots; a 50 ms gap causes +40 ms CRR latency, exactly
+    // Linux's delayed-ACK period).  Idle periods can use the long timeout
+    // safely: any new flow's SYN goes through process_guest_frame which
+    // calls epoll_waker.wake(), and host data arrival fires EPOLLIN — both
+    // wake the wait immediately, so the 50 ms ceiling never bites a real
+    // packet.  We pick the next timeout based on whether the last wait
+    // returned events: had-events ⇒ stay in the active 5 ms cadence,
+    // timed-out ⇒ back off to 50 ms.  Maintains correctness; recovers the
+    // 10x idle wakeup reduction that motivated Phase 6.4 in the first
+    // place.
+    const ACTIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
     const FALLBACK_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+    // Start in the idle regime — first SYN flips us into active.
+    let mut epoll_wait_timeout: std::time::Duration = IDLE_TIMEOUT;
 
     let vm_fd = vm.vm_fd().as_raw_fd();
     let guest_memory = vm.guest_memory();
@@ -1636,10 +1647,19 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // sleep.  This lets the vCPU thread acquire the device lock without
         // contention during the wait phase.
         epoll_events.clear();
+        // Raw kernel count from epoll_wait, including self-pipe wakes
+        // that the filter strips from `epoll_events`. A self-pipe wake
+        // is the signal that handle_tcp_frame queued a frame and called
+        // epoll_waker.wake() — i.e. real activity that should keep the
+        // adaptive timeout in the active 5 ms cadence even though
+        // `epoll_events.is_empty()`.
+        let mut raw_kernel_events: usize = 0;
         if let Some(ref ep_arc) = epoll_arc {
             match ep_arc.lock() {
                 Ok(ep) => {
-                    let _ = ep.wait_with_timeout(&mut epoll_events, EPOLL_WAIT_TIMEOUT);
+                    raw_kernel_events = ep
+                        .wait_with_timeout(&mut epoll_events, epoll_wait_timeout)
+                        .unwrap_or(0);
                 }
                 Err(_) => {
                     std::thread::sleep(FALLBACK_SLEEP);
@@ -1648,6 +1668,18 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         } else {
             std::thread::sleep(FALLBACK_SLEEP);
         }
+
+        // Adapt the next-cycle timeout based on this cycle's outcome.
+        // Any kernel event (real readiness OR self-pipe wake from the
+        // vCPU thread) signals activity and keeps us in the 5 ms
+        // cadence so the guest's TCP delayed-ACK timer fires on time.
+        // A pure timeout drops us to the 50 ms idle cadence.  One quiet
+        // cycle to switch to idle, one event to switch back to active.
+        epoll_wait_timeout = if raw_kernel_events > 0 {
+            ACTIVE_TIMEOUT
+        } else {
+            IDLE_TIMEOUT
+        };
 
         // Push ready events into the backend's queue before acquiring the
         // device lock for inject/IRQ work. drain_to_guest will consume them

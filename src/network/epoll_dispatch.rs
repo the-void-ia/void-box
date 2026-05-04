@@ -174,6 +174,10 @@ impl EpollDispatch {
         }
 
         // Drain self-pipe events from the returned set + the pipe itself.
+        // The raw kernel count is preserved in the return value so callers
+        // (e.g. net_poll_thread's adaptive timeout) can treat self-pipe
+        // wakes as activity even when no real readiness events fire.
+        let raw_count = n as usize;
         let mut filtered: Vec<EpollEvent> = Vec::with_capacity(out.len());
         for ev in out.drain(..) {
             if ev.token == SELF_PIPE_TOKEN {
@@ -193,8 +197,7 @@ impl EpollDispatch {
             filtered.push(ev);
         }
         *out = filtered;
-        let observable_n = out.len();
-        Ok(observable_n)
+        Ok(raw_count)
     }
 
     /// Returns a `Waker` that, when called, unblocks any thread
