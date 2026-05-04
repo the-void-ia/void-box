@@ -92,6 +92,10 @@ vm-fdt = "0.3"
 seccompiler = "0.4"
 ipnet = "2"
 
+# Non-blocking socket creation for SLIRP async outbound connect
+# (Type::STREAM.nonblocking() needs the "all" feature flag)
+socket2 = { version = "0.5", features = ["all"] }
+
 # --- macOS-only dependencies ---
 [target.'cfg(target_os = "macos")'.dependencies]
 # Objective-C 2.0 bindings (auto-generated from Apple frameworks)
