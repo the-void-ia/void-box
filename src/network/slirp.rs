@@ -652,6 +652,9 @@ impl SlirpBackend {
         // Bind listeners for port-forwards and register their FDs with epoll.
         let port_forward_listeners = bind_port_forward_listeners(&nat, &epoll);
 
+        // Bind listeners for port-forwards and register their FDs with epoll.
+        let port_forward_listeners = bind_port_forward_listeners(&nat, &epoll);
+
         Ok(Self {
             queue,
             iface,
