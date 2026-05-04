@@ -177,18 +177,26 @@ pub(crate) struct InboundAccept {
 /// State transitions:
 ///
 /// ```text
-///   SynReceived ──ACK──► Established ──guest FIN──► FinWait1
-///   SynSent ──SYN+ACK──► Established               │  │
-///                              │                    │  └─ host EOF ──► LastAck
-///                              │ host EOF            │                     │
-///                              ▼                    │          guest ACK ──┘
-///                          CloseWait ◄──────────────┘            └──► Closed
+///   Connecting ──SO_ERROR==0──► SynReceived ──ACK──► Established ──guest FIN──► FinWait1
+///       │                                                  │  │
+///       └ SO_ERROR != 0 / CONNECT_TIMEOUT ──► Closed       │  │
+///                                                          │  │
+///   SynSent ──SYN+ACK──► Established                       │  │
+///                              │                            │  └─ host EOF ──► LastAck
+///                              │ host EOF                    │                     │
+///                              ▼                            │          guest ACK ──┘
+///                          CloseWait ◄────────────────────┘            └──► Closed
 ///                              │ guest FIN
 ///                              ▼
 ///                           LastAck ──── LAST_ACK_TIMEOUT ────► Closed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TcpNatState {
+    /// Non-blocking connect issued; waiting for EPOLLOUT readiness to
+    /// arrive on the host socket. On readiness we check
+    /// `getsockopt(SO_ERROR)`: zero → transition to `SynReceived` and send
+    /// SYN-ACK to guest; non-zero → send RST to guest and reap.
+    Connecting,
     /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
     /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
@@ -244,6 +252,13 @@ struct TcpNatEntry {
     /// FIN on repeated epoll readiness events for the same transition.
     /// Read in relay_tcp_nat_data's FIN-emit logic (Task 3).
     our_fin_sent: bool,
+    /// Guest's initial sequence number (`seq` from the original SYN
+    /// frame).  Stashed here only for entries in `Connecting` state so
+    /// the EPOLLOUT-driven completion path can build SYN-ACK with the
+    /// correct ack number (= `guest_isn + 1`).  Once the entry transitions
+    /// to `SynReceived` this field is no longer read.
+    #[allow(dead_code)] // Read by EPOLLOUT-driven completion in relay_pending_connects.
+    guest_isn: u32,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -845,6 +860,10 @@ impl SlirpBackend {
                 flow_token: token,
                 last_state_change: Instant::now(),
                 our_fin_sent: false,
+                // Inbound port-forward entries never enter Connecting; the
+                // EPOLLOUT-driven completion path only reads guest_isn for
+                // outbound (guest-initiated) SYNs.
+                guest_isn: 0,
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -1598,6 +1617,7 @@ impl SlirpBackend {
                         flow_token: token,
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
+                        guest_isn: seq,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -2814,6 +2834,7 @@ impl SlirpBackend {
             flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: false,
+            guest_isn: 0,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -2932,6 +2953,7 @@ impl SlirpBackend {
             flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: true,
+            guest_isn: 0,
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
