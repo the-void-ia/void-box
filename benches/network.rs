@@ -832,18 +832,15 @@ mod linux_benches {
     }
 
     /// Wall-clock latency of the full inbound port-forward path: host
-    /// `TcpStream::connect` → listener thread `accept()` (polled every
-    /// `PORT_FORWARD_POLL_INTERVAL = 50 ms`) → mpsc channel push →
-    /// `process_pending_inbound_accepts` → `synthesize_inbound_syn` →
-    /// first SYN frame visible in `drain_to_guest` output.
+    /// `TcpStream::connect` → epoll readiness event → `process_listener_readiness`
+    /// accept → mpsc channel push → `process_pending_inbound_accepts` →
+    /// `synthesize_inbound_syn` → first SYN frame visible in `drain_to_guest`
+    /// output.
     ///
-    /// The 50 ms polling ceiling means the distribution will be roughly
-    /// uniform on [0, 50 ms] — a median around 25 ms is expected and normal,
-    /// not a bug. Regressions in the inbound state machine or the listener
-    /// poll loop will shift the distribution upward beyond 50 ms.
-    ///
-    /// Regressions in the inbound state machine or listener-poll loop will
-    /// surface numerically against this measurement.
+    /// The listener FD is registered with `EpollDispatch`; accept latency is
+    /// bounded by the epoll_wait cadence (≤ 5 ms active), not a fixed poll
+    /// interval. Sub-millisecond medians are expected. Regressions in the
+    /// inbound state machine will surface numerically against this measurement.
     #[divan::bench(sample_count = 20, sample_size = 1)]
     fn port_forward_accept_latency(bencher: Bencher) {
         const GUEST_PORT: u16 = 8080;
@@ -870,9 +867,8 @@ mod linux_benches {
 
         bencher.bench_local(|| {
             // Spawn a worker thread that connects to the host listener port.
-            // The listener thread inside SlirpBackend will accept() it on the
-            // next poll (within PORT_FORWARD_POLL_INTERVAL = 50ms) and push
-            // the accepted stream onto the mpsc channel.
+            // EpollDispatch fires readiness; process_listener_readiness accepts
+            // and pushes the stream onto the mpsc channel.
             let connect_addr = format!("127.0.0.1:{host_port}");
             let worker = thread::spawn(move || {
                 let addr: std::net::SocketAddr = connect_addr.parse().expect("parse connect addr");
