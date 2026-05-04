@@ -693,9 +693,6 @@ impl SlirpBackend {
         // Bind listeners for port-forwards and register their FDs with epoll.
         let port_forward_listeners = bind_port_forward_listeners(&nat, &epoll);
 
-        // Bind listeners for port-forwards and register their FDs with epoll.
-        let port_forward_listeners = bind_port_forward_listeners(&nat, &epoll);
-
         Ok(Self {
             queue,
             iface,
@@ -2924,6 +2921,7 @@ impl SlirpBackend {
             dst_ip: SLIRP_GATEWAY_IP,
             dst_port: high_port,
         };
+        let token = next_flow_token(PROTO_TAG_TCP);
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::LastAck,
@@ -2931,6 +2929,7 @@ impl SlirpBackend {
             guest_ack: 1,
             last_activity: Instant::now(),
             bytes_in_flight: 0,
+            flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: true,
         };
