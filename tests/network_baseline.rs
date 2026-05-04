@@ -1341,6 +1341,7 @@ fn tcp_half_close_guest_writes_first() {
             }
         }
     }
+    // Complete 3-way handshake: ACK the SYN-ACK.
     stack
         .process_guest_frame(&build_tcp_frame(
             SLIRP_GATEWAY_IP,
@@ -1379,17 +1380,35 @@ fn tcp_half_close_guest_writes_first() {
         .unwrap();
 
     // Drive drain_to_guest until we see host's response data AND its FIN.
+    // We must ACK each data segment as it arrives so the kernel recv buffer
+    // drains — recv_peek returns Ok(0) (EOF) only once all buffered bytes
+    // are consumed via the ACK-driven read path.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut response_bytes: Vec<u8> = Vec::new();
     let mut saw_host_fin = false;
     while std::time::Instant::now() < deadline {
-        for f in drain_n(&mut stack, 1) {
-            if let Some((_, _, ctrl, payload_len)) = parse_tcp_to_guest(&f) {
+        let frames = drain_n(&mut stack, 1);
+        for f in &frames {
+            if let Some((seq, _ack, ctrl, payload_len)) = parse_tcp_to_guest(f) {
                 if payload_len > 0 {
                     let eth = EthernetFrame::new_unchecked(f.as_slice());
                     let ip = Ipv4Packet::new_unchecked(eth.payload());
                     let tcp = TcpPacket::new_unchecked(ip.payload());
                     response_bytes.extend_from_slice(tcp.payload());
+                    // ACK the data so the relay's ACK-driven consume path can
+                    // drain the kernel recv buffer and eventually see EOF.
+                    let ack_num = seq.wrapping_add(payload_len as u32);
+                    stack
+                        .process_guest_frame(&build_tcp_frame(
+                            SLIRP_GATEWAY_IP,
+                            GUEST_EPHEMERAL_PORT,
+                            host_port,
+                            our_seq + 1 + request.len() as u32 + 1, // seq after FIN
+                            ack_num,
+                            TcpControl::None,
+                            &[],
+                        ))
+                        .unwrap();
                 }
                 if matches!(ctrl, TcpControl::Fin) {
                     saw_host_fin = true;
