@@ -2920,6 +2920,7 @@ impl SlirpBackend {
             dst_ip: SLIRP_GATEWAY_IP,
             dst_port: high_port,
         };
+        let token = next_flow_token(PROTO_TAG_TCP);
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::LastAck,
@@ -2927,6 +2928,7 @@ impl SlirpBackend {
             guest_ack: 1,
             last_activity: Instant::now(),
             bytes_in_flight: 0,
+            flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: true,
         };
