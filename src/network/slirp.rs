@@ -1749,22 +1749,23 @@ impl SlirpBackend {
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        // Seed removal list from flows already marked Closed by handle_tcp_frame
-        // (FIN/RST path) via the pending_close queue. No O(n) scan of the full
-        // flow table — each entry is pushed here exactly once when state=Closed.
-        let mut to_remove: Vec<FlowKey> = std::mem::take(&mut self.pending_close);
+        // Seed removal set from flows already marked Closed by handle_tcp_frame
+        // (FIN/RST path) via the pending_close queue. HashSet gives O(1)
+        // membership checks in the idle-timeout sweep and readiness filter below,
+        // avoiding the O(n*k) cost of Vec::contains under connection churn.
+        let mut to_remove_set: std::collections::HashSet<FlowKey> =
+            std::mem::take(&mut self.pending_close)
+                .into_iter()
+                .collect();
 
         // Idle-timeout sweep: scan flow_table once without collecting a
         // separate key Vec. 300-second inactivity applies regardless of epoll
-        // readiness; this is O(n) in the number of TCP flows but has no
-        // heap allocation overhead.
+        // readiness; this is O(n) in the number of TCP flows.
         const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
         for (flow_key, entry) in &self.flow_table {
             if let FlowEntry::Tcp(tcp_entry) = entry {
-                if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT
-                    && !to_remove.contains(flow_key)
-                {
-                    to_remove.push(*flow_key);
+                if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT {
+                    to_remove_set.insert(*flow_key);
                 }
             }
         }
@@ -1775,7 +1776,7 @@ impl SlirpBackend {
             .filter(|ev| ev.readable && ev.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
             .filter_map(|ev| self.token_to_key.get(&ev.token).copied())
             // Skip entries already queued for removal.
-            .filter(|fk| !to_remove.contains(fk))
+            .filter(|fk| !to_remove_set.contains(fk))
             .collect();
 
         for flow_key in tcp_flow_keys {
@@ -1877,13 +1878,13 @@ impl SlirpBackend {
             }
             // Queue for removal so the cleanup loop below can unregister + drop.
             if became_closed {
-                to_remove.push(flow_key);
+                to_remove_set.insert(flow_key);
             }
         }
 
         self.inject_to_guest.append(&mut frames_to_inject);
 
-        for flow_key in to_remove {
+        for flow_key in to_remove_set {
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
                 self.epoll.unregister(entry.host_stream.as_raw_fd()).ok();
@@ -1912,7 +1913,7 @@ impl SlirpBackend {
         // Periodic idle-timeout sweep for flows not in the readiness set.
         // Mirrors the TCP idle-timeout sweep so ICMP sockets do not accumulate
         // indefinitely when the ping target goes silent.
-        let icmp_to_remove: Vec<FlowKey> = self
+        let icmp_to_remove: std::collections::HashSet<FlowKey> = self
             .flow_table
             .iter()
             .filter_map(|(fk, fe)| {
@@ -1926,7 +1927,8 @@ impl SlirpBackend {
             .collect();
 
         for flow_key in &ready_flow_keys {
-            // Skip if already in remove list (idle-timeout caught it first).
+            // Skip if already in remove set (idle-timeout caught it first).
+            // O(1) via HashSet, not O(k) Vec::contains.
             if icmp_to_remove.contains(flow_key) {
                 continue;
             }
