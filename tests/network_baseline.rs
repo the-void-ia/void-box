@@ -1587,3 +1587,57 @@ fn tcp_half_close_host_writes_first() {
         "host must receive guest's reply data after CloseWait"
     );
 }
+
+/// Verify that a LastAck entry whose `last_state_change` is older than
+/// `LAST_ACK_TIMEOUT` (60 s) is reaped by the next `drain_to_guest` sweep,
+/// preventing a leaked flow table entry when the guest drops the final ACK.
+///
+/// Gated on `bench-helpers` because it uses synthetic-injection helpers
+/// (`insert_synthetic_lastack_entry`, `set_synthetic_last_state_change`,
+/// `tcp_flow_state`) that widen internal visibility for external test/bench
+/// consumers. Default `cargo test` skips this pin; CI runs it via
+/// `cargo test --features bench-helpers -- --test-threads=1`.
+#[cfg(feature = "bench-helpers")]
+#[test]
+fn tcp_last_ack_timeout_reaps_stale_entry() {
+    use std::net::TcpListener;
+
+    const GUEST_PORT: u16 = 8080;
+    const HIGH_PORT: u16 = 60000;
+
+    let mut backend = SlirpBackend::new().expect("backend");
+
+    // Open a real TCP connection so host_stream is a valid socket.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host_stream =
+        std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    host_stream.set_nonblocking(true).ok();
+
+    // Insert a synthetic LastAck entry (already past our FIN, waiting for
+    // guest's final ACK which will never arrive).
+    backend.insert_synthetic_lastack_entry(GUEST_PORT, HIGH_PORT, host_stream);
+
+    // Verify the entry is present.
+    assert_eq!(
+        backend.tcp_flow_state(GUEST_PORT, HIGH_PORT),
+        Some(void_box::network::slirp::TcpNatState::LastAck),
+        "entry must start in LastAck"
+    );
+
+    // Back-date last_state_change by 70 s (> LAST_ACK_TIMEOUT = 60 s).
+    backend.set_synthetic_last_state_change(
+        GUEST_PORT,
+        HIGH_PORT,
+        std::time::Duration::from_secs(70),
+    );
+
+    // One drain_to_guest cycle triggers the timeout sweep.
+    let mut out = Vec::new();
+    backend.drain_to_guest(&mut out);
+
+    // The entry should now be gone.
+    assert!(
+        backend.tcp_flow_state(GUEST_PORT, HIGH_PORT).is_none(),
+        "LastAck entry past LAST_ACK_TIMEOUT must be reaped by drain_to_guest"
+    );
+}
