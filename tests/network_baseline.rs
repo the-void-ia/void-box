@@ -1430,3 +1430,160 @@ fn tcp_half_close_guest_writes_first() {
     );
     assert!(saw_host_fin, "guest must receive host's FIN");
 }
+
+/// Pin for the symmetric half-close path: host writes first, then closes its
+/// write side (Established → CloseWait); guest replies with data + FIN.
+/// The host must receive the guest's reply data even after its own shutdown.
+#[test]
+fn tcp_half_close_host_writes_first() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    // Server: write greeting, shutdown write side, then read what guest sends back.
+    let server = std::thread::spawn(move || -> Vec<u8> {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.write_all(b"GREETING").unwrap();
+        sock.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = Vec::new();
+        let _ = sock.read_to_end(&mut buf);
+        buf
+    });
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    // Guest 3-way handshake.
+    let our_seq = 2000u32;
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+    let mut gateway_seq = 0u32;
+    for f in drain_n(&mut stack, 4) {
+        if let Some((s, _, ctrl, _)) = parse_tcp_to_guest(&f) {
+            if matches!(ctrl, TcpControl::Syn) {
+                gateway_seq = s;
+                break;
+            }
+        }
+    }
+    // Complete handshake: ACK the SYN-ACK.
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+        ))
+        .unwrap();
+
+    // Drive drain_to_guest until we see "GREETING" data AND host's FIN.
+    // ACK each data segment so the relay's ACK-driven consume path works.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut received: Vec<u8> = Vec::new();
+    let mut saw_host_fin = false;
+    // gateway_seq_next: the relay's current sequence number (advances with data + FIN).
+    let mut gateway_seq_next = gateway_seq + 1; // after SYN-ACK
+    while std::time::Instant::now() < deadline {
+        let frames = drain_n(&mut stack, 1);
+        for f in &frames {
+            if let Some((seq, _ack, ctrl, payload_len)) = parse_tcp_to_guest(f) {
+                if payload_len > 0 {
+                    let eth = EthernetFrame::new_unchecked(f.as_slice());
+                    let ip = Ipv4Packet::new_unchecked(eth.payload());
+                    let tcp = TcpPacket::new_unchecked(ip.payload());
+                    received.extend_from_slice(tcp.payload());
+                    gateway_seq_next = seq.wrapping_add(payload_len as u32);
+                    // ACK the data.
+                    stack
+                        .process_guest_frame(&build_tcp_frame(
+                            SLIRP_GATEWAY_IP,
+                            GUEST_EPHEMERAL_PORT,
+                            host_port,
+                            our_seq + 1,
+                            gateway_seq_next,
+                            TcpControl::None,
+                            &[],
+                        ))
+                        .unwrap();
+                }
+                if matches!(ctrl, TcpControl::Fin) {
+                    saw_host_fin = true;
+                    // ACK the host FIN so the CloseWait entry receives it.
+                    stack
+                        .process_guest_frame(&build_tcp_frame(
+                            SLIRP_GATEWAY_IP,
+                            GUEST_EPHEMERAL_PORT,
+                            host_port,
+                            our_seq + 1,
+                            gateway_seq_next.wrapping_add(1),
+                            TcpControl::None,
+                            &[],
+                        ))
+                        .unwrap();
+                }
+            }
+        }
+        if received == b"GREETING" && saw_host_fin {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        &received[..],
+        b"GREETING",
+        "guest must receive host's greeting"
+    );
+    assert!(
+        saw_host_fin,
+        "guest must receive host's FIN (CloseWait transition)"
+    );
+
+    // Guest sends reply data + FIN after receiving host's greeting and FIN.
+    // The relay is now in CloseWait; guest data should still be forwarded to host.
+    let reply = b"REPLY";
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq_next.wrapping_add(1),
+            TcpControl::Psh,
+            reply,
+        ))
+        .unwrap();
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1 + reply.len() as u32,
+            gateway_seq_next.wrapping_add(1),
+            TcpControl::Fin,
+            &[],
+        ))
+        .unwrap();
+    // Drain to process the guest FIN (CloseWait → LastAck).
+    drain_n(&mut stack, 4);
+
+    let host_received = server.join().unwrap();
+    assert_eq!(
+        &host_received[..],
+        b"REPLY",
+        "host must receive guest's reply data after CloseWait"
+    );
+}
