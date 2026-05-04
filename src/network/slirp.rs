@@ -168,7 +168,7 @@ pub(crate) struct InboundAccept {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum TcpNatState {
+pub enum TcpNatState {
     /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
     /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
@@ -2815,7 +2815,7 @@ impl SlirpBackend {
     /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,
     /// or `None` if no such entry exists in the flow table.
     #[allow(dead_code)]
-    pub(crate) fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
+    pub fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
         let key = NatKey {
             guest_src_port: guest_port,
             dst_ip: SLIRP_GATEWAY_IP,
@@ -2875,6 +2875,62 @@ impl SlirpBackend {
         let new_waker = new_epoll_inner.waker();
         self.epoll = Arc::new(new_epoll_inner);
         self.epoll_waker = new_waker;
+    }
+
+    /// Insert a synthetic `LastAck` entry into the flow table.
+    ///
+    /// Used by `tcp_last_ack_timeout_reaps_stale_entry` to pre-seed a flow
+    /// in the LastAck state without going through a full half-close exchange.
+    ///
+    /// The entry's `last_state_change` is set to `Instant::now()` and can be
+    /// back-dated with [`set_synthetic_last_state_change`] to simulate an
+    /// expired timeout.
+    pub fn insert_synthetic_lastack_entry(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        host_stream: TcpStream,
+    ) {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        let entry = TcpNatEntry {
+            host_stream,
+            state: TcpNatState::LastAck,
+            our_seq: 1,
+            guest_ack: 1,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+            last_state_change: Instant::now(),
+            our_fin_sent: true,
+        };
+        self.flow_table
+            .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+    }
+
+    /// Back-date the `last_state_change` of the flow identified by
+    /// `(guest_port, GATEWAY_IP, high_port)` by `age`.  Used by
+    /// `tcp_last_ack_timeout_reaps_stale_entry` to simulate a LastAck
+    /// entry that has been sitting past `LAST_ACK_TIMEOUT` without
+    /// receiving the guest's final ACK.
+    pub fn set_synthetic_last_state_change(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        age: Duration,
+    ) {
+        let key = FlowKey::Tcp(NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        });
+        if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&key) {
+            // Instant::now() - age: subtract by creating an instant that
+            // appears to have occurred `age` ago.
+            entry.last_state_change = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
     }
 }
 
