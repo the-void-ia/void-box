@@ -1291,3 +1291,123 @@ fn epoll_set_rebuilt_from_flow_table_smoke() {
         "rebuild_epoll_from_flow_table must register all live flow FDs"
     );
 }
+
+// ── Phase 6.1: TCP half-close pins ──────────────────────────────────────
+
+/// BROKEN_ON_PURPOSE: guest sends FIN after data; current code marks state=Closed
+/// immediately on guest FIN, so host's response data is dropped.
+/// Flips to PASS when Task 2–3 implementation lands.
+#[test]
+fn tcp_half_close_guest_writes_first() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || -> Vec<u8> {
+        let (mut sock, _) = listener.accept().unwrap();
+        // Read until EOF (guest will send data + FIN).
+        let mut request = Vec::new();
+        let _ = sock.read_to_end(&mut request);
+        // After guest's shutdown(WRITE), we still want to send response.
+        sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nBODY").unwrap();
+        // Then close.
+        drop(sock);
+        request
+    });
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    // Guest 3-way handshake.
+    let our_seq = 1000u32;
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+    let mut gateway_seq = 0u32;
+    for f in drain_n(&mut stack, 4) {
+        if let Some((s, _, ctrl, _)) = parse_tcp_to_guest(&f) {
+            if matches!(ctrl, TcpControl::Syn) {
+                gateway_seq = s;
+                break;
+            }
+        }
+    }
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+        ))
+        .unwrap();
+
+    // Guest sends "HELLO" data + FIN.
+    let request = b"HELLO";
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::Psh,
+            request,
+        ))
+        .unwrap();
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1 + request.len() as u32,
+            gateway_seq + 1,
+            TcpControl::Fin,
+            &[],
+        ))
+        .unwrap();
+
+    // Drive drain_to_guest until we see host's response data AND its FIN.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut response_bytes: Vec<u8> = Vec::new();
+    let mut saw_host_fin = false;
+    while std::time::Instant::now() < deadline {
+        for f in drain_n(&mut stack, 1) {
+            if let Some((_, _, ctrl, payload_len)) = parse_tcp_to_guest(&f) {
+                if payload_len > 0 {
+                    let eth = EthernetFrame::new_unchecked(f.as_slice());
+                    let ip = Ipv4Packet::new_unchecked(eth.payload());
+                    let tcp = TcpPacket::new_unchecked(ip.payload());
+                    response_bytes.extend_from_slice(tcp.payload());
+                }
+                if matches!(ctrl, TcpControl::Fin) {
+                    saw_host_fin = true;
+                }
+            }
+        }
+        if !response_bytes.is_empty() && saw_host_fin {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let _ = server.join();
+
+    assert_eq!(
+        &response_bytes[..],
+        b"HTTP/1.1 200 OK\r\n\r\nBODY",
+        "guest must receive ALL host response data after sending FIN"
+    );
+    assert!(saw_host_fin, "guest must receive host's FIN");
+}
