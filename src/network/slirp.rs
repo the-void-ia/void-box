@@ -287,14 +287,10 @@ struct TcpNatEntry {
     /// Guest's advertised receive window in bytes, scaled per
     /// `guest_window_scale`. Updated on every incoming TCP frame's
     /// `window_len`. Initial value 65535 matches an unscaled SYN.
-    // Written by Tasks 2–3; read by Task 7.
-    #[allow(dead_code)]
     guest_window: u32,
     /// Window-scale shift the guest negotiated in its SYN. Zero
     /// means "guest does not support window scaling" (or we did not
     /// see a window-scale option in the SYN).
-    // Written by Task 2; read by Task 3.
-    #[allow(dead_code)]
     guest_window_scale: u8,
 }
 
@@ -1826,6 +1822,11 @@ impl SlirpBackend {
         let mut closed_by_error = false;
 
         entry.last_activity = Instant::now();
+
+        // Track the most recent window advertisement from the guest.  Runs for
+        // every frame (data, ACK, FIN, RST) so `guest_window` always reflects
+        // the current receive-buffer headroom on the guest side.
+        entry.guest_window = u32::from(tcp.window_len()) << entry.guest_window_scale;
 
         // Inbound port-forward: guest's SYN-ACK completing the host-initiated
         // 3-way handshake.  We synthesized a SYN to the guest (5.5b.2/5.5b.3);
