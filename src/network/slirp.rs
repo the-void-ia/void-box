@@ -90,7 +90,10 @@ pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x01];
 
 const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
-const TCP_WINDOW: u16 = 65535;
+/// Window-scale shift we advertise on SYN-ACK frames. Matches passt's
+/// default. 7 means each unit in `window_len` represents 128 bytes,
+/// extending the effective window from 64 KiB to 8 MiB.
+const OUR_WINDOW_SCALE: u8 = 7;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for TCP entries stuck in the LastAck state (i.e. we sent a FIN
 /// but the guest's final ACK never arrived). Two TCP MSLs (2 × 30 s = 60 s)
@@ -1591,6 +1594,8 @@ impl SlirpBackend {
                             seq + 1,
                             TcpControl::Rst,
                             &[],
+                            65535,
+                            None,
                         );
                         self.inject_to_guest.push(rst);
                         return Ok(());
@@ -1617,6 +1622,8 @@ impl SlirpBackend {
                     seq + 1,
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -1637,6 +1644,8 @@ impl SlirpBackend {
                     seq + 1,
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -1677,6 +1686,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Rst,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(rst);
                     return Ok(());
@@ -1729,6 +1740,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Syn,
                         &[],
+                        65535,
+                        Some(OUR_WINDOW_SCALE),
                     );
                     self.inject_to_guest.push(syn_ack);
                     debug!(
@@ -1795,6 +1808,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Rst,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(rst);
                 }
@@ -1848,6 +1863,8 @@ impl SlirpBackend {
                 tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
                 TcpControl::None,
                 &[],
+                65535,
+                None,
             );
             self.inject_to_guest.push(ack_frame);
             entry.our_seq = entry.our_seq.wrapping_add(1);
@@ -1991,6 +2008,8 @@ impl SlirpBackend {
                     entry.guest_ack,
                     TcpControl::None,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(ack_frame);
                 trace!(
@@ -2024,6 +2043,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(ack_frame);
 
@@ -2064,6 +2085,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(ack_frame);
                     if let Err(e) = entry.host_stream.shutdown(std::net::Shutdown::Write) {
@@ -2190,6 +2213,8 @@ impl SlirpBackend {
                     guest_isn.wrapping_add(1),
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
@@ -2226,6 +2251,8 @@ impl SlirpBackend {
                 guest_isn.wrapping_add(1),
                 TcpControl::Syn,
                 &[],
+                65535,
+                Some(OUR_WINDOW_SCALE),
             );
             self.inject_to_guest.push(syn_ack);
             debug!(
@@ -2400,6 +2427,8 @@ impl SlirpBackend {
                                     entry.guest_ack,
                                     TcpControl::None,
                                     chunk,
+                                    65535,
+                                    None,
                                 );
                                 frames_to_inject.push(frame);
                                 entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
@@ -2444,6 +2473,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
+                        65535,
+                        None,
                     ));
                     entry.our_seq = entry.our_seq.wrapping_add(1);
                     entry.our_fin_sent = true;
@@ -2461,6 +2492,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
+                        65535,
+                        None,
                     ));
                 }
             } // entry borrow ends here
@@ -2493,6 +2526,8 @@ impl SlirpBackend {
                             entry.guest_isn.wrapping_add(1),
                             TcpControl::Rst,
                             &[],
+                            65535,
+                            None,
                         );
                         frames_to_inject.push(rst);
                     }
@@ -2841,7 +2876,12 @@ impl NetworkBackend for SlirpBackend {
     }
 }
 
-/// Build a TCP packet (free function to avoid borrow issues with &self methods)
+/// Build a TCP packet (free function to avoid borrow issues with &self methods).
+///
+/// `window_len` is the raw 16-bit window field; `window_scale` is included as a
+/// TCP option only when `Some(_)` — callers pass `Some(OUR_WINDOW_SCALE)` on
+/// SYN-ACK frames and `None` on all other frames (the scale was already
+/// negotiated at handshake time and does not re-appear in later headers).
 #[allow(clippy::too_many_arguments)]
 fn build_tcp_packet_static(
     src_ip: Ipv4Address,
@@ -2852,14 +2892,16 @@ fn build_tcp_packet_static(
     ack: u32,
     control: TcpControl,
     payload: &[u8],
+    window_len: u16,
+    window_scale: Option<u8>,
 ) -> Vec<u8> {
     let tcp_repr = TcpRepr {
         src_port,
         dst_port,
         seq_number: TcpSeqNumber(seq as i32),
         ack_number: Some(TcpSeqNumber(ack as i32)),
-        window_len: TCP_WINDOW,
-        window_scale: None,
+        window_len,
+        window_scale,
         control,
         max_seg_size: if control == TcpControl::Syn {
             Some(MTU as u16 - 40)
@@ -2930,6 +2972,8 @@ pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> 
         0,
         TcpControl::Syn,
         &[],
+        65535,
+        None,
     )
 }
 
@@ -2945,6 +2989,8 @@ fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<
         0,
         TcpControl::Syn,
         &[],
+        65535,
+        None,
     )
 }
 
