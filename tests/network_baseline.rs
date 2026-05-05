@@ -25,7 +25,7 @@
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
+    Ipv4Repr, TcpControl, TcpOption, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -1855,6 +1855,79 @@ fn tcp_connect_async_eventual_rst_on_failure() {
     assert!(
         saw_rst,
         "guest must eventually receive RST when async connect to dropped-listener port fails"
+    );
+}
+
+/// Asserts that the SYN-ACK the stack emits in response to a guest SYN
+/// includes a `WindowScale` option set to `OUR_WINDOW_SCALE` (7).
+///
+/// This pin validates Task 4's SYN-ACK advertisement and is expected to
+/// PASS post-Task-4: `build_tcp_packet_static` now passes
+/// `Some(OUR_WINDOW_SCALE)` on the SYN-ACK call site.
+#[test]
+fn tcp_window_scale_negotiated_in_synack() {
+    use std::time::Instant;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let mut stack = SlirpBackend::new().unwrap();
+
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            1000,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    let mut saw_synack_with_scale = false;
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    'drain: while Instant::now() < deadline {
+        for f in drain_n(&mut stack, 4) {
+            let eth = match EthernetFrame::new_checked(f.as_slice()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if eth.ethertype() != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let ip = match Ipv4Packet::new_checked(eth.payload()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if ip.next_header() != IpProtocol::Tcp || ip.dst_addr() != SLIRP_GUEST_IP {
+                continue;
+            }
+            let tcp = match TcpPacket::new_checked(ip.payload()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !tcp.syn() || !tcp.ack() {
+                continue;
+            }
+            // Parse options to find WindowScale.
+            let mut remaining = tcp.options();
+            loop {
+                match TcpOption::parse(remaining) {
+                    Ok((_, TcpOption::EndOfList)) | Err(_) => break,
+                    Ok((_, TcpOption::WindowScale(scale))) => {
+                        assert_eq!(scale, 7, "advertised scale must be OUR_WINDOW_SCALE (7)");
+                        saw_synack_with_scale = true;
+                        break 'drain;
+                    }
+                    Ok((rest, _)) => remaining = rest,
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        saw_synack_with_scale,
+        "SYN-ACK must include WindowScale option with value 7"
     );
 }
 
