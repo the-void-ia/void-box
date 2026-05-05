@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
 use crate::network::epoll_dispatch::{EpollDispatch, EpollEvent, RegisterMode, Waker};
 use crate::network::{nat, NetworkBackend};
 
@@ -95,6 +97,13 @@ const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// matches the POSIX TIME_WAIT recommendation and prevents LastAck entries
 /// from leaking indefinitely when a guest drops the final ACK.
 const LAST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for TCP entries stuck in the Connecting state (i.e. a non-blocking
+/// `connect()` was issued but EPOLLOUT readiness never arrived — a silent
+/// firewall drop is the common cause). Matches the pre-Phase-6.2 synchronous
+/// `connect_timeout(3 s)` so guest-visible behavior is unchanged.
+#[allow(dead_code)] // Used by relay_pending_connects (Task 7).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// ICMP unprivileged probe state.
 ///
@@ -257,7 +266,8 @@ struct TcpNatEntry {
     /// the EPOLLOUT-driven completion path can build SYN-ACK with the
     /// correct ack number (= `guest_isn + 1`).  Once the entry transitions
     /// to `SynReceived` this field is no longer read.
-    #[allow(dead_code)] // Read by EPOLLOUT-driven completion in relay_pending_connects.
+    #[allow(dead_code)]
+    // Read by EPOLLOUT-driven completion in relay_pending_connects (Task 5).
     guest_isn: u32,
 }
 
@@ -1599,10 +1609,45 @@ impl SlirpBackend {
             }
             self.flow_table.remove(&FlowKey::Tcp(key));
 
-            // Connect to the host address resolved by translate_outbound above.
-            match TcpStream::connect_timeout(&dst_addr, Duration::from_secs(3)) {
-                Ok(stream) => {
-                    stream.set_nonblocking(true).ok();
+            // Issue a non-blocking connect to the host address resolved by
+            // translate_outbound above.  socket2's Type::STREAM.nonblocking()
+            // sets O_NONBLOCK at socket creation so the connect() syscall
+            // returns EINPROGRESS immediately for destinations that require a
+            // network round-trip (the common case).  The vCPU thread is never
+            // blocked.  EPOLLOUT readiness on the connecting socket, handled
+            // in relay_pending_connects(), signals completion.
+            let socket = match Socket::new(
+                Domain::IPV4,
+                Type::STREAM.nonblocking(),
+                Some(Protocol::TCP),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "SLIRP TCP: socket() failed for {}:{}: {}",
+                        dst_ip, dst_port, e
+                    );
+                    let rst = build_tcp_packet_static(
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        0,
+                        seq + 1,
+                        TcpControl::Rst,
+                        &[],
+                    );
+                    self.inject_to_guest.push(rst);
+                    return Ok(());
+                }
+            };
+            let sockaddr = SockAddr::from(dst_addr);
+            match socket.connect(&sockaddr) {
+                Ok(()) => {
+                    // Connected immediately (loopback fast path).  Promote
+                    // straight to SynReceived and send SYN-ACK without waiting
+                    // for EPOLLOUT.
+                    let stream = TcpStream::from(socket);
                     let host_fd = stream.as_raw_fd();
                     let our_seq: u32 = rand_seq();
                     let token = next_flow_token(PROTO_TAG_TCP);
@@ -1632,8 +1677,6 @@ impl SlirpBackend {
                         );
                     }
                     self.epoll_waker.wake();
-
-                    // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
                         dst_ip,
                         SLIRP_GUEST_IP,
@@ -1645,14 +1688,59 @@ impl SlirpBackend {
                         &[],
                     );
                     self.inject_to_guest.push(syn_ack);
-                    debug!("SLIRP TCP: SYN-ACK sent for {}:{}", dst_ip, dst_port);
+                    debug!(
+                        "SLIRP TCP: SYN-ACK sent for {}:{} (immediate connect)",
+                        dst_ip, dst_port
+                    );
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+                    // Async connect in progress.  Insert a Connecting entry,
+                    // register the FD for EPOLLOUT, and return without sending
+                    // a SYN-ACK.  relay_pending_connects() will promote this
+                    // entry to SynReceived and send the SYN-ACK once the
+                    // kernel's connect finishes.
+                    let stream = TcpStream::from(socket);
+                    let host_fd = stream.as_raw_fd();
+                    let our_seq: u32 = rand_seq();
+                    let token = next_flow_token(PROTO_TAG_TCP);
+                    let flow_key = FlowKey::Tcp(key);
+                    let entry = TcpNatEntry {
+                        host_stream: stream,
+                        state: TcpNatState::Connecting,
+                        our_seq,
+                        guest_ack: seq + 1,
+                        last_activity: Instant::now(),
+                        bytes_in_flight: 0,
+                        flow_token: token,
+                        last_state_change: Instant::now(),
+                        our_fin_sent: false,
+                        guest_isn: seq,
+                    };
+                    self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+                    self.token_to_key.insert(token, flow_key);
+                    if let Err(e) = self.epoll.register(host_fd, token, RegisterMode::Write) {
+                        warn!(
+                            guest_src_port = key.guest_src_port,
+                            dst_ip = %key.dst_ip,
+                            dst_port = key.dst_port,
+                            fd = host_fd,
+                            error = %e,
+                            "SLIRP TCP: epoll register (Write) failed for connect-in-progress; \
+                             flow will time out via CONNECT_TIMEOUT"
+                        );
+                    }
+                    self.epoll_waker.wake();
+                    debug!(
+                        "SLIRP TCP: connect-in-progress for {}:{} (our_seq={})",
+                        dst_ip, dst_port, our_seq
+                    );
                 }
                 Err(e) => {
+                    // Synchronous connect failure (address unreachable, etc.).
                     warn!(
-                        "SLIRP TCP: connect to {}:{} failed: {}",
+                        "SLIRP TCP: connect to {}:{} failed synchronously: {}",
                         dst_ip, dst_port, e
                     );
-                    // Send RST to guest
                     let rst = build_tcp_packet_static(
                         dst_ip,
                         SLIRP_GUEST_IP,
