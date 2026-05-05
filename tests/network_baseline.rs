@@ -1744,3 +1744,57 @@ fn tcp_connect_to_unreachable_does_not_block_other_flows() {
     let _ = good_listener.set_nonblocking(true);
     let _ = good_listener.accept();
 }
+
+/// Phase 6.2 pin: when an async connect to a dropped-listener port fails,
+/// the guest must eventually receive a RST.  The RST is delivered once
+/// `drain_to_guest` drives `relay_pending_connects` and `getsockopt(SO_ERROR)`
+/// returns a non-zero error code.
+#[test]
+fn tcp_connect_async_eventual_rst_on_failure() {
+    use std::time::Instant;
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    // Bind+drop a listener: the OS assigns a port and then closes it, so a
+    // subsequent connect will receive ECONNREFUSED from the kernel quickly.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let our_seq = 1000u32;
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            bad_port,
+            our_seq,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    // Drive drain_to_guest until we see a RST or the deadline passes.
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    let mut saw_rst = false;
+    while Instant::now() < deadline {
+        let frames = drain_n(&mut stack, 1);
+        for f in frames {
+            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(f.as_slice()) {
+                if matches!(ctrl, TcpControl::Rst) {
+                    saw_rst = true;
+                    break;
+                }
+            }
+        }
+        if saw_rst {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        saw_rst,
+        "guest must eventually receive RST when async connect to dropped-listener port fails"
+    );
+}
