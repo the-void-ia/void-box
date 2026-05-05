@@ -459,6 +459,138 @@ mod linux_benches {
             });
     }
 
+    /// Parametric bulk-throughput bench: pushes host→guest data with the guest
+    /// advertising a fixed receive window of `guest_window` bytes.
+    ///
+    /// Documents the effect of Task 7's window gating. At small windows (4096 B)
+    /// the relay is constrained to one window's worth of unACK'd data before the
+    /// simulated guest ACKs back; at 65536 B the relay can pipeline far more.
+    /// Divan reports per-arm throughput so regressions are visible numerically.
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench(args = [4096u32, 16384, 65536], sample_count = 10)]
+    fn tcp_bulk_throughput_constrained_window(bencher: Bencher, guest_window: u32) {
+        use smoltcp::wire::TcpControl;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const TOTAL_BYTES: usize = 512 * 1024;
+        const DEADLINE_SECS: u64 = 5;
+        const GUEST_SRC_PORT: u16 = 49210;
+        const INITIAL_GUEST_SEQ: u32 = 2000;
+
+        bencher
+            .counter(BytesCount::new(TOTAL_BYTES as u64))
+            .bench_local(|| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let host_port = listener.local_addr().unwrap().port();
+
+                let bytes_injected = Arc::new(AtomicUsize::new(0));
+                let bytes_injected_thr = Arc::clone(&bytes_injected);
+
+                // Server thread: accept connection and write TOTAL_BYTES.
+                let server = std::thread::spawn(move || {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let payload = vec![0xABu8; TOTAL_BYTES];
+                    let _ = sock.write_all(&payload);
+                });
+
+                let mut stack = SlirpBackend::new().unwrap();
+
+                // Guest SYN with the parametric window (no scale option so
+                // the relay sees a raw 16-bit window exactly as supplied).
+                let win16 = guest_window.min(65535) as u16;
+                let syn = build_tcp_data_frame_with_window(
+                    SLIRP_GATEWAY_IP,
+                    GUEST_SRC_PORT,
+                    host_port,
+                    INITIAL_GUEST_SEQ,
+                    0,
+                    TcpControl::Syn,
+                    &[],
+                    win16,
+                    None,
+                );
+                stack.process_guest_frame(&syn).unwrap();
+
+                // Collect SYN-ACK.
+                let mut drain_frames = Vec::new();
+                let gateway_seq = {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECS);
+                    loop {
+                        drain_frames.clear();
+                        stack.drain_to_guest(&mut drain_frames);
+                        if let Some((s, _, _, _)) = drain_frames
+                            .iter()
+                            .find_map(|f| parse_tcp_to_guest_frame(f))
+                        {
+                            break s;
+                        }
+                        if std::time::Instant::now() > deadline {
+                            panic!("no SYN-ACK");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                };
+
+                // Complete handshake.
+                let ack = build_tcp_data_frame_with_window(
+                    SLIRP_GATEWAY_IP,
+                    GUEST_SRC_PORT,
+                    host_port,
+                    INITIAL_GUEST_SEQ + 1,
+                    gateway_seq + 1,
+                    TcpControl::None,
+                    &[],
+                    win16,
+                    None,
+                );
+                stack.process_guest_frame(&ack).unwrap();
+
+                // Drive drain_to_guest until TOTAL_BYTES worth of payload has
+                // been injected.  Simulate guest ACKs after each drain so the
+                // relay can keep sending (mimics the real guest draining and
+                // re-advertising its window).
+                let guest_seq = INITIAL_GUEST_SEQ + 1;
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECS);
+
+                while bytes_injected.load(Ordering::Relaxed) < TOTAL_BYTES * 95 / 100
+                    && std::time::Instant::now() < deadline
+                {
+                    drain_frames.clear();
+                    stack.drain_to_guest(&mut drain_frames);
+                    for frame in &drain_frames {
+                        if let Some((data_seq, _, _, plen)) = parse_tcp_to_guest_frame(frame) {
+                            if plen > 0 {
+                                let new_ack = data_seq.wrapping_add(plen as u32);
+                                bytes_injected_thr.fetch_add(plen, Ordering::Relaxed);
+                                // Simulate guest ACK with re-advertised window.
+                                let guest_ack_frame = build_tcp_data_frame_with_window(
+                                    SLIRP_GATEWAY_IP,
+                                    GUEST_SRC_PORT,
+                                    host_port,
+                                    guest_seq,
+                                    new_ack,
+                                    TcpControl::None,
+                                    &[],
+                                    win16,
+                                    None,
+                                );
+                                let _ = stack.process_guest_frame(&guest_ack_frame);
+                            }
+                        }
+                    }
+                    if drain_frames.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                let _ = server.join();
+                divan::black_box(bytes_injected.load(Ordering::Relaxed));
+            });
+    }
+
     /// Builds a minimal IPv4-over-Ethernet TCP segment from guest to gateway.
     ///
     /// Returns the full Ethernet frame bytes. Mirrors the `build_tcp_frame`
@@ -487,6 +619,70 @@ mod linux_benches {
             },
             window_len: 65535,
             window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            payload,
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: dst_ip,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let eth_hdr_len = 14usize;
+        let total = eth_hdr_len + ip_repr.buffer_len() + tcp_repr.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[eth_hdr_len..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut tcp = TcpPacket::new_unchecked(&mut buf[eth_hdr_len + ip_repr.buffer_len()..]);
+        tcp_repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            &IpAddress::Ipv4(dst_ip),
+            &Default::default(),
+        );
+        buf
+    }
+
+    /// Like `build_tcp_data_frame` but accepts explicit `window_len` and
+    /// `window_scale` parameters.  Used by the constrained-window bench to
+    /// simulate a guest with a small receive buffer.
+    #[cfg(feature = "bench-helpers")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_tcp_data_frame_with_window(
+        dst_ip: smoltcp::wire::Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        control: TcpControl,
+        payload: &[u8],
+        window_len: u16,
+        window_scale: Option<u8>,
+    ) -> Vec<u8> {
+        use smoltcp::wire::{IpAddress, TcpSeqNumber};
+
+        let tcp_repr = TcpRepr {
+            src_port,
+            dst_port,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: if ack == 0 {
+                None
+            } else {
+                Some(TcpSeqNumber(ack as i32))
+            },
+            window_len,
+            window_scale,
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
