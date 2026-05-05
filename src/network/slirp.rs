@@ -102,7 +102,6 @@ const LAST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 /// `connect()` was issued but EPOLLOUT readiness never arrived — a silent
 /// firewall drop is the common cause). Matches the pre-Phase-6.2 synchronous
 /// `connect_timeout(3 s)` so guest-visible behavior is unchanged.
-#[allow(dead_code)] // Used by relay_pending_connects (Task 7).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// ICMP unprivileged probe state.
@@ -2239,6 +2238,23 @@ impl SlirpBackend {
                     );
                     to_remove_set.insert(*flow_key);
                 }
+                // Connecting-timeout: the kernel is still issuing SYNs (silent
+                // firewall drop) and EPOLLOUT has not fired within CONNECT_TIMEOUT.
+                // Send RST to guest and reap.  This matches the pre-Phase-6.2
+                // synchronous connect_timeout(3 s) behavior.
+                if tcp_entry.state == TcpNatState::Connecting
+                    && tcp_entry.last_state_change.elapsed() > CONNECT_TIMEOUT
+                {
+                    warn!(
+                        "SLIRP TCP: Connecting timeout for guest_port={}, reaping",
+                        if let FlowKey::Tcp(k) = flow_key {
+                            k.guest_src_port
+                        } else {
+                            0
+                        }
+                    );
+                    to_remove_set.insert(*flow_key);
+                }
             }
         }
 
@@ -2419,9 +2435,27 @@ impl SlirpBackend {
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
                 self.epoll.unregister(entry.host_stream.as_raw_fd()).ok();
+                // Connecting entries that timed out never received a SYN-ACK,
+                // so we must send RST now to inform the guest.
+                if entry.state == TcpNatState::Connecting {
+                    if let FlowKey::Tcp(key) = flow_key {
+                        let rst = build_tcp_packet_static(
+                            key.dst_ip,
+                            SLIRP_GUEST_IP,
+                            key.dst_port,
+                            key.guest_src_port,
+                            0,
+                            entry.guest_isn.wrapping_add(1),
+                            TcpControl::Rst,
+                            &[],
+                        );
+                        frames_to_inject.push(rst);
+                    }
+                }
             }
             self.flow_table.remove(&flow_key);
         }
+        self.inject_to_guest.append(&mut frames_to_inject);
     }
 
     /// Drain replies from each active ICMP echo socket and emit echo-reply
