@@ -3262,6 +3262,56 @@ impl SlirpBackend {
             entry.last_state_change = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         }
     }
+
+    /// Insert a synthetic `Connecting` entry into the flow table without
+    /// issuing an actual `connect()` syscall.
+    ///
+    /// Used by `process_syn_during_pending_connects` to pre-populate the flow
+    /// table with `n_pending` Connecting entries so the bench can measure
+    /// `process_guest_frame`'s cost as a function of pending-connect backlog.
+    ///
+    /// The synthetic stream is a loopback pair so it has a valid fd; the
+    /// entry's state is forced to Connecting, and the fd is registered for
+    /// EPOLLOUT (matching what a real non-blocking connect would do).
+    pub fn insert_synthetic_connecting_entry(
+        &mut self,
+        guest_src_port: u16,
+        dst_ip: Ipv4Address,
+        dst_port: u16,
+    ) {
+        use std::net::TcpListener;
+        // Create a real but idle stream pair so host_stream holds a valid fd.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).expect("connect");
+        stream.set_nonblocking(true).ok();
+        let key = NatKey {
+            guest_src_port,
+            dst_ip,
+            dst_port,
+        };
+        let host_fd = stream.as_raw_fd();
+        let token = next_flow_token(PROTO_TAG_TCP);
+        let flow_key = FlowKey::Tcp(key);
+        let entry = TcpNatEntry {
+            host_stream: stream,
+            state: TcpNatState::Connecting,
+            our_seq: rand_seq(),
+            guest_ack: 1,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+            flow_token: token,
+            last_state_change: Instant::now(),
+            our_fin_sent: false,
+            guest_isn: 1000,
+        };
+        self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+        self.token_to_key.insert(token, flow_key);
+        // Register for EPOLLOUT so the synthetic entry looks like a real
+        // in-progress connect from the epoll dispatcher's perspective.
+        let _ = self.epoll.register(host_fd, token, RegisterMode::Write);
+        // listener is dropped here but stream keeps the connection alive.
+    }
 }
 
 #[cfg(test)]
