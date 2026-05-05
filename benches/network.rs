@@ -10,8 +10,8 @@ use divan::{counter::BytesCount, Bencher};
 #[cfg(target_os = "linux")]
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
+    EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
+    TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 #[cfg(target_os = "linux")]
 use void_box::network::slirp::{
@@ -1056,7 +1056,7 @@ mod linux_benches {
         // (which uses guest_src_port 49152).
         // TEST-NET-1 (192.0.2.0/24) is reserved for documentation — not
         // routable, so an actual connect would hang on SYN retransmits.
-        let bad_dst_ip = Ipv4Address::new(192, 0, 2, 1);
+        let bad_dst_ip = smoltcp::wire::Ipv4Address::new(192, 0, 2, 1);
         for i in 0..n_pending {
             let guest_src_port = 60000u16.wrapping_add(i as u16);
             stack.insert_synthetic_connecting_entry(guest_src_port, bad_dst_ip, 80);
