@@ -268,6 +268,18 @@ struct TcpNatEntry {
     #[allow(dead_code)]
     // Read by EPOLLOUT-driven completion in relay_pending_connects (Task 5).
     guest_isn: u32,
+    /// Guest's advertised receive window in bytes, scaled per
+    /// `guest_window_scale`. Updated on every incoming TCP frame's
+    /// `window_len`. Initial value 65535 matches an unscaled SYN.
+    // Written by Tasks 2–3; read by Task 7.
+    #[allow(dead_code)]
+    guest_window: u32,
+    /// Window-scale shift the guest negotiated in its SYN. Zero
+    /// means "guest does not support window scaling" (or we did not
+    /// see a window-scale option in the SYN).
+    // Written by Task 2; read by Task 3.
+    #[allow(dead_code)]
+    guest_window_scale: u8,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -873,6 +885,8 @@ impl SlirpBackend {
                 // EPOLLOUT-driven completion path only reads guest_isn for
                 // outbound (guest-initiated) SYNs.
                 guest_isn: 0,
+                guest_window: 65535,
+                guest_window_scale: 0,
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -1668,6 +1682,8 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
+                        guest_window: 65535,
+                        guest_window_scale: 0,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1720,6 +1736,8 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
+                        guest_window: 65535,
+                        guest_window_scale: 0,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -3106,6 +3124,8 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: false,
             guest_isn: 0,
+            guest_window: 65535,
+            guest_window_scale: 0,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -3225,6 +3245,8 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: true,
             guest_isn: 0,
+            guest_window: 65535,
+            guest_window_scale: 0,
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
@@ -3294,6 +3316,8 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: false,
             guest_isn: 1000,
+            guest_window: 65535,
+            guest_window_scale: 0,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
