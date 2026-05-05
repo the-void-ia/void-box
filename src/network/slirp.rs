@@ -2419,6 +2419,24 @@ impl SlirpBackend {
                             let mut sent_total: usize = 0;
                             let our_window = host_recv_window(entry.host_stream.as_raw_fd());
                             for chunk in new_bytes.chunks(MTU - 54) {
+                                // Honour the guest's advertised receive window.
+                                // `bytes_in_flight` tracks how many bytes the
+                                // guest has not yet ACK'd; stop sending once we
+                                // would exceed its buffer.
+                                let window_remaining = (entry.guest_window as usize)
+                                    .saturating_sub(entry.bytes_in_flight as usize);
+                                if window_remaining == 0 {
+                                    trace!(
+                                        "SLIRP TCP: guest window exhausted on flow \
+                                         guest_port={} (in_flight={}, window={})",
+                                        key.guest_src_port,
+                                        entry.bytes_in_flight,
+                                        entry.guest_window
+                                    );
+                                    break;
+                                }
+                                let send_len = chunk.len().min(window_remaining);
+                                let chunk = &chunk[..send_len];
                                 let frame = build_tcp_packet_static(
                                     key.dst_ip,
                                     SLIRP_GUEST_IP,
