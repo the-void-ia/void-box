@@ -1001,6 +1001,12 @@ impl SlirpBackend {
         // 0b. Drain the accept channel (epoll-driven listeners + test helpers).
         self.process_pending_inbound_accepts();
 
+        // 3b. Complete any async connects whose EPOLLOUT fired this cycle.
+        //     Must run before relay_tcp_nat_data so a flow that transitions
+        //     from Connecting→SynReceived within this cycle can be skipped by
+        //     the data-relay pass (it's not yet in Established).
+        self.relay_pending_connects(&ready);
+
         // 4. Process TCP NAT data relay.
         self.relay_tcp_nat_data(&ready);
 
@@ -2055,6 +2061,136 @@ impl SlirpBackend {
         Ok(())
     }
 
+    /// Drive async-connect completion for flows in the `Connecting` state.
+    ///
+    /// For each EPOLLOUT event that maps to a `Connecting` flow, we call
+    /// `getsockopt(SO_ERROR)` to learn the actual connect outcome:
+    ///
+    /// - `SO_ERROR == 0`: connected.  Transition to `SynReceived`, send
+    ///   SYN-ACK to guest, re-register the fd for `EPOLLIN` (Read) via
+    ///   `EPOLL_CTL_MOD` so data relay can begin.
+    /// - `SO_ERROR != 0`: failed.  Send RST to guest, mark Closed, enqueue
+    ///   in `pending_close` for cleanup on the next `relay_tcp_nat_data` pass.
+    ///
+    /// Called from `drain_to_guest` before `relay_tcp_nat_data` so a flow that
+    /// completes connect and has data arrive in the same epoll cycle is handled
+    /// correctly: the transition fires here, and data relay skips the flow
+    /// because it is still in `SynReceived` (not yet `Established`).
+    fn relay_pending_connects(&mut self, ready: &[EpollEvent]) {
+        // Collect keys for Connecting flows with an EPOLLOUT event this cycle.
+        // We copy the keys to avoid holding a borrow on self while mutating.
+        let connecting_keys: Vec<FlowKey> = ready
+            .iter()
+            .filter(|event| event.writable && event.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
+            .filter_map(|event| self.token_to_key.get(&event.token).copied())
+            .filter(|flow_key| {
+                matches!(
+                    self.flow_table.get(flow_key),
+                    Some(FlowEntry::Tcp(e)) if e.state == TcpNatState::Connecting
+                )
+            })
+            .collect();
+
+        for flow_key in connecting_keys {
+            let FlowKey::Tcp(key) = flow_key else {
+                continue;
+            };
+
+            // Check SO_ERROR to learn the actual connect outcome.
+            let (host_fd, guest_isn, our_seq, flow_token) = {
+                let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) else {
+                    continue;
+                };
+                (
+                    entry.host_stream.as_raw_fd(),
+                    entry.guest_isn,
+                    entry.our_seq,
+                    entry.flow_token,
+                )
+            };
+
+            let mut so_error: libc::c_int = 0;
+            let mut so_error_len: libc::socklen_t =
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: getsockopt with SOL_SOCKET/SO_ERROR writes one c_int.
+            let getsockopt_result = unsafe {
+                libc::getsockopt(
+                    host_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut so_error as *mut _ as *mut libc::c_void,
+                    &mut so_error_len,
+                )
+            };
+
+            if getsockopt_result < 0 || so_error != 0 {
+                // Connect failed.
+                let connect_err = if getsockopt_result < 0 {
+                    io::Error::last_os_error()
+                } else {
+                    io::Error::from_raw_os_error(so_error)
+                };
+                warn!(
+                    guest_src_port = key.guest_src_port,
+                    dst_ip = %key.dst_ip,
+                    dst_port = key.dst_port,
+                    error = %connect_err,
+                    "SLIRP TCP: async connect failed; sending RST to guest"
+                );
+                let rst = build_tcp_packet_static(
+                    key.dst_ip,
+                    SLIRP_GUEST_IP,
+                    key.dst_port,
+                    key.guest_src_port,
+                    0,
+                    guest_isn.wrapping_add(1),
+                    TcpControl::Rst,
+                    &[],
+                );
+                self.inject_to_guest.push(rst);
+                if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
+                    entry.state = TcpNatState::Closed;
+                    entry.last_state_change = Instant::now();
+                }
+                self.pending_close.push(flow_key);
+                continue;
+            }
+
+            // Connected.  Re-register for Read before sending SYN-ACK so
+            // the next drain_to_guest cycle can relay host→guest data.
+            // EPOLL_CTL_MOD is atomic — no window where a data event could
+            // be lost between a DEL and ADD.
+            if let Err(e) = self.epoll.modify(host_fd, flow_token, RegisterMode::Read) {
+                warn!(
+                    guest_src_port = key.guest_src_port,
+                    error = %e,
+                    "SLIRP TCP: epoll modify Write→Read failed; flow may stall on data relay"
+                );
+            }
+
+            // Transition to SynReceived and send SYN-ACK.
+            if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
+                entry.state = TcpNatState::SynReceived;
+                entry.last_state_change = Instant::now();
+            }
+            let syn_ack = build_tcp_packet_static(
+                key.dst_ip,
+                SLIRP_GUEST_IP,
+                key.dst_port,
+                key.guest_src_port,
+                our_seq,
+                guest_isn.wrapping_add(1),
+                TcpControl::Syn,
+                &[],
+            );
+            self.inject_to_guest.push(syn_ack);
+            debug!(
+                "SLIRP TCP: async connect OK for {}:{} guest_src_port={}; SYN-ACK sent",
+                key.dst_ip, key.dst_port, key.guest_src_port
+            );
+        }
+    }
+
     /// Relay data from host TCP connections to guest, driven by epoll readiness.
     ///
     /// Closed flows enqueued by handle_tcp_frame (FIN/RST) are drained from
@@ -2839,6 +2975,29 @@ impl SlirpBackend {
     pub fn rebuild_epoll_from_flow_table(&mut self) {
         use std::os::fd::AsRawFd;
         self.token_to_key.clear();
+
+        // Collect Connecting keys for reaping: post-snapshot the underlying
+        // socket fd is dead (the kernel's connect state lives in vhost-vsock
+        // and does not survive snapshot).  Re-registering a dead fd for
+        // EPOLLOUT would stall the flow until CONNECT_TIMEOUT fires — reaping
+        // immediately is correct and matches the "no useful state to persist"
+        // principle stated in the Phase 6.2 plan.
+        let connecting_keys: Vec<FlowKey> = self
+            .flow_table
+            .iter()
+            .filter_map(|(k, v)| {
+                if let FlowEntry::Tcp(e) = v {
+                    if e.state == TcpNatState::Connecting {
+                        return Some(*k);
+                    }
+                }
+                None
+            })
+            .collect();
+        for key in connecting_keys {
+            self.flow_table.remove(&key);
+        }
+
         for (flow_key, entry) in &self.flow_table {
             match (flow_key, entry) {
                 (FlowKey::Tcp(_), FlowEntry::Tcp(e)) => {
