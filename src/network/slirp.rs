@@ -65,7 +65,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, Icmpv4Packet,
     Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
-    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    TcpOption, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 use tracing::{debug, trace, warn};
@@ -131,6 +131,22 @@ const PROTO_TAG_LISTEN: u64 = 0x0400_0000_0000_0000;
 /// 2^56 unique tokens are available before wrap — effectively infinite for
 /// any realistic process lifetime.
 static FLOW_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Parse the `WindowScale` option from a raw TCP options buffer.
+///
+/// Returns 0 when no `WindowScale` option is present (the guest is not
+/// advertising window scaling, so shift = 0 means no scaling applied).
+fn parse_tcp_window_scale(options: &[u8]) -> u8 {
+    let mut remaining = options;
+    loop {
+        match TcpOption::parse(remaining) {
+            Ok((_, TcpOption::EndOfList)) | Err(_) => break,
+            Ok((_, TcpOption::WindowScale(scale))) => return scale,
+            Ok((rest, _)) => remaining = rest,
+        }
+    }
+    0
+}
 
 /// Allocate a fresh, globally unique `FlowToken` tagged for the given protocol.
 ///
@@ -1548,6 +1564,16 @@ impl SlirpBackend {
                 src_ip, src_port, dst_ip, dst_port
             );
 
+            // Parse window scaling from the SYN's TCP options so it can be
+            // stored on the flow entry.  Zero when the guest omits the option.
+            let syn_window_scale = parse_tcp_window_scale(tcp.options());
+            let syn_window: u32 = u32::from(tcp.window_len()) << syn_window_scale;
+            trace!(
+                "SLIRP TCP SYN: guest window_scale={} initial_window={}",
+                syn_window_scale,
+                syn_window
+            );
+
             // Unified outbound translation: combines the gateway-loopback
             // rewrite + deny-list check in one pure-function call. Returns None if
             // the dst is denied; on Some, the SocketAddr already has the right
@@ -1682,8 +1708,8 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
-                        guest_window: 65535,
-                        guest_window_scale: 0,
+                        guest_window: syn_window,
+                        guest_window_scale: syn_window_scale,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1736,8 +1762,8 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
-                        guest_window: 65535,
-                        guest_window_scale: 0,
+                        guest_window: syn_window,
+                        guest_window_scale: syn_window_scale,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
