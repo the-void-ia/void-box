@@ -1863,7 +1863,7 @@ impl SlirpBackend {
                 tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
                 TcpControl::None,
                 &[],
-                65535,
+                host_recv_window(entry.host_stream.as_raw_fd()),
                 None,
             );
             self.inject_to_guest.push(ack_frame);
@@ -2008,7 +2008,7 @@ impl SlirpBackend {
                     entry.guest_ack,
                     TcpControl::None,
                     &[],
-                    65535,
+                    host_recv_window(entry.host_stream.as_raw_fd()),
                     None,
                 );
                 self.inject_to_guest.push(ack_frame);
@@ -2043,7 +2043,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
-                        65535,
+                        host_recv_window(entry.host_stream.as_raw_fd()),
                         None,
                     );
                     self.inject_to_guest.push(ack_frame);
@@ -2085,7 +2085,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
-                        65535,
+                        host_recv_window(entry.host_stream.as_raw_fd()),
                         None,
                     );
                     self.inject_to_guest.push(ack_frame);
@@ -2417,6 +2417,7 @@ impl SlirpBackend {
                         if peek_n > in_flight {
                             let new_bytes = &peek_buf[in_flight..peek_n];
                             let mut sent_total: usize = 0;
+                            let our_window = host_recv_window(entry.host_stream.as_raw_fd());
                             for chunk in new_bytes.chunks(MTU - 54) {
                                 let frame = build_tcp_packet_static(
                                     key.dst_ip,
@@ -2427,7 +2428,7 @@ impl SlirpBackend {
                                     entry.guest_ack,
                                     TcpControl::None,
                                     chunk,
-                                    65535,
+                                    our_window,
                                     None,
                                 );
                                 frames_to_inject.push(frame);
@@ -2473,7 +2474,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
-                        65535,
+                        host_recv_window(entry.host_stream.as_raw_fd()),
                         None,
                     ));
                     entry.our_seq = entry.our_seq.wrapping_add(1);
@@ -2492,7 +2493,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
-                        65535,
+                        host_recv_window(entry.host_stream.as_raw_fd()),
                         None,
                     ));
                 }
@@ -2874,6 +2875,49 @@ impl NetworkBackend for SlirpBackend {
     fn push_ready_events(&self, events: &[crate::network::epoll_dispatch::EpollEvent]) {
         SlirpBackend::push_ready_events(self, events)
     }
+}
+
+/// Host kernel's current receive-buffer headroom for a TCP socket, scaled down
+/// by `OUR_WINDOW_SCALE`, for advertising as our `window_len` on outgoing frames.
+///
+/// A fresh TCP socket has `tcpi_rcv_space` pre-filled to ~32 KiB; under load it
+/// grows to 4 MiB+ on Linux with auto-tuning enabled. Dividing by 128 (shift 7)
+/// keeps the value within `u16::MAX` and matches the scale we advertised in the
+/// SYN-ACK.
+///
+/// Returns `32768` on `getsockopt` failure rather than `0` (which stalls the
+/// connection) or `u16::MAX` (which over-commits buffer space).
+#[cfg(target_os = "linux")]
+fn host_recv_window(fd: std::os::fd::RawFd) -> u16 {
+    use std::mem::MaybeUninit;
+    let mut info: MaybeUninit<libc::tcp_info> = MaybeUninit::zeroed();
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: `getsockopt` writes into `info` when it returns 0; the pointer
+    // is valid and the length is exact.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return 32768;
+    }
+    // SAFETY: getsockopt returned 0, so `info` is fully initialised.
+    let info = unsafe { info.assume_init() };
+    let scaled = info.tcpi_rcv_space >> OUR_WINDOW_SCALE;
+    scaled.min(u32::from(u16::MAX)) as u16
+}
+
+/// Non-Linux stub: always return a conservative fixed window.
+/// The SLIRP relay only runs on Linux; this stub keeps cross-platform builds
+/// compiling without `#[cfg]` gating at every call site.
+#[cfg(not(target_os = "linux"))]
+fn host_recv_window(_fd: std::os::fd::RawFd) -> u16 {
+    32768
 }
 
 /// Build a TCP packet (free function to avoid borrow issues with &self methods).
