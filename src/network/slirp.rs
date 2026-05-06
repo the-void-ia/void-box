@@ -59,6 +59,12 @@ struct PendingDnsQuery {
 /// while keeping the implementation simple.
 const DNS_CACHE_TTL_SECS: u64 = 60;
 
+/// Initial capacity for the ready-event scratch buffers.  Sized to
+/// `EpollDispatch`'s typical per-wait batch so the buffers fit a
+/// busy-loop wakeup without reallocating; oversized batches grow
+/// once and stabilize.
+const EVENTS_PRESIZE: usize = 128;
+
 use ipnet::Ipv4Net;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -689,6 +695,13 @@ pub struct SlirpBackend {
     /// keep the fallback so synthetic harnesses still observe
     /// readiness.
     has_external_poller: AtomicBool,
+    /// Per-call scratch buffer for the events `drain_to_guest`
+    /// processes.  Owned by `SlirpBackend` so its capacity persists
+    /// across calls — `mem::take`-into-local would discard the
+    /// allocation and force the next round to grow from cap=0,
+    /// which heaptrack measured as ~half of all per-CRR
+    /// allocations.
+    ready_scratch: Vec<EpollEvent>,
 }
 
 impl SlirpBackend {
@@ -793,9 +806,10 @@ impl SlirpBackend {
             accept_sender: accept_tx,
             epoll,
             epoll_waker,
-            pending_events: Mutex::new(Vec::new()),
+            pending_events: Mutex::new(Vec::with_capacity(EVENTS_PRESIZE)),
             pending_close: Vec::new(),
             has_external_poller: AtomicBool::new(false),
+            ready_scratch: Vec::with_capacity(EVENTS_PRESIZE),
         })
     }
 
@@ -1033,26 +1047,33 @@ impl SlirpBackend {
         //
         // Then, only if no net-poll thread has populated the queue
         // (unit tests / benches), fall back to a non-blocking poll on
-        // the epoll FD ourselves. `try_lock` keeps that fallback safe
-        // under contention.
-        let ready: Vec<EpollEvent> = {
-            let mut events: Vec<EpollEvent> = {
-                let mut queue = self.pending_events.lock().unwrap();
-                std::mem::take(&mut *queue)
-            };
-            // Fallback non-blocking poll only when no external poller
-            // (net_poll_thread) is feeding us events — otherwise we'd
-            // pay one mutex op + one epoll_wait syscall per call
-            // (~310 ns) for nothing. The flag is one-way: set by the
-            // first push_ready_events and stays set for the backend's
-            // lifetime.
-            if events.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
-                let _ = self
-                    .epoll
-                    .wait_with_timeout(&mut events, std::time::Duration::ZERO);
-            }
-            events
-        };
+        // the epoll FD ourselves.
+        //
+        // The local `ready` Vec is taken from `self.ready_scratch`,
+        // populated by copying out of the locked queue (which is
+        // `clear()`-ed in place to keep its capacity), processed,
+        // then cleared and stashed back.  The previous `mem::take`
+        // pattern dropped the queue's allocation every cycle —
+        // heaptrack measured that as ~half of all per-CRR
+        // allocations on this hot path.
+        let mut ready: Vec<EpollEvent> = std::mem::take(&mut self.ready_scratch);
+        ready.clear();
+        {
+            let mut queue = self.pending_events.lock().unwrap();
+            ready.extend_from_slice(&queue);
+            queue.clear();
+        }
+        // Fallback non-blocking poll only when no external poller
+        // (net_poll_thread) is feeding us events — otherwise we'd
+        // pay one mutex op + one epoll_wait syscall per call
+        // (~310 ns) for nothing. The flag is one-way: set by the
+        // first push_ready_events and stays set for the backend's
+        // lifetime.
+        if ready.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
+            let _ = self
+                .epoll
+                .wait_with_timeout(&mut ready, std::time::Duration::ZERO);
+        }
 
         // 0a. Accept any newly-ready listener connections (may push into
         //     accept_sender for the next step).
@@ -1091,6 +1112,12 @@ impl SlirpBackend {
             out.append(&mut q.tx_queue);
         }
         out.append(&mut self.inject_to_guest);
+
+        // Stash the local `ready` Vec back as scratch.  `clear()`
+        // preserves capacity, so the next `drain_to_guest` reuses
+        // the buffer instead of allocating from cap=0.
+        ready.clear();
+        self.ready_scratch = ready;
     }
 
     /// Poll the stack and return ethernet frames to send to the guest.
