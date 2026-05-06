@@ -2907,8 +2907,8 @@ impl SlirpBackend {
     /// in the LastAck state without going through a full half-close exchange.
     ///
     /// The entry's `last_state_change` is set to `Instant::now()` and can be
-    /// back-dated with [`set_synthetic_last_state_change`] to simulate an
-    /// expired timeout.
+    /// back-dated with [`Self::set_synthetic_last_state_change`] to simulate
+    /// an expired timeout.
     pub fn insert_synthetic_lastack_entry(
         &mut self,
         guest_port: u16,
