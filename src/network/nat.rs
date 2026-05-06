@@ -6,9 +6,9 @@
 //! function call.
 //!
 //! Mirrors passt's `fwd.c::nat_inbound` design: address rewrites are
-//! pure functions of (address, rules), not per-flow state. Sets up the
-//! shape for IPv6 dual-stack (Phase 6) and port-forwarding (Phase 5
-//! Task 5.5).
+//! pure functions of (address, rules), not per-flow state. The same
+//! pure-function shape extends cleanly to IPv6 dual-stack and
+//! port-forwarding without introducing per-flow mutable state.
 
 use std::net::{Ipv4Addr, SocketAddr};
 

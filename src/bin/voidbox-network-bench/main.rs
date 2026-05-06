@@ -127,9 +127,9 @@ FAST SMOKE RUN\n\
         no_throughput: bool,
 
         /// Push N MB through the SLIRP relay against a slow-receiving host
-        /// (`SO_RCVBUF = 4096`). Forces the post-Phase-3 backpressure path to
-        /// actually engage — the small-payload throughput numbers don't
-        /// exercise it because the host drains too fast.
+        /// (`SO_RCVBUF = 4096`). Forces the backpressure path to actually
+        /// engage — the small-payload throughput numbers don't exercise it
+        /// because the host drains too fast.
         ///
         /// 0 (default) skips the measurement. 10 MiB is a reasonable smoke
         /// value; larger N produces more stable numbers but takes longer.
@@ -140,10 +140,10 @@ FAST SMOKE RUN\n\
     #[derive(Serialize, Debug, Default)]
     struct Report {
         /// Sustained guest→host throughput against a slow-receiving host
-        /// (`SO_RCVBUF = 4096`). Probes the post-Phase-3 TCP backpressure path
-        /// — pre-Phase-3 this would be the 256 KB cliff (connection RST mid-
-        /// transfer); post-Phase-3 it's a real number bounded by the kernel
-        /// recv buffer's drain rate. Populated only when `--bulk-mb > 0`.
+        /// (`SO_RCVBUF = 4096`). Probes the TCP backpressure path — rather
+        /// than hitting a fixed userspace cliff and resetting the connection,
+        /// throughput is bounded by the kernel recv buffer's drain rate.
+        /// Populated only when `--bulk-mb > 0`.
         tcp_bulk_throughput_g2h_mbps: Option<f64>,
         tcp_throughput_g2h_mbps: Option<f64>,
         // TODO(h2g): host→guest requires either a guest-side `nc -l` listener
@@ -159,6 +159,17 @@ FAST SMOKE RUN\n\
         tcp_crr_latency_us_p50: Option<f64>,
         udp_dns_qps: Option<f64>,
         icmp_rr_latency_us_p50: Option<f64>,
+        /// p50 host→guest RX latency: "host write completes" → "SLIRP relay
+        /// delivers frame to drain_to_guest output".  Measured at the VMM
+        /// layer against a live guest TCP flow via `nc -l`.
+        ///
+        /// Not yet populated: wiring a guest-side listener and synchronizing
+        /// on first-byte arrival requires either a guest daemon or an additional
+        /// RPC. The divan microbench `tcp_rx_latency_one_packet` captures the
+        /// SLIRP-layer dispatch cost directly (epoll_wait + peek + frame build);
+        /// this wall-clock field will complement it once the guest-listener
+        /// infrastructure is in place.
+        tcp_rx_latency_us_p50: Option<f64>,
     }
 
     #[tokio::main(flavor = "multi_thread")]
@@ -328,9 +339,9 @@ FAST SMOKE RUN\n\
     /// pinned on the listener socket. The small recv buffer forces TCP-level
     /// backpressure: the kernel send buffer fills, our `host_stream.write`
     /// returns `WouldBlock`, the SLIRP relay declines to ACK the guest's
-    /// segment, and the guest retransmits. Pre-Phase-3 this same scenario hit
-    /// the 256 KB userspace cliff (`MAX_TO_HOST_BUFFER`) and got the connection
-    /// reset; post-Phase-3 the relay holds the line and the bytes go through.
+    /// segment, and the guest retransmits. The relay holds the line and the
+    /// bytes go through rather than resetting the connection at a fixed
+    /// userspace buffer limit.
     ///
     /// Returned value is the mean Mbps across `iterations` iterations of pushing
     /// `bulk_mb` MiB. Effective throughput is much lower than
@@ -396,7 +407,7 @@ FAST SMOKE RUN\n\
                             exit_code = ?output.exit_code,
                             stderr = output.stderr_str(),
                             "bulk-g2h iteration non-zero exit; the connection may have \
-                             been reset (pre-Phase-3 cliff regression?). skipping"
+                             been reset (backpressure cliff regression?). skipping"
                         );
                         continue;
                     }

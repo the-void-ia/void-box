@@ -1594,8 +1594,19 @@ fn vsock_irq_thread(
 /// from host TCP sockets accumulates unread, causing TLS handshakes and
 /// API calls to time out.
 ///
-/// This thread wakes every 5 ms, reads any pending host data via
-/// `try_inject_rx`, and fires IRQ 10 to notify the guest.
+/// This thread uses an adaptive `EpollDispatch::wait_with_timeout`:
+/// - **Active** (5 ms): any kernel readiness event in the last cycle keeps
+///   the thread in the 5 ms cadence so the guest's TCP delayed-ACK timer
+///   fires on schedule.  Both real socket readiness events and self-pipe
+///   wakes (from `epoll_waker.wake()` after a new SYN or injected ACK)
+///   count as activity.
+/// - **Idle** (50 ms): a cycle with no kernel events backs off to 50 ms.
+///   New flows or incoming data wake the wait immediately via the epoll set
+///   or the waker, so the 50 ms cap only fires when the network is truly
+///   quiet.
+///
+/// When the network backend does not provide an epoll instance
+/// (non-SlirpBackend), the thread falls back to a fixed 5 ms sleep.
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
@@ -1603,10 +1614,83 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         level: u32,
     }
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+    // Adaptive epoll_wait timeout.  Active periods need a 5 ms cadence so
+    // the guest's TCP delayed-ACK timer fires on schedule (the guest spends
+    // most idle time in HLT and relies on our IRQ pulses to advance vCPU
+    // schedule slots; a 50 ms gap causes +40 ms CRR latency, exactly
+    // Linux's delayed-ACK period).  Idle periods can use the long timeout
+    // safely: any new flow's SYN goes through process_guest_frame which
+    // calls epoll_waker.wake(), and host data arrival fires EPOLLIN — both
+    // wake the wait immediately, so the 50 ms ceiling never bites a real
+    // packet.  We pick the next timeout based on whether the last wait
+    // returned events: had-events ⇒ stay in the active 5 ms cadence,
+    // timed-out ⇒ back off to 50 ms.  Maintains correctness; recovers the
+    // 10x idle wakeup reduction that motivated Phase 6.4 in the first
+    // place.
+    const ACTIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+    const FALLBACK_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+    // Start in the idle regime — first SYN flips us into active.
+    let mut epoll_wait_timeout: std::time::Duration = IDLE_TIMEOUT;
+
     let vm_fd = vm.vm_fd().as_raw_fd();
     let guest_memory = vm.guest_memory();
+
+    // Obtain the epoll Arc from the backend without holding the device lock
+    // across the blocking wait.  Falls back to None if the backend is not
+    // a SlirpBackend (e.g. in unit tests or future alternative backends).
+    let epoll_arc = {
+        match net_dev.lock() {
+            Ok(guard) => guard.epoll_arc(),
+            Err(_) => None,
+        }
+    };
+
+    let mut epoll_events: Vec<crate::network::epoll_dispatch::EpollEvent> = Vec::new();
+
     while running.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Block outside the device lock: either on epoll readiness or a short
+        // sleep.  This lets the vCPU thread acquire the device lock without
+        // contention during the wait phase.
+        epoll_events.clear();
+        // Raw kernel count from epoll_wait, including self-pipe wakes
+        // that the filter strips from `epoll_events`. A self-pipe wake
+        // is the signal that handle_tcp_frame queued a frame and called
+        // epoll_waker.wake() — i.e. real activity that should keep the
+        // adaptive timeout in the active 5 ms cadence even though
+        // `epoll_events.is_empty()`.
+        let mut raw_kernel_events: usize = 0;
+        if let Some(ref ep_arc) = epoll_arc {
+            raw_kernel_events = ep_arc
+                .wait_with_timeout(&mut epoll_events, epoll_wait_timeout)
+                .unwrap_or(0);
+        } else {
+            std::thread::sleep(FALLBACK_SLEEP);
+        }
+
+        // Adapt the next-cycle timeout based on this cycle's outcome.
+        // Any kernel event (real readiness OR self-pipe wake from the
+        // vCPU thread) signals activity and keeps us in the 5 ms
+        // cadence so the guest's TCP delayed-ACK timer fires on time.
+        // A pure timeout drops us to the 50 ms idle cadence.  One quiet
+        // cycle to switch to idle, one event to switch back to active.
+        epoll_wait_timeout = if raw_kernel_events > 0 {
+            ACTIVE_TIMEOUT
+        } else {
+            IDLE_TIMEOUT
+        };
+
+        // Push ready events into the backend's queue before acquiring the
+        // device lock for inject/IRQ work. drain_to_guest will consume them
+        // without re-locking EpollDispatch, eliminating mutex contention
+        // between the net-poll thread's 50 ms blocking wait and the vCPU
+        // thread's process_guest_frame → drain_to_guest path.
+        if !epoll_events.is_empty() {
+            if let Ok(guard) = net_dev.lock() {
+                guard.push_events_to_backend(&epoll_events);
+            }
+        }
 
         let has_interrupt = {
             let mut guard = match net_dev.lock() {
@@ -1621,6 +1705,9 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // an earlier edge was missed by the guest.
         if has_interrupt {
             let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
+            // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
+            // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
+            // for the lifetime of `vm`.
             unsafe {
                 libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
             }

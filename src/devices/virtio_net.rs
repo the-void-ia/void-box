@@ -785,6 +785,29 @@ impl VirtioNetDevice {
     pub fn mac(&self) -> &[u8; 6] {
         &self.mac
     }
+
+    /// Return the epoll dispatch instance from the underlying network backend,
+    /// if the backend is a `SlirpBackend` (Linux only).
+    ///
+    /// `net_poll_thread` uses this to block on `epoll_wait` instead of
+    /// sleeping, waking immediately when host sockets become readable.
+    #[cfg(target_os = "linux")]
+    pub fn epoll_arc(
+        &self,
+    ) -> Option<std::sync::Arc<crate::network::epoll_dispatch::EpollDispatch>> {
+        let backend = self.slirp.lock().unwrap();
+        backend.epoll_arc()
+    }
+
+    /// Forward ready epoll events into the network backend's per-tick queue.
+    ///
+    /// Called by net_poll_thread after each epoll_wait returns so that
+    /// drain_to_guest can process events without re-locking EpollDispatch.
+    #[cfg(target_os = "linux")]
+    pub fn push_events_to_backend(&self, events: &[crate::network::epoll_dispatch::EpollEvent]) {
+        let backend = self.slirp.lock().unwrap();
+        backend.push_ready_events(events);
+    }
 }
 
 #[cfg(test)]

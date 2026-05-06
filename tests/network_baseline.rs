@@ -10,11 +10,11 @@
 #![allow(deprecated)]
 //!
 //! Three tests assert *broken* behavior on purpose. Each is marked
-//! `BROKEN_ON_PURPOSE` and flips in the phase that fixes it:
+//! `BROKEN_ON_PURPOSE` and flips when the corresponding fix lands:
 //!
-//! - `tcp_writes_more_than_256kb_succeed` — flipped in Phase 3 (was `tcp_to_host_buffer_drops_at_256kb`)
-//! - `udp_non_dns_round_trips` — flipped in Phase 2 (was `udp_non_dns_silently_dropped`)
-//! - `icmp_echo_returns_reply` — flipped in Phase 1 (was `icmp_echo_silently_dropped`)
+//! - `tcp_writes_more_than_256kb_succeed` (was `tcp_to_host_buffer_drops_at_256kb`)
+//! - `udp_non_dns_round_trips` (was `udp_non_dns_silently_dropped`)
+//! - `icmp_echo_returns_reply` (was `icmp_echo_silently_dropped`)
 //!
 //! Run with: `cargo test --test network_baseline`
 
@@ -168,12 +168,13 @@ fn parse_tcp_to_guest(frame: &[u8]) -> Option<(u32, u32, TcpControl, usize)> {
     ))
 }
 
-/// Drains frames the stack wants to send to the guest, calling `poll`
-/// up to `n` times.
+/// Drains frames the stack wants to send to the guest, calling
+/// `drain_to_guest` up to `n` times.  Returns all frames produced
+/// across the calls (caller may not care about per-call boundaries).
 fn drain_n(stack: &mut SlirpBackend, n: usize) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for _ in 0..n {
-        out.extend(stack.poll());
+        stack.drain_to_guest(&mut out);
     }
     out
 }
@@ -293,12 +294,11 @@ fn tcp_data_round_trip() {
     );
 }
 
-/// Phase 3 flipped this BROKEN_ON_PURPOSE pin: passt-style sequence
-/// mirroring + don't-ACK-on-WouldBlock backpressure replaces the
-/// 256 KB userspace cliff. Pushing >1 MB through the relay now
-/// succeeds — the kernel's socket buffer holds outstanding bytes,
-/// the guest retransmits unacked segments, and the connection stays
-/// alive instead of being reset.
+/// BROKEN_ON_PURPOSE pin (now passing): passt-style sequence mirroring and
+/// don't-ACK-on-WouldBlock backpressure replace the 256 KB userspace cliff.
+/// Pushing >1 MB through the relay succeeds — the kernel's socket buffer
+/// holds outstanding bytes, the guest retransmits unacked segments, and the
+/// connection stays alive instead of being reset.
 #[test]
 fn tcp_writes_more_than_256kb_succeed() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -385,7 +385,11 @@ fn tcp_writes_more_than_256kb_succeed() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
     while bytes_received.load(Ordering::Relaxed) < TOTAL && std::time::Instant::now() < deadline {
-        // Send a chunk; advance our seq.
+        // Retransmit semantics: only advance the send cursor once the
+        // previous chunk has been ACK'd. If the stack stops ACKing
+        // (backpressure engaged), we re-send the same seq/payload until
+        // it's acknowledged. This matches production guest-TCP retransmit
+        // behavior.
         let _ = stack.process_guest_frame(&build_tcp_frame(
             SLIRP_GATEWAY_IP,
             GUEST_EPHEMERAL_PORT,
@@ -395,10 +399,9 @@ fn tcp_writes_more_than_256kb_succeed() {
             TcpControl::Psh,
             &chunk,
         ));
-        seq = seq.wrapping_add(CHUNK as u32);
 
         // Drain frames; track the highest ACK we've seen and watch
-        // for RST/FIN that would indicate a Phase-2 era close.
+        // for RST/FIN that would indicate a premature close.
         for f in drain_n(&mut stack, 4) {
             if let Some((_, ack, ctrl, _)) = parse_tcp_to_guest(&f) {
                 if matches!(ctrl, TcpControl::Rst | TcpControl::Fin) {
@@ -414,9 +417,14 @@ fn tcp_writes_more_than_256kb_succeed() {
             break;
         }
 
-        // If we've out-paced the kernel's recv buffer, sleep briefly
-        // so the server thread can drain it.
-        if seq.wrapping_sub(acked_seq) > 256 * 1024 {
+        // Advance our send cursor only past ACK'd data.  If the stack
+        // didn't ACK this chunk, the next loop iteration re-sends the
+        // same seq/payload (true TCP retransmit semantics).
+        if acked_seq >= seq.wrapping_add(CHUNK as u32) {
+            seq = seq.wrapping_add(CHUNK as u32);
+        } else if seq.wrapping_sub(acked_seq) > 256 * 1024 {
+            // Out-paced kernel recv buffer; sleep briefly so the host
+            // server thread can drain.
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -443,13 +451,13 @@ fn tcp_writes_more_than_256kb_succeed() {
     let received = bytes_received.load(Ordering::Relaxed);
     assert!(
         !saw_close,
-        "Phase 3 contract: connection must NOT be reset/FIN'd mid-stream \
-         (was the 256 KB cliff bug). Saw RST or FIN."
+        "TCP backpressure must not RST/FIN mid-stream — the relay must hold \
+         the line while the kernel drains. Saw RST or FIN."
     );
     assert!(
         received >= TOTAL * 95 / 100,
-        "Phase 3 contract: server must receive ~all bytes pushed (got {received}/{TOTAL}); \
-         backpressure should retransmit until success, not silently drop."
+        "server must receive ~all bytes pushed (got {received}/{TOTAL}); \
+         backpressure must retransmit until success, not silently drop."
     );
 }
 
@@ -831,9 +839,9 @@ fn dns_cache_keys_by_question_not_xid() {
     }
 }
 
-/// Phase 2 flipped this BROKEN_ON_PURPOSE pin: arbitrary UDP (any
-/// destination port, not just 53) now round-trips through the per-flow
-/// connected-socket NAT introduced in Tasks 2.1–2.4.
+/// BROKEN_ON_PURPOSE pin (now passing): arbitrary UDP (any destination
+/// port, not just 53) round-trips through the per-flow connected-socket
+/// NAT.
 #[test]
 fn udp_non_dns_round_trips() {
     let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -897,9 +905,8 @@ fn udp_non_dns_round_trips() {
     assert!(saw_reply, "guest must receive UDP reply via per-flow NAT");
 }
 
-/// Phase 1 flipped the BROKEN_ON_PURPOSE assertion: the guest now
-/// receives an ICMP echo reply via the host's unprivileged
-/// `IPPROTO_ICMP SOCK_DGRAM` socket.
+/// BROKEN_ON_PURPOSE pin (now passing): the guest receives an ICMP echo
+/// reply via the host's unprivileged `IPPROTO_ICMP SOCK_DGRAM` socket.
 ///
 /// Skips gracefully if `net.ipv4.ping_group_range` forbids unprivileged
 /// ICMP for the calling GID — in that environment the warn-once log
@@ -1032,7 +1039,7 @@ fn nat_translate_outbound_unmodified_external_ip() {
     );
 }
 
-/// E2E contract for Phase 5.5b inbound port-forwarding.
+/// E2E contract for inbound port-forwarding.
 ///
 /// Builds a `SlirpBackend` with one TCP port-forward rule
 /// (`HOST_PORT` → `GUEST_PORT`), has a host thread connect to
@@ -1229,5 +1236,58 @@ fn nat_translate_outbound_deny_list() {
     assert!(
         translate_outbound(&rules, public, 80, SLIRP_GATEWAY_IP).is_some(),
         "IPs outside deny CIDR must pass"
+    );
+}
+
+/// Snapshot/restore must rebuild the epoll dispatch from `flow_table`
+/// contents.  The `epoll_fd` is a kernel handle that does not survive
+/// snapshot; a fresh dispatcher starts with zero registered FDs even
+/// though `flow_table` may contain entries with live host sockets.
+///
+/// This smoke test verifies the rebuild path end-to-end:
+/// 1. Insert a synthetic TCP flow into the flow table.
+/// 2. Reset the epoll dispatcher to a fresh empty one (simulating what
+///    snapshot restore does: the kernel handle is gone, a new one is created).
+/// 3. Confirm the pre-rebuild count is zero.
+/// 4. Call `rebuild_epoll_from_flow_table`.
+/// 5. Confirm the post-rebuild count is one.
+///
+/// Gated on `bench-helpers` because it consumes synthetic-injection helpers
+/// (`insert_synthetic_synsent_entry`, `reset_epoll_for_snapshot_test`,
+/// `registered_fd_count`) that are only visible to external test/bench
+/// consumers when that feature is enabled.  Default `cargo test` skips this
+/// pin; CI runs it via `cargo test --features bench-helpers`.
+#[cfg(feature = "bench-helpers")]
+#[test]
+fn epoll_set_rebuilt_from_flow_table_smoke() {
+    use std::net::TcpListener;
+
+    let mut backend = SlirpBackend::new().expect("backend");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host_stream =
+        std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+    host_stream.set_nonblocking(true).ok();
+
+    // Insert a synthetic flow (may or may not register with epoll depending on
+    // cfg context).  Then reset the epoll dispatcher to a fresh empty one —
+    // this is the key step that simulates what happens after snapshot restore:
+    // the kernel-side `epoll_fd` does not survive, so a new one is created
+    // with zero registrations even though `flow_table` has live entries.
+    backend.insert_synthetic_synsent_entry(8080, 49152, 1000, host_stream);
+    backend.reset_epoll_for_snapshot_test();
+
+    let before = backend.registered_fd_count();
+    assert_eq!(
+        before, 0,
+        "after reset, epoll must have zero registered FDs (simulates post-snapshot state)"
+    );
+
+    backend.rebuild_epoll_from_flow_table();
+
+    let after = backend.registered_fd_count();
+    assert_eq!(
+        after, 1,
+        "rebuild_epoll_from_flow_table must register all live flow FDs"
     );
 }

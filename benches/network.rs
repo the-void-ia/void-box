@@ -170,8 +170,8 @@ mod linux_benches {
     ///
     /// The timed section is a single `poll()` call on the pre-populated stack,
     /// so the measurement reflects the NAT-walk cost at that table size.
-    /// Today the walk is `O(n)`; the unified flow table planned for Phase 4
-    /// should keep the same asymptotic complexity but with smaller constants.
+    /// Today the walk is `O(n)`; the unified flow table keeps the same
+    /// asymptotic complexity but with smaller per-entry constants.
     #[divan::bench(args = [1, 100, 1000])]
     fn poll_with_n_flows(bencher: Bencher, n: usize) {
         let mut stack = SlirpBackend::new().unwrap();
@@ -276,9 +276,9 @@ mod linux_benches {
         });
     }
 
-    /// Pure-compute bench for `nat::translate_outbound`. Phase 5 baseline
-    /// for future hasher / data-structure changes (e.g. moving deny_cidrs
-    /// from `Vec<Ipv4Net>` to a longest-prefix trie). Tens of nanoseconds
+    /// Pure-compute bench for `nat::translate_outbound`. Baseline for future
+    /// hasher / data-structure changes (e.g. moving deny_cidrs from
+    /// `Vec<Ipv4Net>` to a longest-prefix trie). Tens of nanoseconds
     /// expected; microseconds would indicate an allocation in the hot path.
     #[divan::bench]
     fn nat_translate_outbound_hot_path(bencher: Bencher) {
@@ -305,13 +305,13 @@ mod linux_benches {
     /// Measures TCP bulk throughput through the SLIRP relay under backpressure.
     ///
     /// Pushes 1 MiB through the relay in 1 KiB chunks with a constrained host
-    /// receiver (`SO_RCVBUF=4096`) so the post-Phase-3 backpressure path is
-    /// exercised every iteration. Divan reports throughput in MB/s alongside
-    /// per-iteration latency, giving a numerical regression signal for the
-    /// passt-style sequence-mirroring + don't-ACK-on-EAGAIN backpressure path.
+    /// receiver (`SO_RCVBUF=4096`) so the backpressure path is exercised every
+    /// iteration. Divan reports throughput in MB/s alongside per-iteration
+    /// latency, giving a numerical regression signal for the passt-style
+    /// sequence-mirroring + don't-ACK-on-EAGAIN backpressure path.
     ///
     /// The 95% delivery threshold mirrors `tcp_writes_more_than_256kb_succeed`
-    /// — the binary contract test for Phase 3.
+    /// — the binary contract test for TCP backpressure correctness.
     #[divan::bench(sample_count = 10)]
     fn tcp_bulk_throughput_1mb(bencher: Bencher) {
         use smoltcp::wire::TcpControl;
@@ -612,13 +612,12 @@ mod linux_benches {
 
     /// Open `n/3` TCP + `n/3` UDP + `n/3` ICMP-echo flows, then time `poll()`.
     ///
-    /// Mirrors `poll_with_n_flows` (TCP-only) but exercises Phase 4's
-    /// unified `flow_table` with all three protocols populated. Catches
-    /// enum-dispatch + filter regressions at scale: each `relay_*_data`
-    /// loop now `filter(|k| matches!(k, FlowKey::Foo(_)))` over the unified
-    /// table, so per-protocol scan cost is `O(total_flows)` not
-    /// `O(this_protocol's_flows)`. This bench is the regression gate for
-    /// that change.
+    /// Mirrors `poll_with_n_flows` (TCP-only) but exercises the unified
+    /// `flow_table` with all three protocols populated. Catches enum-dispatch
+    /// and filter regressions at scale: each `relay_*_data` loop filters
+    /// by `FlowKey` variant over the unified table, so per-protocol scan cost
+    /// is `O(total_flows)` not `O(this_protocol's_flows)`. This bench is the
+    /// regression gate for that property.
     #[divan::bench(args = [3, 99, 999])]
     fn poll_with_n_mixed_flows(bencher: Bencher, n: usize) {
         let mut stack = SlirpBackend::new().unwrap();
@@ -649,10 +648,10 @@ mod linux_benches {
 
     /// Insert + remove `n` flow-table entries using synthetic data.
     ///
-    /// Pure-compute baseline for the unified `HashMap<FlowKey, FlowEntry>`
-    /// in Phase 4. Phase 5+ reference number for hasher experiments
-    /// (foldhash, ahash, SipHash) or container-shape changes (e.g.
-    /// hashbrown raw API). Uses synthetic `u32` values instead of real
+    /// Pure-compute baseline for the unified `HashMap<FlowKey, FlowEntry>`.
+    /// Reference number for hasher experiments (foldhash, ahash, SipHash)
+    /// or container-shape changes (e.g. hashbrown raw API). Uses synthetic
+    /// `u32` values instead of real
     /// `TcpNatEntry` (which requires TcpStream) to isolate HashMap
     /// mechanics from socket cloning overhead — the real cost is
     /// HashMap insert/remove, not socket ops.
@@ -784,8 +783,8 @@ mod linux_benches {
     }
 
     /// Pure-compute cost of synthesizing an inbound SYN frame for
-    /// port-forwarding (Phase 5.5b.2). No stack allocation or guest frame
-    /// processing — just the `build_tcp_packet_static` wire encoding.
+    /// port-forwarding. No stack allocation or guest frame processing —
+    /// just the `build_tcp_packet_static` wire encoding.
     ///
     /// Expected magnitude: sub-microsecond (pure packet construction).
     ///
@@ -843,8 +842,8 @@ mod linux_benches {
     /// not a bug. Regressions in the inbound state machine or the listener
     /// poll loop will shift the distribution upward beyond 50 ms.
     ///
-    /// Phase 5.5b baseline. Regressions in the inbound state machine or
-    /// listener-poll loop will surface numerically against this measurement.
+    /// Regressions in the inbound state machine or listener-poll loop will
+    /// surface numerically against this measurement.
     #[divan::bench(sample_count = 20, sample_size = 1)]
     fn port_forward_accept_latency(bencher: Bencher) {
         const GUEST_PORT: u16 = 8080;
@@ -896,5 +895,145 @@ mod linux_benches {
 
             worker.join().expect("worker thread panicked");
         });
+    }
+
+    /// Cost of one `drain_to_guest` call when one TCP flow is `Established`
+    /// and the host kernel has data ready to relay.
+    ///
+    /// Captures the per-packet SLIRP dispatch overhead via epoll: epoll_wait
+    /// (non-blocking, zero-timeout), readiness scan, peek, and Ethernet frame
+    /// construction. Only the flows with data ready are dispatched — flows
+    /// with nothing to relay are skipped.
+    ///
+    /// This bench cannot exercise the `net_poll_thread` 50 ms epoll cycle
+    /// (that thread does not run inside divan).  The wall-clock latency floor
+    /// is captured separately by `voidbox-network-bench`'s `tcp_rx_latency_us_p50`
+    /// field; see that binary's `Report` struct for the measurement shape.
+    ///
+    /// Requires the `bench-helpers` feature (compile with
+    /// `cargo bench --features bench-helpers`).
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn tcp_rx_latency_one_packet(bencher: Bencher) {
+        use smoltcp::wire::TcpControl;
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        const GUEST_SRC_PORT: u16 = 49155;
+        const INITIAL_GUEST_SEQ: u32 = 5000;
+        const PAYLOAD: &[u8] = &[0xAB; 64];
+
+        // Build a fresh stack with one Established TCP flow.  Setup happens
+        // outside the timed loop so divan only measures the relay dispatch.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = listener.local_addr().unwrap().port();
+        let server_thread = thread::spawn(move || listener.accept().unwrap());
+
+        let mut stack = SlirpBackend::new().unwrap();
+
+        // 3-way handshake: guest sends SYN → stack produces SYN-ACK → guest
+        // sends ACK.  This mirrors `tcp_bulk_throughput_1mb` setup.
+        let syn = build_tcp_syn_for_latency_bench(GUEST_SRC_PORT, host_port, INITIAL_GUEST_SEQ);
+        stack.process_guest_frame(&syn).unwrap();
+
+        // Drain for up to 200 ms to collect the SYN-ACK.
+        let mut drain_frames: Vec<Vec<u8>> = Vec::new();
+        let gateway_seq = {
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            loop {
+                drain_frames.clear();
+                stack.drain_to_guest(&mut drain_frames);
+                if let Some((seq, _, _, _)) = drain_frames
+                    .iter()
+                    .find_map(|f| parse_tcp_to_guest_frame(f))
+                {
+                    break seq;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("no SYN-ACK within deadline");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Complete the handshake: guest sends ACK.
+        let ack = build_tcp_data_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_SRC_PORT,
+            host_port,
+            INITIAL_GUEST_SEQ + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+        );
+        stack.process_guest_frame(&ack).unwrap();
+
+        // The server thread accepted the connection; grab the socket.
+        let (mut server_sock, _) = server_thread.join().unwrap();
+        server_sock
+            .set_nonblocking(true)
+            .expect("server non-blocking");
+
+        // Set up state for the timed loop.
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(8);
+        let guest_seq = INITIAL_GUEST_SEQ + 1;
+
+        // Prime: put one payload in the kernel buffer before the first
+        // iteration begins so the first measured call sees a ready event.
+        let _ = server_sock.write(PAYLOAD);
+
+        bencher.bench_local(|| {
+            out.clear();
+            // Refill the kernel buffer from the previous iteration's drain.
+            // write() may return EAGAIN if the buffer is full; that is fine —
+            // the previous iteration's peek left data in place.
+            let _ = server_sock.write(divan::black_box(PAYLOAD));
+
+            // The cost we are measuring: one non-blocking epoll_wait + relay.
+            divan::black_box(&mut stack).drain_to_guest(&mut out);
+
+            // Consume the relay output so inject_to_guest doesn't grow
+            // unboundedly across iterations.
+            divan::black_box(&out);
+
+            // Keep the TCP stream happy: send an ACK for any data the relay
+            // fed into inject_to_guest (frame content doesn't matter for the
+            // bench; we just need the host stream not to stall).
+            for frame in &out {
+                if let Some((data_seq, _, _, plen)) = parse_tcp_to_guest_frame(frame) {
+                    if plen > 0 {
+                        let ack_back = build_tcp_data_frame(
+                            SLIRP_GATEWAY_IP,
+                            GUEST_SRC_PORT,
+                            host_port,
+                            guest_seq,
+                            data_seq.wrapping_add(plen as u32),
+                            TcpControl::None,
+                            &[],
+                        );
+                        let _ = stack.process_guest_frame(&ack_back);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Build a SYN frame from the guest toward the host for the latency bench.
+    ///
+    /// Identical to `build_tcp_data_frame` with `TcpControl::Syn` and zero
+    /// `ack`.  Kept as a separate function to document intent: this is the
+    /// opening segment of the 3-way handshake used by
+    /// `tcp_rx_latency_one_packet`.
+    #[cfg(feature = "bench-helpers")]
+    fn build_tcp_syn_for_latency_bench(src_port: u16, dst_port: u16, seq: u32) -> Vec<u8> {
+        build_tcp_data_frame(
+            SLIRP_GATEWAY_IP,
+            src_port,
+            dst_port,
+            seq,
+            0,
+            smoltcp::wire::TcpControl::Syn,
+            &[],
+        )
     }
 } // mod linux_benches

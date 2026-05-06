@@ -6,6 +6,7 @@
 //! - virtio-net configuration
 //! - Network isolation and NAT
 
+pub(crate) mod epoll_dispatch;
 pub mod nat;
 pub mod slirp;
 
@@ -93,6 +94,25 @@ pub trait NetworkBackend: Send {
     fn is_healthy(&self) -> bool {
         true
     }
+
+    /// Return the epoll dispatch instance shared by this backend, if any.
+    ///
+    /// Only `SlirpBackend` returns `Some`; other backends (mock, future
+    /// alternatives) return `None`.  `net_poll_thread` uses this to block on
+    /// `epoll_wait` instead of sleeping, reducing host CPU burn between
+    /// network events.
+    #[cfg(target_os = "linux")]
+    fn epoll_arc(&self) -> Option<std::sync::Arc<epoll_dispatch::EpollDispatch>> {
+        None
+    }
+
+    /// Push ready epoll events into the backend's per-tick queue.
+    ///
+    /// Called by net_poll_thread after each epoll_wait returns, so
+    /// drain_to_guest can consume them without re-locking EpollDispatch.
+    /// The default is a no-op; `SlirpBackend` overrides this.
+    #[cfg(target_os = "linux")]
+    fn push_ready_events(&self, _events: &[epoll_dispatch::EpollEvent]) {}
 }
 
 /// TAP device handle
