@@ -1758,11 +1758,19 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     // (see vmm/cpu.rs), so this thread only needs to push frames.
     type PendingRxArc = std::sync::Arc<crossbeam_queue::SegQueue<Vec<u8>>>;
     type BackendArc = std::sync::Arc<Mutex<dyn crate::network::NetworkBackend>>;
-    let (pending_rx_arc, slirp_arc): (Option<PendingRxArc>, Option<BackendArc>) =
-        match net_dev.lock() {
-            Ok(g) => (Some(g.pending_rx()), Some(g.slirp_arc())),
-            Err(_) => (None, None),
-        };
+    type InterruptStatusArc = std::sync::Arc<std::sync::atomic::AtomicU32>;
+    let (pending_rx_arc, slirp_arc, interrupt_status_arc): (
+        Option<PendingRxArc>,
+        Option<BackendArc>,
+        Option<InterruptStatusArc>,
+    ) = match net_dev.lock() {
+        Ok(g) => (
+            Some(g.pending_rx()),
+            Some(g.slirp_arc()),
+            Some(g.interrupt_status_arc()),
+        ),
+        Err(_) => (None, None, None),
+    };
 
     // Reusable buffer for frames pulled from the backend each cycle.
     let mut rx_scratch: Vec<Vec<u8>> = Vec::new();
@@ -1867,10 +1875,15 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
             _ => 0,
         };
+        // Lock-free check: read interrupt_status via the AtomicU32 we
+        // cached at thread startup.  Avoids one device-mutex acquisition
+        // per cycle on idle paths (the hot RX path skips this branch
+        // because frames_pushed > 0 already implies interrupt_status
+        // is about to be set when the vCPU drains pending_rx).
         let has_interrupt = frames_pushed > 0
-            || match net_dev.lock() {
-                Ok(g) => g.has_pending_interrupt(),
-                Err(_) => false,
+            || match interrupt_status_arc {
+                Some(ref isr) => isr.load(std::sync::atomic::Ordering::Relaxed) != 0,
+                None => false,
             };
         let frames_injected = frames_pushed;
 

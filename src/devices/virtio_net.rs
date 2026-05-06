@@ -8,6 +8,7 @@
 //! - Integration with SLIRP stack for NAT
 //! - No root/TAP required
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
@@ -158,8 +159,16 @@ pub struct VirtioNetDevice {
     queue_sel: u32,
     /// Device status
     status: u32,
-    /// Interrupt status
-    interrupt_status: u32,
+    /// Interrupt status, accessed concurrently from the vCPU thread
+    /// (MMIO read of `INTERRUPT_STATUS`, MMIO write of `INTERRUPT_ACK`)
+    /// and the net-poll thread (sets bit 0 when new RX frames are
+    /// queued, polls on idle cycles).
+    ///
+    /// Wrapped in [`Arc<AtomicU32>`] so the net-poll thread can hold
+    /// its own clone and read/update the value without taking the
+    /// device mutex.  The vCPU thread accesses it via the device
+    /// guard during MMIO dispatch; both sides see the same atomic.
+    interrupt_status: Arc<AtomicU32>,
     /// Configuration generation counter
     config_generation: u32,
     /// Receive queue state
@@ -211,7 +220,7 @@ impl VirtioNetDevice {
             features_sel: 0,
             queue_sel: 0,
             status: 0,
-            interrupt_status: 0,
+            interrupt_status: Arc::new(AtomicU32::new(0)),
             config_generation: 0,
             rx_queue: QueueState {
                 num_max: 256,
@@ -251,6 +260,13 @@ impl VirtioNetDevice {
     /// from the per-packet RX hot path.
     pub fn slirp_arc(&self) -> Arc<Mutex<dyn NetworkBackend>> {
         Arc::clone(&self.slirp)
+    }
+
+    /// Returns a clone of the [`Arc<AtomicU32>`] backing
+    /// `interrupt_status`.  The net-poll thread holds this clone and
+    /// reads/updates the ISR without ever taking the device mutex.
+    pub fn interrupt_status_arc(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.interrupt_status)
     }
 
     /// Set the MMIO base address
@@ -296,7 +312,7 @@ impl VirtioNetDevice {
                 let queue = self.current_queue();
                 queue.ready as u32
             }
-            mmio::INTERRUPT_STATUS => self.interrupt_status,
+            mmio::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Relaxed),
             mmio::STATUS => self.status,
             mmio::CONFIG_GENERATION => self.config_generation,
             // Device config (MAC address at offset 0x100)
@@ -371,7 +387,7 @@ impl VirtioNetDevice {
                 self.handle_queue_notify(value, guest_memory);
             }
             mmio::INTERRUPT_ACK => {
-                self.interrupt_status &= !value;
+                self.interrupt_status.fetch_and(!value, Ordering::Relaxed);
             }
             mmio::STATUS => {
                 self.status = value;
@@ -575,7 +591,7 @@ impl VirtioNetDevice {
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
-        self.interrupt_status |= 1;
+        self.interrupt_status.fetch_or(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -733,7 +749,7 @@ impl VirtioNetDevice {
         }
 
         if frames_injected > 0 {
-            self.interrupt_status |= 1;
+            self.interrupt_status.fetch_or(1, Ordering::Relaxed);
         }
         Ok(frames_injected as usize)
     }
@@ -742,7 +758,7 @@ impl VirtioNetDevice {
     fn reset(&mut self) {
         debug!("virtio-net: device reset");
         self.status = 0;
-        self.interrupt_status = 0;
+        self.interrupt_status.store(0, Ordering::Relaxed);
         self.driver_features = 0;
         self.tx_avail_idx = 0;
         self.tx_used_idx = 0;
@@ -809,7 +825,7 @@ impl VirtioNetDevice {
         self.rx_buffer.push(packet);
 
         // Set interrupt
-        self.interrupt_status |= 1;
+        self.interrupt_status.fetch_or(1, Ordering::Relaxed);
     }
 
     /// Capture device state for snapshot.
@@ -844,7 +860,7 @@ impl VirtioNetDevice {
             features_sel: self.features_sel,
             queue_sel: self.queue_sel,
             status: self.status,
-            interrupt_status: self.interrupt_status,
+            interrupt_status: self.interrupt_status.load(Ordering::Relaxed),
             config_generation: self.config_generation,
             mac: self.mac,
             queues,
@@ -858,7 +874,8 @@ impl VirtioNetDevice {
         self.features_sel = state.features_sel;
         self.queue_sel = state.queue_sel;
         self.status = state.status;
-        self.interrupt_status = state.interrupt_status;
+        self.interrupt_status
+            .store(state.interrupt_status, Ordering::Relaxed);
         self.config_generation = state.config_generation;
         self.mac = state.mac;
 
@@ -894,9 +911,13 @@ impl VirtioNetDevice {
         );
     }
 
-    /// Check if there are pending interrupts
+    /// Check if there are pending interrupts.
+    ///
+    /// Atomic load — safe to call from any thread without holding the
+    /// device mutex.  The net-poll thread uses this to decide whether
+    /// to pulse the IRQ line.
     pub fn has_pending_interrupt(&self) -> bool {
-        self.interrupt_status != 0
+        self.interrupt_status.load(Ordering::Relaxed) != 0
     }
 
     /// Get the MAC address
