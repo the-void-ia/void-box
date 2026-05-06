@@ -1649,6 +1649,13 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
 
     let mut epoll_events: Vec<crate::network::epoll_dispatch::EpollEvent> = Vec::new();
 
+    // Tracks whether the device's interrupt_status was non-zero on the
+    // previous cycle.  Used to decide whether to pulse the IRQ line:
+    // we pulse only on transitions clear→pending (or when new RX frames
+    // are injected this cycle), not on every cycle where pending is
+    // still set from an un-acked earlier pulse.
+    let mut prev_pending: bool = false;
+
     while running.load(Ordering::Relaxed) {
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
@@ -1692,18 +1699,28 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
         }
 
-        let has_interrupt = {
+        let (frames_injected, has_interrupt) = {
             let mut guard = match net_dev.lock() {
                 Ok(g) => g,
                 Err(_) => continue,
             };
-            let _ = guard.try_inject_rx(guest_memory);
-            guard.has_pending_interrupt()
+            let injected = guard.try_inject_rx(guest_memory).unwrap_or(0);
+            (injected, guard.has_pending_interrupt())
         };
 
-        // Always pulse IRQ10 while pending; this prevents RX stalls if
-        // an earlier edge was missed by the guest.
-        if has_interrupt {
+        // Pulse IRQ10 only when there is *new* work for the guest:
+        //   - frames just injected this cycle, OR
+        //   - interrupt_status went from clear → pending (TX completion
+        //     by the vCPU thread between cycles).
+        // Skipping pulses when the guest hasn't acknowledged a previous
+        // pulse saves two ioctl(KVM_IRQ_LINE) calls per cycle (~5–10 µs
+        // on the CRR hot path).  If we pulse once and the guest's
+        // ISR services the queue, has_pending_interrupt will be false
+        // on the next cycle and `prev_pending` resets.
+        let now_pending = has_interrupt;
+        let pulse = frames_injected > 0 || (now_pending && !prev_pending);
+        prev_pending = now_pending;
+        if pulse {
             let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
             // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
             // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid

@@ -451,6 +451,16 @@ impl VirtioNetDevice {
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
+        let initial_tx_used_idx = self.tx_used_idx;
+
+        // Reusable per-call packet buffer.  Capacity carried across
+        // iterations within this call so chained-descriptor frames don't
+        // re-grow the buffer; cleared between frames so each
+        // process_tx_frame sees only this frame's bytes.  Pre-size to
+        // a typical MTU + virtio-net header so the common single-segment
+        // path needs no realloc.
+        let mut packet: Vec<u8> = Vec::with_capacity(1600);
+
         while self.tx_avail_idx != avail_idx {
             // Ring entry: 2 bytes, at avail_addr + 4 + (tx_avail_idx % queue_size)*2
             let ring_offset = 4 + ((self.tx_avail_idx as usize) % queue_size) * 2;
@@ -462,8 +472,7 @@ impl VirtioNetDevice {
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
-            // Walk descriptor chain and collect packet
-            let mut packet = Vec::new();
+            packet.clear();
             let mut next = head_idx;
             loop {
                 if next >= queue_size {
@@ -478,10 +487,14 @@ impl VirtioNetDevice {
                 let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
                 let next_desc = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
                 if len > 0 && addr != 0 {
-                    let mut buf = vec![0u8; len];
-                    mem.read(&mut buf, GuestAddress(addr))
+                    // Read directly into the packet's tail instead of
+                    // allocating an intermediate `Vec<u8>` and then
+                    // `extend_from_slice`-ing it in.  Saves one alloc
+                    // and one full memcpy per descriptor segment.
+                    let off = packet.len();
+                    packet.resize(off + len, 0);
+                    mem.read(&mut packet[off..off + len], GuestAddress(addr))
                         .map_err(|e| crate::Error::Memory(e.to_string()))?;
-                    packet.extend_from_slice(&buf);
                 }
                 if (flags & VIRTQ_DESC_F_NEXT) == 0 {
                     break;
@@ -493,20 +506,27 @@ impl VirtioNetDevice {
                 self.process_tx_frame(&packet)?;
             }
 
-            // Write used ring: used->ring[tx_used_idx % queue_size] = { id: head_idx, len: 0 }
+            // Used-ring entry: 8 bytes (head_idx as u32, 0 as u32).
+            // Built on the stack to avoid heap-alloc-per-frame from
+            // `[...].concat()`.  TX descriptors carry no return data
+            // so the length field is always 0.
             let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * 8;
-            let used_elem = [
-                (head_idx as u32).to_le_bytes(),
-                0u32.to_le_bytes(), // len for TX typically 0
-            ]
-            .concat();
+            let mut used_elem = [0u8; 8];
+            used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
+            // bytes [4..8] stay zero (the length field).
             mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.tx_used_idx = self.tx_used_idx.wrapping_add(1);
             self.tx_avail_idx = self.tx_avail_idx.wrapping_add(1);
+        }
 
-            // Update used.idx so guest sees progress
+        // Publish used.idx ONCE per batch instead of after every frame.
+        // virtio spec: the device updates the used-ring entries first,
+        // then bumps used.idx; the guest reads used.idx with a memory
+        // barrier and iterates new entries.  Per-frame writes are
+        // redundant for correctness and waste one mem.write per frame.
+        if self.tx_used_idx != initial_tx_used_idx {
             let used_idx_bytes = self.tx_used_idx.to_le_bytes();
             mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -517,10 +537,16 @@ impl VirtioNetDevice {
     }
 
     /// Try to inject received frames from SLIRP into guest RX queue. Call from vCPU loop or after RX notify.
-    pub fn try_inject_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
+    ///
+    /// Returns the number of frames the guest now has visible in its RX
+    /// ring after this call.  Callers can use this to decide whether to
+    /// raise an IRQ — pulsing the line is only useful when the guest
+    /// has new work to do, not on every poll cycle while interrupt_status
+    /// is still set from an earlier (un-acked) injection.
+    pub fn try_inject_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<usize> {
         let frames = self.get_rx_frames();
         if frames.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let q = &self.rx_queue;
@@ -533,30 +559,31 @@ impl VirtioNetDevice {
                 frames.len()
             );
             self.rx_buffer.extend(frames);
-            return Ok(());
+            return Ok(0);
         }
         let desc_addr = GuestAddress(q.desc_addr);
         let avail_addr = GuestAddress(q.driver_addr);
         let used_addr = GuestAddress(q.device_addr);
         let queue_size = q.num as usize;
 
+        // avail_idx is monotonically increasing; the driver bumps it
+        // whenever it adds new buffers.  Read it once per try_inject_rx
+        // call rather than per frame — saves one mem.read per frame in
+        // the hot path.  If the device runs out of available buffers
+        // mid-batch the remaining frames are buffered for the next
+        // call, which is the same correctness contract as before.
+        let mut idx_buf = [0u8; 2];
+        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+        let avail_idx = u16::from_le_bytes(idx_buf);
+
+        let mut frames_injected: u16 = 0;
+
         for frame in frames {
-            // Read available ring: how many buffers has driver given us?
-            let mut idx_buf = [0u8; 2];
-            mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
-                .map_err(|e| crate::Error::Memory(e.to_string()))?;
-            let avail_idx = u16::from_le_bytes(idx_buf);
             if self.rx_avail_idx == avail_idx {
-                debug!("virtio-net: RX no available buffers (avail_idx={}, our_idx={}), buffering frame ({} bytes)",
-                    avail_idx, self.rx_avail_idx, frame.len());
                 self.rx_buffer.push(frame);
                 continue;
             }
-            debug!(
-                "virtio-net: RX injecting frame ({} bytes), avail_idx={}",
-                frame.len(),
-                avail_idx
-            );
 
             let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
             let mut desc_id_buf = [0u8; 2];
@@ -599,25 +626,38 @@ impl VirtioNetDevice {
                 next = next_desc;
             }
 
+            // Used-ring entry is exactly 8 bytes (2x u32, little-endian).
+            // Build it on the stack instead of allocating a Vec via
+            // `[...].concat()` — the previous code did a heap alloc per
+            // frame in the hot path.
             let used_ring_off = 4 + ((self.rx_used_idx as usize) % queue_size) * 8;
-            let used_elem = [
-                (head_idx as u32).to_le_bytes(),
-                (written as u32).to_le_bytes(),
-            ]
-            .concat();
+            let mut used_elem = [0u8; 8];
+            used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
+            used_elem[4..8].copy_from_slice(&(written as u32).to_le_bytes());
             mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.rx_used_idx = self.rx_used_idx.wrapping_add(1);
             self.rx_avail_idx = self.rx_avail_idx.wrapping_add(1);
+            frames_injected = frames_injected.wrapping_add(1);
+        }
 
+        // Publish the new used.idx ONCE at the end of the batch.  The
+        // virtio spec only requires the device to update used.idx after
+        // it has written all corresponding used-ring entries; the guest
+        // reads used.idx with a memory barrier and then iterates new
+        // entries.  Per-frame writes are redundant — saves one
+        // mem.write per frame on the hot path.
+        if frames_injected > 0 {
             let used_idx_bytes = self.rx_used_idx.to_le_bytes();
             mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
-        self.interrupt_status |= 1;
-        Ok(())
+        if frames_injected > 0 {
+            self.interrupt_status |= 1;
+        }
+        Ok(frames_injected as usize)
     }
 
     /// Reset device to initial state
