@@ -107,6 +107,12 @@ ipnet = "2"
 # (Type::STREAM.nonblocking() needs the "all" feature flag)
 socket2 = { version = "0.5", features = ["all"] }
 
+# Non-cryptographic hasher for the SLIRP flow table.  The default std
+# HashMap uses SipHash for DoS resistance, which is the right default
+# for attacker-influenced keys but unnecessary overhead on the data
+# path of a NAT keyed by guest-side ports the guest itself chooses.
+rustc-hash = "2"
+
 # --- macOS-only dependencies ---
 [target.'cfg(target_os = "macos")'.dependencies]
 # Objective-C 2.0 bindings (auto-generated from Apple frameworks)
