@@ -3007,6 +3007,7 @@ dependencies = [
  "postcard",
  "regex-lite",
  "reqwest",
+ "rustc-hash",
  "rustix",
  "seccompiler",
  "secrecy",
