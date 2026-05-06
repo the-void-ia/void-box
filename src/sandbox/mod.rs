@@ -86,6 +86,14 @@ pub struct SandboxConfig {
     /// validate save/restore support at cold boot instead of deferring a
     /// cryptic failure to save time.
     pub enable_snapshots: bool,
+    /// Override `max_connections_per_second` on the network backend's
+    /// rate limiter.  `None` keeps the production default (50/s);
+    /// raise it for benches that intentionally exceed the
+    /// anti-DoS limit.
+    pub network_max_connections_per_second: Option<u32>,
+    /// Override `max_concurrent_connections` on the network
+    /// backend.  `None` keeps the production default (64).
+    pub network_max_concurrent_connections: Option<usize>,
 }
 
 impl Default for SandboxConfig {
@@ -108,6 +116,8 @@ impl Default for SandboxConfig {
             env: Vec::new(),
             snapshot: None,
             enable_snapshots: false,
+            network_max_connections_per_second: None,
+            network_max_concurrent_connections: None,
         }
     }
 }
@@ -812,6 +822,23 @@ impl SandboxBuilder {
     /// Enable or disable networking
     pub fn network(mut self, enable: bool) -> Self {
         self.config.network = enable;
+        self
+    }
+
+    /// Override the SLIRP backend's per-second new-connection rate
+    /// limit.  The production default (50/s) protects the host from
+    /// guest-side connection floods; benches that intentionally
+    /// exceed it should call this to disable the limit.
+    pub fn network_max_connections_per_second(mut self, rate: u32) -> Self {
+        self.config.network_max_connections_per_second = Some(rate);
+        self
+    }
+
+    /// Override the SLIRP backend's concurrent-connection ceiling.
+    /// Production default is 64; raise for sustained-throughput
+    /// benches.
+    pub fn network_max_concurrent_connections(mut self, count: usize) -> Self {
+        self.config.network_max_concurrent_connections = Some(count);
         self
     }
 

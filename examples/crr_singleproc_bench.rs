@@ -97,6 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .from_env()?
         .memory_mb(cli.memory_mb)
         .network(true)
+        // Production SLIRP defaults (50/s rate, 64 concurrent) are
+        // sized to throttle a guest-side flood — far below what a
+        // CRR microbench wants.  Lift both ceilings so the bench
+        // exercises the steady-state NAT path, not the rate limiter.
+        .network_max_connections_per_second(u32::MAX)
+        .network_max_concurrent_connections(usize::MAX)
         .mount(MountConfig {
             host_path: bench_binary_dir.clone(),
             guest_path: "/tmp/host".into(),
