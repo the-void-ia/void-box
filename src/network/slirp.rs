@@ -91,6 +91,11 @@ const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeout for TCP entries stuck in the LastAck state (i.e. we sent a FIN
+/// but the guest's final ACK never arrived). Two TCP MSLs (2 × 30 s = 60 s)
+/// matches the POSIX TIME_WAIT recommendation and prevents LastAck entries
+/// from leaking indefinitely when a guest drops the final ACK.
+const LAST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sleep interval for the port-forward listener thread between non-blocking
 /// accept polls. Short enough to keep accept latency low; long enough to
@@ -157,20 +162,48 @@ pub(crate) struct InboundAccept {
 //  TCP NAT connection tracking
 // ──────────────────────────────────────────────────────────────────────
 
+/// TCP connection state for the SLIRP NAT relay.
+///
+/// The state machine models both guest-initiated and host-initiated half-close
+/// sequences. `FinWait2` is omitted: distinguishing it from `FinWait1` requires
+/// observing per-segment ACKs from the kernel, which the relay does not track.
+/// Instead, the relay stays in `FinWait1` until host EOF arrives, then jumps
+/// directly to `LastAck`.
+///
+/// State transitions:
+///
+/// ```text
+///   SynReceived ──ACK──► Established ──guest FIN──► FinWait1
+///   SynSent ──SYN+ACK──► Established               │  │
+///                              │                    │  └─ host EOF ──► LastAck
+///                              │ host EOF            │                     │
+///                              ▼                    │          guest ACK ──┘
+///                          CloseWait ◄──────────────┘            └──► Closed
+///                              │ guest FIN
+///                              ▼
+///                           LastAck ──── LAST_ACK_TIMEOUT ────► Closed
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum TcpNatState {
+pub enum TcpNatState {
     /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
     /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
     /// We synthesized a SYN to the guest (port-forwarding); waiting
     /// for the guest's SYN-ACK to advance to Established.
     SynSent,
+    /// Both sides exchanged handshake; data flows in both directions.
     Established,
+    /// Guest closed its write side (sent FIN); we ACKed and called
+    /// shutdown(Write) on the host socket. Host response data may still
+    /// be in-flight — relay continues until host EOF.
     FinWait1,
-    FinWait2,
+    /// Host closed its write side first (we saw EOF); we sent a FIN to
+    /// the guest. Guest may still send data, which the relay forwards.
     CloseWait,
+    /// We have sent our FIN to the guest; waiting for the guest's final
+    /// ACK. Reaped on ACK or after LAST_ACK_TIMEOUT.
     LastAck,
+    /// Connection fully closed; entry pending removal from the flow table.
     Closed,
 }
 
@@ -199,6 +232,14 @@ struct TcpNatEntry {
     /// via `next_flow_token(PROTO_TAG_TCP)` and stored here so unregister
     /// sites never need to recompute it.
     flow_token: u64,
+    /// Wall clock when the entry's state last changed. Used by
+    /// LAST_ACK_TIMEOUT reaping in relay_tcp_nat_data so a missing
+    /// final ACK doesn't leak the entry forever.
+    last_state_change: Instant,
+    /// True once we have sent our FIN to the guest. Prevents re-sending
+    /// FIN on repeated epoll readiness events for the same transition.
+    /// Read in relay_tcp_nat_data's FIN-emit logic (Task 3).
+    our_fin_sent: bool,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -732,6 +773,8 @@ impl SlirpBackend {
                 last_activity: Instant::now(),
                 bytes_in_flight: 0,
                 flow_token: token,
+                last_state_change: Instant::now(),
+                our_fin_sent: false,
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -1479,6 +1522,8 @@ impl SlirpBackend {
                         last_activity: Instant::now(),
                         bytes_in_flight: 0,
                         flow_token: token,
+                        last_state_change: Instant::now(),
+                        our_fin_sent: false,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1584,6 +1629,16 @@ impl SlirpBackend {
             return Ok(());
         }
 
+        // ACK while in LastAck — guest acknowledged our FIN. Reap.
+        // Placed before the SynReceived ACK branch to be explicit (the
+        // states are mutually exclusive, but explicit ordering is clearer).
+        if tcp.ack() && entry.state == TcpNatState::LastAck {
+            debug!("SLIRP TCP: LastAck → Closed for {}:{}", dst_ip, dst_port);
+            entry.state = TcpNatState::Closed;
+            self.pending_close.push(flow_key);
+            return Ok(());
+        }
+
         // ACK (completing handshake or acknowledging data)
         if tcp.ack() && entry.state == TcpNatState::SynReceived {
             entry.state = TcpNatState::Established;
@@ -1600,9 +1655,18 @@ impl SlirpBackend {
         // buffer to advance the kernel's read pointer.  Without this step the
         // kernel buffer fills up and recv_peek keeps returning the same bytes.
         //
-        // Only runs in Established state — the SynReceived ACK above does not
-        // carry data acknowledgements from us yet (bytes_in_flight == 0 then).
-        if tcp.ack() && entry.state == TcpNatState::Established && entry.bytes_in_flight > 0 {
+        // Runs in Established and FinWait1: even after the guest half-closes
+        // (FinWait1), the relay may have already sent host response data that
+        // the guest must ACK. Draining the kernel buffer on ACK lets
+        // recv_peek see Ok(0) (EOF) once all data is consumed, which then
+        // triggers the FinWait1 → LastAck transition and the final FIN to guest.
+        //
+        // Does not run in SynReceived — that ACK doesn't carry data acks yet.
+        let ack_consume_state = matches!(
+            entry.state,
+            TcpNatState::Established | TcpNatState::FinWait1
+        );
+        if tcp.ack() && ack_consume_state && entry.bytes_in_flight > 0 {
             // segment_ack: what the guest is now confirming it has received
             // from us (our send-side sequence space).
             let segment_ack: u32 = tcp.ack_number().0 as u32;
@@ -1654,7 +1718,15 @@ impl SlirpBackend {
         }
 
         let payload = tcp.payload();
-        if !payload.is_empty() && entry.state == TcpNatState::Established {
+        // Forward guest data in Established and CloseWait: in CloseWait the
+        // host closed its write side but can still read data the guest sends.
+        // FinWait1 is not included — in that state the guest already closed
+        // its write side (we called shutdown(Write) on the host socket).
+        let forward_data = matches!(
+            entry.state,
+            TcpNatState::Established | TcpNatState::CloseWait
+        );
+        if !payload.is_empty() && forward_data {
             // Guest→host backpressure: rely on the kernel's send buffer + TCP
             // retransmit.  ACK only the bytes the kernel accepted right now;
             // on WouldBlock, don't ACK at all and let the guest retransmit.
@@ -1703,23 +1775,83 @@ impl SlirpBackend {
         // FIN from guest
         if tcp.fin() {
             debug!("SLIRP TCP: FIN from guest for {}:{}", dst_ip, dst_port);
-            entry.guest_ack = seq.wrapping_add(1);
-            let fin_ack_frame = build_tcp_packet_static(
-                dst_ip,
-                SLIRP_GUEST_IP,
-                dst_port,
-                src_port,
-                entry.our_seq,
-                entry.guest_ack,
-                TcpControl::Fin,
-                &[],
-            );
-            self.inject_to_guest.push(fin_ack_frame);
-            entry.our_seq = entry.our_seq.wrapping_add(1);
-            entry.state = TcpNatState::Closed;
-            // entry last used above; borrow ends before pending_close push.
-            self.pending_close.push(flow_key);
-            return Ok(());
+            match entry.state {
+                TcpNatState::Established => {
+                    entry.guest_ack = seq.wrapping_add(1);
+
+                    // ACK the guest's FIN — but don't send our own FIN yet. Host
+                    // application may have data still to send. We transition to
+                    // FinWait1 and shut down the host socket's write side so the
+                    // host knows no more data is coming from the guest.
+                    let ack_frame = build_tcp_packet_static(
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        entry.our_seq,
+                        entry.guest_ack,
+                        TcpControl::None,
+                        &[],
+                    );
+                    self.inject_to_guest.push(ack_frame);
+
+                    if let Err(e) = entry.host_stream.shutdown(std::net::Shutdown::Write) {
+                        warn!(
+                            "SLIRP TCP: shutdown(Write) failed on guest FIN, falling back \
+                               to immediate close: {}",
+                            e
+                        );
+                        entry.state = TcpNatState::Closed;
+                        self.pending_close.push(flow_key);
+                        return Ok(());
+                    }
+
+                    entry.state = TcpNatState::FinWait1;
+                    entry.last_state_change = Instant::now();
+                    trace!(
+                        "SLIRP TCP: state Established → FinWait1 for {}:{}",
+                        dst_ip,
+                        dst_port
+                    );
+                    return Ok(());
+                }
+                TcpNatState::CloseWait => {
+                    // Host already closed its write side; guest just closed
+                    // too. Shut down our write side of host_stream so the
+                    // host application's read sees EOF, ACK the guest's FIN,
+                    // and transition to LastAck waiting for guest's final ACK
+                    // of our FIN (which was already sent when we entered
+                    // CloseWait).
+                    entry.guest_ack = seq.wrapping_add(1);
+                    let ack_frame = build_tcp_packet_static(
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        entry.our_seq,
+                        entry.guest_ack,
+                        TcpControl::None,
+                        &[],
+                    );
+                    self.inject_to_guest.push(ack_frame);
+                    if let Err(e) = entry.host_stream.shutdown(std::net::Shutdown::Write) {
+                        // Non-fatal: host already closed; ENOTCONN or similar
+                        // is expected in some cases.
+                        trace!("SLIRP TCP: shutdown(Write) in CloseWait (non-fatal): {}", e);
+                    }
+                    entry.state = TcpNatState::LastAck;
+                    entry.last_state_change = Instant::now();
+                    trace!(
+                        "SLIRP TCP: state CloseWait → LastAck for {}:{}",
+                        dst_ip,
+                        dst_port
+                    );
+                    return Ok(());
+                }
+                _ => {
+                    // Repeat FIN or unexpected — ACK and stay where we are.
+                }
+            }
         }
 
         // RST from guest
@@ -1760,13 +1892,33 @@ impl SlirpBackend {
                 .into_iter()
                 .collect();
 
-        // Idle-timeout sweep: scan flow_table once without collecting a
-        // separate key Vec. 300-second inactivity applies regardless of epoll
-        // readiness; this is O(n) in the number of TCP flows.
+        // Timeout sweep: one pass over the flow table handles two independent
+        // timeout conditions without a separate Vec or extra allocation.
+        // Uses to_remove_set (HashSet) for O(1) membership checks.
         const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
         for (flow_key, entry) in &self.flow_table {
             if let FlowEntry::Tcp(tcp_entry) = entry {
+                if to_remove_set.contains(flow_key) {
+                    continue;
+                }
+                // Standard idle-timeout: 300 s of inactivity in any state.
                 if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT {
+                    to_remove_set.insert(*flow_key);
+                    continue;
+                }
+                // LastAck-timeout: final guest ACK never arrived. Reap so a
+                // misbehaving or crashed guest doesn't leak entries forever.
+                if tcp_entry.state == TcpNatState::LastAck
+                    && tcp_entry.last_state_change.elapsed() > LAST_ACK_TIMEOUT
+                {
+                    warn!(
+                        "SLIRP TCP: LastAck timeout for guest_port={}, reaping",
+                        if let FlowKey::Tcp(k) = flow_key {
+                            k.guest_src_port
+                        } else {
+                            0
+                        }
+                    );
                     to_remove_set.insert(*flow_key);
                 }
             }
@@ -1799,7 +1951,13 @@ impl SlirpBackend {
                     continue;
                 };
 
-                if entry.state != TcpNatState::Established {
+                // Relay data for Established and FinWait1 (guest half-closed;
+                // host may still have data to send). Skip all other states.
+                let relay_data = matches!(
+                    entry.state,
+                    TcpNatState::Established | TcpNatState::FinWait1
+                );
+                if !relay_data {
                     continue;
                 }
 
@@ -1811,13 +1969,42 @@ impl SlirpBackend {
                 let mut peek_buf = [0u8; 65536];
                 match recv_peek(&entry.host_stream, &mut peek_buf) {
                     Ok(0) => {
-                        // Host closed the connection. Send FIN to guest below.
+                        // Host closed the connection.
                         debug!(
-                            "SLIRP TCP: host EOF on flow guest_port={}, marking Closed",
+                            "SLIRP TCP: host EOF on flow guest_port={}",
                             key.guest_src_port
                         );
-                        entry.state = TcpNatState::Closed;
-                        became_closed = true;
+                        match entry.state {
+                            TcpNatState::Established => {
+                                // Host closed first → CloseWait. We send FIN to
+                                // guest; guest may still have data to send which
+                                // we'll forward (host's write side may be closed
+                                // already — that's a guest write failure, not our
+                                // concern).
+                                entry.state = TcpNatState::CloseWait;
+                                entry.last_state_change = Instant::now();
+                                trace!(
+                                    "SLIRP TCP: Established → CloseWait for guest_port={}",
+                                    key.guest_src_port
+                                );
+                                became_closed = false;
+                            }
+                            TcpNatState::FinWait1 => {
+                                // Guest closed first; now host has finished writing.
+                                // Send FIN to guest, transition to LastAck.
+                                entry.state = TcpNatState::LastAck;
+                                entry.last_state_change = Instant::now();
+                                trace!(
+                                    "SLIRP TCP: FinWait1 → LastAck for guest_port={}",
+                                    key.guest_src_port
+                                );
+                                became_closed = false;
+                            }
+                            _ => {
+                                // Already in a closing state or Closed — no action.
+                                became_closed = false;
+                            }
+                        }
                     }
                     Ok(peek_n) => {
                         let in_flight = entry.bytes_in_flight as usize;
@@ -1850,7 +2037,7 @@ impl SlirpBackend {
                             );
                         }
                         // else: kernel buffer holds only already-in-flight bytes.
-                        // Wait for guest ACK before sending more (Task 3.4).
+                        // Wait for guest ACK before sending more.
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         // Kernel recv buffer empty; nothing to do this poll.
@@ -1865,8 +2052,27 @@ impl SlirpBackend {
                     }
                 }
 
-                // FIN if host closed
-                if entry.state == TcpNatState::Closed {
+                // Send FIN if we just transitioned to a state that demands one.
+                let needs_fin =
+                    matches!(entry.state, TcpNatState::CloseWait | TcpNatState::LastAck);
+                if needs_fin && !entry.our_fin_sent {
+                    fin_frame = Some(build_tcp_packet_static(
+                        key.dst_ip,
+                        SLIRP_GUEST_IP,
+                        key.dst_port,
+                        key.guest_src_port,
+                        entry.our_seq,
+                        entry.guest_ack,
+                        TcpControl::Fin,
+                        &[],
+                    ));
+                    entry.our_seq = entry.our_seq.wrapping_add(1);
+                    entry.our_fin_sent = true;
+                    trace!("SLIRP TCP: sent FIN to guest, state={:?}", entry.state);
+                }
+
+                // Legacy: FIN for the immediate Closed path (error or RST).
+                if entry.state == TcpNatState::Closed && became_closed && fin_frame.is_none() {
                     fin_frame = Some(build_tcp_packet_static(
                         key.dst_ip,
                         SLIRP_GUEST_IP,
@@ -2605,6 +2811,8 @@ impl SlirpBackend {
             last_activity: Instant::now(),
             bytes_in_flight: 0,
             flow_token: token,
+            last_state_change: Instant::now(),
+            our_fin_sent: false,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -2631,7 +2839,7 @@ impl SlirpBackend {
     /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,
     /// or `None` if no such entry exists in the flow table.
     #[allow(dead_code)]
-    pub(crate) fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
+    pub fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
         let key = NatKey {
             guest_src_port: guest_port,
             dst_ip: SLIRP_GATEWAY_IP,
@@ -2691,6 +2899,64 @@ impl SlirpBackend {
         let new_waker = new_epoll_inner.waker();
         self.epoll = Arc::new(new_epoll_inner);
         self.epoll_waker = new_waker;
+    }
+
+    /// Insert a synthetic `LastAck` entry into the flow table.
+    ///
+    /// Used by `tcp_last_ack_timeout_reaps_stale_entry` to pre-seed a flow
+    /// in the LastAck state without going through a full half-close exchange.
+    ///
+    /// The entry's `last_state_change` is set to `Instant::now()` and can be
+    /// back-dated with [`Self::set_synthetic_last_state_change`] to simulate
+    /// an expired timeout.
+    pub fn insert_synthetic_lastack_entry(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        host_stream: TcpStream,
+    ) {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        let token = next_flow_token(PROTO_TAG_TCP);
+        let entry = TcpNatEntry {
+            host_stream,
+            state: TcpNatState::LastAck,
+            our_seq: 1,
+            guest_ack: 1,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+            flow_token: token,
+            last_state_change: Instant::now(),
+            our_fin_sent: true,
+        };
+        self.flow_table
+            .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+    }
+
+    /// Back-date the `last_state_change` of the flow identified by
+    /// `(guest_port, GATEWAY_IP, high_port)` by `age`.  Used by
+    /// `tcp_last_ack_timeout_reaps_stale_entry` to simulate a LastAck
+    /// entry that has been sitting past `LAST_ACK_TIMEOUT` without
+    /// receiving the guest's final ACK.
+    pub fn set_synthetic_last_state_change(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        age: Duration,
+    ) {
+        let key = FlowKey::Tcp(NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        });
+        if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&key) {
+            // Instant::now() - age: subtract by creating an instant that
+            // appears to have occurred `age` ago.
+            entry.last_state_change = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
     }
 }
 
