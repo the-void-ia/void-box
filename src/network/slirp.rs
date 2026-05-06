@@ -65,7 +65,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, Icmpv4Packet,
     Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
-    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    TcpOption, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 use tracing::{debug, trace, warn};
@@ -90,7 +90,10 @@ pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x01];
 
 const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
-const TCP_WINDOW: u16 = 65535;
+/// Window-scale shift we advertise on SYN-ACK frames. Matches passt's
+/// default. 7 means each unit in `window_len` represents 128 bytes,
+/// extending the effective window from 64 KiB to 8 MiB.
+const OUR_WINDOW_SCALE: u8 = 7;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for TCP entries stuck in the LastAck state (i.e. we sent a FIN
 /// but the guest's final ACK never arrived). Two TCP MSLs (2 × 30 s = 60 s)
@@ -131,6 +134,22 @@ const PROTO_TAG_LISTEN: u64 = 0x0400_0000_0000_0000;
 /// 2^56 unique tokens are available before wrap — effectively infinite for
 /// any realistic process lifetime.
 static FLOW_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Parse the `WindowScale` option from a raw TCP options buffer.
+///
+/// Returns 0 when no `WindowScale` option is present (the guest is not
+/// advertising window scaling, so shift = 0 means no scaling applied).
+fn parse_tcp_window_scale(options: &[u8]) -> u8 {
+    let mut remaining = options;
+    loop {
+        match TcpOption::parse(remaining) {
+            Ok((_, TcpOption::EndOfList)) | Err(_) => break,
+            Ok((_, TcpOption::WindowScale(scale))) => return scale,
+            Ok((rest, _)) => remaining = rest,
+        }
+    }
+    0
+}
 
 /// Allocate a fresh, globally unique `FlowToken` tagged for the given protocol.
 ///
@@ -268,6 +287,25 @@ struct TcpNatEntry {
     #[allow(dead_code)]
     // Read by EPOLLOUT-driven completion in relay_pending_connects (Task 5).
     guest_isn: u32,
+    /// Guest's advertised receive window in bytes, scaled per
+    /// `guest_window_scale`. Updated on every incoming TCP frame's
+    /// `window_len`. Initial value 65535 matches an unscaled SYN.
+    guest_window: u32,
+    /// Window-scale shift the guest negotiated in its SYN. Zero
+    /// means "guest does not support window scaling" (or we did not
+    /// see a window-scale option in the SYN).
+    guest_window_scale: u8,
+    /// Cached value of `host_recv_window(host_stream)`. Refreshed
+    /// every `RECV_WINDOW_TTL` instead of on every outgoing frame
+    /// so the bulk-throughput data path doesn't issue a
+    /// `getsockopt(TCP_INFO)` per packet. The window we advertise
+    /// stays within `RECV_WINDOW_TTL` of reality, which is well below
+    /// any realistic RTT.
+    cached_recv_window: u16,
+    /// Wall clock when `cached_recv_window` was last refreshed.
+    /// `Instant::now() - RECV_WINDOW_TTL` at construction forces
+    /// the first emit to populate the cache before advertising.
+    cached_recv_window_at: Instant,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -859,6 +897,7 @@ impl SlirpBackend {
                 dst_port: high_port,
             };
             let token = next_flow_token(PROTO_TAG_TCP);
+            let cached_recv_window = host_recv_window(host_stream.as_raw_fd());
             let entry = TcpNatEntry {
                 host_stream,
                 state: TcpNatState::SynSent,
@@ -873,6 +912,10 @@ impl SlirpBackend {
                 // EPOLLOUT-driven completion path only reads guest_isn for
                 // outbound (guest-initiated) SYNs.
                 guest_isn: 0,
+                guest_window: 65535,
+                guest_window_scale: 0,
+                cached_recv_window,
+                cached_recv_window_at: Instant::now(),
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -1534,6 +1577,16 @@ impl SlirpBackend {
                 src_ip, src_port, dst_ip, dst_port
             );
 
+            // Parse window scaling from the SYN's TCP options so it can be
+            // stored on the flow entry.  Zero when the guest omits the option.
+            let syn_window_scale = parse_tcp_window_scale(tcp.options());
+            let syn_window: u32 = u32::from(tcp.window_len()) << syn_window_scale;
+            trace!(
+                "SLIRP TCP SYN: guest window_scale={} initial_window={}",
+                syn_window_scale,
+                syn_window
+            );
+
             // Unified outbound translation: combines the gateway-loopback
             // rewrite + deny-list check in one pure-function call. Returns None if
             // the dst is denied; on Some, the SocketAddr already has the right
@@ -1555,6 +1608,8 @@ impl SlirpBackend {
                             seq + 1,
                             TcpControl::Rst,
                             &[],
+                            65535,
+                            None,
                         );
                         self.inject_to_guest.push(rst);
                         return Ok(());
@@ -1581,6 +1636,8 @@ impl SlirpBackend {
                     seq + 1,
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -1601,6 +1658,8 @@ impl SlirpBackend {
                     seq + 1,
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 return Ok(());
@@ -1641,6 +1700,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Rst,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(rst);
                     return Ok(());
@@ -1657,6 +1718,7 @@ impl SlirpBackend {
                     let our_seq: u32 = rand_seq();
                     let token = next_flow_token(PROTO_TAG_TCP);
                     let flow_key = FlowKey::Tcp(key);
+                    let cached_recv_window = host_recv_window(host_fd);
                     let entry = TcpNatEntry {
                         host_stream: stream,
                         state: TcpNatState::SynReceived,
@@ -1668,6 +1730,10 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
+                        guest_window: syn_window,
+                        guest_window_scale: syn_window_scale,
+                        cached_recv_window,
+                        cached_recv_window_at: Instant::now(),
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1691,6 +1757,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Syn,
                         &[],
+                        65535,
+                        Some(OUR_WINDOW_SCALE),
                     );
                     self.inject_to_guest.push(syn_ack);
                     debug!(
@@ -1709,6 +1777,7 @@ impl SlirpBackend {
                     let our_seq: u32 = rand_seq();
                     let token = next_flow_token(PROTO_TAG_TCP);
                     let flow_key = FlowKey::Tcp(key);
+                    let cached_recv_window = host_recv_window(host_fd);
                     let entry = TcpNatEntry {
                         host_stream: stream,
                         state: TcpNatState::Connecting,
@@ -1720,6 +1789,10 @@ impl SlirpBackend {
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
                         guest_isn: seq,
+                        guest_window: syn_window,
+                        guest_window_scale: syn_window_scale,
+                        cached_recv_window,
+                        cached_recv_window_at: Instant::now(),
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1755,6 +1828,8 @@ impl SlirpBackend {
                         seq + 1,
                         TcpControl::Rst,
                         &[],
+                        65535,
+                        None,
                     );
                     self.inject_to_guest.push(rst);
                 }
@@ -1783,6 +1858,11 @@ impl SlirpBackend {
 
         entry.last_activity = Instant::now();
 
+        // Track the most recent window advertisement from the guest.  Runs for
+        // every frame (data, ACK, FIN, RST) so `guest_window` always reflects
+        // the current receive-buffer headroom on the guest side.
+        entry.guest_window = u32::from(tcp.window_len()) << entry.guest_window_scale;
+
         // Inbound port-forward: guest's SYN-ACK completing the host-initiated
         // 3-way handshake.  We synthesized a SYN to the guest (5.5b.2/5.5b.3);
         // the guest's kernel accepted it and replied with SYN+ACK.  Send an ACK
@@ -1803,6 +1883,8 @@ impl SlirpBackend {
                 tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
                 TcpControl::None,
                 &[],
+                cached_host_recv_window(entry),
+                None,
             );
             self.inject_to_guest.push(ack_frame);
             entry.our_seq = entry.our_seq.wrapping_add(1);
@@ -1946,6 +2028,8 @@ impl SlirpBackend {
                     entry.guest_ack,
                     TcpControl::None,
                     &[],
+                    cached_host_recv_window(entry),
+                    None,
                 );
                 self.inject_to_guest.push(ack_frame);
                 trace!(
@@ -1979,6 +2063,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
+                        cached_host_recv_window(entry),
+                        None,
                     );
                     self.inject_to_guest.push(ack_frame);
 
@@ -2019,6 +2105,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
+                        cached_host_recv_window(entry),
+                        None,
                     );
                     self.inject_to_guest.push(ack_frame);
                     if let Err(e) = entry.host_stream.shutdown(std::net::Shutdown::Write) {
@@ -2145,6 +2233,8 @@ impl SlirpBackend {
                     guest_isn.wrapping_add(1),
                     TcpControl::Rst,
                     &[],
+                    65535,
+                    None,
                 );
                 self.inject_to_guest.push(rst);
                 if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
@@ -2181,6 +2271,8 @@ impl SlirpBackend {
                 guest_isn.wrapping_add(1),
                 TcpControl::Syn,
                 &[],
+                65535,
+                Some(OUR_WINDOW_SCALE),
             );
             self.inject_to_guest.push(syn_ack);
             debug!(
@@ -2345,7 +2437,26 @@ impl SlirpBackend {
                         if peek_n > in_flight {
                             let new_bytes = &peek_buf[in_flight..peek_n];
                             let mut sent_total: usize = 0;
+                            let our_window = cached_host_recv_window(entry);
                             for chunk in new_bytes.chunks(MTU - 54) {
+                                // Honour the guest's advertised receive window.
+                                // `bytes_in_flight` tracks how many bytes the
+                                // guest has not yet ACK'd; stop sending once we
+                                // would exceed its buffer.
+                                let window_remaining = (entry.guest_window as usize)
+                                    .saturating_sub(entry.bytes_in_flight as usize);
+                                if window_remaining == 0 {
+                                    trace!(
+                                        "SLIRP TCP: guest window exhausted on flow \
+                                         guest_port={} (in_flight={}, window={})",
+                                        key.guest_src_port,
+                                        entry.bytes_in_flight,
+                                        entry.guest_window
+                                    );
+                                    break;
+                                }
+                                let send_len = chunk.len().min(window_remaining);
+                                let chunk = &chunk[..send_len];
                                 let frame = build_tcp_packet_static(
                                     key.dst_ip,
                                     SLIRP_GUEST_IP,
@@ -2355,6 +2466,8 @@ impl SlirpBackend {
                                     entry.guest_ack,
                                     TcpControl::None,
                                     chunk,
+                                    our_window,
+                                    None,
                                 );
                                 frames_to_inject.push(frame);
                                 entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
@@ -2399,6 +2512,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
+                        cached_host_recv_window(entry),
+                        None,
                     ));
                     entry.our_seq = entry.our_seq.wrapping_add(1);
                     entry.our_fin_sent = true;
@@ -2416,6 +2531,8 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
+                        cached_host_recv_window(entry),
+                        None,
                     ));
                 }
             } // entry borrow ends here
@@ -2448,6 +2565,8 @@ impl SlirpBackend {
                             entry.guest_isn.wrapping_add(1),
                             TcpControl::Rst,
                             &[],
+                            65535,
+                            None,
                         );
                         frames_to_inject.push(rst);
                     }
@@ -2796,7 +2915,91 @@ impl NetworkBackend for SlirpBackend {
     }
 }
 
-/// Build a TCP packet (free function to avoid borrow issues with &self methods)
+/// Refresh interval for the per-flow `cached_recv_window`. Bounding the
+/// freshness of the advertised window to a few milliseconds keeps it well
+/// below any realistic RTT, while collapsing what would otherwise be one
+/// `getsockopt(TCP_INFO)` per outgoing frame into one per `RECV_WINDOW_TTL`.
+const RECV_WINDOW_TTL: Duration = Duration::from_millis(5);
+
+/// Per-flow cache wrapper around [`host_recv_window`].
+///
+/// Reads the cached value from `entry` and refreshes it via a real
+/// `getsockopt(TCP_INFO)` only when it is older than [`RECV_WINDOW_TTL`].
+/// At line-rate this drops the syscall from "every outgoing frame" to
+/// "every few milliseconds", which profiling identified as the dominant
+/// per-frame cost in Phase 6.3.
+#[cfg(target_os = "linux")]
+fn cached_host_recv_window(entry: &mut TcpNatEntry) -> u16 {
+    if entry.cached_recv_window_at.elapsed() >= RECV_WINDOW_TTL {
+        entry.cached_recv_window = host_recv_window(entry.host_stream.as_raw_fd());
+        entry.cached_recv_window_at = Instant::now();
+    }
+    entry.cached_recv_window
+}
+
+/// Non-Linux stub: same shape as the Linux version, but `host_recv_window`
+/// is itself a constant on non-Linux so caching is moot.
+#[cfg(not(target_os = "linux"))]
+fn cached_host_recv_window(entry: &mut TcpNatEntry) -> u16 {
+    if entry.cached_recv_window_at.elapsed() >= RECV_WINDOW_TTL {
+        entry.cached_recv_window = host_recv_window(entry.host_stream.as_raw_fd());
+        entry.cached_recv_window_at = Instant::now();
+    }
+    entry.cached_recv_window
+}
+
+/// Host kernel's current receive-buffer headroom for a TCP socket, scaled down
+/// by `OUR_WINDOW_SCALE`, for advertising as our `window_len` on outgoing frames.
+///
+/// A fresh TCP socket has `tcpi_rcv_space` pre-filled to ~32 KiB; under load it
+/// grows to 4 MiB+ on Linux with auto-tuning enabled. Dividing by 128 (shift 7)
+/// keeps the value within `u16::MAX` and matches the scale we advertised in the
+/// SYN-ACK.
+///
+/// Returns `32768` on `getsockopt` failure rather than `0` (which stalls the
+/// connection) or `u16::MAX` (which over-commits buffer space).
+///
+/// Hot-path callers should use [`cached_host_recv_window`] instead — this
+/// function is the uncached primitive used by the cache itself.
+#[cfg(target_os = "linux")]
+fn host_recv_window(fd: std::os::fd::RawFd) -> u16 {
+    use std::mem::MaybeUninit;
+    let mut info: MaybeUninit<libc::tcp_info> = MaybeUninit::zeroed();
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: `getsockopt` writes into `info` when it returns 0; the pointer
+    // is valid and the length is exact.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return 32768;
+    }
+    // SAFETY: getsockopt returned 0, so `info` is fully initialised.
+    let info = unsafe { info.assume_init() };
+    let scaled = info.tcpi_rcv_space >> OUR_WINDOW_SCALE;
+    scaled.min(u32::from(u16::MAX)) as u16
+}
+
+/// Non-Linux stub: always return a conservative fixed window.
+/// The SLIRP relay only runs on Linux; this stub keeps cross-platform builds
+/// compiling without `#[cfg]` gating at every call site.
+#[cfg(not(target_os = "linux"))]
+fn host_recv_window(_fd: std::os::fd::RawFd) -> u16 {
+    32768
+}
+
+/// Build a TCP packet (free function to avoid borrow issues with &self methods).
+///
+/// `window_len` is the raw 16-bit window field; `window_scale` is included as a
+/// TCP option only when `Some(_)` — callers pass `Some(OUR_WINDOW_SCALE)` on
+/// SYN-ACK frames and `None` on all other frames (the scale was already
+/// negotiated at handshake time and does not re-appear in later headers).
 #[allow(clippy::too_many_arguments)]
 fn build_tcp_packet_static(
     src_ip: Ipv4Address,
@@ -2807,14 +3010,16 @@ fn build_tcp_packet_static(
     ack: u32,
     control: TcpControl,
     payload: &[u8],
+    window_len: u16,
+    window_scale: Option<u8>,
 ) -> Vec<u8> {
     let tcp_repr = TcpRepr {
         src_port,
         dst_port,
         seq_number: TcpSeqNumber(seq as i32),
         ack_number: Some(TcpSeqNumber(ack as i32)),
-        window_len: TCP_WINDOW,
-        window_scale: None,
+        window_len,
+        window_scale,
         control,
         max_seg_size: if control == TcpControl::Syn {
             Some(MTU as u16 - 40)
@@ -2885,6 +3090,8 @@ pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> 
         0,
         TcpControl::Syn,
         &[],
+        65535,
+        None,
     )
 }
 
@@ -2900,6 +3107,8 @@ fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<
         0,
         TcpControl::Syn,
         &[],
+        65535,
+        None,
     )
 }
 
@@ -3095,6 +3304,7 @@ impl SlirpBackend {
         let host_fd = host_stream.as_raw_fd();
         let token = next_flow_token(PROTO_TAG_TCP);
         let flow_key = FlowKey::Tcp(key);
+        let cached_recv_window = host_recv_window(host_fd);
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::SynSent,
@@ -3106,6 +3316,10 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: false,
             guest_isn: 0,
+            guest_window: 65535,
+            guest_window_scale: 0,
+            cached_recv_window,
+            cached_recv_window_at: Instant::now(),
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -3214,6 +3428,7 @@ impl SlirpBackend {
             dst_port: high_port,
         };
         let token = next_flow_token(PROTO_TAG_TCP);
+        let cached_recv_window = host_recv_window(host_stream.as_raw_fd());
         let entry = TcpNatEntry {
             host_stream,
             state: TcpNatState::LastAck,
@@ -3225,6 +3440,10 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: true,
             guest_isn: 0,
+            guest_window: 65535,
+            guest_window_scale: 0,
+            cached_recv_window,
+            cached_recv_window_at: Instant::now(),
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
@@ -3283,6 +3502,7 @@ impl SlirpBackend {
         let host_fd = stream.as_raw_fd();
         let token = next_flow_token(PROTO_TAG_TCP);
         let flow_key = FlowKey::Tcp(key);
+        let cached_recv_window = host_recv_window(host_fd);
         let entry = TcpNatEntry {
             host_stream: stream,
             state: TcpNatState::Connecting,
@@ -3294,6 +3514,10 @@ impl SlirpBackend {
             last_state_change: Instant::now(),
             our_fin_sent: false,
             guest_isn: 1000,
+            guest_window: 65535,
+            guest_window_scale: 0,
+            cached_recv_window,
+            cached_recv_window_at: Instant::now(),
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);

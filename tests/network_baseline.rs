@@ -25,7 +25,7 @@
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
+    Ipv4Repr, TcpControl, TcpOption, TcpPacket, TcpRepr, UdpPacket, UdpRepr,
 };
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -69,6 +69,65 @@ fn build_tcp_frame(
         },
         window_len: 65535,
         window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        payload,
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: SLIRP_GUEST_IP,
+        dst_addr: dst_ip,
+        next_header: IpProtocol::Tcp,
+        payload_len: tcp_repr.buffer_len(),
+        hop_limit: 64,
+    };
+    let eth_repr = EthernetRepr {
+        src_addr: EthernetAddress(GUEST_MAC),
+        dst_addr: EthernetAddress(GATEWAY_MAC),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let total = ETH_HDR_LEN + ip_repr.buffer_len() + tcp_repr.buffer_len();
+    let mut buf = vec![0u8; total];
+    let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth_repr.emit(&mut eth);
+    let mut ip = Ipv4Packet::new_unchecked(&mut buf[ETH_HDR_LEN..]);
+    ip_repr.emit(&mut ip, &Default::default());
+    let mut tcp = TcpPacket::new_unchecked(&mut buf[ETH_HDR_LEN + ip_repr.buffer_len()..]);
+    tcp_repr.emit(
+        &mut tcp,
+        &IpAddress::Ipv4(SLIRP_GUEST_IP),
+        &IpAddress::Ipv4(dst_ip),
+        &Default::default(),
+    );
+    buf
+}
+
+/// Like `build_tcp_frame` but exposes explicit `window_len` and `window_scale`
+/// parameters so tests can exercise window-management behaviour.
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_frame_with_window(
+    dst_ip: Ipv4Address,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    control: TcpControl,
+    payload: &[u8],
+    window_len: u16,
+    window_scale: Option<u8>,
+) -> Vec<u8> {
+    let tcp_repr = TcpRepr {
+        src_port,
+        dst_port,
+        control,
+        seq_number: smoltcp::wire::TcpSeqNumber(seq as i32),
+        ack_number: if ack == 0 {
+            None
+        } else {
+            Some(smoltcp::wire::TcpSeqNumber(ack as i32))
+        },
+        window_len,
+        window_scale,
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
@@ -1796,5 +1855,171 @@ fn tcp_connect_async_eventual_rst_on_failure() {
     assert!(
         saw_rst,
         "guest must eventually receive RST when async connect to dropped-listener port fails"
+    );
+}
+
+/// Asserts that the SYN-ACK the stack emits in response to a guest SYN
+/// includes a `WindowScale` option set to `OUR_WINDOW_SCALE` (7).
+///
+/// This pin validates Task 4's SYN-ACK advertisement and is expected to
+/// PASS post-Task-4: `build_tcp_packet_static` now passes
+/// `Some(OUR_WINDOW_SCALE)` on the SYN-ACK call site.
+#[test]
+fn tcp_window_scale_negotiated_in_synack() {
+    use std::time::Instant;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let mut stack = SlirpBackend::new().unwrap();
+
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            1000,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    let mut saw_synack_with_scale = false;
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    'drain: while Instant::now() < deadline {
+        for f in drain_n(&mut stack, 4) {
+            let eth = match EthernetFrame::new_checked(f.as_slice()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if eth.ethertype() != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let ip = match Ipv4Packet::new_checked(eth.payload()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if ip.next_header() != IpProtocol::Tcp || ip.dst_addr() != SLIRP_GUEST_IP {
+                continue;
+            }
+            let tcp = match TcpPacket::new_checked(ip.payload()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !tcp.syn() || !tcp.ack() {
+                continue;
+            }
+            // Parse options to find WindowScale.
+            let mut remaining = tcp.options();
+            loop {
+                match TcpOption::parse(remaining) {
+                    Ok((_, TcpOption::EndOfList)) | Err(_) => break,
+                    Ok((_, TcpOption::WindowScale(scale))) => {
+                        assert_eq!(scale, 7, "advertised scale must be OUR_WINDOW_SCALE (7)");
+                        saw_synack_with_scale = true;
+                        break 'drain;
+                    }
+                    Ok((rest, _)) => remaining = rest,
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        saw_synack_with_scale,
+        "SYN-ACK must include WindowScale option with value 7"
+    );
+}
+
+/// BROKEN_ON_PURPOSE: `relay_tcp_nat_data` does not yet gate host→guest sends
+/// on `entry.guest_window`.  This test will FAIL until Task 7 gates the relay
+/// on `guest_window`, at which point it flips to PASSING.
+///
+/// The test establishes a flow with a small guest window (4096 bytes, no scale),
+/// feeds 64 KiB from the host side, and asserts that injected payload before any
+/// ACK does not exceed the guest's advertised window plus one MTU slop.
+#[test]
+fn tcp_advertised_window_tracks_guest_buffer() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || -> std::net::TcpStream {
+        let (sock, _) = listener.accept().unwrap();
+        sock
+    });
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    let our_seq = 1000u32;
+    // Guest SYN with explicit small window (4096 bytes, no scale).
+    let syn = build_tcp_frame_with_window(
+        SLIRP_GATEWAY_IP,
+        GUEST_EPHEMERAL_PORT,
+        host_port,
+        our_seq,
+        0,
+        TcpControl::Syn,
+        &[],
+        4096,
+        None,
+    );
+    stack.process_guest_frame(&syn).unwrap();
+
+    // Collect SYN-ACK from the stack.
+    let mut gateway_seq = 0u32;
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    'outer: while Instant::now() < deadline {
+        for f in drain_n(&mut stack, 4) {
+            if let Some((s, _, ctrl, _)) = parse_tcp_to_guest(f.as_slice()) {
+                if matches!(ctrl, TcpControl::Syn) {
+                    gateway_seq = s;
+                    break 'outer;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Complete handshake with the same small window.
+    stack
+        .process_guest_frame(&build_tcp_frame_with_window(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            host_port,
+            our_seq + 1,
+            gateway_seq + 1,
+            TcpControl::None,
+            &[],
+            4096,
+            None,
+        ))
+        .unwrap();
+
+    // Wait for the server thread to accept and obtain the host stream.
+    let mut host_stream = server.join().unwrap();
+
+    // Push 64 KiB from the host side.
+    let payload = vec![0xABu8; 64 * 1024];
+    host_stream.write_all(&payload).unwrap();
+
+    // Drive drain_to_guest a few times. With proper window tracking,
+    // total bytes injected before any ACK should be <= guest_window
+    // (4096 plus one MTU-sized slop for partial segment).
+    let mut total_payload_injected: usize = 0;
+    for _ in 0..20 {
+        for f in drain_n(&mut stack, 1) {
+            if let Some((_, _, _, payload_len)) = parse_tcp_to_guest(f.as_slice()) {
+                total_payload_injected += payload_len;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        total_payload_injected <= 4096 + 1500,
+        "injected {total_payload_injected} bytes; must respect guest_window=4096 (one MTU slop allowed)"
     );
 }
