@@ -3,10 +3,10 @@
 //! existing bench's per-iteration `nc` fork+exec overhead.
 //!
 //! NOT meant for the production bench surface; this is a one-off
-//! diagnostic that pairs with `tools/crr-client.c` + the pasta side
-//! of the head-to-head.  Compile and run directly:
+//! diagnostic that pairs with `tools/perf-harness/crr-client.c` + the
+//! pasta side of the head-to-head.  Compile and run directly:
 //!
-//!     gcc -O2 -static -o /tmp/crr-client tools/crr-client.c
+//!     gcc -O2 -static -o /tmp/crr-client tools/perf-harness/crr-client.c
 //!     cargo run --release --example crr_singleproc_bench -- \
 //!         --iterations 100 --bench-binary /tmp/crr-client
 //!
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bench_binary = std::path::PathBuf::from(&cli.bench_binary);
     if !bench_binary.exists() {
         return Err(format!(
-            "bench binary not found: {} (compile with `gcc -static -o /tmp/crr-client tools/crr-client.c`)",
+            "bench binary not found: {} (compile with `gcc -static -o /tmp/crr-client tools/perf-harness/crr-client.c`)",
             cli.bench_binary
         )
         .into());

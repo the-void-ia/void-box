@@ -63,15 +63,23 @@ cargo run --release --bin voidbox-network-bench -- \
     --iterations 3 --output /tmp/voidbox-bench.json
 
 # Generate pasta numbers (requires pasta on PATH or via $PASTA).
-scripts/bench-pasta.py --output /tmp/pasta-bench.json
+tools/perf-harness/bench-pasta.py --output /tmp/pasta-bench.json
 
 # Side-by-side markdown.
-scripts/bench-compare-pasta.py /tmp/voidbox-bench.json /tmp/pasta-bench.json \
+tools/perf-harness/bench-compare-pasta.py /tmp/voidbox-bench.json /tmp/pasta-bench.json \
     --output /tmp/voidbox-vs-pasta.md
+
+# qemu+libslirp / qemu+passt CRR (apples-to-apples SLIRP-vs-SLIRP).
+gcc -O2 -static -o /tmp/crr-client tools/perf-harness/crr-client.c
+tools/perf-harness/bench-qemu-slirp.sh --backend libslirp --iterations 30
+tools/perf-harness/bench-qemu-slirp.sh --backend passt    --iterations 30
+
+# Voidbox single-process CRR (no per-iteration nc fork).
+cargo run --release --example crr_singleproc_bench -- --iterations 30
 ```
 
-`scripts/bench-pasta.py --help` lists tunables (iterations, transfer
-size, sample counts).
+`tools/perf-harness/bench-pasta.py --help` lists tunables (iterations,
+transfer size, sample counts).
 
 ## Reading the report
 

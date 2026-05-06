@@ -8,7 +8,7 @@
 #   --backend libslirp    qemu's built-in -netdev user (libslirp)
 #   --backend passt       qemu -netdev stream + a passt(1) instance over UNIX socket
 #
-# Both produce a number directly comparable to scripts/bench-pasta.py's
+# Both produce a number directly comparable to tools/perf-harness/bench-pasta.py's
 # pasta-side number AND to examples/crr_singleproc_bench.rs's voidbox-side
 # number — same workload, same C client, same iteration count.
 #
@@ -24,7 +24,15 @@ ITERATIONS=30
 KERNEL=${KERNEL:-/boot/vmlinuz-$(uname -r)}
 # NB: must be the `passt` binary (VM/socket mode), NOT the `pasta` symlink
 # (namespace mode).  The two modes are the same code keyed on argv[0].
-PASST=${PASST:-/home/diego/github/passt/passt}
+# Default discovery order: $PASST env var → `passt` on $PATH → /usr/bin/passt.
+default_passt() {
+  if command -v passt >/dev/null 2>&1; then
+    command -v passt
+  else
+    echo /usr/bin/passt
+  fi
+}
+PASST=${PASST:-$(default_passt)}
 HOST_PORT=${HOST_PORT:-18877}
 GUEST_ADDR=${GUEST_ADDR:-10.0.2.15}
 GUEST_GATEWAY=${GUEST_GATEWAY:-10.0.2.2}
@@ -38,7 +46,7 @@ Usage: $0 [--backend libslirp|passt] [--iterations N] [--kernel PATH] [--port PO
 
 Env vars:
   KERNEL          path to a Linux bzImage (default: host distro kernel)
-  PASST           path to the passt binary (default: /home/diego/github/passt/pasta)
+  PASST           path to the passt binary (default: \`passt\` on \$PATH, falling back to /usr/bin/passt)
   CRR_CLIENT_BIN  path to the static crr-client binary (default: /tmp/crr-client)
   HOST_PORT       TCP port for the host listener (default: 18877)
   GUEST_ADDR      IPv4 to assign to the guest (default: 10.0.2.15)
@@ -68,14 +76,14 @@ esac
 
 [[ -x "$CRR_CLIENT_BIN" ]] || {
   echo "ERROR: crr-client not found at $CRR_CLIENT_BIN" >&2
-  echo "       compile it with: gcc -O2 -static -o $CRR_CLIENT_BIN tools/crr-client.c" >&2
+  echo "       compile it with: gcc -O2 -static -o $CRR_CLIENT_BIN tools/perf-harness/crr-client.c" >&2
   exit 2
 }
 
 [[ -r "$KERNEL" ]] || { echo "ERROR: kernel not readable: $KERNEL" >&2; exit 2; }
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-INIT_TEMPLATE="$REPO_ROOT/tools/qemu-init.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INIT_TEMPLATE="$SCRIPT_DIR/qemu-init.sh"
 [[ -r "$INIT_TEMPLATE" ]] || { echo "ERROR: missing $INIT_TEMPLATE" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
@@ -95,8 +103,8 @@ mkdir -p "$ROOTFS_DIR"/{bin,sbin,proc,sys,dev,tmp}
 # to extracting from voidbox's claude rootfs if needed.
 if [[ -x /usr/bin/busybox ]] && file /usr/bin/busybox 2>/dev/null | grep -q "statically linked"; then
   cp /usr/bin/busybox "$ROOTFS_DIR/bin/busybox"
-elif [[ -r "$REPO_ROOT/target/void-box-claude.cpio.gz" ]]; then
-  (cd "$ROOTFS_DIR" && zcat "$REPO_ROOT/target/void-box-claude.cpio.gz" | cpio -idm bin/busybox 2>/dev/null)
+elif [[ -r "$SCRIPT_DIR/../../target/void-box-claude.cpio.gz" ]]; then
+  (cd "$ROOTFS_DIR" && zcat "$SCRIPT_DIR/../../target/void-box-claude.cpio.gz" | cpio -idm bin/busybox 2>/dev/null)
 else
   echo "ERROR: no static busybox found; install busybox-static or build target/void-box-claude.cpio.gz" >&2
   exit 2

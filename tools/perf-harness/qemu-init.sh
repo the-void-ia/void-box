@@ -1,7 +1,7 @@
 #!/bin/sh
-# tools/qemu-init.sh — /init for the SLIRP-vs-SLIRP comparison guest.
+# tools/perf-harness/qemu-init.sh — /init for the SLIRP-vs-SLIRP comparison guest.
 #
-# Used by scripts/bench-qemu-slirp.sh.  Read /proc/cmdline for:
+# Used by tools/perf-harness/bench-qemu-slirp.sh.  Read /proc/cmdline for:
 #   crr_target=HOST:PORT:N      target server + iteration count
 #   crr_net=ADDR/MASK,GW        static network config
 #
