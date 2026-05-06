@@ -1,17 +1,21 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_box::ServiceExit;
+use crate::daemon_listen::{self, ListenAddress};
 use crate::error::ApiError;
 use crate::persistence::{
     generate_event_id, legacy_to_v2_event_type, now_ms, now_rfc3339, provider_from_env,
@@ -20,6 +24,29 @@ use crate::persistence::{
 use crate::spec::{AgentMode, RunKind, RunSpec};
 
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Authentication policy applied to every accepted connection.
+///
+/// AF_UNIX listeners delegate to the kernel's mode-`0o600` ACL — only the
+/// daemon's uid can `connect(2)`, so the route layer skips the bearer check.
+/// TCP listeners share the address space with every local user, so a
+/// bearer-token compare runs in front of the route table.
+#[derive(Clone)]
+enum AuthMode {
+    /// AF_UNIX listener — `connect(2)` is gated by socket-mode `0o600`,
+    /// so by the time a request reaches the route the kernel has already
+    /// confirmed the peer's uid. No application-level auth needed.
+    UnixSocket,
+    /// TCP listener with required bearer-token authentication. The token
+    /// is compared in constant time against the value the operator
+    /// configured at daemon startup.
+    BearerToken(Arc<SecretString>),
+    /// Test-only mode that accepts every request without authentication.
+    /// Constructable only via `serve_on_listener_no_auth`, which is
+    /// `#[doc(hidden)]` and named to surface the security implication
+    /// at the call site. Production paths cannot reach this variant.
+    Disabled,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -34,6 +61,7 @@ struct AppState {
         >,
     >,
     sidecar_handles: Arc<Mutex<HashMap<String, Arc<crate::sidecar::SidecarHandle>>>>,
+    auth: AuthMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,17 +115,145 @@ struct AppendMessageRequest {
     content: String,
 }
 
-pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    serve_on_listener(listener).await
+/// Configuration for [`serve`]: address plus the bearer token required by
+/// TCP listeners.
+pub struct ServeConfig {
+    pub address: ListenAddress,
+    pub token: Option<SecretString>,
 }
 
-/// Serve the daemon on an already-bound listener.
+/// Bind the listener described by `config` and serve until cancelled.
 ///
-/// Useful for tests that need to reserve a port before spawning the server:
-/// binding here (rather than reserving a port and re-binding later) closes the
-/// TOCTOU window where another process could claim the port in between.
-pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+/// AF_UNIX listeners are created with mode `0o600` so the kernel rejects
+/// `connect(2)` from any uid other than the daemon's. TCP listeners require
+/// a bearer token because loopback is shared across local accounts.
+pub async fn serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    match config.address {
+        ListenAddress::Unix(path) => {
+            let (listener, guard) = bind_unix_socket(&path)?;
+            info!(path = %path.display(), "[void-box] daemon listening on unix://{}", path.display());
+            serve_unix(guard, listener, AuthMode::UnixSocket).await
+        }
+        ListenAddress::Tcp(addr) => {
+            let token = config
+                .token
+                .ok_or_else::<Box<dyn std::error::Error>, _>(|| {
+                    Box::new(daemon_listen::ListenConfigError::MissingTcpToken)
+                })?;
+            let listener = TcpListener::bind(addr).await?;
+            serve_tcp(listener, AuthMode::BearerToken(Arc::new(token))).await
+        }
+    }
+}
+
+/// Serve the daemon on an already-bound TCP listener with a bearer token
+/// gating every request. Tests reserve a port before spawning the server
+/// so the bind-here-rather-than-rebind-later sequence closes the TOCTOU
+/// window where another process could claim the port in between.
+///
+/// The token is non-optional: an embedder that calls this from outside
+/// the daemon CLI must explicitly think about authentication. Tests that
+/// genuinely need an unauthenticated TCP daemon (where the test client
+/// itself doesn't send `Authorization`) call
+/// [`serve_on_listener_no_auth`] instead — the name makes the security
+/// implication impossible to miss at the call site.
+pub async fn serve_on_listener_with_token(
+    listener: TcpListener,
+    token: SecretString,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_tcp(listener, AuthMode::BearerToken(Arc::new(token))).await
+}
+
+/// Test-only serve entry point that accepts **every** request without
+/// checking `Authorization`. Used by integration tests that do not send a
+/// bearer header.
+///
+/// **Do not use this from production code.** The function name carries
+/// the security implication; `#[doc(hidden)]` keeps it out of public
+/// rustdoc. Routes through [`AuthMode::Disabled`], so an embedder cannot
+/// reach this code path by accidentally constructing an empty
+/// `SecretString` and calling [`serve_on_listener_with_token`].
+#[doc(hidden)]
+pub async fn serve_on_listener_no_auth(
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn!("daemon TCP listener has authentication disabled; accepting all requests");
+    serve_tcp(listener, AuthMode::Disabled).await
+}
+
+/// RAII unlink for the daemon's AF_UNIX socket file.
+///
+/// Holds the bound socket path; on drop, calls
+/// [`daemon_listen::remove_stale_socket`] so the file is unlinked on every
+/// exit path: graceful shutdown, panic, signal-triggered shutdown, or any
+/// future error return out of the serve loop. The remove helper refuses to
+/// unlink non-socket entries, so a path collision is never silently
+/// destructive.
+struct UnixSocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for UnixSocketGuard {
+    fn drop(&mut self) {
+        match daemon_listen::remove_stale_socket(&self.path) {
+            Ok(()) => debug!(path = %self.path.display(), "removed unix socket on shutdown"),
+            Err(err) => warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove unix socket on shutdown"
+            ),
+        }
+    }
+}
+
+fn bind_unix_socket(path: &Path) -> std::io::Result<(UnixListener, UnixSocketGuard)> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    daemon_listen::remove_stale_socket(path)?;
+    // Tighten umask around bind so the socket is born `0o600` rather than
+    // `0o777 & ~umask` (typically `0o755` under default umask `0o022`). The
+    // post-bind chmod still runs as belt-and-braces, but with the umask in
+    // place there is no window where a different uid could `connect(2)`
+    // before the chmod takes effect — the kernel-enforced boundary the
+    // threat model relies on holds across the entire bind sequence.
+    // Construct the guard immediately after a successful `bind` so any
+    // post-bind failure (e.g. `set_permissions` denied by an exotic FS,
+    // ENOSPC mid-chmod) still unlinks the freshly-created socket inode on
+    // the error return. Constructing it later would defeat the point of
+    // the guard for exactly the failure modes this PR is meant to catch.
+    #[cfg(unix)]
+    let (listener, guard) = {
+        // SAFETY: `umask` is process-global; the daemon binds its listener
+        // once at startup, before background work that might want a
+        // different umask is started. Restoring the prior value below
+        // keeps the broader process invariant intact.
+        let prior_umask = unsafe { libc::umask(0o077) };
+        let bind_result = UnixListener::bind(path);
+        unsafe {
+            libc::umask(prior_umask);
+        }
+        let listener = bind_result?;
+        let guard = UnixSocketGuard {
+            path: path.to_path_buf(),
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        (listener, guard)
+    };
+    #[cfg(not(unix))]
+    let (listener, guard) = {
+        let listener = UnixListener::bind(path)?;
+        let guard = UnixSocketGuard {
+            path: path.to_path_buf(),
+        };
+        (listener, guard)
+    };
+    Ok((listener, guard))
+}
+
+async fn build_app_state(auth: AuthMode) -> AppState {
     let provider = provider_from_env();
     let mut initial_runs = provider.load_runs().unwrap_or_default();
 
@@ -108,12 +264,20 @@ pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std:
     // observers see the transition and the run is no longer a ghost.
     reconcile_orphan_runs_on_startup(&mut initial_runs, provider.as_ref());
 
-    let state = AppState {
+    AppState {
         runs: Arc::new(Mutex::new(initial_runs)),
         provider,
         telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
         sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
-    };
+        auth,
+    }
+}
+
+async fn serve_tcp(
+    listener: TcpListener,
+    auth: AuthMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = build_app_state(auth).await;
 
     let addr = listener.local_addr()?;
     println!("[void-box] daemon listening on http://{}", addr);
@@ -135,6 +299,113 @@ pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std:
             }
         });
     }
+}
+
+async fn serve_unix(
+    _guard: UnixSocketGuard,
+    listener: UnixListener,
+    auth: AuthMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = build_app_state(auth).await;
+    // Function parameters drop in reverse declaration order, so `_guard`
+    // is declared first to ensure `listener` drops before it: the kernel
+    // socket fd closes first, then the path is unlinked. This avoids a
+    // brief window where the path is gone but the listener fd is still
+    // accepting; a new daemon racing to bind the same path would still
+    // succeed (fresh inode), but the order matches the comment's claim
+    // and is what the next reader expects.
+    //
+    // The guard lives for the duration of this future; on any return path
+    // — clean shutdown, accept error, panic, task cancellation — its Drop
+    // unlinks the socket file. `_guard` is bound rather than passed by
+    // value into a sub-scope so the borrow checker keeps it alive across
+    // every `.await` below.
+    let mut shutdown = shutdown_signal();
+    loop {
+        debug!("daemon awaiting accept (unix)");
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("[void-box] daemon shutdown signal received; closing listener");
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(stream, state).await {
+                        debug!(%e, "daemon unix connection error");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Future that resolves on the first SIGINT or SIGTERM the process
+/// receives. Returned as a boxed `Future` so the caller can pin it once
+/// and `select!` against it across the accept loop without re-arming on
+/// every iteration (which would lose the signal between iterations).
+fn shutdown_signal() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            // If installing the SIGTERM handler fails (e.g., a sandbox
+            // forbids signal-handler registration), fall back to ctrl_c
+            // alone rather than aborting startup — the listener still
+            // works, the operator just has fewer ways to ask it to stop.
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    warn!(%err, "failed to install SIGTERM handler; relying on SIGINT only");
+                    None
+                }
+            };
+            // `ctrl_c()` and `term.recv()` can complete with errors or stream
+            // closures that aren't actually shutdown signals: a sandbox refusing
+            // signal-handler installation, or the SIGTERM dispatcher closing.
+            // Treating those as shutdown would cause the daemon to exit seconds
+            // after starting, with no useful diagnostic. Park on `pending()` in
+            // those cases so a working signal source still wins, and so the
+            // accept loop keeps serving when no signal source survives.
+            match term.as_mut() {
+                Some(term) => tokio::select! {
+                    res = tokio::signal::ctrl_c() => match res {
+                        Ok(()) => {}
+                        Err(err) => {
+                            warn!(%err, "ctrl_c handler failed; relying on SIGTERM only");
+                            std::future::pending::<()>().await;
+                        }
+                    },
+                    res = term.recv() => match res {
+                        Some(()) => {}
+                        None => {
+                            warn!("SIGTERM stream closed; relying on SIGINT only");
+                            std::future::pending::<()>().await;
+                        }
+                    },
+                },
+                None => match tokio::signal::ctrl_c().await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(%err, "ctrl_c handler failed; signal-based shutdown disabled");
+                        std::future::pending::<()>().await;
+                    }
+                },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(%err, "ctrl_c handler failed; signal-based shutdown disabled");
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    })
 }
 
 /// Mark every non-terminal persisted run as `Failed` with a `run.failed`
@@ -207,16 +478,72 @@ fn parse_content_length(headers: &str) -> usize {
     0
 }
 
-async fn handle_stream(
-    mut stream: TcpStream,
-    state: AppState,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let peer = stream.peer_addr().ok();
-    debug!(?peer, "handle_stream enter");
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// Auth chokepoint that runs in front of the route table.
+///
+/// AF_UNIX listeners short-circuit because the kernel already gates
+/// `connect(2)` on the socket's `0o600` mode. TCP listeners require the
+/// caller to present a matching bearer token; the comparison is constant
+/// time so a network attacker cannot probe the token byte-by-byte.
+fn enforce_auth(auth: &AuthMode, headers: &str) -> Option<(String, String, Vec<u8>)> {
+    match auth {
+        AuthMode::UnixSocket | AuthMode::Disabled => None,
+        AuthMode::BearerToken(expected) => {
+            let presented = header_value(headers, "authorization")
+                .and_then(daemon_listen::parse_bearer)
+                .unwrap_or("");
+            let expected_bytes = expected.expose_secret().as_bytes();
+            let presented_bytes = presented.as_bytes();
+            // ConstantTimeEq compares equal-length slices in constant time.
+            // For length mismatches we still drive the comparison against
+            // the expected secret so the work performed is uncorrelated
+            // with secret length.
+            let lengths_match = presented_bytes.len() == expected_bytes.len();
+            let bytes_eq: bool = if lengths_match {
+                presented_bytes.ct_eq(expected_bytes).into()
+            } else {
+                let _ = expected_bytes.ct_eq(expected_bytes);
+                false
+            };
+            if lengths_match && bytes_eq {
+                None
+            } else {
+                Some(unauthorized_response())
+            }
+        }
+    }
+}
+
+fn unauthorized_response() -> (String, String, Vec<u8>) {
+    (
+        "401 Unauthorized".to_string(),
+        "application/json".to_string(),
+        ApiError::unauthorized("missing or invalid bearer token")
+            .to_json()
+            .into_bytes(),
+    )
+}
+
+async fn handle_stream<S>(mut stream: S, state: AppState) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    debug!("handle_stream enter");
 
     let mut buf = vec![0u8; MAX_REQUEST_BYTES];
     let mut total = 0usize;
-    debug!(?peer, "handle_stream reading");
+    debug!("handle_stream reading");
 
     let header_end = loop {
         if total >= buf.len() {
@@ -228,7 +555,7 @@ async fn handle_stream(
         let n = stream.read(&mut buf[total..]).await?;
         if n == 0 {
             if total == 0 {
-                debug!(?peer, "handle_stream eof");
+                debug!("handle_stream eof");
             }
             return Ok(());
         }
@@ -238,7 +565,7 @@ async fn handle_stream(
             break pos;
         }
     };
-    debug!(?peer, bytes = total, "handle_stream headers complete");
+    debug!(bytes = total, "handle_stream headers complete");
 
     let headers_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let body_start = header_end + 4;
@@ -282,28 +609,28 @@ async fn handle_stream(
         .split_once('?')
         .map_or((raw_path, None), |(p, q)| (p, Some(q)));
 
-    debug!(?peer, method, path, "handle_stream routing");
-    let (status, content_type, payload) = route_request(method, path, query, body, state).await;
-    debug!(?peer, method, path, %status, "handle_stream route complete");
+    debug!(method, path, "handle_stream routing");
+    let (status, content_type, payload) =
+        route_request(method, path, query, &headers_str, body, state).await;
+    debug!(method, path, %status, "handle_stream route complete");
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
         payload.len(),
     );
-    debug!(?peer, method, path, "handle_stream writing header");
+    debug!(method, path, "handle_stream writing header");
     stream.write_all(header.as_bytes()).await?;
-    debug!(?peer, method, path, "handle_stream header write complete");
+    debug!(method, path, "handle_stream header write complete");
     debug!(
-        ?peer,
         method,
         path,
         bytes = payload.len(),
         "handle_stream writing body"
     );
     stream.write_all(&payload).await?;
-    debug!(?peer, method, path, "handle_stream body write complete");
-    debug!(?peer, "handle_stream exit");
+    debug!(method, path, "handle_stream body write complete");
+    debug!("handle_stream exit");
     Ok(())
 }
 
@@ -327,10 +654,14 @@ async fn route_request(
     method: &str,
     path: &str,
     query: Option<&str>,
+    headers: &str,
     body: &str,
     state: AppState,
 ) -> (String, String, Vec<u8>) {
     debug!(method, path, "route_request enter");
+    if let Some(reject) = enforce_auth(&state.auth, headers) {
+        return reject;
+    }
     match (method, path) {
         ("GET", "/v1/health") => as_json((
             "200 OK".to_string(),
@@ -2696,6 +3027,138 @@ mod tests {
                 assert!(runs[id].terminal_event_id.is_none());
             }
             assert!(provider.saved.lock().unwrap().is_empty());
+        }
+    }
+
+    mod auth {
+        use super::super::*;
+
+        fn make_state(auth: AuthMode) -> AppState {
+            AppState {
+                runs: Arc::new(Mutex::new(HashMap::new())),
+                provider: provider_from_env(),
+                telemetry_buffers: Arc::new(Mutex::new(HashMap::new())),
+                sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
+                auth,
+            }
+        }
+
+        #[test]
+        fn unix_socket_mode_skips_auth_check() {
+            let state = make_state(AuthMode::UnixSocket);
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer wrong\r\n").is_none());
+            assert!(enforce_auth(&state.auth, "").is_none());
+        }
+
+        #[test]
+        fn bearer_mode_rejects_missing_header() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            let reject = enforce_auth(&state.auth, "Host: example\r\n").expect("expected reject");
+            assert!(reject.0.starts_with("401"));
+        }
+
+        #[test]
+        fn bearer_mode_rejects_wrong_token() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            let reject =
+                enforce_auth(&state.auth, "Authorization: Bearer wrong\r\n").expect("reject");
+            assert!(reject.0.starts_with("401"));
+        }
+
+        #[test]
+        fn bearer_mode_accepts_matching_token() {
+            let state = make_state(AuthMode::BearerToken(Arc::new(SecretString::from(
+                "expected".to_string(),
+            ))));
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer expected\r\n").is_none());
+        }
+
+        #[test]
+        fn disabled_mode_passes_all_requests_regardless_of_header() {
+            // `AuthMode::Disabled` is the test-only no-auth variant; it
+            // bypasses the bearer-token check entirely. Confirm both an
+            // empty-header request and one bearing a wrong-looking token
+            // are accepted.
+            let state = make_state(AuthMode::Disabled);
+            assert!(enforce_auth(&state.auth, "").is_none());
+            assert!(enforce_auth(&state.auth, "Authorization: Bearer wrong-token\r\n").is_none());
+        }
+
+        #[tokio::test]
+        async fn serve_refuses_tcp_without_token() {
+            use crate::daemon_listen::ListenAddress;
+            let cfg = ServeConfig {
+                address: ListenAddress::Tcp("127.0.0.1:0".parse().unwrap()),
+                token: None,
+            };
+            let err = serve(cfg).await.unwrap_err();
+            assert!(
+                err.to_string().contains("bearer token"),
+                "expected bearer-token error, got: {err}"
+            );
+        }
+    }
+
+    mod unix_listener {
+        use super::super::*;
+        use std::os::unix::fs::MetadataExt;
+
+        #[tokio::test]
+        async fn bind_unix_socket_sets_owner_only_perms() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            let (_listener, _guard) = bind_unix_socket(&path).expect("bind");
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_replaces_stale_socket() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            // Plant a stale socket file via a raw `UnixListener::bind` so
+            // the [`UnixSocketGuard`] is not involved — we are exercising
+            // the rebind-over-stale-inode path, not the guard's unlink.
+            // The kernel leaves the inode in the filesystem until
+            // something unlinks it; dropping a guard-less listener is
+            // exactly the "previous daemon crashed" state we model here.
+            let raw = UnixListener::bind(&path).expect("first bind");
+            drop(raw);
+            assert!(path.exists());
+            let (_listener, _guard) = bind_unix_socket(&path).expect("rebind despite stale socket");
+            assert!(path.exists());
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_unlinks_on_guard_drop() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            let (listener, guard) = bind_unix_socket(&path).expect("bind");
+            assert!(path.exists());
+            drop(listener);
+            drop(guard);
+            assert!(
+                !path.exists(),
+                "guard drop must unlink the socket file at {}",
+                path.display()
+            );
+        }
+
+        #[tokio::test]
+        async fn bind_unix_socket_refuses_non_socket_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voidbox.sock");
+            std::fs::write(&path, b"important data").unwrap();
+            let err = bind_unix_socket(&path)
+                .map(|_| ())
+                .expect_err("must refuse non-socket file");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            // The user's file is still there — we did not silently delete it.
+            assert_eq!(std::fs::read(&path).unwrap(), b"important data");
         }
     }
 }

@@ -1410,12 +1410,12 @@ impl SlirpBackend {
                     }
                 };
 
-            let mut tcp_flow_count = 0;
-            for flow_key in self.flow_table.keys() {
-                if let FlowKey::Tcp(_) = flow_key {
-                    tcp_flow_count += 1;
-                }
-            }
+            // Check max concurrent connections
+            let tcp_flow_count = self
+                .flow_table
+                .keys()
+                .filter(|k| matches!(k, FlowKey::Tcp(_)))
+                .count();
             if tcp_flow_count >= self.max_concurrent_connections {
                 warn!(
                     "SLIRP TCP: max concurrent connections ({}) reached, rejecting SYN to {}:{}",
@@ -2521,16 +2521,6 @@ impl Drop for SlirpBackend {
 }
 
 impl SlirpBackend {
-    /// Re-register every live host FD in `flow_table` with the current epoll
-    /// dispatcher.  Called from snapshot restore: `epoll_fd` is a kernel
-    /// handle that does not survive snapshot, so a fresh dispatcher starts
-    /// empty even though `flow_table` deserialized correctly with new FDs.
-    ///
-    /// The current snapshot path does not reconstruct `flow_table` — the
-    /// backend always starts empty after restore and new flows form naturally.
-    /// This method is therefore a no-op today but is wired in advance so
-    /// future work that persists restored flows across snapshot/restore has a
-    /// ready call site.
     /// Re-register every live host FD in `flow_table` with the current epoll
     /// dispatcher and rebuild `token_to_key`.  Called from snapshot restore:
     /// the `epoll_fd` is a kernel handle that does not survive snapshot, so a

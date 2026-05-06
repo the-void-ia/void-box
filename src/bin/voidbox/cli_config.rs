@@ -1,8 +1,46 @@
 use std::path::{Path, PathBuf};
 
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 use void_box::snapshot_store;
+
+/// Read a bearer-token file via `void_box::daemon_listen::read_token_file`
+/// — same `0o600`-style owner-only perm check the daemon applies. Returns
+/// `None` and falls through to the next discovery tier on any failure.
+///
+/// When `explicit` is true (the operator pointed `VOIDBOX_DAEMON_TOKEN_FILE`
+/// at this path), failures emit a one-line `eprintln!` warning so a
+/// misconfigured token file produces a hint rather than a confusing 401
+/// from the daemon. When `explicit` is false (tier-3 auto-discovery at
+/// `~/.config/voidbox/daemon-token`), missing files are silent — they're
+/// the expected state until the daemon generates one — but loose
+/// permissions still warn, since that's a real misconfig regardless of
+/// how we found the file.
+fn read_secure_token_file_or_warn(path_str: Option<String>, explicit: bool) -> Option<String> {
+    let path_str = path_str?;
+    let path = Path::new(&path_str);
+    if !explicit && !path.exists() {
+        return None;
+    }
+    match void_box::daemon_listen::read_token_file(path) {
+        Ok(secret) => {
+            let trimmed = secret.expose_secret().trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: ignoring daemon token at {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 /// Resolved filesystem paths used by the CLI.
 #[derive(Debug, Clone)]
@@ -115,11 +153,24 @@ pub struct ResolvedConfig {
     pub paths: CliPaths,
     pub kernel: Option<PathBuf>,
     pub initramfs: Option<PathBuf>,
+    /// Bearer token used by the CLI when talking to a TCP daemon. Read at
+    /// load time from `VOIDBOX_DAEMON_TOKEN`, `VOIDBOX_DAEMON_TOKEN_FILE`,
+    /// or `~/.config/voidbox/daemon-token` (in that priority). Always
+    /// `None` for AF_UNIX daemons — the resolution is short-circuited
+    /// when `daemon_url` starts with `unix://`, both because the token
+    /// would never be used (AF_UNIX gates access via socket permissions)
+    /// and to avoid spurious warnings from a stale or misconfigured
+    /// token file that isn't actually relevant to this run.
+    pub daemon_token: Option<String>,
 }
 
 impl ResolvedConfig {
+    /// Default daemon URL: the AF_UNIX path the daemon resolves at startup.
+    /// Both ends consult `void_box::daemon_listen::default_unix_socket_path`
+    /// so a same-uid invocation auto-discovers the socket.
     pub fn default_daemon_url() -> String {
-        "http://127.0.0.1:43100".into()
+        let path = void_box::daemon_listen::default_unix_socket_path();
+        format!("unix://{}", path.display())
     }
 }
 
@@ -198,15 +249,46 @@ pub fn load_and_merge(
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| "info".into());
 
+    // The bearer token is only sent on TCP daemon URLs; AF_UNIX gates
+    // access via socket permissions. Skipping the resolution work for
+    // unix:// URLs avoids spurious "bad perms" warnings from a stale
+    // ~/.config/voidbox/daemon-token (or a misconfigured
+    // VOIDBOX_DAEMON_TOKEN_FILE) when the user has switched back to a
+    // local AF_UNIX daemon — the file isn't being used either way.
+    let resolved_daemon_url = merged
+        .daemon_url
+        .clone()
+        .unwrap_or_else(ResolvedConfig::default_daemon_url);
+    let daemon_token = if resolved_daemon_url.starts_with("unix://") {
+        None
+    } else {
+        std::env::var("VOIDBOX_DAEMON_TOKEN")
+            .ok()
+            .or_else(|| {
+                read_secure_token_file_or_warn(
+                    std::env::var("VOIDBOX_DAEMON_TOKEN_FILE").ok(),
+                    true,
+                )
+            })
+            .or_else(|| {
+                // Tier-3 fallback: pick up the token the daemon
+                // auto-generates and persists when started without
+                // explicit token wiring. Same path on both sides
+                // converges client and server with zero env-var plumbing
+                // for the typical local-dev TCP case.
+                let path = void_box::daemon_listen::default_token_path();
+                read_secure_token_file_or_warn(Some(path.to_string_lossy().into_owned()), false)
+            })
+    };
+
     ResolvedConfig {
         log_level,
-        daemon_url: merged
-            .daemon_url
-            .unwrap_or_else(ResolvedConfig::default_daemon_url),
+        daemon_url: resolved_daemon_url,
         banner: merged.banner.unwrap_or(true),
         kernel: merged.paths.kernel,
         initramfs: merged.paths.initramfs,
         paths,
+        daemon_token,
     }
 }
 

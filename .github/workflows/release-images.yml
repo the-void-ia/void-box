@@ -38,6 +38,23 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
+      # This job is the disk-heaviest in the repo: it builds four
+      # initramfs flavors (base, claude, codex, agents), compiles a
+      # slim kernel from source (~4-5 GB working tree), and produces
+      # both compressed and uncompressed kernel artifacts — all on a
+      # default ubuntu-latest with ~14 GB free. Reclaim ~28 GB of
+      # preinstalled SDKs/runtimes before the build starts.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

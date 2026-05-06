@@ -7,7 +7,6 @@ mod output;
 mod snapshot;
 
 use std::io::{self, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -174,9 +173,14 @@ enum Command {
 
     /// Internal HTTP daemon (future `voidboxd`).
     Serve {
-        /// Listen address.
-        #[arg(long, default_value = "127.0.0.1:43100")]
-        listen: String,
+        /// Listen address. Defaults to an auto-discovered AF_UNIX socket
+        /// (mode 0o600) shared between server and client. Use
+        /// `tcp://host:port` to opt into TCP, which requires a bearer token.
+        #[arg(long)]
+        listen: Option<String>,
+        /// Bearer token file (mode 0o600). TCP mode only.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
 
     /// Attach an interactive PTY to a running VM.
@@ -269,7 +273,7 @@ async fn main() {
     }
 
     let daemon_url = resolved_daemon_url(&cli.command, &config);
-    let remote = RemoteBackend::new(daemon_url);
+    let remote = RemoteBackend::with_token(daemon_url, config.daemon_token.clone());
     let exit_code = match run(cli, &config, &remote).await {
         Ok(code) => code,
         Err(e) => {
@@ -346,7 +350,11 @@ async fn run(
         Command::Image { command } => image::handle(command).await.map(|_| 0),
         Command::Config { command } => cmd_config(command, output, config).map(|_| 0),
         Command::Version => cmd_version(output).map(|_| 0),
-        Command::Serve { listen } => cmd_serve(&listen).await.map(|_| 0),
+        Command::Serve { listen, token_file } => {
+            cmd_serve(listen.as_deref(), token_file.as_deref())
+                .await
+                .map(|_| 0)
+        }
         Command::Attach {
             run_id,
             program,
@@ -934,9 +942,51 @@ fn cmd_version(format: OutputFormat) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handler for `serve`: internal HTTP daemon (future `voidboxd`); see `Command::Serve`.
-async fn cmd_serve(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = listen.parse()?;
-    void_box::daemon::serve(addr).await
+async fn cmd_serve(
+    listen: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use void_box::daemon::ServeConfig;
+    use void_box::daemon_listen::{
+        self, parse_listen_address, resolve_tcp_token, ListenAddress, DAEMON_TOKEN_ENV,
+        DAEMON_TOKEN_FILE_ENV,
+    };
+
+    let address = match listen {
+        Some(raw) => {
+            let parsed = parse_listen_address(raw)?;
+            // Bare `host:port` (no scheme) is grandfathered for one release.
+            // Warn loudly so operators migrate to `tcp://host:port` and to
+            // signal that token configuration is now mandatory on TCP.
+            if matches!(parsed, ListenAddress::Tcp(_))
+                && !raw.starts_with("tcp://")
+                && !raw.starts_with("unix://")
+            {
+                tracing::warn!(
+                    listen = raw,
+                    "legacy bare-host listen address: bind requires `tcp://{raw}` going forward, and TCP requires a bearer token (set {DAEMON_TOKEN_ENV} or pass --token-file)"
+                );
+            }
+            parsed
+        }
+        None => ListenAddress::Unix(daemon_listen::default_unix_socket_path()),
+    };
+
+    let token = match &address {
+        ListenAddress::Unix(_) => None,
+        ListenAddress::Tcp(_) => {
+            let resolved = resolve_tcp_token(token_file)?;
+            if let Some(path) = &resolved.generated_path {
+                tracing::info!(
+                    token_file = %path.display(),
+                    "[void-box] generated bearer token; clients should read this file or set {DAEMON_TOKEN_ENV} / {DAEMON_TOKEN_FILE_ENV}"
+                );
+            }
+            Some(resolved.token)
+        }
+    };
+
+    void_box::daemon::serve(ServeConfig { address, token }).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,9 +1258,22 @@ mod cli_parse_tests {
 
     #[test]
     fn serve_hidden_listen_override() {
-        let cli = Cli::try_parse_from(["voidbox", "serve", "--listen", "127.0.0.1:9999"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["voidbox", "serve", "--listen", "tcp://127.0.0.1:9999"]).unwrap();
         match cli.command {
-            Command::Serve { listen } => assert_eq!(listen, "127.0.0.1:9999"),
+            Command::Serve { listen, token_file } => {
+                assert_eq!(listen.as_deref(), Some("tcp://127.0.0.1:9999"));
+                assert!(token_file.is_none());
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn serve_default_listen_is_unix_socket() {
+        let cli = Cli::try_parse_from(["voidbox", "serve"]).unwrap();
+        match cli.command {
+            Command::Serve { listen, .. } => assert!(listen.is_none()),
             _ => panic!("expected Serve"),
         }
     }
@@ -1316,6 +1379,7 @@ mod behavior_tests {
             },
             kernel: None,
             initramfs: None,
+            daemon_token: None,
         }
     }
 
@@ -1451,7 +1515,8 @@ mod behavior_tests {
                 args: vec![],
             },
             Command::Serve {
-                listen: "127.0.0.1:9999".into(),
+                listen: Some("tcp://127.0.0.1:9999".into()),
+                token_file: None,
             },
             Command::Snapshot {
                 command: snapshot::SnapshotCommand::List,

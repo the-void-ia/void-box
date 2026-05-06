@@ -96,6 +96,25 @@ struct SendSyncDevice(Retained<VZVirtioSocketDevice>);
 unsafe impl Send for SendSyncDevice {}
 unsafe impl Sync for SendSyncDevice {}
 
+/// Append a hint pointing the operator at the codesign helper when a VZ
+/// validation error mentions the missing virtualization entitlement.
+///
+/// Apple's `validateWithError` returns a localized message we don't try to
+/// parse — a case-insensitive `entitlement` substring is enough to recognise
+/// the unsigned-binary case without coupling to the exact string. Other
+/// validation errors are passed through unchanged so we don't mislead
+/// operators when the cause is unrelated (e.g. an undersized memory config).
+fn enrich_vz_validation_error(message: &str) -> String {
+    if message.to_ascii_lowercase().contains("entitlement") {
+        format!(
+            "{message}. Hint: run scripts/sign-macos.sh to codesign target/release/voidbox \
+             with the virtualization entitlement."
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 /// macOS Virtualization.framework backend.
 ///
 /// Wraps a `VZVirtualMachine` and communicates with the guest agent
@@ -611,9 +630,12 @@ impl VzBackend {
         // the VM can run fine for non-snapshot workloads. On the restore path
         // we always validate, since the whole operation depends on it.
         unsafe {
-            vm_config
-                .validateWithError()
-                .map_err(|e| crate::Error::Backend(format!("VZ config validation: {}", e)))?;
+            vm_config.validateWithError().map_err(|e| {
+                crate::Error::Backend(format!(
+                    "VZ config validation: {}",
+                    enrich_vz_validation_error(&e.to_string())
+                ))
+            })?;
             if validate_save_restore {
                 vm_config
                     .validateSaveRestoreSupportWithError()
@@ -1423,5 +1445,20 @@ mod tests {
         assert_eq!(writes[0].0, GUEST_NETWORK_DENY_LIST_PATH);
         let written_json: Vec<String> = serde_json::from_slice(&writes[0].1).unwrap();
         assert_eq!(written_json, deny_list);
+    }
+
+    #[test]
+    fn enrich_vz_validation_error_appends_hint_for_entitlement_messages() {
+        let original = "The process doesn't have the \
+                        \"com.apple.security.virtualization\" entitlement.";
+        let enriched = enrich_vz_validation_error(original);
+        assert!(enriched.starts_with(original));
+        assert!(enriched.contains("scripts/sign-macos.sh"));
+    }
+
+    #[test]
+    fn enrich_vz_validation_error_passes_unrelated_errors_through() {
+        let original = "Memory size 64 MiB is below the minimum supported.";
+        assert_eq!(enrich_vz_validation_error(original), original);
     }
 }

@@ -31,6 +31,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Release builds run all the heavy steps in one job: cargo musl
+      # cross-compile, initramfs build, kernel download/extract, plus
+      # nfpm packaging. Reclaim ~28 GB of preinstalled SDKs so a future
+      # kernel/image bump doesn't push past the runner's ~14 GB ceiling.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

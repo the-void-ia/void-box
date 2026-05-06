@@ -9,38 +9,28 @@ use void_box::sidecar::{start_sidecar, InboxEntry, InboxSnapshot};
 #[path = "common/net.rs"]
 mod test_net;
 
-/// Response data extracted in the blocking thread.
 struct Resp {
     status: u16,
     body: Value,
 }
 
-/// Helper: perform a blocking GET from a spawned blocking thread.
 async fn get(url: String) -> Resp {
-    tokio::task::spawn_blocking(move || {
-        let resp = reqwest::blocking::get(&url).unwrap();
-        let status = resp.status().as_u16();
-        let body: Value = resp.json().unwrap_or(Value::Null);
-        Resp { status, body }
-    })
-    .await
-    .unwrap()
+    let resp = reqwest::get(&url).await.unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    Resp { status, body }
 }
 
-/// Helper: perform a blocking POST with JSON body from a spawned blocking thread.
 async fn post_json(url: String, body: Value) -> Resp {
-    tokio::task::spawn_blocking(move || {
-        let resp = reqwest::blocking::Client::new()
-            .post(&url)
-            .json(&body)
-            .send()
-            .unwrap();
-        let status = resp.status().as_u16();
-        let body: Value = resp.json().unwrap_or(Value::Null);
-        Resp { status, body }
-    })
-    .await
-    .unwrap()
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    Resp { status, body }
 }
 
 fn base_url(port: u16) -> String {
@@ -392,7 +382,7 @@ fn start_daemon() -> SocketAddr {
             let dir = tempfile::tempdir().unwrap();
             std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
             let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            let _ = void_box::daemon::serve_on_listener(tokio_listener).await;
+            let _ = void_box::daemon::serve_on_listener_no_auth(tokio_listener).await;
         });
     });
 

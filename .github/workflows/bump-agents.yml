@@ -309,10 +309,15 @@ jobs:
           # Plain push for a fresh branch. If a previous run of this job
           # already opened a branch with the same name (e.g. the prior PR
           # was closed without merging), fall back to --force-with-lease
-          # so we don't silently overwrite unrelated work.
+          # so we don't silently overwrite unrelated work. The shallow
+          # checkout never fetched the bump branch, so a bare
+          # --force-with-lease has no baseline to compare and fails with
+          # "stale info"; fetch the remote ref first so the lease has
+          # something concrete to expect.
           if ! git push origin "$branch"; then
-            echo "Branch exists on remote; retrying with --force-with-lease"
-            git push --force-with-lease origin "$branch"
+            echo "Branch exists on remote; fetching it for --force-with-lease baseline"
+            git fetch origin "$branch":"refs/remotes/origin/$branch"
+            git push --force-with-lease="$branch:refs/remotes/origin/$branch" origin "$branch"
           fi
 
           body_file="$(mktemp)"
@@ -324,7 +329,7 @@ jobs:
           bumps = plan["bumps"]
           skipped = [a for a in ("x86_64", "aarch64")
                      if a not in {b["arch"] for b in bumps}]
-          print(f"Automated R-B5c.1 bump for `{agent}` to version `{version}`.")
+          print(f"Automated bump for `{agent}` to version `{version}`.")
           print()
           print("| tuple | prev | url | sha256 (computed by CI) |")
           print("| --- | --- | --- | --- |")
@@ -337,12 +342,45 @@ jobs:
                   print(f"- `linux/{a}` — either already pinned to `{version}` or upstream artifact was unavailable (see job log).")
               print()
           print("CI downloaded each artifact from the URL above and recorded the")
-          print("SHA-256 shown here. For claude-code, each SHA-256 was also")
-          print("cross-checked against Anthropic's advertised `manifest.json`")
-          print("(CDN-edge integrity; same origin, so not an independent oracle).")
+          print("SHA-256 shown here.")
           print()
-          print("Please review the version+hash combination before merging — that")
-          print("manual review is the human gate required by R-B5c.1.")
+          print("## How to verify the SHA-256s")
+          print()
+          if agent == "claude-code":
+              print("CI cross-checks each download against Anthropic's `manifest.json`")
+              print("(CDN-edge integrity — same origin, so not an independent oracle).")
+              print("You can spot-check manually:")
+              print()
+              print("```bash")
+              print(f"curl -fsSL https://downloads.claude.ai/claude-code-releases/{version}/manifest.json \\")
+              print("  | jq '.platforms | {\"linux-x64\", \"linux-arm64\"} | map_values(.checksum)'")
+              print("```")
+              print()
+              print("The `linux-x64` / `linux-arm64` checksums must match the")
+              print("`linux/x86_64` / `linux/aarch64` rows above.")
+          elif agent == "codex":
+              print("Upstream publishes per-asset digests on the GitHub release page:")
+              print(f"https://github.com/openai/codex/releases/tag/rust-v{version}")
+              print()
+              print("Spot-check from the CLI:")
+              print()
+              print("```bash")
+              print(f"gh release view rust-v{version} --repo openai/codex --json assets \\")
+              print("  --jq '.assets[] | select(.name | test(\"^codex-(x86_64|aarch64)-unknown-linux-musl\\\\.tar\\\\.gz$\")) | \"\\(.name) \\(.digest)\"'")
+              print("```")
+              print()
+              print("Each printed `sha256:…` must match the row above for the corresponding arch.")
+          print()
+          print("## Why this needs a human")
+          print()
+          print("Once merged, the hashes above lock these binaries in place — every")
+          print("future build aborts unless the download matches byte-for-byte. CI")
+          print("just computed them from a single fetch against upstream, so merging")
+          print("without spot-checking trusts whatever upstream served at that one")
+          print("moment. The cross-check above is what catches a CDN-edge tamper or")
+          print("an upstream-account compromise before it propagates into our")
+          print("images. A surprise version jump (off-schedule, several releases at")
+          print("once, pre-release tag) is its own signal worth a second look.")
           PY
 
           gh pr create \
