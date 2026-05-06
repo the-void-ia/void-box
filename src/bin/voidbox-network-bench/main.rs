@@ -1,0 +1,788 @@
+//! Wall-clock end-to-end network benchmark harness.
+//!
+//! Boots a real VM and measures TCP throughput, RR/CRR latency, and
+//! UDP DNS qps inside the guest. Output is JSON for diffing against
+//! a baseline.
+//!
+//! Mirrors `voidbox-startup-bench` in CLI shape and lifecycle.
+//!
+//! Linux-only because the smoltcp-based SLIRP stack is Linux-only. On
+//! other platforms `main()` prints a skip notice and exits 0 so
+//! cross-platform CI (`cargo build`, `cargo check`) compiles cleanly.
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!(
+        "voidbox-network-bench: SLIRP-backed wall-clock harness is Linux-only \
+         (smoltcp dep is `cfg(target_os = \"linux\")` in Cargo.toml). \
+         Nothing to run on this platform."
+    );
+}
+
+#[cfg(target_os = "linux")]
+use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+use clap::Parser;
+#[cfg(target_os = "linux")]
+use serde::Serialize;
+#[cfg(target_os = "linux")]
+use void_box::sandbox::Sandbox;
+
+// Linux-only block. Wrapped in a `mod linux_main` so cross-platform
+// CI (macOS, etc.) compiles `voidbox-network-bench` cleanly — only
+// `main()` (above, the non-Linux stub) is needed there.
+#[cfg(target_os = "linux")]
+mod linux_main {
+    use super::*;
+
+    /// Transfer size per measurement run: 50 MiB.
+    const TRANSFER_MB: u32 = 50;
+
+    /// Bytes per megabit.
+    const BYTES_PER_MEGABIT: f64 = 1_000_000.0 / 8.0;
+
+    /// VM memory for the benchmark sandbox (MiB).
+    const BENCH_MEMORY_MB: usize = 1024;
+
+    /// SLIRP host-gateway address reachable from inside the guest.
+    const SLIRP_HOST_ADDR: &str = "10.0.2.2";
+
+    /// Number of RR samples collected per iteration.
+    const RR_SAMPLES_PER_ITER: u32 = 100;
+
+    /// Number of CRR samples collected per iteration.
+    const CRR_SAMPLES_PER_ITER: u32 = 30;
+
+    /// Timeout for the host-side channel receive on RR/CRR measurements.
+    const LATENCY_RECV_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// Accept-side deadline for spawned echo/drain threads.  Set slightly longer
+    /// than `LATENCY_RECV_TIMEOUT` (the channel-side wait) so the channel times
+    /// out first when the iteration is genuinely stuck — the accept thread then
+    /// exits on its own deadline shortly after, releasing the listener FD before
+    /// the next iteration.
+    const ACCEPT_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+
+    #[derive(Parser, Debug)]
+    #[command(
+        version,
+        about = "VoidBox network benchmark harness",
+        long_about = "VoidBox network benchmark harness\n\
+\n\
+Boots one VM, exercises TCP throughput, TCP RR/CRR latency, and UDP DNS qps,\n\
+then emits a JSON report suitable for automated diffing.\n\
+\n\
+REQUIRED ENVIRONMENT VARIABLES\n\
+  VOID_BOX_KERNEL      Path to the guest kernel image (vmlinuz / vmlinux).\n\
+  VOID_BOX_INITRAMFS   Path to the guest initramfs (cpio.gz).\n\
+\n\
+RECOMMENDED WORKFLOW — CAPTURING AND DIFFING A BASELINE\n\
+  # 1. Before a refactor or networking-stack change, capture a baseline:\n\
+  cargo run --bin voidbox-network-bench -- --output baseline.json\n\
+\n\
+  # 2. Make your change, then capture a post-change report:\n\
+  cargo run --bin voidbox-network-bench -- --output after.json\n\
+\n\
+  # 3. Compare with diff or a JSON-diff tool:\n\
+  diff baseline.json after.json\n\
+  # Or with jq for a side-by-side view of individual metrics:\n\
+  jq -s '.[0] as $b | .[1] as $a | {metric: keys} | .metric[] |\n\
+    {metric: ., before: $b[.], after: $a[.]}' baseline.json after.json\n\
+\n\
+METRIC NAMES\n\
+  tcp_throughput_g2h_mbps   Guest→host TCP throughput (Mbps)\n\
+  tcp_rr_latency_us_p50     Persistent-connection round-trip latency p50 (µs)\n\
+  tcp_rr_latency_us_p99     Persistent-connection round-trip latency p99 (µs)\n\
+  tcp_crr_latency_us_p50    Connect-request-response latency p50 (µs)\n\
+  udp_dns_qps               UDP DNS queries per second against SLIRP resolver\n\
+\n\
+The metric names mirror the columns in passt's published performance table so\n\
+results can be compared directly.\n\
+\n\
+FAST SMOKE RUN\n\
+  cargo run --bin voidbox-network-bench -- --iterations 1 --no-throughput"
+    )]
+    struct Cli {
+        /// Number of iterations per metric.
+        #[arg(long, default_value_t = 5)]
+        iterations: u32,
+
+        /// Output JSON file. If omitted, prints to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Skip throughput measurements (useful for fast smoke runs).
+        #[arg(long, default_value_t = false)]
+        no_throughput: bool,
+
+        /// Push N MB through the SLIRP relay against a slow-receiving host
+        /// (`SO_RCVBUF = 4096`). Forces the post-Phase-3 backpressure path to
+        /// actually engage — the small-payload throughput numbers don't
+        /// exercise it because the host drains too fast.
+        ///
+        /// 0 (default) skips the measurement. 10 MiB is a reasonable smoke
+        /// value; larger N produces more stable numbers but takes longer.
+        #[arg(long, default_value_t = 0)]
+        bulk_mb: u32,
+    }
+
+    #[derive(Serialize, Debug, Default)]
+    struct Report {
+        /// Sustained guest→host throughput against a slow-receiving host
+        /// (`SO_RCVBUF = 4096`). Probes the post-Phase-3 TCP backpressure path
+        /// — pre-Phase-3 this would be the 256 KB cliff (connection RST mid-
+        /// transfer); post-Phase-3 it's a real number bounded by the kernel
+        /// recv buffer's drain rate. Populated only when `--bulk-mb > 0`.
+        tcp_bulk_throughput_g2h_mbps: Option<f64>,
+        tcp_throughput_g2h_mbps: Option<f64>,
+        // TODO(h2g): host→guest requires either a guest-side `nc -l` listener
+        // or an inverse data-push loop.  The current harness only supports
+        // guest-initiated connections (the guest calls `nc HOST PORT`).  A
+        // host-push direction would need the guest to accept connections, which
+        // means either (a) a guest-side daemon started before exec returns, or
+        // (b) an additional RPC for "open a listening socket and tell us the
+        // guest port" — out of scope for the minimal harness.
+        tcp_throughput_h2g_mbps: Option<f64>,
+        tcp_rr_latency_us_p50: Option<f64>,
+        tcp_rr_latency_us_p99: Option<f64>,
+        tcp_crr_latency_us_p50: Option<f64>,
+        udp_dns_qps: Option<f64>,
+        icmp_rr_latency_us_p50: Option<f64>,
+    }
+
+    #[tokio::main(flavor = "multi_thread")]
+    pub(super) async fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+
+        let cli = Cli::parse();
+        let mut report = Report::default();
+
+        // Boot one shared VM for all measurements that require a live guest.
+        // Throughput and latency measurements reuse this single sandbox to avoid
+        // paying the boot cost multiple times.
+        let sandbox = Sandbox::local()
+            .from_env()?
+            .memory_mb(BENCH_MEMORY_MB)
+            .network(true)
+            .build()?;
+
+        // Prime the VM (triggers boot + vsock handshake) before any timed work.
+        let probe = sandbox.exec("sh", &["-c", ":"]).await?;
+        if !probe.success() {
+            return Err(format!(
+                "VM probe exec failed: exit={:?} stderr={}",
+                probe.exit_code,
+                probe.stderr_str()
+            )
+            .into());
+        }
+
+        if !cli.no_throughput {
+            report.tcp_throughput_g2h_mbps =
+                measure_tcp_throughput_g2h(&sandbox, cli.iterations).await?;
+        }
+
+        if cli.bulk_mb > 0 {
+            report.tcp_bulk_throughput_g2h_mbps =
+                measure_bulk_throughput_g2h(&sandbox, cli.iterations, cli.bulk_mb).await?;
+        }
+
+        // Latency measurements always run (--no-throughput only skips throughput).
+        let (rr_p50, rr_p99) = measure_rr_latency(&sandbox, cli.iterations).await?;
+        report.tcp_rr_latency_us_p50 = rr_p50;
+        report.tcp_rr_latency_us_p99 = rr_p99;
+        report.tcp_crr_latency_us_p50 = measure_crr_latency(&sandbox, cli.iterations).await?;
+        report.udp_dns_qps = measure_dns_qps(&sandbox).await?;
+        report.icmp_rr_latency_us_p50 = measure_icmp_rr_latency(&sandbox, cli.iterations).await?;
+
+        sandbox.stop().await?;
+
+        let json = serde_json::to_string_pretty(&report)?;
+        match cli.output {
+            Some(path) => std::fs::write(path, json)?,
+            None => println!("{json}"),
+        }
+        Ok(())
+    }
+
+    /// Measure guest-to-host TCP throughput.
+    ///
+    /// Binds a host-side TCP listener on `127.0.0.1:0` and execs a BusyBox shell
+    /// snippet inside `sandbox` that pipes `dd` output to `nc`.  The host drain
+    /// thread records bytes received and wall-clock elapsed time; Mbps is computed
+    /// from those two numbers.  Runs `iterations` times and returns the mean.
+    ///
+    /// Returns `None` if every iteration fails to parse or times out.
+    async fn measure_tcp_throughput_g2h(
+        sandbox: &Sandbox,
+        iterations: u32,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+        let mut mbps_samples: Vec<f64> = Vec::new();
+
+        for iteration_index in 0..iterations {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let host_port = listener.local_addr()?.port();
+
+            let (drain_tx, drain_rx) = mpsc::channel::<(u64, Duration)>();
+
+            let drain_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
+            std::thread::spawn(move || {
+                let drain_result = drain_one_connection(&listener, drain_deadline);
+                let _ = drain_tx.send(drain_result);
+            });
+
+            let guest_cmd = format!(
+            "dd if=/dev/zero bs=1M count={TRANSFER_MB} 2>/dev/null | nc {SLIRP_HOST_ADDR} {host_port}",
+        );
+
+            let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+
+            match exec_result {
+                Err(exec_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %exec_err,
+                        "g2h iteration exec error; skipping"
+                    );
+                    continue;
+                }
+                Ok(output) => {
+                    if !output.success() {
+                        tracing::warn!(
+                            iteration = iteration_index,
+                            exit_code = ?output.exit_code,
+                            stderr = output.stderr_str(),
+                            "g2h iteration non-zero exit; skipping"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            match drain_rx.recv_timeout(Duration::from_secs(120)) {
+                Err(recv_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %recv_err,
+                        "g2h drain channel receive error; skipping"
+                    );
+                }
+                Ok((bytes_received, elapsed)) => {
+                    let elapsed_secs = elapsed.as_secs_f64();
+                    if elapsed_secs < 0.01 {
+                        tracing::warn!(
+                            iteration = iteration_index,
+                            elapsed_secs,
+                            "g2h elapsed too small to measure reliably; skipping"
+                        );
+                        continue;
+                    }
+                    let mbps = (bytes_received as f64 * 8.0) / elapsed_secs / BYTES_PER_MEGABIT;
+                    tracing::info!(
+                        iteration = iteration_index,
+                        bytes_received,
+                        elapsed_secs,
+                        mbps,
+                        "g2h iteration complete"
+                    );
+                    eprintln!(
+                    "g2h[{iteration_index:>2}]: {bytes_received} B in {elapsed_secs:.3}s = {mbps:.1} Mbps"
+                );
+                    mbps_samples.push(mbps);
+                }
+            }
+        }
+
+        if mbps_samples.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_mbps = 0.0_f64;
+        for sample in &mbps_samples {
+            total_mbps += sample;
+        }
+        let mean_mbps = total_mbps / mbps_samples.len() as f64;
+        Ok(Some(mean_mbps))
+    }
+
+    /// Sustained guest→host throughput against a constrained receiver.
+    ///
+    /// Same shape as [`measure_tcp_throughput_g2h`] but with `SO_RCVBUF = 4096`
+    /// pinned on the listener socket. The small recv buffer forces TCP-level
+    /// backpressure: the kernel send buffer fills, our `host_stream.write`
+    /// returns `WouldBlock`, the SLIRP relay declines to ACK the guest's
+    /// segment, and the guest retransmits. Pre-Phase-3 this same scenario hit
+    /// the 256 KB userspace cliff (`MAX_TO_HOST_BUFFER`) and got the connection
+    /// reset; post-Phase-3 the relay holds the line and the bytes go through.
+    ///
+    /// Returned value is the mean Mbps across `iterations` iterations of pushing
+    /// `bulk_mb` MiB. Effective throughput is much lower than
+    /// [`measure_tcp_throughput_g2h`]'s number because the constrained receiver
+    /// is the bottleneck — that's the point.
+    async fn measure_bulk_throughput_g2h(
+        sandbox: &Sandbox,
+        iterations: u32,
+        bulk_mb: u32,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+        let mut mbps_samples: Vec<f64> = Vec::new();
+
+        for iteration_index in 0..iterations {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            // Constrain the receiver: 4 KiB request, kernel rounds up to the
+            // configured minimum (~8 KiB on Linux) — still small enough that
+            // the SLIRP send buffer fills quickly and backpressure engages.
+            let val: libc::c_int = 4096;
+            // SAFETY: listener.as_raw_fd() outlives the syscall; the int is
+            // stack-local and pointer-sized.
+            let rc = unsafe {
+                libc::setsockopt(
+                    listener.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &val as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    "bulk-g2h: SO_RCVBUF setsockopt failed; skipping"
+                );
+                continue;
+            }
+            let host_port = listener.local_addr()?.port();
+
+            let (drain_tx, drain_rx) = mpsc::channel::<(u64, Duration)>();
+            let drain_deadline = Instant::now() + Duration::from_secs(300) + ACCEPT_DEADLINE_SLACK;
+            std::thread::spawn(move || {
+                let drain_result = drain_one_connection(&listener, drain_deadline);
+                let _ = drain_tx.send(drain_result);
+            });
+
+            let guest_cmd = format!(
+            "dd if=/dev/zero bs=1M count={bulk_mb} 2>/dev/null | nc {SLIRP_HOST_ADDR} {host_port}",
+        );
+            let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+            match exec_result {
+                Err(exec_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %exec_err,
+                        "bulk-g2h iteration exec error; skipping"
+                    );
+                    continue;
+                }
+                Ok(output) => {
+                    if !output.success() {
+                        tracing::warn!(
+                            iteration = iteration_index,
+                            exit_code = ?output.exit_code,
+                            stderr = output.stderr_str(),
+                            "bulk-g2h iteration non-zero exit; the connection may have \
+                             been reset (pre-Phase-3 cliff regression?). skipping"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            match drain_rx.recv_timeout(Duration::from_secs(300)) {
+                Err(recv_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %recv_err,
+                        "bulk-g2h drain channel receive error; skipping"
+                    );
+                }
+                Ok((bytes_received, elapsed)) => {
+                    let elapsed_secs = elapsed.as_secs_f64();
+                    if elapsed_secs < 0.01 {
+                        tracing::warn!(
+                            iteration = iteration_index,
+                            elapsed_secs,
+                            "bulk-g2h elapsed too small to measure reliably; skipping"
+                        );
+                        continue;
+                    }
+                    let mbps = (bytes_received as f64 * 8.0) / elapsed_secs / BYTES_PER_MEGABIT;
+                    tracing::info!(
+                        iteration = iteration_index,
+                        bytes_received,
+                        elapsed_secs,
+                        mbps,
+                        "bulk-g2h iteration complete"
+                    );
+                    eprintln!(
+                    "bulk-g2h[{iteration_index:>2}]: {bytes_received} B in {elapsed_secs:.3}s = {mbps:.1} Mbps (constrained receiver)"
+                );
+                    mbps_samples.push(mbps);
+                }
+            }
+        }
+
+        if mbps_samples.is_empty() {
+            return Ok(None);
+        }
+        let mean_mbps: f64 = mbps_samples.iter().sum::<f64>() / mbps_samples.len() as f64;
+        Ok(Some(mean_mbps))
+    }
+
+    /// Accept one connection on `listener` with a deadline. Returns `None` if the
+    /// deadline lapses before any connection arrives (the spawning iteration has
+    /// likely failed and the thread should exit cleanly so the listener FD is
+    /// released for the next iteration).
+    fn accept_with_deadline(
+        listener: &TcpListener,
+        deadline: Instant,
+    ) -> Option<(TcpStream, std::net::SocketAddr)> {
+        listener.set_nonblocking(true).ok()?;
+        loop {
+            match listener.accept() {
+                Ok(pair) => {
+                    let _ = pair.0.set_nonblocking(false);
+                    return Some(pair);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Accept exactly one TCP connection on `listener`, drain it to EOF, and
+    /// return `(bytes_received, elapsed)`.  Intended to run in a background thread.
+    ///
+    /// Returns `(0, Duration::ZERO)` if no connection arrives before `deadline`.
+    fn drain_one_connection(listener: &TcpListener, deadline: Instant) -> (u64, Duration) {
+        let Some((mut stream, _peer_addr)) = accept_with_deadline(listener, deadline) else {
+            return (0, Duration::ZERO);
+        };
+
+        let start = Instant::now();
+        let bytes_received = drain_stream(&mut stream);
+        let elapsed = start.elapsed();
+        (bytes_received, elapsed)
+    }
+
+    /// Read `stream` to EOF and return the total byte count.
+    fn drain_stream(stream: &mut TcpStream) -> u64 {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total_bytes: u64 = 0;
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(bytes_read) => total_bytes += bytes_read as u64,
+                Err(_) => break,
+            }
+        }
+        total_bytes
+    }
+
+    fn percentile(samples: &mut [Duration], p: f64) -> Duration {
+        samples.sort();
+        let idx = ((samples.len() as f64) * p).clamp(0.0, samples.len() as f64 - 1.0) as usize;
+        samples[idx]
+    }
+
+    /// Measure TCP RR (Request-Response) latency on a kept-open connection.
+    ///
+    /// The guest pipes `RR_SAMPLES_PER_ITER` null bytes over a single `nc`
+    /// connection (`dd if=/dev/zero bs=1 count=N | nc host port`).  The host
+    /// accepts one connection and services each byte as an independent echo
+    /// round-trip, timing each host-side `read + write` pair.
+    ///
+    /// Using dd+nc avoids BusyBox shell limitations around interactive TCP
+    /// sockets while still measuring per-message in-flight latency on a
+    /// persistent connection.  The first sample from each iteration is discarded
+    /// because the first byte arrival absorbs TCP connect and Nagle jitter from
+    /// the guest side.  Remaining samples are accumulated across all iterations;
+    /// p50 and p99 are computed over the union.
+    ///
+    /// Returns `(p50_us, p99_us)`, both `None` if no samples were collected.
+    async fn measure_rr_latency(
+        sandbox: &Sandbox,
+        iterations: u32,
+    ) -> Result<(Option<f64>, Option<f64>), Box<dyn std::error::Error>> {
+        let mut all_samples: Vec<Duration> = Vec::new();
+
+        for iteration_index in 0..iterations {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let host_port = listener.local_addr()?.port();
+
+            let (echo_tx, echo_rx) = mpsc::channel::<Vec<Duration>>();
+
+            let echo_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
+            std::thread::spawn(move || {
+                let samples = rr_echo_server(&listener, RR_SAMPLES_PER_ITER, echo_deadline);
+                let _ = echo_tx.send(samples);
+            });
+
+            // Guest: pipe RR_SAMPLES_PER_ITER zero bytes over one nc connection.
+            // dd generates the bytes; nc forwards them to the host echo server.
+            // The guest does not need to read the echoed bytes — the host drives
+            // the timing loop and closes when done.  BusyBox dd + nc suffice.
+            let guest_cmd = format!(
+                "dd if=/dev/zero bs=1 count={n} 2>/dev/null | nc {host} {port}",
+                n = RR_SAMPLES_PER_ITER,
+                host = SLIRP_HOST_ADDR,
+                port = host_port,
+            );
+
+            let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+            if let Err(exec_err) = exec_result {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %exec_err,
+                    "rr iteration exec error; skipping"
+                );
+            }
+
+            match echo_rx.recv_timeout(LATENCY_RECV_TIMEOUT) {
+                Err(recv_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %recv_err,
+                        "rr echo channel receive error; skipping"
+                    );
+                }
+                Ok(mut samples) => {
+                    // Discard first sample (absorbs TCP connect jitter).
+                    if samples.len() > 1 {
+                        samples.remove(0);
+                    }
+                    let count = samples.len();
+                    let p50_us = if count > 0 {
+                        percentile(&mut samples.clone(), 0.50).as_micros()
+                    } else {
+                        0
+                    };
+                    eprintln!("rr[{iteration_index:>2}]: {count} samples, p50={p50_us} µs");
+                    all_samples.extend(samples);
+                }
+            }
+        }
+
+        if all_samples.is_empty() {
+            return Ok((None, None));
+        }
+
+        let p50 = percentile(&mut all_samples, 0.50).as_micros() as f64;
+        let p99 = percentile(&mut all_samples, 0.99).as_micros() as f64;
+        Ok((Some(p50), Some(p99)))
+    }
+
+    /// Host-side echo server for RR latency.
+    ///
+    /// Accepts one connection, then for each of the `count` iterations: reads
+    /// one byte, times that read, writes the byte back, and records the elapsed
+    /// duration.  Returns the list of per-round-trip host-side durations.
+    ///
+    /// The timer starts just before the blocking `read` call and stops after the
+    /// `write` returns.  This measures the host-observed round-trip time: the
+    /// interval from "host waiting for a byte" to "host has written the echo",
+    /// which is approximately the guest-side send→receive latency plus the
+    /// network stack overhead on both sides.
+    fn rr_echo_server(listener: &TcpListener, count: u32, deadline: Instant) -> Vec<Duration> {
+        let Some((mut stream, _)) = accept_with_deadline(listener, deadline) else {
+            return Vec::new();
+        };
+
+        let mut samples = Vec::with_capacity(count as usize);
+        let mut buf = [0u8; 1];
+
+        for _ in 0..count {
+            let start = Instant::now();
+            match stream.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+            match stream.write_all(&buf) {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+            samples.push(start.elapsed());
+        }
+
+        samples
+    }
+
+    /// Measure TCP CRR (Connect-Request-Response) latency.
+    ///
+    /// Each sample is one full `accept + read + write + close` cycle on the host,
+    /// timed from `accept` returning to the connection dropping.  The guest runs
+    /// a shell loop that performs `CRR_SAMPLES_PER_ITER` independent `nc` invocations
+    /// per iteration (each is a full connect → send → recv → close).
+    ///
+    /// Host-side timing is the ground truth: the host observes when the
+    /// connection arrives and when it closes, so each sample faithfully captures
+    /// the TCP setup + data round-trip + teardown cost end-to-end.
+    ///
+    /// Returns `p50_us` across all collected samples, or `None` if none arrived.
+    async fn measure_crr_latency(
+        sandbox: &Sandbox,
+        iterations: u32,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+        let mut all_samples: Vec<Duration> = Vec::new();
+
+        for iteration_index in 0..iterations {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let host_port = listener.local_addr()?.port();
+
+            // The host accepts CRR_SAMPLES_PER_ITER connections, times each cycle,
+            // and sends results back over a channel.
+            let (crr_tx, crr_rx) = mpsc::channel::<Vec<Duration>>();
+            let sample_count = CRR_SAMPLES_PER_ITER;
+
+            let crr_deadline = Instant::now() + LATENCY_RECV_TIMEOUT + ACCEPT_DEADLINE_SLACK;
+            std::thread::spawn(move || {
+                let samples = crr_echo_server(&listener, sample_count, crr_deadline);
+                let _ = crr_tx.send(samples);
+            });
+
+            // Guest: loop CRR_SAMPLES_PER_ITER times; each iteration is a full
+            // nc invocation (connect → send one byte → read echo → disconnect).
+            let n = CRR_SAMPLES_PER_ITER;
+            let guest_cmd = format!(
+                "i=0; while [ $i -lt {n} ]; do printf 'A' | nc {host} {port}; i=$((i+1)); done",
+                host = SLIRP_HOST_ADDR,
+                port = host_port,
+                n = n,
+            );
+
+            let exec_result = sandbox.exec("sh", &["-c", &guest_cmd]).await;
+            if let Err(exec_err) = exec_result {
+                tracing::warn!(
+                    iteration = iteration_index,
+                    error = %exec_err,
+                    "crr iteration exec error; skipping"
+                );
+            }
+
+            match crr_rx.recv_timeout(LATENCY_RECV_TIMEOUT) {
+                Err(recv_err) => {
+                    tracing::warn!(
+                        iteration = iteration_index,
+                        error = %recv_err,
+                        "crr echo channel receive error; skipping"
+                    );
+                }
+                Ok(samples) => {
+                    let count = samples.len();
+                    let p50_us = if count > 0 {
+                        percentile(&mut samples.clone(), 0.50).as_micros()
+                    } else {
+                        0
+                    };
+                    eprintln!("crr[{iteration_index:>2}]: {count} samples, p50={p50_us} µs");
+                    all_samples.extend(samples);
+                }
+            }
+        }
+
+        if all_samples.is_empty() {
+            return Ok(None);
+        }
+
+        let p50 = percentile(&mut all_samples, 0.50).as_micros() as f64;
+        Ok(Some(p50))
+    }
+
+    /// Measure UDP DNS query throughput against the SLIRP resolver.
+    ///
+    /// Returns `None` — the busybox-`nc` tool available in the minimal test
+    /// initramfs cannot produce a meaningful number here.  Each `nc -u -w1`
+    /// invocation blocks for the full 1-second `-w1` timeout after stdin EOF
+    /// even when the cached SLIRP reply arrives in microseconds, capping
+    /// throughput at roughly 1 qps regardless of stack latency.  Tighter
+    /// alternatives tried:
+    ///
+    /// - `-q0`: nc exits before the UDP reply arrives, yielding 0 successes.
+    /// - `/dev/udp/HOST/PORT`: bash-specific; busybox ash does not support it.
+    /// - `timeout 0.1 nc ...`: `timeout` is not present in the test initramfs.
+    ///
+    /// A meaningful qps measurement requires a host-side UDP socket that sends
+    /// queries through SLIRP directly, bypassing the per-query nc process
+    /// spawn.  Until that is implemented, `udp_dns_qps` is reported as `null`
+    /// in the JSON output.
+    async fn measure_dns_qps(
+        _sandbox: &Sandbox,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+        tracing::warn!(
+            "dns_qps: busybox-nc bottleneck (~1 qps due to -w1 per-query); \
+         reporting null — replace with host-side UDP socket for real numbers"
+        );
+        Ok(None)
+    }
+
+    /// Measure ICMP echo round-trip latency.
+    ///
+    /// Currently a stub that returns `None`: the guest images intentionally
+    /// omit `/bin/ping` (busybox-static on Fedora lacks
+    /// `CONFIG_FEATURE_PING_TYPE_DGRAM`, and SOCK_RAW would require root in
+    /// the guest). A proper measurement path needs either a guest-agent RPC
+    /// or a custom static ICMP binary in the test image — tracked as a
+    /// follow-up.
+    async fn measure_icmp_rr_latency(
+        _sandbox: &Sandbox,
+        _iterations: u32,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+        tracing::warn!(
+            "icmp_rr_latency: guest-side ping unavailable (no /bin/ping symlink, \
+             busybox-static lacks CONFIG_FEATURE_PING_TYPE_DGRAM); reporting null. \
+             A host-driven ICMP measurement path is tracked as a follow-up."
+        );
+        Ok(None)
+    }
+
+    /// Host-side echo server for CRR latency.
+    ///
+    /// Accepts `count` independent connections in sequence.  For each: starts the
+    /// timer on `accept`, reads one byte, writes it back, closes the connection,
+    /// and stops the timer.  Returns all per-connection durations.
+    fn crr_echo_server(listener: &TcpListener, count: u32, deadline: Instant) -> Vec<Duration> {
+        let mut samples = Vec::with_capacity(count as usize);
+        let mut buf = [0u8; 1];
+
+        for _ in 0..count {
+            let start = Instant::now();
+            let Some((mut stream, _)) = accept_with_deadline(listener, deadline) else {
+                break;
+            };
+            // Read the request byte and echo it back.
+            if stream.read_exact(&mut buf).is_ok() {
+                let _ = stream.write_all(&buf);
+            }
+            // Explicit drop closes the connection.
+            drop(stream);
+            samples.push(start.elapsed());
+        }
+
+        samples
+    }
+} // mod linux_main
+
+#[cfg(target_os = "linux")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    linux_main::main_impl()
+}

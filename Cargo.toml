@@ -131,6 +131,9 @@ divan = "0.1"
 default = []
 # Enable full OpenTelemetry integration (OTLP export, trace context propagation)
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# Expose internal SlirpBackend helpers (insert_synthetic_synsent_entry, etc.)
+# for use in benches/. Never enable in production builds.
+bench-helpers = []
 
 [[bin]]
 name = "voidbox"
@@ -193,9 +196,18 @@ path = "tests/oci_integration.rs"
 name = "observe_codex"
 path = "tests/observe_codex.rs"
 
+[[test]]
+name = "network_baseline"
+path = "tests/network_baseline.rs"
+
 [[bench]]
 name = "startup"
 path = "benches/startup.rs"
+harness = false
+
+[[bench]]
+name = "network"
+path = "benches/network.rs"
 harness = false
 
 [[bin]]
@@ -205,6 +217,10 @@ path = "src/bin/voidbox-startup-bench/main.rs"
 [[bin]]
 name = "voidbox-rpc-bench"
 path = "src/bin/voidbox-rpc-bench/main.rs"
+
+[[bin]]
+name = "voidbox-network-bench"
+path = "src/bin/voidbox-network-bench/main.rs"
 
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]

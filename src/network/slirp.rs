@@ -9,9 +9,18 @@
 //! - DNS:      10.0.2.3
 //!
 //! Architecture:
+//! - Unified flow table: All TCP/UDP/ICMP echo flows live in a single
+//!   `flow_table: HashMap<FlowKey, FlowEntry>` (Phase 4). Per-protocol
+//!   relay logic dispatches on the FlowEntry variant.
 //! - ARP: custom handler responds as gateway for all 10.0.2.x IPs
-//! - TCP: NAT proxy (raw packet parsing + host TCP sockets)
-//! - UDP port 53 (DNS): forwarded to host resolver
+//! - TCP: passt-style sequence-mirroring NAT (host→guest via
+//!   `recv(MSG_PEEK)` + ACK-driven consume; guest→host via direct
+//!   write + don't-ACK-on-WouldBlock TCP backpressure). No userspace
+//!   per-connection buffers — the host kernel's socket buffer holds
+//!   outstanding data.
+//! - ICMP echo: relayed via unprivileged `SOCK_DGRAM IPPROTO_ICMP`
+//! - UDP: per-flow connected sockets; DNS to 10.0.2.3:53 takes a
+//!   cached fast-path
 //! - Other: silently dropped
 //!
 //! The smoltcp library is used for its Ethernet/IPv4/TCP/UDP wire types
@@ -19,10 +28,15 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use crate::network::{nat, NetworkBackend};
 
 /// Cached DNS response with expiry.
 struct DnsCacheEntry {
@@ -47,9 +61,9 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, IpAddress,
-    IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
-    TcpSeqNumber, UdpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, Icmpv4Packet,
+    Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
+    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 use tracing::{debug, trace, warn};
@@ -75,7 +89,38 @@ pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x01];
 const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
-const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Sleep interval for the port-forward listener thread between non-blocking
+/// accept polls. Short enough to keep accept latency low; long enough to
+/// avoid busy-waiting the host CPU.
+#[allow(dead_code)]
+const PORT_FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// ICMP unprivileged probe state.
+///
+/// `0` = unknown (not yet probed), `1` = available, `2` = unavailable
+/// (kernel returned `EACCES` or `EPERM` — typically `net.ipv4.ping_group_range`
+/// excludes the calling GID). Once set to `2`, `open_icmp_socket` short-circuits.
+static ICMP_PROBE: AtomicU8 = AtomicU8::new(0);
+
+// ──────────────────────────────────────────────────────────────────────
+//  Inbound port-forward accept channel (Phase 5.5b)
+// ──────────────────────────────────────────────────────────────────────
+
+/// One accepted host-side TCP connection waiting to be forwarded into the guest.
+///
+/// Produced by [`run_port_forward_listener`] and consumed by
+/// [`SlirpBackend::process_pending_inbound_accepts`] on the net-poll thread.
+pub(crate) struct InboundAccept {
+    /// The accepted host-side TCP stream (non-blocking after accept).
+    host_stream: TcpStream,
+    /// Ephemeral port used as the synthesized SYN source port on the gateway side.
+    /// Derived from the peer's remote port so it is unique per connection.
+    high_port: u16,
+    /// Guest-side destination port (the service the guest is listening on).
+    guest_port: u16,
+}
 
 // ──────────────────────────────────────────────────────────────────────
 //  TCP NAT connection tracking
@@ -83,8 +128,13 @@ const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
-enum TcpNatState {
+pub(crate) enum TcpNatState {
+    /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
+    /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
+    /// We synthesized a SYN to the guest (port-forwarding); waiting
+    /// for the guest's SYN-ACK to advance to Established.
+    SynSent,
     Established,
     FinWait1,
     FinWait2,
@@ -94,7 +144,7 @@ enum TcpNatState {
 }
 
 /// Key for NAT table: (guest_src_port, dst_ip, dst_port)
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct NatKey {
     guest_src_port: u16,
     dst_ip: Ipv4Address,
@@ -108,13 +158,172 @@ struct TcpNatEntry {
     our_seq: u32,
     /// Last acknowledged guest sequence number
     guest_ack: u32,
-    /// Data received from host, pending delivery to guest
-    to_guest: Vec<u8>,
-    /// Data received from guest, pending write to host (buffered on EAGAIN)
-    to_host: Vec<u8>,
-    /// Guest sequence number to ACK once `to_host` is flushed
-    to_host_pending_ack: Option<u32>,
     last_activity: Instant,
+    /// Bytes sent to the guest but not yet ACK'd by the guest.
+    /// Equivalent to `our_seq - last_acked_seq`, stored explicitly so
+    /// the relay can decide how much new payload to peek+send each poll.
+    /// The ACK-driven consume path decrements this as the guest ACKs data.
+    bytes_in_flight: u32,
+}
+
+/// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
+///
+/// The host kernel rewrites the ICMP id when sending through a
+/// `SOCK_DGRAM IPPROTO_ICMP` socket; we keep the guest's original id here so
+/// the reply frame can be translated back before injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct IcmpEchoKey {
+    guest_id: u16,
+    dst_ip: Ipv4Address,
+}
+
+/// State for one in-flight ICMP echo request from the guest.
+struct IcmpEchoEntry {
+    /// Host-side socket: `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`.
+    /// Set non-blocking; the kernel handles ICMP framing — no
+    /// `CAP_NET_RAW` needed.
+    sock: std::net::UdpSocket,
+    /// The guest's original ICMP id from the echo request.  The host kernel
+    /// rewrites the id to a kernel-assigned value when the `SOCK_DGRAM`
+    /// ICMP socket sends; we translate back to `guest_id` when emitting the
+    /// reply frame.
+    // Read in `relay_icmp_echo` when translating the reply frame.
+    guest_id: u16,
+    last_activity: Instant,
+}
+
+/// Key for the UDP flow NAT table: (guest source port, destination IP, destination port).
+///
+/// Each unique 3-tuple maps to its own connected `UdpSocket` on the host,
+/// mirroring passt's `udp_flow_from_tap` per-flow design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct UdpFlowKey {
+    guest_src_port: u16,
+    dst_ip: Ipv4Address,
+    dst_port: u16,
+}
+
+/// State for one active UDP flow from the guest.
+struct UdpFlowEntry {
+    /// Connected `UdpSocket`. The host kernel handles source-port
+    /// preservation and reply demux; we just `send` and `recv`.
+    /// Set non-blocking.
+    sock: std::net::UdpSocket,
+    /// Last frame timestamp; read by Task 2.4 idle-timeout reaper.
+    last_activity: Instant,
+}
+
+/// Unified flow-table key. Each variant wraps the protocol-specific
+/// key already defined elsewhere in this module — no field changes,
+/// just one type the unified `flow_table` `HashMap` (added in Task 4.2)
+/// can store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FlowKey {
+    Tcp(NatKey),
+    Udp(UdpFlowKey),
+    IcmpEcho(IcmpEchoKey),
+}
+
+/// Unified flow-table value. Each variant wraps the protocol's existing
+/// entry struct.
+enum FlowEntry {
+    Tcp(TcpNatEntry),
+    Udp(UdpFlowEntry),
+    IcmpEcho(IcmpEchoEntry),
+}
+
+/// Open an unprivileged ICMP socket (`SOCK_DGRAM IPPROTO_ICMP`).
+///
+/// The kernel handles ICMP framing; `CAP_NET_RAW` is **not** required.
+/// The socket is set `SOCK_NONBLOCK | SOCK_CLOEXEC` at creation time.
+///
+/// Returns `Err` if the kernel rejects the call (e.g. the
+/// `net.ipv4.ping_group_range` sysctl excludes the current GID).
+/// After the first rejection, subsequent calls short-circuit and return
+/// `PermissionDenied` without retrying the syscall.
+fn open_icmp_socket() -> io::Result<std::net::UdpSocket> {
+    if ICMP_PROBE.load(Ordering::Relaxed) == 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ICMP unprivileged probe previously failed",
+        ));
+    }
+    // SAFETY: socket(2) returns -1 on error; we check before wrapping.
+    // IPPROTO_ICMP + SOCK_DGRAM is the unprivileged ICMP path: the kernel
+    // handles ICMP framing, no CAP_NET_RAW required.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_ICMP,
+        )
+    };
+    if raw < 0 {
+        let err = io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+            // First failure transitions 0 → 2 and emits the warn-once log.
+            // swap returns the previous value; only log if we were the first
+            // to set it.
+            if ICMP_PROBE.swap(2, Ordering::Relaxed) != 2 {
+                warn!(
+                    "SLIRP: unprivileged ICMP unavailable on this host \
+                     (sysctl net.ipv4.ping_group_range likely restricts \
+                     it); ICMP echo from guests will be dropped."
+                );
+            }
+        }
+        return Err(err);
+    }
+    ICMP_PROBE.store(1, Ordering::Relaxed);
+    // SAFETY: `raw` is a valid fd from socket(2); UdpSocket adopts
+    // ownership and closes on drop.
+    Ok(unsafe { std::net::UdpSocket::from_raw_fd(raw) })
+}
+
+/// Open a connected UDP socket for one guest→host flow.
+///
+/// Binds to an ephemeral port on `0.0.0.0`, sets non-blocking mode,
+/// then calls `connect(dst)` so that:
+/// - `send` delivers datagrams to `dst` without specifying the address each time.
+/// - Incoming datagrams are filtered to replies from `dst` only, enabling
+///   per-flow demux without an additional dispatch table.
+///
+/// No `CAP_NET_RAW` required — `SOCK_DGRAM` UDP is fully unprivileged.
+fn open_udp_flow_socket(dst: std::net::SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_nonblocking(true)?;
+    sock.connect(dst)?;
+    Ok(sock)
+}
+
+/// Non-blocking `recv(MSG_PEEK)` on a `TcpStream`, returning the
+/// number of bytes available without consuming them from the
+/// kernel's recv queue.
+///
+/// `std::net::TcpStream` does not expose `MSG_PEEK`; we go through
+/// `libc::recv` directly. `MSG_DONTWAIT` keeps the call non-blocking
+/// even if the underlying stream's `set_nonblocking` flag was
+/// dropped at some intermediate point.
+///
+/// Used by the passt-style host→guest TCP relay (Task 3.3): peek
+/// what's in the kernel buffer, send the un-ACK'd portion to the
+/// guest. Bytes stay in the kernel until the guest ACKs and Task
+/// 3.4's ACK-driven `read()` consumes them.
+fn recv_peek(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `stream` outlives the syscall; `buf` is uniquely
+    // borrowed and `len` matches the slice length.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -237,13 +446,11 @@ fn parse_resolv_conf() -> Vec<String> {
 //  SLIRP Stack
 // ──────────────────────────────────────────────────────────────────────
 
-pub struct SlirpStack {
+pub struct SlirpBackend {
     queue: Arc<Mutex<PacketQueue>>,
     iface: Interface,
     sockets: SocketSet<'static>,
     _device: VirtualDevice,
-    /// TCP NAT table
-    tcp_nat: HashMap<NatKey, TcpNatEntry>,
     /// Frames to inject into guest (built by our NAT, not by smoltcp)
     inject_to_guest: Vec<Vec<u8>>,
     /// Maximum concurrent TCP connections allowed
@@ -252,26 +459,52 @@ pub struct SlirpStack {
     max_connections_per_second: u32,
     /// Sliding window of recent connection timestamps for rate limiting
     connection_timestamps: VecDeque<Instant>,
-    /// Network deny list (CIDR ranges that the guest cannot reach)
-    deny_list: Vec<Ipv4Net>,
+    /// Stateless outbound translation rules (deny-list, gateway loopback, port forwards).
+    nat: nat::Rules,
     /// Host DNS servers (parsed from /etc/resolv.conf, fallback to public)
     dns_servers: Vec<String>,
     /// DNS response cache keyed by the raw query bytes (question section)
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
     /// DNS queries waiting to be resolved on the net-poll thread.
     pending_dns: Vec<PendingDnsQuery>,
+    /// Unified flow table — Phase 4.
+    ///
+    /// All three protocols (TCP, UDP, ICMP echo) are keyed here after Task 4.5.
+    /// ICMP migrated in 4.3; UDP in 4.4; TCP in 4.5.
+    flow_table: HashMap<FlowKey, FlowEntry>,
+    /// Background threads bound to host TCP ports for inbound port
+    /// forwarding (Phase 5.5b). Each handle corresponds to one
+    /// `nat::PortForward` rule. Joined on `Drop`.
+    port_forward_listeners: Vec<JoinHandle<()>>,
+    /// Shutdown signal for `port_forward_listeners`. Set true on Drop;
+    /// each listener thread checks it after every accept and exits cleanly.
+    port_forward_shutdown: Arc<AtomicBool>,
+    /// Receiver end of the accept channel fed by [`run_port_forward_listener`]
+    /// threads. Processed on the net-poll thread in
+    /// [`SlirpBackend::process_pending_inbound_accepts`].
+    pending_inbound_accepts: mpsc::Receiver<InboundAccept>,
+    /// Sender end of `pending_inbound_accepts`. Kept alive so the channel
+    /// stays open when no listener threads are running (e.g. in tests) and
+    /// so test helpers can inject [`InboundAccept`] values directly.
+    #[allow(dead_code)]
+    accept_sender: mpsc::Sender<InboundAccept>,
 }
 
-impl SlirpStack {
+impl SlirpBackend {
     pub fn new() -> Result<Self> {
-        Self::with_security(64, 50, &["169.254.0.0/16".to_string()])
+        Self::with_security(64, 50, &["169.254.0.0/16".to_string()], &[])
     }
 
     /// Create a SLIRP stack with security parameters.
+    ///
+    /// `port_forwards` maps host ports to guest ports as `(host_port, guest_port)` pairs.
+    /// Each entry is stored in [`nat::Rules`] as a TCP forward rule; host listeners are
+    /// spawned in sub-task B (5.5b) and not yet active.
     pub fn with_security(
         max_concurrent_connections: usize,
         max_connections_per_second: u32,
         deny_list_cidrs: &[String],
+        port_forwards: &[(u16, u16)],
     ) -> Result<Self> {
         debug!("Creating SLIRP stack");
         let queue = Arc::new(Mutex::new(PacketQueue::new()));
@@ -296,8 +529,7 @@ impl SlirpStack {
 
         let sockets = SocketSet::new(vec![]);
 
-        // Parse deny list CIDRs
-        let deny_list: Vec<Ipv4Net> = deny_list_cidrs
+        let deny_cidrs: Vec<Ipv4Net> = deny_list_cidrs
             .iter()
             .filter_map(|cidr| {
                 cidr.parse::<Ipv4Net>()
@@ -309,33 +541,52 @@ impl SlirpStack {
             })
             .collect();
 
+        let nat_port_forwards: Vec<nat::PortForward> = port_forwards
+            .iter()
+            .map(|&(host_port, guest_port)| nat::PortForward {
+                proto: nat::ForwardProto::Tcp,
+                host_port,
+                guest_port,
+            })
+            .collect();
+
+        let nat = nat::Rules {
+            gateway_loopback: true,
+            deny_cidrs,
+            port_forwards: nat_port_forwards,
+        };
+
         let dns_servers = parse_resolv_conf();
         debug!(
-            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, dns_servers: {:?}",
-            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second, deny_list.len(), dns_servers
+            "SLIRP stack created - Gateway: {}, DNS: {}, max_conn: {}, rate: {}/s, deny_list: {} CIDRs, port_forwards: {}, dns_servers: {:?}",
+            SLIRP_GATEWAY_IP, SLIRP_DNS_IP, max_concurrent_connections, max_connections_per_second,
+            nat.deny_cidrs.len(), nat.port_forwards.len(), dns_servers
         );
+
+        // Spawn listener threads for port-forwards (Phase 5.5b).
+        let port_forward_shutdown = Arc::new(AtomicBool::new(false));
+        let (port_forward_listeners, pending_inbound_accepts, accept_sender) =
+            spawn_port_forward_listeners(&nat, &port_forward_shutdown);
 
         Ok(Self {
             queue,
             iface,
             sockets,
             _device: device,
-            tcp_nat: HashMap::new(),
             inject_to_guest: Vec::new(),
             max_concurrent_connections,
             max_connections_per_second,
             connection_timestamps: VecDeque::new(),
-            deny_list,
+            nat,
             dns_servers,
             dns_cache: HashMap::new(),
             pending_dns: Vec::new(),
+            flow_table: HashMap::new(),
+            port_forward_listeners,
+            port_forward_shutdown,
+            pending_inbound_accepts,
+            accept_sender,
         })
-    }
-
-    /// Check if a destination IP is blocked by the deny list.
-    fn is_denied(&self, ip: &Ipv4Address) -> bool {
-        let addr = std::net::Ipv4Addr::new(ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
-        self.deny_list.iter().any(|net| net.contains(&addr))
     }
 
     /// Check if a new connection is allowed by the rate limiter.
@@ -359,6 +610,52 @@ impl SlirpStack {
 
         self.connection_timestamps.push_back(now);
         true
+    }
+
+    /// Drain the inbound-accept channel and seed a `SynSent` flow-table entry
+    /// plus a synthesized SYN frame for each accepted connection.
+    ///
+    /// Called at the top of [`drain_to_guest`] so all `SlirpBackend` mutation
+    /// stays on the net-poll thread — same single-writer lock model as the rest
+    /// of the relay pipeline. The listener threads only enqueue via the mpsc
+    /// channel; they never touch `flow_table` or `inject_to_guest` directly.
+    fn process_pending_inbound_accepts(&mut self) {
+        loop {
+            let accepted = match self.pending_inbound_accepts.try_recv() {
+                Ok(accepted) => accepted,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            let InboundAccept {
+                host_stream,
+                high_port,
+                guest_port,
+            } = accepted;
+            let our_isn = rand_seq();
+            let key = NatKey {
+                guest_src_port: guest_port,
+                dst_ip: SLIRP_GATEWAY_IP,
+                dst_port: high_port,
+            };
+            let entry = TcpNatEntry {
+                host_stream,
+                state: TcpNatState::SynSent,
+                our_seq: our_isn,
+                guest_ack: 0,
+                last_activity: Instant::now(),
+                bytes_in_flight: 0,
+            };
+            self.flow_table
+                .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+            let syn_frame = synthesize_inbound_syn(high_port, guest_port, our_isn);
+            self.inject_to_guest.push(syn_frame);
+            trace!(
+                host_port = high_port,
+                guest_port,
+                our_isn,
+                "SLIRP port-forward: seeded SynSent entry"
+            );
+        }
     }
 
     // ── Public API ──────────────────────────────────────────────────
@@ -388,27 +685,38 @@ impl SlirpStack {
         Ok(())
     }
 
-    /// Poll the stack. Returns ethernet frames to send to the guest.
-    pub fn poll(&mut self) -> Vec<Vec<u8>> {
-        // Check rx_queue size before polling
+    /// Drain frames destined to the guest into `out`, reusing the caller's
+    /// buffer across calls and avoiding a fresh allocation on every tick.
+    ///
+    /// See [`crate::network::NetworkBackend::drain_to_guest`].
+    pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        // 0. Process any accepted host-side connections from port-forward listeners.
+        self.process_pending_inbound_accepts();
+
+        // Check rx_queue size before polling.
         let rx_count = {
             let q = self.queue.lock().unwrap();
             q.rx_queue.len()
         };
 
-        // 1. Let smoltcp handle ARP
+        // 1. Let smoltcp handle ARP.
         let ts = smol_instant_now();
         let mut dev = VirtualDevice::new(self.queue.clone());
         let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
 
-        // 2. Resolve pending DNS queries (off vCPU thread)
+        // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
 
-        // 3. Process TCP NAT data relay
+        // 3. Process TCP NAT data relay.
         self.relay_tcp_nat_data();
 
-        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames
-        let mut frames = Vec::new();
+        // 4. Relay ICMP echo replies from host sockets back to the guest.
+        self.relay_icmp_echo();
+
+        // 5. Relay UDP flow replies from host sockets back to the guest.
+        self.relay_udp_flows();
+
+        // 6. Collect frames: smoltcp ARP responses + our NAT-built frames.
         {
             let mut q = self.queue.lock().unwrap();
             if !q.tx_queue.is_empty() || rx_count > 0 {
@@ -420,11 +728,24 @@ impl SlirpStack {
                     self.inject_to_guest.len()
                 );
             }
-            frames.append(&mut q.tx_queue);
+            out.append(&mut q.tx_queue);
         }
-        frames.append(&mut self.inject_to_guest);
+        out.append(&mut self.inject_to_guest);
+    }
 
-        frames
+    /// Poll the stack and return ethernet frames to send to the guest.
+    ///
+    /// # Deprecated
+    ///
+    /// Allocates a fresh [`Vec`] on every call. Prefer [`drain_to_guest`],
+    /// which writes into a caller-supplied buffer and avoids the allocation.
+    ///
+    /// [`drain_to_guest`]: SlirpBackend::drain_to_guest
+    #[deprecated(note = "use drain_to_guest")]
+    pub fn poll(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        self.drain_to_guest(&mut out);
+        out
     }
 
     /// Extract the DNS question section (bytes after the 12-byte header up to
@@ -621,9 +942,13 @@ impl SlirpStack {
         let dst_ip = ipv4.dst_addr();
         let protocol = ipv4.next_header();
 
-        // DNS (UDP to 10.0.2.3:53) – handle specially
-        if dst_ip == SLIRP_DNS_IP && protocol == IpProtocol::Udp {
-            return self.handle_dns_frame(&ipv4);
+        // UDP — DNS keeps its dedicated cache+forward handler; everything
+        // else goes through the per-flow connected-socket NAT.
+        if protocol == IpProtocol::Udp {
+            if dst_ip == SLIRP_DNS_IP {
+                return self.handle_dns_frame(&ipv4);
+            }
+            return self.handle_udp_frame(&ipv4);
         }
 
         // TCP to any external IP (not gateway) – NAT proxy
@@ -634,7 +959,12 @@ impl SlirpStack {
             }
         }
 
-        // Everything else (ICMP, etc.) – drop silently
+        // ICMP echo requests — forward via unprivileged SOCK_DGRAM IPPROTO_ICMP socket
+        if protocol == IpProtocol::Icmp {
+            return self.handle_icmp_frame(&ipv4);
+        }
+
+        // Everything else – drop silently
         trace!("SLIRP: dropping {:?} packet to {}", protocol, dst_ip);
         Ok(())
     }
@@ -684,6 +1014,157 @@ impl SlirpStack {
         Ok(())
     }
 
+    // ── Non-DNS UDP forwarding ────────────────────────────────────────
+
+    /// Forward a non-DNS guest UDP datagram to the host via a per-flow connected socket.
+    ///
+    /// Each unique (guest source port, destination IP, destination port) 3-tuple maps to
+    /// one connected `UdpSocket`. On the first frame for a flow the socket is created via
+    /// [`open_udp_flow_socket`] and stored in `flow_table` under `FlowKey::Udp`. Subsequent
+    /// frames reuse the existing socket, updating `last_activity` for idle-timeout reaping (Task 2.4).
+    ///
+    /// The SLIRP gateway address (`10.0.2.2`) is translated to `127.0.0.1` before
+    /// connecting, mirroring the same translation used on the TCP NAT path.
+    ///
+    /// Reply delivery back to the guest is handled by Task 2.3 (`relay_udp_flows`).
+    fn handle_udp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
+        let udp = match UdpPacket::new_checked(ipv4.payload()) {
+            Ok(u) => u,
+            Err(_) => return Ok(()),
+        };
+        let payload = udp.payload().to_vec();
+        let key = UdpFlowKey {
+            guest_src_port: udp.src_port(),
+            dst_ip: ipv4.dst_addr(),
+            dst_port: udp.dst_port(),
+        };
+
+        let dst =
+            match nat::translate_outbound(&self.nat, key.dst_ip, key.dst_port, SLIRP_GATEWAY_IP) {
+                Some(addr) => addr,
+                None => {
+                    trace!(
+                        "SLIRP UDP: deny-list reject dst={}:{} from guest_port={}",
+                        key.dst_ip,
+                        key.dst_port,
+                        key.guest_src_port
+                    );
+                    return Ok(());
+                }
+            };
+
+        let flow_key = FlowKey::Udp(key);
+        let entry: &mut UdpFlowEntry = match self.flow_table.entry(flow_key) {
+            std::collections::hash_map::Entry::Occupied(o) => match o.into_mut() {
+                FlowEntry::Udp(e) => e,
+                _ => unreachable!("FlowKey::Udp must map to FlowEntry::Udp"),
+            },
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let sock = match open_udp_flow_socket(dst) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        trace!("SLIRP UDP: open flow socket failed: {e}");
+                        return Ok(());
+                    }
+                };
+                match v.insert(FlowEntry::Udp(UdpFlowEntry {
+                    sock,
+                    last_activity: Instant::now(),
+                })) {
+                    FlowEntry::Udp(e) => e,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        entry.last_activity = Instant::now();
+
+        if let Err(e) = entry.sock.send(&payload) {
+            trace!("SLIRP UDP: send failed: {e}");
+        }
+        Ok(())
+    }
+
+    // ── ICMP echo forwarding ─────────────────────────────────────────
+
+    /// Forward a guest ICMP echo request to the host kernel via an unprivileged
+    /// `SOCK_DGRAM IPPROTO_ICMP` socket.
+    ///
+    /// The kernel rewrites the ICMP identifier on `send_to`; the entry stores
+    /// the guest's original `ident` so the reply path (Task 1.3) can translate
+    /// it back before injecting the frame into the guest.
+    fn handle_icmp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
+        let icmp = match Icmpv4Packet::new_checked(ipv4.payload()) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let repr = match Icmpv4Repr::parse(&icmp, &Default::default()) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        let (ident, seq_no, data) = match repr {
+            Icmpv4Repr::EchoRequest {
+                ident,
+                seq_no,
+                data,
+            } => (ident, seq_no, data),
+            _ => return Ok(()), // only echo request handled today
+        };
+
+        // Copy data before the mutable borrow of self.flow_table below.
+        let data_owned: Vec<u8> = data.to_vec();
+
+        let key = IcmpEchoKey {
+            guest_id: ident,
+            dst_ip: ipv4.dst_addr(),
+        };
+        let flow_key = FlowKey::IcmpEcho(key);
+        let entry: &mut IcmpEchoEntry = match self.flow_table.entry(flow_key) {
+            std::collections::hash_map::Entry::Occupied(occupied) => match occupied.into_mut() {
+                FlowEntry::IcmpEcho(e) => e,
+                _ => unreachable!("FlowKey::IcmpEcho must map to FlowEntry::IcmpEcho"),
+            },
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let sock = match open_icmp_socket() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Sysctl-driven fallback handled in Task 1.4.
+                        trace!("SLIRP ICMP: open socket failed: {e}");
+                        return Ok(());
+                    }
+                };
+                match vacant.insert(FlowEntry::IcmpEcho(IcmpEchoEntry {
+                    sock,
+                    guest_id: ident,
+                    last_activity: Instant::now(),
+                })) {
+                    FlowEntry::IcmpEcho(e) => e,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        entry.last_activity = Instant::now();
+
+        // Build a wire ICMP echo packet with seq + data; the kernel will
+        // rewrite the ident on send_to.
+        let req = Icmpv4Repr::EchoRequest {
+            ident: 0, // kernel rewrites
+            seq_no,
+            data: &data_owned,
+        };
+        let mut buf = vec![0u8; req.buffer_len()];
+        let mut pkt = Icmpv4Packet::new_unchecked(&mut buf);
+        req.emit(&mut pkt, &Default::default());
+
+        let dst = SocketAddr::from((
+            Ipv4Addr::from(ipv4.dst_addr().0),
+            0u16, // port ignored for ICMP
+        ));
+        if let Err(e) = entry.sock.send_to(&buf, dst) {
+            trace!("SLIRP ICMP: send_to failed: {e}");
+        }
+        Ok(())
+    }
+
     // ── TCP NAT ─────────────────────────────────────────────────────
 
     fn handle_tcp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
@@ -711,28 +1192,40 @@ impl SlirpStack {
                 src_ip, src_port, dst_ip, dst_port
             );
 
-            // Check deny list before connecting
-            if self.is_denied(&dst_ip) {
-                warn!(
-                    "SLIRP TCP: connection to {}:{} denied by network deny list",
-                    dst_ip, dst_port
-                );
-                let rst = build_tcp_packet_static(
-                    dst_ip,
-                    SLIRP_GUEST_IP,
-                    dst_port,
-                    src_port,
-                    0,
-                    seq + 1,
-                    TcpControl::Rst,
-                    &[],
-                );
-                self.inject_to_guest.push(rst);
-                return Ok(());
-            }
+            // Phase 5 unified outbound translation: combines the gateway-loopback
+            // rewrite + deny-list check in one pure-function call. Returns None if
+            // the dst is denied; on Some, the SocketAddr already has the right
+            // host IP (loopback for the gateway, original for everything else).
+            let dst_addr =
+                match nat::translate_outbound(&self.nat, dst_ip, dst_port, SLIRP_GATEWAY_IP) {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "SLIRP TCP: connection to {}:{} denied by network deny list",
+                            dst_ip, dst_port
+                        );
+                        let rst = build_tcp_packet_static(
+                            dst_ip,
+                            SLIRP_GUEST_IP,
+                            dst_port,
+                            src_port,
+                            0,
+                            seq + 1,
+                            TcpControl::Rst,
+                            &[],
+                        );
+                        self.inject_to_guest.push(rst);
+                        return Ok(());
+                    }
+                };
 
             // Check max concurrent connections
-            if self.tcp_nat.len() >= self.max_concurrent_connections {
+            let tcp_flow_count = self
+                .flow_table
+                .keys()
+                .filter(|k| matches!(k, FlowKey::Tcp(_)))
+                .count();
+            if tcp_flow_count >= self.max_concurrent_connections {
                 warn!(
                     "SLIRP TCP: max concurrent connections ({}) reached, rejecting SYN to {}:{}",
                     self.max_concurrent_connections, dst_ip, dst_port
@@ -772,19 +1265,10 @@ impl SlirpStack {
             }
 
             // Remove any stale entry with the same key
-            self.tcp_nat.remove(&key);
+            self.flow_table.remove(&FlowKey::Tcp(key));
 
-            // Create host TCP connection.
-            // Map the SLIRP gateway IP (10.0.2.2) to localhost so the guest
-            // can reach host services (e.g. Ollama at localhost:11434).
-            let host_ip = if dst_ip == SLIRP_GATEWAY_IP {
-                std::net::Ipv4Addr::new(127, 0, 0, 1)
-            } else {
-                std::net::Ipv4Addr::new(dst_ip.0[0], dst_ip.0[1], dst_ip.0[2], dst_ip.0[3])
-            };
-            let addr = SocketAddr::new(std::net::IpAddr::V4(host_ip), dst_port);
-
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            // Connect to the host address resolved by translate_outbound above.
+            match TcpStream::connect_timeout(&dst_addr, Duration::from_secs(3)) {
                 Ok(stream) => {
                     stream.set_nonblocking(true).ok();
                     let our_seq: u32 = rand_seq();
@@ -793,12 +1277,11 @@ impl SlirpStack {
                         state: TcpNatState::SynReceived,
                         our_seq,
                         guest_ack: seq + 1,
-                        to_guest: Vec::new(),
-                        to_host: Vec::new(),
-                        to_host_pending_ack: None,
                         last_activity: Instant::now(),
+                        bytes_in_flight: 0,
                     };
-                    self.tcp_nat.insert(key.clone(), entry);
+                    self.flow_table
+                        .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
 
                     // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
@@ -837,21 +1320,52 @@ impl SlirpStack {
         }
 
         // Look up existing connection
-        let entry = match self.tcp_nat.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                trace!(
-                    "SLIRP TCP: no NAT entry for {}:{} -> {}:{}",
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port
-                );
-                return Ok(());
-            }
+        let flow_key = FlowKey::Tcp(key);
+        let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
+            trace!(
+                "SLIRP TCP: no NAT entry for {}:{} -> {}:{}",
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port
+            );
+            return Ok(());
         };
 
         entry.last_activity = Instant::now();
+
+        // Inbound port-forward: guest's SYN-ACK completing the host-initiated
+        // 3-way handshake.  We synthesized a SYN to the guest (5.5b.2/5.5b.3);
+        // the guest's kernel accepted it and replied with SYN+ACK.  Send an ACK
+        // back so the guest's TCP stack transitions to Established on its side,
+        // then record our state as Established too.
+        //
+        // NatKey for the inbound flow: guest_src_port = guest service port,
+        // dst_ip = SLIRP_GATEWAY_IP, dst_port = the ephemeral high port we
+        // used as the SYN's source port.  The ACK frame therefore flows
+        // src=SLIRP_GATEWAY_IP:dst_port → dst=SLIRP_GUEST_IP:guest_src_port.
+        if entry.state == TcpNatState::SynSent && tcp.syn() && tcp.ack() {
+            let ack_frame = build_tcp_packet_static(
+                SLIRP_GATEWAY_IP,              // src_ip  — the "host" side of the forward
+                SLIRP_GUEST_IP,                // dst_ip  — the guest
+                key.dst_port, // src_port — high ephemeral port we sent the SYN from
+                key.guest_src_port, // dst_port — the guest's service port
+                entry.our_seq.wrapping_add(1), // seq — our ISN + 1 (SYN consumed one)
+                tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
+                TcpControl::None,
+                &[],
+            );
+            self.inject_to_guest.push(ack_frame);
+            entry.our_seq = entry.our_seq.wrapping_add(1);
+            entry.guest_ack = tcp.seq_number().0.wrapping_add(1) as u32;
+            entry.state = TcpNatState::Established;
+            trace!(
+                "SLIRP TCP: inbound 3WH complete for guest_port={} high_port={}, → Established",
+                key.guest_src_port,
+                key.dst_port
+            );
+            return Ok(());
+        }
 
         // ACK (completing handshake or acknowledging data)
         if tcp.ack() && entry.state == TcpNatState::SynReceived {
@@ -864,50 +1378,106 @@ impl SlirpStack {
             );
         }
 
-        let payload = tcp.payload();
-        if !payload.is_empty() && entry.state == TcpNatState::Established {
-            let new_ack = seq.wrapping_add(payload.len() as u32);
+        // ACK-driven consume: when the guest acknowledges data we sent via
+        // peek-based relay (Task 3.3), read those bytes from the kernel recv
+        // buffer to advance the kernel's read pointer.  Without this step the
+        // kernel buffer fills up and recv_peek keeps returning the same bytes.
+        //
+        // Only runs in Established state — the SynReceived ACK above does not
+        // carry data acknowledgements from us yet (bytes_in_flight == 0 then).
+        if tcp.ack() && entry.state == TcpNatState::Established && entry.bytes_in_flight > 0 {
+            // segment_ack: what the guest is now confirming it has received
+            // from us (our send-side sequence space).
+            let segment_ack: u32 = tcp.ack_number().0 as u32;
 
-            if entry.to_host.is_empty() {
-                match entry.host_stream.write(payload) {
-                    Ok(n) if n == payload.len() => {
-                        entry.guest_ack = new_ack;
-                        let ack_frame = build_tcp_packet_static(
-                            dst_ip,
-                            SLIRP_GUEST_IP,
-                            dst_port,
-                            src_port,
-                            entry.our_seq,
-                            entry.guest_ack,
-                            TcpControl::None,
-                            &[],
-                        );
-                        self.inject_to_guest.push(ack_frame);
-                    }
-                    Ok(n) => {
-                        entry.to_host.extend_from_slice(&payload[n..]);
-                        entry.to_host_pending_ack = Some(new_ack);
-                        entry.guest_ack = seq.wrapping_add(n as u32);
-                        entry.last_activity = Instant::now();
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        entry.to_host.extend_from_slice(payload);
-                        entry.to_host_pending_ack = Some(new_ack);
-                        entry.last_activity = Instant::now();
-                    }
-                    Err(e) => {
-                        warn!("SLIRP TCP: write to host failed: {}", e);
-                        entry.state = TcpNatState::Closed;
+            // last_sent_acked: the highest our-seq the guest had already
+            // confirmed before this segment.  `our_seq` is the *next* byte we
+            // would send, so subtracting bytes_in_flight gives the start of the
+            // in-flight window.
+            // All arithmetic is wrapping — TCP sequence numbers wrap at 2^32.
+            let last_sent_acked: u32 = entry.our_seq.wrapping_sub(entry.bytes_in_flight);
+
+            // acked_bytes: how many new bytes the guest acknowledged in this
+            // segment.  Guards:
+            //   > 0   — ACK actually advances (not a duplicate or stale ACK)
+            //   <= bytes_in_flight — guest cannot ack more than we've sent
+            //   (defends against malformed / spoofed ACKs from a guest)
+            let acked_bytes: u32 = segment_ack.wrapping_sub(last_sent_acked);
+
+            if acked_bytes > 0 && acked_bytes <= entry.bytes_in_flight {
+                let mut sink = [0u8; 65536];
+                let mut to_drain = acked_bytes as usize;
+                let mut drained: u32 = 0;
+                while to_drain > 0 {
+                    let want = to_drain.min(sink.len());
+                    match entry.host_stream.read(&mut sink[..want]) {
+                        Ok(0) => break, // EOF — nothing more to drain
+                        Ok(n) => {
+                            to_drain -= n;
+                            drained = drained.wrapping_add(n as u32);
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            warn!(
+                                "SLIRP TCP: ACK-driven read failed on flow guest_port={}, marking Closed: {}",
+                                key.guest_src_port, e
+                            );
+                            entry.state = TcpNatState::Closed;
+                            break;
+                        }
                     }
                 }
-            } else if entry.to_host.len() + payload.len() <= MAX_TO_HOST_BUFFER {
-                entry.to_host.extend_from_slice(payload);
-                entry.to_host_pending_ack = Some(new_ack);
-                entry.last_activity = Instant::now();
-            } else {
-                warn!("SLIRP TCP: to_host buffer full, dropping connection");
-                entry.state = TcpNatState::Closed;
+                entry.bytes_in_flight = entry.bytes_in_flight.wrapping_sub(drained);
+                trace!(
+                    "SLIRP TCP: ACK consumed {} bytes from kernel (in_flight now={}, segment_ack={})",
+                    drained, entry.bytes_in_flight, segment_ack
+                );
             }
+        }
+
+        let payload = tcp.payload();
+        if !payload.is_empty() && entry.state == TcpNatState::Established {
+            // Phase 3 guest→host: rely on the kernel's send buffer + TCP
+            // retransmit for backpressure.  ACK only the bytes the kernel
+            // accepted right now; on WouldBlock, don't ACK at all and let
+            // the guest retransmit.  No userspace buffering, no 256 KB cap.
+            let payload_seq = seq;
+            let n_written = match entry.host_stream.write(payload) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                Err(e) => {
+                    warn!(
+                        "SLIRP TCP: write to host failed on flow guest_port={}, marking Closed: {}",
+                        key.guest_src_port, e
+                    );
+                    entry.state = TcpNatState::Closed;
+                    return Ok(());
+                }
+            };
+
+            if n_written > 0 {
+                let ack_seq = payload_seq.wrapping_add(n_written as u32);
+                entry.guest_ack = ack_seq;
+                let ack_frame = build_tcp_packet_static(
+                    dst_ip,
+                    SLIRP_GUEST_IP,
+                    dst_port,
+                    src_port,
+                    entry.our_seq,
+                    entry.guest_ack,
+                    TcpControl::None,
+                    &[],
+                );
+                self.inject_to_guest.push(ack_frame);
+                trace!(
+                    "SLIRP TCP guest→host: wrote {}/{} bytes, ACK={}",
+                    n_written,
+                    payload.len(),
+                    ack_seq
+                );
+            }
+            // else: kernel send buffer full (WouldBlock) — don't ACK.
+            // Guest TCP will retransmit; kernel buffer drains over time.
         }
 
         // FIN from guest
@@ -940,88 +1510,95 @@ impl SlirpStack {
 
     /// Relay data from host TCP connections to guest
     fn relay_tcp_nat_data(&mut self) {
-        let mut to_remove = Vec::new();
+        let mut to_remove: Vec<FlowKey> = Vec::new();
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        for (key, entry) in self.tcp_nat.iter_mut() {
+        let tcp_flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::Tcp(_)))
+            .collect();
+
+        for flow_key in tcp_flow_keys {
+            let FlowKey::Tcp(key) = flow_key else {
+                continue;
+            };
+            let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) else {
+                continue;
+            };
+
             if entry.state == TcpNatState::Closed {
-                to_remove.push(key.clone());
+                to_remove.push(flow_key);
                 continue;
             }
             if entry.last_activity.elapsed() > Duration::from_secs(300) {
-                to_remove.push(key.clone());
+                to_remove.push(flow_key);
                 continue;
             }
             if entry.state != TcpNatState::Established {
                 continue;
             }
 
-            if !entry.to_host.is_empty() {
-                match entry.host_stream.write(&entry.to_host) {
-                    Ok(n) => {
-                        entry.to_host.drain(..n);
-                        entry.last_activity = Instant::now();
-                        if entry.to_host.is_empty() {
-                            if let Some(ack) = entry.to_host_pending_ack.take() {
-                                entry.guest_ack = ack;
-                                let ack_frame = build_tcp_packet_static(
-                                    key.dst_ip,
-                                    SLIRP_GUEST_IP,
-                                    key.dst_port,
-                                    key.guest_src_port,
-                                    entry.our_seq,
-                                    entry.guest_ack,
-                                    TcpControl::None,
-                                    &[],
-                                );
-                                frames_to_inject.push(ack_frame);
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        warn!("SLIRP TCP: buffered write to host failed: {}", e);
-                        entry.state = TcpNatState::Closed;
-                        continue;
-                    }
-                }
-            }
-
-            // Read from host
-            let mut buf = [0u8; 16384];
-            match entry.host_stream.read(&mut buf) {
+            // Phase 3 host→guest path: peek what's in the kernel recv buffer
+            // without consuming. Send only the un-ACK'd portion (bytes past
+            // what we've already sent). The kernel's socket buffer holds the
+            // outstanding data; Task 3.4's ACK-driven `read()` consumes it
+            // once the guest ACKs.
+            let mut peek_buf = [0u8; 65536];
+            match recv_peek(&entry.host_stream, &mut peek_buf) {
                 Ok(0) => {
-                    debug!("SLIRP TCP: host closed for {}:{}", key.dst_ip, key.dst_port);
+                    // Host closed the connection. Send FIN to guest below.
+                    debug!(
+                        "SLIRP TCP: host EOF on flow guest_port={}, marking Closed",
+                        key.guest_src_port
+                    );
                     entry.state = TcpNatState::Closed;
                 }
-                Ok(n) => {
-                    entry.to_guest.extend_from_slice(&buf[..n]);
-                    entry.last_activity = Instant::now();
+                Ok(peek_n) => {
+                    let in_flight = entry.bytes_in_flight as usize;
+                    if peek_n > in_flight {
+                        let new_bytes = &peek_buf[in_flight..peek_n];
+                        let mut sent_total: usize = 0;
+                        for chunk in new_bytes.chunks(MTU - 54) {
+                            let frame = build_tcp_packet_static(
+                                key.dst_ip,
+                                SLIRP_GUEST_IP,
+                                key.dst_port,
+                                key.guest_src_port,
+                                entry.our_seq,
+                                entry.guest_ack,
+                                TcpControl::None,
+                                chunk,
+                            );
+                            frames_to_inject.push(frame);
+                            entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
+                            entry.bytes_in_flight =
+                                entry.bytes_in_flight.wrapping_add(chunk.len() as u32);
+                            sent_total += chunk.len();
+                        }
+                        entry.last_activity = Instant::now();
+                        trace!(
+                            "SLIRP TCP relay: peeked {} bytes (in_flight before={}, sent now={})",
+                            peek_n,
+                            in_flight,
+                            sent_total
+                        );
+                    }
+                    // else: kernel buffer holds only already-in-flight bytes.
+                    // Wait for guest ACK before sending more (Task 3.4).
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Kernel recv buffer empty; nothing to do this poll.
+                }
                 Err(e) => {
-                    trace!("SLIRP TCP: host read error: {}", e);
+                    warn!(
+                        "SLIRP TCP: recv_peek failed on flow guest_port={}, marking Closed: {}",
+                        key.guest_src_port, e
+                    );
                     entry.state = TcpNatState::Closed;
                 }
-            }
-
-            // Build data frames for guest
-            while !entry.to_guest.is_empty() && entry.state == TcpNatState::Established {
-                let chunk_size = entry.to_guest.len().min(MTU - 54);
-                let chunk: Vec<u8> = entry.to_guest.drain(..chunk_size).collect();
-                let frame = build_tcp_packet_static(
-                    key.dst_ip,
-                    SLIRP_GUEST_IP,
-                    key.dst_port,
-                    key.guest_src_port,
-                    entry.our_seq,
-                    entry.guest_ack,
-                    TcpControl::None,
-                    &chunk,
-                );
-                entry.our_seq = entry.our_seq.wrapping_add(chunk.len() as u32);
-                frames_to_inject.push(frame);
             }
 
             // FIN if host closed
@@ -1042,9 +1619,230 @@ impl SlirpStack {
 
         self.inject_to_guest.append(&mut frames_to_inject);
 
-        for key in to_remove {
-            self.tcp_nat.remove(&key);
+        for flow_key in to_remove {
+            self.flow_table.remove(&flow_key);
         }
+    }
+
+    /// Drain replies from each active ICMP echo socket and emit echo-reply
+    /// frames to the guest.
+    ///
+    /// Called on every [`drain_to_guest`] tick.  Entries idle longer than
+    /// `ICMP_IDLE_TIMEOUT` are evicted.
+    fn relay_icmp_echo(&mut self) {
+        const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+        let now = Instant::now();
+
+        let flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::IcmpEcho(_)))
+            .collect();
+        for flow_key in flow_keys {
+            let FlowKey::IcmpEcho(key) = flow_key else {
+                continue;
+            };
+            let frame = {
+                let Some(FlowEntry::IcmpEcho(entry)) = self.flow_table.get_mut(&flow_key) else {
+                    continue;
+                };
+                if now.duration_since(entry.last_activity) > ICMP_IDLE_TIMEOUT {
+                    None // mark for removal below
+                } else {
+                    let mut buf = [0u8; 1500];
+                    match entry.sock.recv_from(&mut buf) {
+                        Ok((n, _addr)) => {
+                            entry.last_activity = now;
+                            // Wrap in Some to distinguish from the idle-timeout
+                            // None arm in the outer match.
+                            Some(Self::build_icmp_echo_reply_to_guest(
+                                key.dst_ip,
+                                entry.guest_id,
+                                &buf[..n],
+                            ))
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            match frame {
+                None => {
+                    // Idle timeout — evict entry.
+                    self.flow_table.remove(&FlowKey::IcmpEcho(key));
+                }
+                Some(Some(frame_bytes)) => self.inject_to_guest.push(frame_bytes),
+                Some(None) => {} // build failed; drop silently
+            }
+        }
+    }
+
+    /// Build an Ethernet/IPv4/ICMP echo-reply frame addressed to the guest.
+    ///
+    /// `src_ip` is the original ping destination (becomes the reply source).
+    /// `guest_id` is the ICMP identifier to write into the reply so the guest
+    /// can match it against its outstanding echo request.
+    /// `raw_icmp` is the raw ICMP packet received from the host kernel via
+    /// the `SOCK_DGRAM IPPROTO_ICMP` socket (no IP header; ICMP type + code +
+    /// checksum + payload).
+    ///
+    /// Returns `Some(frame)` on success, `None` if the packet cannot be parsed
+    /// or is not an `EchoReply`.
+    fn build_icmp_echo_reply_to_guest(
+        src_ip: Ipv4Address,
+        guest_id: u16,
+        raw_icmp: &[u8],
+    ) -> Option<Vec<u8>> {
+        let icmp = Icmpv4Packet::new_checked(raw_icmp).ok()?;
+        let parsed = Icmpv4Repr::parse(&icmp, &Default::default()).ok()?;
+        // Copy the payload before `icmp` / `parsed` go out of scope so we can
+        // build the outgoing `EchoReply` with a fresh borrow.  Mirrors the
+        // same pattern used in `handle_icmp_frame` (Task 1.2).
+        let (seq_no, data_owned) = match parsed {
+            Icmpv4Repr::EchoReply { seq_no, data, .. } => (seq_no, data.to_vec()),
+            _ => return None,
+        };
+        let reply = Icmpv4Repr::EchoReply {
+            ident: guest_id,
+            seq_no,
+            data: &data_owned,
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: src_ip,
+            dst_addr: SLIRP_GUEST_IP,
+            next_header: IpProtocol::Icmp,
+            payload_len: reply.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GATEWAY_MAC),
+            dst_addr: EthernetAddress(GUEST_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + reply.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut icmp_out = Icmpv4Packet::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        reply.emit(&mut icmp_out, &Default::default());
+        Some(buf)
+    }
+
+    /// Drain replies from each active UDP flow socket and emit UDP frames to
+    /// the guest.
+    ///
+    /// Called on every [`drain_to_guest`] tick.  Each connected socket is
+    /// polled non-blocking; `WouldBlock` and other errors are silently skipped
+    /// so a stale or unreachable flow never stalls the relay loop.
+    ///
+    /// Reply addressing mirrors the original guest datagram in reverse: the
+    /// frame's IP source is the original destination (`key.dst_ip`) and UDP
+    /// source port is `key.dst_port`; the destination is the guest IP and
+    /// `key.guest_src_port`.
+    fn relay_udp_flows(&mut self) {
+        let now = Instant::now();
+        // Reap idle flows; the per-flow connected socket is closed by Drop.
+        let stale: Vec<FlowKey> = self
+            .flow_table
+            .iter()
+            .filter(|(k, e)| {
+                matches!(k, FlowKey::Udp(_))
+                    && match e {
+                        FlowEntry::Udp(entry) => {
+                            now.duration_since(entry.last_activity) > UDP_IDLE_TIMEOUT
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            self.flow_table.remove(&k);
+        }
+
+        let flow_keys: Vec<FlowKey> = self
+            .flow_table
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, FlowKey::Udp(_)))
+            .collect();
+        for flow_key in flow_keys {
+            let FlowKey::Udp(key) = flow_key else {
+                continue;
+            };
+            let frame = {
+                let Some(FlowEntry::Udp(entry)) = self.flow_table.get_mut(&flow_key) else {
+                    continue;
+                };
+                let mut buf = [0u8; 1500];
+                match entry.sock.recv(&mut buf) {
+                    Ok(n) => {
+                        entry.last_activity = now;
+                        Self::build_udp_reply_to_guest(
+                            key.dst_ip,
+                            key.dst_port,
+                            key.guest_src_port,
+                            &buf[..n],
+                        )
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => continue,
+                }
+            };
+            if let Some(frame_bytes) = frame {
+                self.inject_to_guest.push(frame_bytes);
+            }
+        }
+    }
+
+    /// Build an Ethernet/IPv4/UDP frame addressed to the guest, carrying a
+    /// reply from a host-side UDP flow socket.
+    ///
+    /// - `src_ip` — original destination IP (becomes the reply source address).
+    /// - `src_port` — original destination port (becomes the reply source port).
+    /// - `dst_port` — guest's ephemeral source port (becomes the reply destination).
+    /// - `payload` — raw UDP payload received from the host socket.
+    ///
+    /// Returns `Some(frame)` on success.  Currently infallible, but wrapped in
+    /// `Option` for symmetry with [`build_icmp_echo_reply_to_guest`].
+    fn build_udp_reply_to_guest(
+        src_ip: Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let udp_repr = UdpRepr { src_port, dst_port };
+        let ip_repr = Ipv4Repr {
+            src_addr: src_ip,
+            dst_addr: SLIRP_GUEST_IP,
+            next_header: IpProtocol::Udp,
+            payload_len: 8 + payload.len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GATEWAY_MAC),
+            dst_addr: EthernetAddress(GUEST_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let total = 14 + ip_repr.buffer_len() + 8 + payload.len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip_repr.emit(&mut ip, &Default::default());
+        let mut udp = UdpPacket::new_unchecked(&mut buf[14 + ip_repr.buffer_len()..]);
+        udp_repr.emit(
+            &mut udp,
+            &IpAddress::Ipv4(src_ip),
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            payload.len(),
+            |b| b.copy_from_slice(payload),
+            &Default::default(),
+        );
+        Some(buf)
     }
 
     // ── Packet building helpers ──────────────────────────────────────
@@ -1096,6 +1894,16 @@ impl SlirpStack {
         buf[udp_offset + 8..].copy_from_slice(payload);
 
         buf
+    }
+}
+
+impl NetworkBackend for SlirpBackend {
+    fn process_guest_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        SlirpBackend::process_guest_frame(self, frame).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        SlirpBackend::drain_to_guest(self, out)
     }
 }
 
@@ -1163,6 +1971,49 @@ fn build_tcp_packet_static(
     buf
 }
 
+/// Build a synthetic TCP SYN frame from the SLIRP gateway to the guest,
+/// used for inbound port-forwarding (Phase 5.5b).
+///
+/// The frame mirrors what the guest would see from a real TCP client:
+/// - src: `SLIRP_GATEWAY_IP:high_port`
+/// - dst: `SLIRP_GUEST_IP:guest_port`
+/// - control: `TcpControl::Syn`
+/// - seq: caller-supplied `our_seq` (the host's chosen ISN for this flow)
+/// - ack: 0 (no piggybacked ACK on the initial SYN)
+///
+/// Caller pushes the returned bytes into `inject_to_guest`. The guest's
+/// kernel sees an inbound TCP SYN, routes it to whatever's bound at
+/// `guest_port`, and emits a SYN-ACK that `handle_tcp_frame` matches
+/// to the seeded `SynSent` flow_table entry (5.5b.1).
+#[cfg(any(test, feature = "bench-helpers"))]
+pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
+    build_tcp_packet_static(
+        SLIRP_GATEWAY_IP,
+        SLIRP_GUEST_IP,
+        high_port,
+        guest_port,
+        our_seq,
+        0,
+        TcpControl::Syn,
+        &[],
+    )
+}
+
+#[cfg(not(any(test, feature = "bench-helpers")))]
+#[allow(dead_code)] // consumed in 5.5b.3
+fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
+    build_tcp_packet_static(
+        SLIRP_GATEWAY_IP,
+        SLIRP_GUEST_IP,
+        high_port,
+        guest_port,
+        our_seq,
+        0,
+        TcpControl::Syn,
+        &[],
+    )
+}
+
 // ── Utility functions ────────────────────────────────────────────────
 
 fn rand_seq() -> u32 {
@@ -1195,9 +2046,238 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
     !sum as u16
 }
 
-impl Default for SlirpStack {
+/// Spawn one listener thread per TCP port-forward rule and return the join
+/// handles, the receiver end of the accept channel, and the sender end.
+///
+/// The caller stores the handles in `SlirpBackend::port_forward_listeners`,
+/// the receiver in `SlirpBackend::pending_inbound_accepts`, and the sender in
+/// `SlirpBackend::accept_sender` (so the channel stays open when zero listener
+/// threads are running, e.g. in tests).
+///
+/// When `nat.port_forwards` contains no TCP rules the returned `Vec` is empty
+/// and no background threads are spawned.
+pub(crate) fn spawn_port_forward_listeners(
+    nat: &nat::Rules,
+    shutdown: &Arc<AtomicBool>,
+) -> (
+    Vec<JoinHandle<()>>,
+    mpsc::Receiver<InboundAccept>,
+    mpsc::Sender<InboundAccept>,
+) {
+    let (accept_tx, accept_rx) = mpsc::channel::<InboundAccept>();
+    let mut handles = Vec::new();
+    for port_forward in &nat.port_forwards {
+        if port_forward.proto != nat::ForwardProto::Tcp {
+            continue;
+        }
+        let host_port = port_forward.host_port;
+        let guest_port = port_forward.guest_port;
+        let tx = accept_tx.clone();
+        let shutdown = Arc::clone(shutdown);
+        let handle = std::thread::Builder::new()
+            .name(format!("slirp-pf-{host_port}-{guest_port}"))
+            .spawn(move || {
+                run_port_forward_listener(host_port, guest_port, tx, shutdown);
+            })
+            .expect("spawn port-forward listener thread");
+        handles.push(handle);
+    }
+    (handles, accept_rx, accept_tx)
+}
+
+/// Main loop for a port-forward listener thread.
+///
+/// Binds `127.0.0.1:host_port`, accepts connections in non-blocking mode,
+/// and forwards each accepted [`TcpStream`] to the net-poll thread via
+/// `accept_tx`.  The peer's remote port is used as `high_port` — it is
+/// unique per connection and requires no extra allocation.
+///
+/// The thread exits when `shutdown` is `true` or when `accept_tx.send`
+/// fails (receiver dropped — backend is shutting down).
+fn run_port_forward_listener(
+    host_port: u16,
+    guest_port: u16,
+    accept_tx: mpsc::Sender<InboundAccept>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let listener = match TcpListener::bind(("127.0.0.1", host_port)) {
+        Ok(listener) => listener,
+        Err(bind_error) => {
+            warn!(
+                host_port,
+                error = %bind_error,
+                "SLIRP port-forward: bind failed, port-forward disabled"
+            );
+            return;
+        }
+    };
+    if let Err(nb_error) = listener.set_nonblocking(true) {
+        warn!(
+            host_port,
+            error = %nb_error,
+            "SLIRP port-forward: set_nonblocking failed, port-forward disabled"
+        );
+        return;
+    }
+    debug!(
+        host_port,
+        guest_port, "SLIRP port-forward: listening on 127.0.0.1"
+    );
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                let high_port = peer_addr.port();
+                if let Err(nb_error) = stream.set_nonblocking(true) {
+                    warn!(
+                        host_port,
+                        guest_port,
+                        high_port,
+                        error = %nb_error,
+                        "SLIRP port-forward: accepted stream set_nonblocking failed, dropping"
+                    );
+                    continue;
+                }
+                trace!(
+                    host_port,
+                    guest_port,
+                    high_port,
+                    peer = %peer_addr,
+                    "SLIRP port-forward: accepted connection"
+                );
+                let accepted = InboundAccept {
+                    host_stream: stream,
+                    high_port,
+                    guest_port,
+                };
+                if accept_tx.send(accepted).is_err() {
+                    debug!(
+                        host_port,
+                        "SLIRP port-forward: backend gone, listener exiting"
+                    );
+                    return;
+                }
+            }
+            Err(ref would_block) if would_block.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(PORT_FORWARD_POLL_INTERVAL);
+            }
+            Err(accept_error) => {
+                warn!(
+                    host_port,
+                    error = %accept_error,
+                    "SLIRP port-forward: accept error"
+                );
+                std::thread::sleep(PORT_FORWARD_POLL_INTERVAL);
+            }
+        }
+    }
+    debug!(host_port, "SLIRP port-forward: listener shutting down");
+}
+
+impl Default for SlirpBackend {
     fn default() -> Self {
-        Self::new().expect("Failed to create default SlirpStack")
+        Self::new().expect("Failed to create default SlirpBackend")
+    }
+}
+
+impl Drop for SlirpBackend {
+    fn drop(&mut self) {
+        self.port_forward_shutdown.store(true, Ordering::Relaxed);
+        for handle in std::mem::take(&mut self.port_forward_listeners) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Test-only helpers — not compiled into production builds.
+///
+/// These are `#[cfg(test)]`/`#[cfg(feature = "bench-helpers")]` methods on
+/// `SlirpBackend` that allow unit tests and divan benches to insert synthetic
+/// flow entries without widening the visibility of private types.
+/// The full behavioral contract for the SynSent → Established transition is
+/// pinned in the E2E test `tcp_inbound_syn_ack_completes_handshake` below and
+/// will be further exercised end-to-end in task 5.5b.5
+/// (`tcp_port_forward_inbound` in `tests/network_baseline.rs`).
+#[cfg(any(test, feature = "bench-helpers"))]
+impl SlirpBackend {
+    /// Insert a synthetic `SynSent` entry into the flow table.
+    ///
+    /// Used by `tcp_inbound_syn_ack_completes_handshake` to pre-seed the state
+    /// that would normally be created by `synthesize_inbound_syn` (5.5b.2).
+    ///
+    /// `guest_port`: the guest's listening service port (e.g. 8080).
+    /// `high_port`:  the ephemeral source port we used for the synthesized SYN.
+    /// `our_isn`:    the ISN we put in the synthesized SYN.
+    /// `host_stream`: a `TcpStream` representing the accepted host-side connection.
+    pub fn insert_synthetic_synsent_entry(
+        &mut self,
+        guest_port: u16,
+        high_port: u16,
+        our_isn: u32,
+        host_stream: TcpStream,
+    ) {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        let entry = TcpNatEntry {
+            host_stream,
+            state: TcpNatState::SynSent,
+            our_seq: our_isn,
+            guest_ack: 0,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+        };
+        self.flow_table
+            .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
+    }
+
+    /// Return the `TcpNatState` for the flow identified by `(guest_port, GATEWAY_IP, high_port)`,
+    /// or `None` if no such entry exists in the flow table.
+    #[allow(dead_code)]
+    pub(crate) fn tcp_flow_state(&self, guest_port: u16, high_port: u16) -> Option<TcpNatState> {
+        let key = NatKey {
+            guest_src_port: guest_port,
+            dst_ip: SLIRP_GATEWAY_IP,
+            dst_port: high_port,
+        };
+        match self.flow_table.get(&FlowKey::Tcp(key))? {
+            FlowEntry::Tcp(entry) => Some(entry.state),
+            _ => None,
+        }
+    }
+
+    /// Count how many frames queued for injection carry the given TCP flags.
+    ///
+    /// Checks `inject_to_guest` for Ethernet/IPv4/TCP frames where the TCP
+    /// `ack` flag is set and the `syn` flag is clear (i.e. a plain ACK).
+    #[allow(dead_code)]
+    pub(crate) fn injected_plain_ack_count(&self) -> usize {
+        let mut count = 0;
+        for frame in &self.inject_to_guest {
+            if frame.len() < 54 {
+                continue;
+            }
+            let tcp_offset = 14 + 20;
+            let flags_byte = frame[tcp_offset + 13];
+            let ack = flags_byte & 0x10 != 0;
+            let syn = flags_byte & 0x02 != 0;
+            if ack && !syn {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Inject an [`InboundAccept`] directly into the accept channel, bypassing
+    /// the listener thread. Used by unit tests to drive
+    /// `process_pending_inbound_accepts` without a real listener.
+    #[allow(dead_code)]
+    pub(crate) fn push_inbound_accept(&self, accepted: InboundAccept) {
+        self.accept_sender
+            .send(accepted)
+            .expect("accept channel must be open");
     }
 }
 
@@ -1220,7 +2300,7 @@ mod tests {
 
     #[test]
     fn test_slirp_stack_creation() {
-        let stack = SlirpStack::new();
+        let stack = SlirpBackend::new();
         assert!(stack.is_ok());
     }
 
@@ -1232,44 +2312,217 @@ mod tests {
         assert_ne!(cksum, 0);
     }
 
-    #[test]
-    fn test_to_host_buffer_limit() {
-        assert_eq!(MAX_TO_HOST_BUFFER, 256 * 1024);
-    }
-
-    #[test]
-    fn test_tcp_nat_entry_has_write_buffer() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
-        stream.set_nonblocking(true).ok();
-
-        let entry = TcpNatEntry {
-            host_stream: stream,
-            state: TcpNatState::Established,
-            our_seq: 1000,
-            guest_ack: 2000,
-            to_guest: Vec::new(),
-            to_host: Vec::new(),
-            to_host_pending_ack: None,
-            last_activity: Instant::now(),
+    /// Build a TCP frame from the guest (SLIRP_GUEST_IP) to a given destination.
+    ///
+    /// Used by `tcp_inbound_syn_ack_completes_handshake` to synthesize the
+    /// guest's SYN-ACK reply to our port-forward SYN.
+    fn build_guest_tcp_frame(
+        dst_ip: Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack_number: u32,
+        control: TcpControl,
+        set_ack_flag: bool,
+    ) -> Vec<u8> {
+        use smoltcp::wire::{
+            EthernetAddress, EthernetFrame, EthernetRepr, IpAddress, Ipv4Packet, Ipv4Repr,
+            TcpPacket, TcpRepr, TcpSeqNumber,
         };
-
-        assert!(entry.to_host.is_empty());
-        assert!(entry.to_host_pending_ack.is_none());
+        let tcp_repr = TcpRepr {
+            src_port,
+            dst_port,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: if set_ack_flag {
+                Some(TcpSeqNumber(ack_number as i32))
+            } else {
+                None
+            },
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            payload: &[],
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: SLIRP_GUEST_IP,
+            dst_addr: dst_ip,
+            next_header: smoltcp::wire::IpProtocol::Tcp,
+            payload_len: tcp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: smoltcp::wire::EthernetProtocol::Ipv4,
+        };
+        let checksums = smoltcp::phy::ChecksumCapabilities::default();
+        let total = eth_repr.buffer_len() + ip_repr.buffer_len() + tcp_repr.buffer_len();
+        let mut buf = vec![0u8; total];
+        let mut eth = EthernetFrame::new_unchecked(&mut buf);
+        eth_repr.emit(&mut eth);
+        let mut ip = Ipv4Packet::new_unchecked(eth.payload_mut());
+        ip_repr.emit(&mut ip, &checksums);
+        let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+        tcp_repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(SLIRP_GUEST_IP),
+            &IpAddress::Ipv4(dst_ip),
+            &checksums,
+        );
+        buf
     }
 
+    /// Verify that a guest SYN-ACK frame on a SynSent entry:
+    ///   (a) transitions the flow state to Established, and
+    ///   (b) queues exactly one plain ACK frame towards the guest.
+    ///
+    /// The full E2E behavioral contract (including host-listener wiring) will be
+    /// pinned in `tests/network_baseline.rs::tcp_port_forward_inbound` (task 5.5b.5).
     #[test]
-    fn test_to_host_buffer_rejects_over_limit() {
-        let existing = vec![0u8; MAX_TO_HOST_BUFFER];
-        let new_payload = [0u8; 1];
-        assert!(existing.len() + new_payload.len() > MAX_TO_HOST_BUFFER);
+    fn tcp_inbound_syn_ack_completes_handshake() {
+        use std::net::TcpListener;
 
-        let small_existing = vec![0u8; MAX_TO_HOST_BUFFER - 10];
-        let fits = [0u8; 10];
-        assert!(small_existing.len() + fits.len() <= MAX_TO_HOST_BUFFER);
+        let guest_port: u16 = 8080;
+        let high_port: u16 = 44000;
+        let our_isn: u32 = 0x0000_1000;
+        let guest_isn: u32 = 0xDEAD_BEEF;
 
-        let overflows = [0u8; 11];
-        assert!(small_existing.len() + overflows.len() > MAX_TO_HOST_BUFFER);
+        // Create a loopback TcpStream pair for the host_stream field.
+        // The stream is never read/written in this unit test — we only
+        // exercise the TCP state machine.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let host_stream =
+            TcpStream::connect(listener.local_addr().unwrap()).expect("connect loopback");
+        host_stream.set_nonblocking(true).ok();
+
+        let mut backend = SlirpBackend::new().expect("SlirpBackend::new");
+        backend.insert_synthetic_synsent_entry(guest_port, high_port, our_isn, host_stream);
+
+        // Confirm state is SynSent before feeding the SYN-ACK.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::SynSent),
+            "entry must start as SynSent"
+        );
+
+        // Build the guest's SYN-ACK: src=GUEST:guest_port, dst=GATEWAY:high_port,
+        // SYN+ACK, seq=guest_isn, ack=our_isn+1.
+        let syn_ack = build_guest_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            guest_port,
+            high_port,
+            guest_isn,
+            our_isn.wrapping_add(1),
+            TcpControl::Syn, // SYN flag — combined with ACK flag via ack_number=Some(...)
+            true,            // set ACK flag
+        );
+
+        backend
+            .process_guest_frame(&syn_ack)
+            .expect("process SYN-ACK");
+
+        // (a) state must be Established now.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::Established),
+            "state must be Established after SYN-ACK"
+        );
+
+        // (b) exactly one plain ACK must have been queued for injection to the guest.
+        assert_eq!(
+            backend.injected_plain_ack_count(),
+            1,
+            "exactly one plain ACK must be queued for the guest"
+        );
+    }
+
+    /// Verify that `process_pending_inbound_accepts` drains one `InboundAccept`
+    /// from the channel, inserts a `SynSent` flow-table entry, and queues a
+    /// synthesized SYN frame for injection to the guest.
+    ///
+    /// This pins the contract for task 5.5b.3.  The test is white-box: it uses
+    /// `push_inbound_accept` (a `#[cfg(test)]` helper that injects into the
+    /// internal channel) so we don't need a real listener thread.
+    #[test]
+    fn process_pending_inbound_accepts_seeds_synsent_and_queues_syn() {
+        use std::net::TcpListener;
+
+        let guest_port: u16 = 9000;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let local_addr = listener.local_addr().unwrap();
+        let host_stream = TcpStream::connect(local_addr).expect("connect loopback");
+        let high_port = host_stream.local_addr().unwrap().port();
+        host_stream.set_nonblocking(true).ok();
+
+        let mut backend = SlirpBackend::new().expect("SlirpBackend::new");
+
+        // Inject an InboundAccept without a real listener thread.
+        backend.push_inbound_accept(InboundAccept {
+            host_stream,
+            high_port,
+            guest_port,
+        });
+
+        // Before processing, no flow entry should exist.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            None,
+            "no flow entry before processing"
+        );
+
+        // Drive process_pending_inbound_accepts.
+        backend.process_pending_inbound_accepts();
+
+        // After processing, a SynSent entry must exist.
+        assert_eq!(
+            backend.tcp_flow_state(guest_port, high_port),
+            Some(TcpNatState::SynSent),
+            "SynSent entry must be present after processing"
+        );
+
+        // Exactly one SYN frame must have been queued for injection.
+        // Note: build_tcp_packet_static sets ack_number=Some(0) which also
+        // sets the ACK flag bit; we detect the SYN by checking just the SYN bit.
+        let syn_count = backend
+            .inject_to_guest
+            .iter()
+            .filter(|frame| {
+                if frame.len() < 54 {
+                    return false;
+                }
+                let tcp_offset = 14 + 20;
+                let flags_byte = frame[tcp_offset + 13];
+                flags_byte & 0x02 != 0
+            })
+            .count();
+        assert_eq!(syn_count, 1, "exactly one SYN must be queued for the guest");
+    }
+
+    /// Verify that `with_security` spawns exactly one listener thread when
+    /// given one TCP port-forward rule, and zero threads when given none.
+    #[test]
+    fn with_security_spawns_listener_per_tcp_port_forward() {
+        // Empty port-forwards: no listener threads.
+        let empty = SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[])
+            .expect("SlirpBackend::with_security (empty)");
+        assert_eq!(
+            empty.port_forward_listeners.len(),
+            0,
+            "zero listener threads for empty port_forwards"
+        );
+
+        // One TCP port-forward: exactly one listener thread.
+        let one =
+            SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[(18080, 80)])
+                .expect("SlirpBackend::with_security (one forward)");
+        assert_eq!(
+            one.port_forward_listeners.len(),
+            1,
+            "one listener thread for one TCP port-forward rule"
+        );
     }
 }

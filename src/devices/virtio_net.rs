@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, trace, warn};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 
-use crate::network::slirp::{SlirpStack, GUEST_MAC};
+use crate::network::slirp::GUEST_MAC;
+use crate::network::NetworkBackend;
 use crate::Result;
 
 /// Virtio descriptor flags
@@ -142,8 +143,8 @@ struct QueueState {
 
 /// Virtio-net device state
 pub struct VirtioNetDevice {
-    /// SLIRP stack for networking
-    slirp: Arc<Mutex<SlirpStack>>,
+    /// Network backend (SLIRP or any [`NetworkBackend`] impl)
+    slirp: Arc<Mutex<dyn NetworkBackend>>,
     /// Guest MAC address
     mac: [u8; 6],
     /// Device features
@@ -166,6 +167,8 @@ pub struct VirtioNetDevice {
     tx_queue: QueueState,
     /// Packets waiting to be received by guest
     rx_buffer: Vec<Vec<u8>>,
+    /// Scratch buffer reused across `drain_to_guest` calls to avoid per-poll allocation
+    rx_scratch: Vec<Vec<u8>>,
     /// MMIO base address
     mmio_base: u64,
     /// MMIO size
@@ -181,8 +184,8 @@ pub struct VirtioNetDevice {
 }
 
 impl VirtioNetDevice {
-    /// Create a new virtio-net device with SLIRP backend
-    pub fn new(slirp: Arc<Mutex<SlirpStack>>) -> Result<Self> {
+    /// Create a new virtio-net device with the given network backend
+    pub fn new(slirp: Arc<Mutex<dyn NetworkBackend>>) -> Result<Self> {
         debug!("Creating virtio-net device with SLIRP backend");
 
         let device_features = features::VIRTIO_NET_F_MAC
@@ -208,6 +211,7 @@ impl VirtioNetDevice {
                 ..Default::default()
             },
             rx_buffer: Vec::new(),
+            rx_scratch: Vec::new(),
             mmio_base: 0,
             mmio_size: 0x200,
             tx_avail_idx: 0,
@@ -656,11 +660,13 @@ impl VirtioNetDevice {
 
     /// Get frames waiting to be received by guest (RX path)
     pub fn get_rx_frames(&mut self) -> Vec<Vec<u8>> {
-        // Poll SLIRP for new packets
-        let frames = {
-            let mut slirp = self.slirp.lock().unwrap();
-            slirp.poll()
-        };
+        // Drain backend frames into the reused scratch buffer.
+        self.rx_scratch.clear();
+        {
+            let mut backend = self.slirp.lock().unwrap();
+            backend.drain_to_guest(&mut self.rx_scratch);
+        }
+        let frames = std::mem::take(&mut self.rx_scratch);
 
         // Prepend virtio-net header to each frame
         let mut result = Vec::new();
@@ -784,6 +790,7 @@ impl VirtioNetDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::slirp::SlirpBackend;
 
     #[test]
     fn test_virtio_net_header() {
@@ -798,7 +805,8 @@ mod tests {
 
     #[test]
     fn test_mmio_magic() {
-        let slirp = Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+        let slirp: Arc<Mutex<dyn NetworkBackend>> =
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];
@@ -809,7 +817,8 @@ mod tests {
 
     #[test]
     fn test_mmio_version() {
-        let slirp = Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+        let slirp: Arc<Mutex<dyn NetworkBackend>> =
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];
@@ -820,7 +829,8 @@ mod tests {
 
     #[test]
     fn test_device_type() {
-        let slirp = Arc::new(Mutex::new(SlirpStack::new().unwrap()));
+        let slirp: Arc<Mutex<dyn NetworkBackend>> =
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
         let device = VirtioNetDevice::new(slirp).unwrap();
 
         let mut data = [0u8; 4];

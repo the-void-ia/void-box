@@ -1,13 +1,19 @@
 name: Startup Bench
 
-# Two layers, both run in this workflow:
+# Three layers, all run in this workflow:
 #
-#   1. **Divan micro-bench** — `cargo bench --bench startup`. Pure-compute
-#      hot paths (Message::serialize/deserialize, kernel_cmdline,
-#      getrandom). No KVM, no nested virt, no L2 boot — same wall-clock
-#      cost on every Linux runner. Cheap regression gate.
+#   1. **Divan micro-bench (startup)** — `cargo bench --bench startup`.
+#      Pure-compute hot paths (Message::serialize/deserialize,
+#      kernel_cmdline, getrandom). No KVM, no nested virt, no L2 boot —
+#      same wall-clock cost on every Linux runner. Cheap regression gate.
 #
-#   2. **Wall-clock harness** — `voidbox-startup-bench --iters 20
+#   2. **Divan micro-bench (network)** — `cargo bench --bench network`.
+#      SLIRP hot paths (process_syn, poll_idle, process_arp_request,
+#      poll_with_n_flows, dns_cache_hit, dns_cache_miss). Also pure
+#      compute, no nested virt — stable regression gate for the network
+#      stack without requiring KVM or a real VM boot.
+#
+#   3. **Wall-clock harness** — `voidbox-startup-bench --iters 20
 #      --breakdown`. Boots a real KVM VM through the slim kernel + test
 #      initramfs and measures cold-boot + warm-restore p50/p95/p99 end
 #      to end. Informational only on this runner: the GitHub-hosted
@@ -171,14 +177,37 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run wall-clock harness (informational)
-        # No threshold gate — Azure nested-virt is slower than the
-        # bare-metal targets the verify-skill thresholds were tuned for.
-        # `continue-on-error` keeps the workflow green even if the
-        # harness fails outright (e.g. missing /dev/vhost-vsock on a
-        # future runner image change). The artifact preserves the log
-        # either way.
-        continue-on-error: true
+      - name: Run network divan micro-bench (regression gate)
+        # Same regression-detection role as the startup divan step, but
+        # for SLIRP hot paths: process_syn, poll_idle, process_arp_request,
+        # poll_with_n_flows, dns_cache_hit, dns_cache_miss. Pure compute,
+        # no nested virt — stable across CI hosts. Output captured for
+        # artifact + step summary.
+        run: |
+          cargo bench --bench network 2>&1 | tee target/tmp/divan-network.log
+
+          {
+            echo
+            echo "## Divan network micro-bench (cargo bench --bench network)"
+            echo
+            echo '```'
+            grep -E 'fastest|median|slowest|^[a-z_]+\.' target/tmp/divan-network.log \
+              || tail -40 target/tmp/divan-network.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run wall-clock harness (strict)
+        # NO `continue-on-error` — was previously silently masking the
+        # vhost/userspace vsock backend mismatch on warm restore (root
+        # cause: `capture_snapshot` was building a Sandbox without
+        # `.enable_snapshots(true)` so vhost-vsock was selected, but
+        # `from_snapshot` always restores into userspace vsock; vring
+        # state lives in the kernel's vhost-vsock module and isn't part
+        # of our snapshot, so the restored userspace device couldn't
+        # accept connections and every host connect timed out).
+        # Threshold gate stays informal — Azure nested-virt is slower
+        # than the bare-metal Fedora 43 / KVM targets the verify-skill
+        # thresholds were tuned for, but the harness MUST exit 0.
         env:
           ITERS: ${{ inputs.iters || '20' }}
           VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
@@ -204,10 +233,51 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build voidbox-network-bench (release)
+        # Network wall-clock harness: boots one VM with `network(true)`,
+        # measures TCP throughput, RR/CRR latency, UDP DNS qps, and ICMP
+        # RR latency. Mirror the startup harness build step.
+        run: cargo build --release --bin voidbox-network-bench
+
+      - name: Run voidbox-network-bench (network wall-clock harness)
+        # NO `continue-on-error` here — unlike the startup-bench warm
+        # phase, this harness has well-defined failure modes that we
+        # want to surface in CI. A regression like the setuid-busybox
+        # bug fixed at 77dfc67 (Phase 1.6 → ECONNRESET on every
+        # connect for `network(true)` VMs) would otherwise hide behind
+        # `continue-on-error`. If this step is genuinely flaky on the
+        # runner image, fix the runner image — don't mask the signal.
+        env:
+          VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          if [ ! -e /dev/vhost-vsock ]; then
+            echo "::warning::/dev/vhost-vsock not available; skipping voidbox-network-bench"
+            exit 0
+          fi
+          ls -la "$VOID_BOX_KERNEL" "$VOID_BOX_INITRAMFS"
+          ./target/release/voidbox-network-bench --iterations 3 \
+            --output target/tmp/network-bench.json 2>&1 \
+            | tee target/tmp/network-bench.log
+
+          {
+            echo
+            echo "## Network wall-clock harness (voidbox-network-bench --iterations 3)"
+            echo
+            echo "Metric names mirror passt's published table (passt.top/passt) so a"
+            echo "future side-by-side comparison run on the same host is plug-compatible."
+            echo
+            echo '```json'
+            cat target/tmp/network-bench.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload bench logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: startup-bench-${{ github.run_id }}
-          path: target/tmp/*.log
+          path: |
+            target/tmp/*.log
+            target/tmp/*.json
           retention-days: 30

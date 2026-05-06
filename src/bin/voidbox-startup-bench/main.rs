@@ -138,10 +138,19 @@ async fn capture_snapshot(
     memory_mb: usize,
     dir: &std::path::Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // `enable_snapshots(true)` flips the backend selector at
+    // `backend/kvm.rs:212` to `VsockBackendType::Userspace`. Without
+    // this, the cold boot uses vhost-vsock and the snapshot file
+    // captures vhost-shaped state — but `from_snapshot` always
+    // restores into the userspace backend, producing a mismatch that
+    // surfaces as `control_channel: deadline reached` on the warm
+    // phase (vhost's vring state lives in the host kernel's
+    // vhost-vsock module and isn't part of our snapshot at all).
     let sandbox = Sandbox::local()
         .from_env()?
         .memory_mb(memory_mb)
         .network(false)
+        .enable_snapshots(true)
         .build()?;
     // Trigger cold boot.
     let _ = sandbox.exec("sh", &["-c", ":"]).await?;

@@ -6,9 +6,11 @@
 //! - virtio-net configuration
 //! - Network isolation and NAT
 
+pub mod nat;
 pub mod slirp;
 
 use std::ffi::CString;
+use std::io;
 
 use crate::{Error, Result};
 
@@ -60,6 +62,36 @@ impl NetworkConfig {
     pub fn port_forward(mut self, host_port: u16, guest_port: u16) -> Self {
         self.port_forwards.push((host_port, guest_port));
         self
+    }
+}
+
+/// A network backend processes raw Ethernet frames between guest and host.
+///
+/// Implementations must be `Send` so they can be held behind
+/// `Arc<Mutex<_>>` and accessed from both the vCPU thread (TX path) and
+/// the net-poll thread (RX path).
+pub trait NetworkBackend: Send {
+    /// Process a raw Ethernet frame sent by the guest.
+    ///
+    /// Called from the vCPU thread on MMIO write to the TX virtqueue.
+    /// Implementations must not block.
+    fn process_guest_frame(&mut self, frame: &[u8]) -> io::Result<()>;
+
+    /// Drain Ethernet frames destined for the guest into `out`.
+    ///
+    /// Called every ~5ms from the net-poll thread. Frames are
+    /// complete Ethernet payloads — no virtio-net header (the caller
+    /// prepends that). The buffer is reused across calls to avoid
+    /// per-poll allocation.
+    fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>);
+
+    /// Return the backend health status.
+    ///
+    /// `false` means the backend has entered an unrecoverable state
+    /// and should be reconstructed by the caller. The default
+    /// implementation always returns `true`.
+    fn is_healthy(&self) -> bool {
+        true
     }
 }
 
