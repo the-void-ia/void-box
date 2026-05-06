@@ -434,6 +434,17 @@ impl VirtioNetDevice {
         }
     }
 
+    /// Process the TX queue from outside the vCPU thread.
+    ///
+    /// Called by `net_poll_thread` when the KVM_IOEVENTFD registered for
+    /// the virtio-net QUEUE_NOTIFY MMIO fires.  Same body as the
+    /// synchronous TX-queue handler used from the MMIO write path,
+    /// just exposed under a different name so callers outside this
+    /// module can drive it.
+    pub fn process_tx_queue_external<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
+        self.process_tx_queue(mem)
+    }
+
     /// Process TX queue: read descriptor chains from guest, send frames to SLIRP, update used ring.
     fn process_tx_queue<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
         let q = &self.tx_queue;

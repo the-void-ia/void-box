@@ -1683,6 +1683,74 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
         };
 
+    // KVM_IOEVENTFD for the virtio-net TX queue notify.
+    //
+    // Without this, every guest TX (write to QUEUE_NOTIFY MMIO with value=1)
+    // forces a KVM_RUN exit, the vCPU thread dispatches into virtio-net's
+    // MMIO write handler, then calls process_tx_queue and re-enters KVM_RUN.
+    // ~1–5 µs per packet of pure VM-exit overhead.
+    //
+    // With KVM_IOEVENTFD: the guest's MMIO write is consumed in-kernel,
+    // KVM signals the eventfd, and the vCPU thread continues running.
+    // The net-poll thread sees the eventfd as another epoll source, drains
+    // it, and calls process_tx_queue asynchronously.  No vCPU exit.
+    //
+    // Address: virtio-net mmio_base (0xd000_0000) + QUEUE_NOTIFY offset
+    // (0x050) = 0xd000_0050.  Datamatch=1 triggers only on TX queue
+    // notifies (value=1 → queue index 1 = transmit queue).  Notifies for
+    // queue 0 (RX) still take the slow path through MMIO; they're rare
+    // (only when guest adds new RX buffers) so the optimisation isn't
+    // needed there.
+    const VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
+    const VIRTIO_NET_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
+    const TX_NOTIFY_QUEUE_IDX: u32 = 1;
+    let tx_notify_eventfd: Option<vmm_sys_util::eventfd::EventFd> =
+        match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+            Ok(fd) => {
+                let mmio_addr = kvm_ioctls::IoEventAddress::Mmio(
+                    VIRTIO_NET_MMIO_BASE + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
+                );
+                match vm
+                    .vm_fd()
+                    .register_ioevent(&fd, &mmio_addr, TX_NOTIFY_QUEUE_IDX)
+                {
+                    Ok(()) => Some(fd),
+                    Err(e) => {
+                        debug!(
+                            "net-poll: KVM_IOEVENTFD register failed; TX notifies will continue to take MMIO exits: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "net-poll: eventfd create for tx-notify failed; falling back to MMIO-exit TX path: {}",
+                    e
+                );
+                None
+            }
+        };
+    // Token used to identify the TX-notify eventfd in epoll readiness
+    // events.  Lives in a tag space that doesn't collide with the
+    // PROTO_TAG_* values SlirpBackend uses for flow tokens.
+    const TX_NOTIFY_TOKEN: u64 = 0x4000_0000_0000_0000;
+    if let Some(ref fd) = tx_notify_eventfd {
+        if let Some(ref ep_arc) = epoll_arc {
+            if let Err(e) = ep_arc.register(
+                fd.as_raw_fd(),
+                TX_NOTIFY_TOKEN,
+                crate::network::epoll_dispatch::RegisterMode::Read,
+            ) {
+                debug!(
+                    "net-poll: failed to register tx-notify eventfd with epoll dispatch: {}",
+                    e
+                );
+            }
+        }
+    }
+
     while running.load(Ordering::Relaxed) {
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
@@ -1715,11 +1783,37 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             IDLE_TIMEOUT
         };
 
-        // Push ready events into the backend's queue before acquiring the
-        // device lock for inject/IRQ work. drain_to_guest will consume them
-        // without re-locking EpollDispatch, eliminating mutex contention
-        // between the net-poll thread's 50 ms blocking wait and the vCPU
-        // thread's process_guest_frame → drain_to_guest path.
+        // Filter out the TX-notify eventfd event (if any) before pushing
+        // the rest to the SLIRP backend.  When the guest writes to the
+        // virtio-net QUEUE_NOTIFY MMIO with value=1, KVM consumes it
+        // in-kernel and signals our eventfd; we drain it here and call
+        // process_tx_queue ourselves — the vCPU thread never exits for
+        // that MMIO write.
+        let mut tx_notify_fired = false;
+        if tx_notify_eventfd.is_some() {
+            epoll_events.retain(|e| {
+                if e.token == TX_NOTIFY_TOKEN {
+                    tx_notify_fired = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if tx_notify_fired {
+            if let Some(ref efd) = tx_notify_eventfd {
+                let _ = efd.read();
+            }
+            if let Ok(mut guard) = net_dev.lock() {
+                let _ = guard.process_tx_queue_external(guest_memory);
+            }
+        }
+
+        // Push remaining (flow) events into the backend's queue before
+        // acquiring the device lock for inject/IRQ work.  drain_to_guest
+        // will consume them without re-locking EpollDispatch, eliminating
+        // mutex contention between the net-poll thread's blocking wait and
+        // the vCPU thread's process_guest_frame → drain_to_guest path.
         if !epoll_events.is_empty() {
             if let Ok(guard) = net_dev.lock() {
                 guard.push_events_to_backend(&epoll_events);
