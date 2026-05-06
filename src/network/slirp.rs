@@ -163,6 +163,17 @@ fn next_flow_token(proto_tag: u64) -> u64 {
     proto_tag | counter
 }
 
+/// Marks the calling code path as cold so the compiler keeps it out of the
+/// hot inline window.
+///
+/// `std::hint::cold_path` is still unstable as of Rust 1.93, so this stable
+/// `#[cold] #[inline(never)]` no-op stub is the portable equivalent: the
+/// optimizer treats the call site as a rare branch and lays out the
+/// surrounding code with the cold arm spilled away from the hot path.
+#[cold]
+#[inline(never)]
+fn cold_branch() {}
+
 /// Build an epoll token for a port-forward listener FD.
 ///
 /// The high byte carries `PROTO_TAG_LISTEN`; the low 16 bits encode the
@@ -1646,6 +1657,7 @@ impl SlirpBackend {
         // Placed before the SynReceived ACK branch to be explicit (the
         // states are mutually exclusive, but explicit ordering is clearer).
         if tcp.ack() && entry.state == TcpNatState::LastAck {
+            cold_branch();
             debug!("SLIRP TCP: LastAck → Closed for {}:{}", dst_ip, dst_port);
             entry.state = TcpNatState::Closed;
             self.pending_close.push(flow_key);
@@ -1712,6 +1724,7 @@ impl SlirpBackend {
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => {
+                            cold_branch();
                             warn!(
                                 "SLIRP TCP: ACK-driven read failed on flow guest_port={}, marking Closed: {}",
                                 key.guest_src_port, e
@@ -1749,12 +1762,12 @@ impl SlirpBackend {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(e) => {
+                    cold_branch();
                     warn!(
                         "SLIRP TCP: write to host failed on flow guest_port={}, marking Closed: {}",
                         key.guest_src_port, e
                     );
                     entry.state = TcpNatState::Closed;
-                    // entry last used above; borrow ends here before pending_close push.
                     self.pending_close.push(flow_key);
                     return Ok(());
                 }
@@ -1789,6 +1802,7 @@ impl SlirpBackend {
 
         // FIN from guest
         if tcp.fin() {
+            cold_branch();
             debug!("SLIRP TCP: FIN from guest for {}:{}", dst_ip, dst_port);
             match entry.state {
                 TcpNatState::Established => {
@@ -1875,9 +1889,9 @@ impl SlirpBackend {
 
         // RST from guest
         if tcp.rst() {
+            cold_branch();
             debug!("SLIRP TCP: RST from guest for {}:{}", dst_ip, dst_port);
             entry.state = TcpNatState::Closed;
-            // entry last used above; borrow ends before pending_close push.
             self.pending_close.push(flow_key);
             return Ok(());
         }
@@ -1913,6 +1927,7 @@ impl SlirpBackend {
     /// cost separately from SYN setup.
     ///
     /// [`EINPROGRESS`]: libc::EINPROGRESS
+    #[cold]
     fn handle_tcp_syn_outbound(
         &mut self,
         tcp: &TcpPacket<&[u8]>,
