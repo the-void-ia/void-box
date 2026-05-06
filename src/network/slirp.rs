@@ -1570,6 +1570,7 @@ impl SlirpBackend {
 
     // ── TCP NAT ─────────────────────────────────────────────────────
 
+    #[inline(never)]
     fn handle_tcp_frame(&mut self, ipv4: &Ipv4Packet<&[u8]>) -> Result<()> {
         let tcp = match TcpPacket::new_checked(ipv4.payload()) {
             Ok(t) => t,
