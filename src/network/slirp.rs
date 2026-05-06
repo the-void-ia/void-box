@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
 use crate::network::epoll_dispatch::{EpollDispatch, EpollEvent, RegisterMode, Waker};
 use crate::network::{nat, NetworkBackend};
 
@@ -95,6 +97,12 @@ const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// matches the POSIX TIME_WAIT recommendation and prevents LastAck entries
 /// from leaking indefinitely when a guest drops the final ACK.
 const LAST_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for TCP entries stuck in the Connecting state (i.e. a non-blocking
+/// `connect()` was issued but EPOLLOUT readiness never arrived — a silent
+/// firewall drop is the common cause). Matches the pre-Phase-6.2 synchronous
+/// `connect_timeout(3 s)` so guest-visible behavior is unchanged.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// ICMP unprivileged probe state.
 ///
@@ -177,18 +185,26 @@ pub(crate) struct InboundAccept {
 /// State transitions:
 ///
 /// ```text
-///   SynReceived ──ACK──► Established ──guest FIN──► FinWait1
-///   SynSent ──SYN+ACK──► Established               │  │
-///                              │                    │  └─ host EOF ──► LastAck
-///                              │ host EOF            │                     │
-///                              ▼                    │          guest ACK ──┘
-///                          CloseWait ◄──────────────┘            └──► Closed
+///   Connecting ──SO_ERROR==0──► SynReceived ──ACK──► Established ──guest FIN──► FinWait1
+///       │                                                  │  │
+///       └ SO_ERROR != 0 / CONNECT_TIMEOUT ──► Closed       │  │
+///                                                          │  │
+///   SynSent ──SYN+ACK──► Established                       │  │
+///                              │                            │  └─ host EOF ──► LastAck
+///                              │ host EOF                    │                     │
+///                              ▼                            │          guest ACK ──┘
+///                          CloseWait ◄────────────────────┘            └──► Closed
 ///                              │ guest FIN
 ///                              ▼
 ///                           LastAck ──── LAST_ACK_TIMEOUT ────► Closed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TcpNatState {
+    /// Non-blocking connect issued; waiting for EPOLLOUT readiness to
+    /// arrive on the host socket. On readiness we check
+    /// `getsockopt(SO_ERROR)`: zero → transition to `SynReceived` and send
+    /// SYN-ACK to guest; non-zero → send RST to guest and reap.
+    Connecting,
     /// Guest sent SYN; we responded with SYN-ACK; waiting for guest's
     /// final ACK to complete the outbound 3-way handshake.
     SynReceived,
@@ -244,6 +260,14 @@ struct TcpNatEntry {
     /// FIN on repeated epoll readiness events for the same transition.
     /// Read in relay_tcp_nat_data's FIN-emit logic (Task 3).
     our_fin_sent: bool,
+    /// Guest's initial sequence number (`seq` from the original SYN
+    /// frame).  Stashed here only for entries in `Connecting` state so
+    /// the EPOLLOUT-driven completion path can build SYN-ACK with the
+    /// correct ack number (= `guest_isn + 1`).  Once the entry transitions
+    /// to `SynReceived` this field is no longer read.
+    #[allow(dead_code)]
+    // Read by EPOLLOUT-driven completion in relay_pending_connects (Task 5).
+    guest_isn: u32,
 }
 
 /// Key for the ICMP echo NAT table: (guest ICMP id, destination IP).
@@ -845,6 +869,10 @@ impl SlirpBackend {
                 flow_token: token,
                 last_state_change: Instant::now(),
                 our_fin_sent: false,
+                // Inbound port-forward entries never enter Connecting; the
+                // EPOLLOUT-driven completion path only reads guest_isn for
+                // outbound (guest-initiated) SYNs.
+                guest_isn: 0,
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -971,6 +999,12 @@ impl SlirpBackend {
 
         // 0b. Drain the accept channel (epoll-driven listeners + test helpers).
         self.process_pending_inbound_accepts();
+
+        // 3b. Complete any async connects whose EPOLLOUT fired this cycle.
+        //     Must run before relay_tcp_nat_data so a flow that transitions
+        //     from Connecting→SynReceived within this cycle can be skipped by
+        //     the data-relay pass (it's not yet in Established).
+        self.relay_pending_connects(&ready);
 
         // 4. Process TCP NAT data relay.
         self.relay_tcp_nat_data(&ready);
@@ -1580,10 +1614,45 @@ impl SlirpBackend {
             }
             self.flow_table.remove(&FlowKey::Tcp(key));
 
-            // Connect to the host address resolved by translate_outbound above.
-            match TcpStream::connect_timeout(&dst_addr, Duration::from_secs(3)) {
-                Ok(stream) => {
-                    stream.set_nonblocking(true).ok();
+            // Issue a non-blocking connect to the host address resolved by
+            // translate_outbound above.  socket2's Type::STREAM.nonblocking()
+            // sets O_NONBLOCK at socket creation so the connect() syscall
+            // returns EINPROGRESS immediately for destinations that require a
+            // network round-trip (the common case).  The vCPU thread is never
+            // blocked.  EPOLLOUT readiness on the connecting socket, handled
+            // in relay_pending_connects(), signals completion.
+            let socket = match Socket::new(
+                Domain::IPV4,
+                Type::STREAM.nonblocking(),
+                Some(Protocol::TCP),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "SLIRP TCP: socket() failed for {}:{}: {}",
+                        dst_ip, dst_port, e
+                    );
+                    let rst = build_tcp_packet_static(
+                        dst_ip,
+                        SLIRP_GUEST_IP,
+                        dst_port,
+                        src_port,
+                        0,
+                        seq + 1,
+                        TcpControl::Rst,
+                        &[],
+                    );
+                    self.inject_to_guest.push(rst);
+                    return Ok(());
+                }
+            };
+            let sockaddr = SockAddr::from(dst_addr);
+            match socket.connect(&sockaddr) {
+                Ok(()) => {
+                    // Connected immediately (loopback fast path).  Promote
+                    // straight to SynReceived and send SYN-ACK without waiting
+                    // for EPOLLOUT.
+                    let stream = TcpStream::from(socket);
                     let host_fd = stream.as_raw_fd();
                     let our_seq: u32 = rand_seq();
                     let token = next_flow_token(PROTO_TAG_TCP);
@@ -1598,6 +1667,7 @@ impl SlirpBackend {
                         flow_token: token,
                         last_state_change: Instant::now(),
                         our_fin_sent: false,
+                        guest_isn: seq,
                     };
                     self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                     self.token_to_key.insert(token, flow_key);
@@ -1612,8 +1682,6 @@ impl SlirpBackend {
                         );
                     }
                     self.epoll_waker.wake();
-
-                    // Send SYN-ACK back to guest
                     let syn_ack = build_tcp_packet_static(
                         dst_ip,
                         SLIRP_GUEST_IP,
@@ -1625,14 +1693,59 @@ impl SlirpBackend {
                         &[],
                     );
                     self.inject_to_guest.push(syn_ack);
-                    debug!("SLIRP TCP: SYN-ACK sent for {}:{}", dst_ip, dst_port);
+                    debug!(
+                        "SLIRP TCP: SYN-ACK sent for {}:{} (immediate connect)",
+                        dst_ip, dst_port
+                    );
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+                    // Async connect in progress.  Insert a Connecting entry,
+                    // register the FD for EPOLLOUT, and return without sending
+                    // a SYN-ACK.  relay_pending_connects() will promote this
+                    // entry to SynReceived and send the SYN-ACK once the
+                    // kernel's connect finishes.
+                    let stream = TcpStream::from(socket);
+                    let host_fd = stream.as_raw_fd();
+                    let our_seq: u32 = rand_seq();
+                    let token = next_flow_token(PROTO_TAG_TCP);
+                    let flow_key = FlowKey::Tcp(key);
+                    let entry = TcpNatEntry {
+                        host_stream: stream,
+                        state: TcpNatState::Connecting,
+                        our_seq,
+                        guest_ack: seq + 1,
+                        last_activity: Instant::now(),
+                        bytes_in_flight: 0,
+                        flow_token: token,
+                        last_state_change: Instant::now(),
+                        our_fin_sent: false,
+                        guest_isn: seq,
+                    };
+                    self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+                    self.token_to_key.insert(token, flow_key);
+                    if let Err(e) = self.epoll.register(host_fd, token, RegisterMode::Write) {
+                        warn!(
+                            guest_src_port = key.guest_src_port,
+                            dst_ip = %key.dst_ip,
+                            dst_port = key.dst_port,
+                            fd = host_fd,
+                            error = %e,
+                            "SLIRP TCP: epoll register (Write) failed for connect-in-progress; \
+                             flow will time out via CONNECT_TIMEOUT"
+                        );
+                    }
+                    self.epoll_waker.wake();
+                    debug!(
+                        "SLIRP TCP: connect-in-progress for {}:{} (our_seq={})",
+                        dst_ip, dst_port, our_seq
+                    );
                 }
                 Err(e) => {
+                    // Synchronous connect failure (address unreachable, etc.).
                     warn!(
-                        "SLIRP TCP: connect to {}:{} failed: {}",
+                        "SLIRP TCP: connect to {}:{} failed synchronously: {}",
                         dst_ip, dst_port, e
                     );
-                    // Send RST to guest
                     let rst = build_tcp_packet_static(
                         dst_ip,
                         SLIRP_GUEST_IP,
@@ -1947,6 +2060,136 @@ impl SlirpBackend {
         Ok(())
     }
 
+    /// Drive async-connect completion for flows in the `Connecting` state.
+    ///
+    /// For each EPOLLOUT event that maps to a `Connecting` flow, we call
+    /// `getsockopt(SO_ERROR)` to learn the actual connect outcome:
+    ///
+    /// - `SO_ERROR == 0`: connected.  Transition to `SynReceived`, send
+    ///   SYN-ACK to guest, re-register the fd for `EPOLLIN` (Read) via
+    ///   `EPOLL_CTL_MOD` so data relay can begin.
+    /// - `SO_ERROR != 0`: failed.  Send RST to guest, mark Closed, enqueue
+    ///   in `pending_close` for cleanup on the next `relay_tcp_nat_data` pass.
+    ///
+    /// Called from `drain_to_guest` before `relay_tcp_nat_data` so a flow that
+    /// completes connect and has data arrive in the same epoll cycle is handled
+    /// correctly: the transition fires here, and data relay skips the flow
+    /// because it is still in `SynReceived` (not yet `Established`).
+    fn relay_pending_connects(&mut self, ready: &[EpollEvent]) {
+        // Collect keys for Connecting flows with an EPOLLOUT event this cycle.
+        // We copy the keys to avoid holding a borrow on self while mutating.
+        let connecting_keys: Vec<FlowKey> = ready
+            .iter()
+            .filter(|event| event.writable && event.token & PROTO_TAG_MASK == PROTO_TAG_TCP)
+            .filter_map(|event| self.token_to_key.get(&event.token).copied())
+            .filter(|flow_key| {
+                matches!(
+                    self.flow_table.get(flow_key),
+                    Some(FlowEntry::Tcp(e)) if e.state == TcpNatState::Connecting
+                )
+            })
+            .collect();
+
+        for flow_key in connecting_keys {
+            let FlowKey::Tcp(key) = flow_key else {
+                continue;
+            };
+
+            // Check SO_ERROR to learn the actual connect outcome.
+            let (host_fd, guest_isn, our_seq, flow_token) = {
+                let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) else {
+                    continue;
+                };
+                (
+                    entry.host_stream.as_raw_fd(),
+                    entry.guest_isn,
+                    entry.our_seq,
+                    entry.flow_token,
+                )
+            };
+
+            let mut so_error: libc::c_int = 0;
+            let mut so_error_len: libc::socklen_t =
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: getsockopt with SOL_SOCKET/SO_ERROR writes one c_int.
+            let getsockopt_result = unsafe {
+                libc::getsockopt(
+                    host_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut so_error as *mut _ as *mut libc::c_void,
+                    &mut so_error_len,
+                )
+            };
+
+            if getsockopt_result < 0 || so_error != 0 {
+                // Connect failed.
+                let connect_err = if getsockopt_result < 0 {
+                    io::Error::last_os_error()
+                } else {
+                    io::Error::from_raw_os_error(so_error)
+                };
+                warn!(
+                    guest_src_port = key.guest_src_port,
+                    dst_ip = %key.dst_ip,
+                    dst_port = key.dst_port,
+                    error = %connect_err,
+                    "SLIRP TCP: async connect failed; sending RST to guest"
+                );
+                let rst = build_tcp_packet_static(
+                    key.dst_ip,
+                    SLIRP_GUEST_IP,
+                    key.dst_port,
+                    key.guest_src_port,
+                    0,
+                    guest_isn.wrapping_add(1),
+                    TcpControl::Rst,
+                    &[],
+                );
+                self.inject_to_guest.push(rst);
+                if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
+                    entry.state = TcpNatState::Closed;
+                    entry.last_state_change = Instant::now();
+                }
+                self.pending_close.push(flow_key);
+                continue;
+            }
+
+            // Connected.  Re-register for Read before sending SYN-ACK so
+            // the next drain_to_guest cycle can relay host→guest data.
+            // EPOLL_CTL_MOD is atomic — no window where a data event could
+            // be lost between a DEL and ADD.
+            if let Err(e) = self.epoll.modify(host_fd, flow_token, RegisterMode::Read) {
+                warn!(
+                    guest_src_port = key.guest_src_port,
+                    error = %e,
+                    "SLIRP TCP: epoll modify Write→Read failed; flow may stall on data relay"
+                );
+            }
+
+            // Transition to SynReceived and send SYN-ACK.
+            if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
+                entry.state = TcpNatState::SynReceived;
+                entry.last_state_change = Instant::now();
+            }
+            let syn_ack = build_tcp_packet_static(
+                key.dst_ip,
+                SLIRP_GUEST_IP,
+                key.dst_port,
+                key.guest_src_port,
+                our_seq,
+                guest_isn.wrapping_add(1),
+                TcpControl::Syn,
+                &[],
+            );
+            self.inject_to_guest.push(syn_ack);
+            debug!(
+                "SLIRP TCP: async connect OK for {}:{} guest_src_port={}; SYN-ACK sent",
+                key.dst_ip, key.dst_port, key.guest_src_port
+            );
+        }
+    }
+
     /// Relay data from host TCP connections to guest, driven by epoll readiness.
     ///
     /// Closed flows enqueued by handle_tcp_frame (FIN/RST) are drained from
@@ -1987,6 +2230,23 @@ impl SlirpBackend {
                 {
                     warn!(
                         "SLIRP TCP: LastAck timeout for guest_port={}, reaping",
+                        if let FlowKey::Tcp(k) = flow_key {
+                            k.guest_src_port
+                        } else {
+                            0
+                        }
+                    );
+                    to_remove_set.insert(*flow_key);
+                }
+                // Connecting-timeout: the kernel is still issuing SYNs (silent
+                // firewall drop) and EPOLLOUT has not fired within CONNECT_TIMEOUT.
+                // Send RST to guest and reap.  This matches the pre-Phase-6.2
+                // synchronous connect_timeout(3 s) behavior.
+                if tcp_entry.state == TcpNatState::Connecting
+                    && tcp_entry.last_state_change.elapsed() > CONNECT_TIMEOUT
+                {
+                    warn!(
+                        "SLIRP TCP: Connecting timeout for guest_port={}, reaping",
                         if let FlowKey::Tcp(k) = flow_key {
                             k.guest_src_port
                         } else {
@@ -2175,9 +2435,27 @@ impl SlirpBackend {
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
                 self.epoll.unregister(entry.host_stream.as_raw_fd()).ok();
+                // Connecting entries that timed out never received a SYN-ACK,
+                // so we must send RST now to inform the guest.
+                if entry.state == TcpNatState::Connecting {
+                    if let FlowKey::Tcp(key) = flow_key {
+                        let rst = build_tcp_packet_static(
+                            key.dst_ip,
+                            SLIRP_GUEST_IP,
+                            key.dst_port,
+                            key.guest_src_port,
+                            0,
+                            entry.guest_isn.wrapping_add(1),
+                            TcpControl::Rst,
+                            &[],
+                        );
+                        frames_to_inject.push(rst);
+                    }
+                }
             }
             self.flow_table.remove(&flow_key);
         }
+        self.inject_to_guest.append(&mut frames_to_inject);
     }
 
     /// Drain replies from each active ICMP echo socket and emit echo-reply
@@ -2731,6 +3009,29 @@ impl SlirpBackend {
     pub fn rebuild_epoll_from_flow_table(&mut self) {
         use std::os::fd::AsRawFd;
         self.token_to_key.clear();
+
+        // Collect Connecting keys for reaping: post-snapshot the underlying
+        // socket fd is dead (the kernel's connect state lives in vhost-vsock
+        // and does not survive snapshot).  Re-registering a dead fd for
+        // EPOLLOUT would stall the flow until CONNECT_TIMEOUT fires — reaping
+        // immediately is correct and matches the "no useful state to persist"
+        // principle stated in the Phase 6.2 plan.
+        let connecting_keys: Vec<FlowKey> = self
+            .flow_table
+            .iter()
+            .filter_map(|(k, v)| {
+                if let FlowEntry::Tcp(e) = v {
+                    if e.state == TcpNatState::Connecting {
+                        return Some(*k);
+                    }
+                }
+                None
+            })
+            .collect();
+        for key in connecting_keys {
+            self.flow_table.remove(&key);
+        }
+
         for (flow_key, entry) in &self.flow_table {
             match (flow_key, entry) {
                 (FlowKey::Tcp(_), FlowEntry::Tcp(e)) => {
@@ -2804,6 +3105,7 @@ impl SlirpBackend {
             flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: false,
+            guest_isn: 0,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -2922,6 +3224,7 @@ impl SlirpBackend {
             flow_token: token,
             last_state_change: Instant::now(),
             our_fin_sent: true,
+            guest_isn: 0,
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
@@ -2948,6 +3251,56 @@ impl SlirpBackend {
             // appears to have occurred `age` ago.
             entry.last_state_change = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         }
+    }
+
+    /// Insert a synthetic `Connecting` entry into the flow table without
+    /// issuing an actual `connect()` syscall.
+    ///
+    /// Used by `process_syn_during_pending_connects` to pre-populate the flow
+    /// table with `n_pending` Connecting entries so the bench can measure
+    /// `process_guest_frame`'s cost as a function of pending-connect backlog.
+    ///
+    /// The synthetic stream is a loopback pair so it has a valid fd; the
+    /// entry's state is forced to Connecting, and the fd is registered for
+    /// EPOLLOUT (matching what a real non-blocking connect would do).
+    pub fn insert_synthetic_connecting_entry(
+        &mut self,
+        guest_src_port: u16,
+        dst_ip: Ipv4Address,
+        dst_port: u16,
+    ) {
+        use std::net::TcpListener;
+        // Create a real but idle stream pair so host_stream holds a valid fd.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).expect("connect");
+        stream.set_nonblocking(true).ok();
+        let key = NatKey {
+            guest_src_port,
+            dst_ip,
+            dst_port,
+        };
+        let host_fd = stream.as_raw_fd();
+        let token = next_flow_token(PROTO_TAG_TCP);
+        let flow_key = FlowKey::Tcp(key);
+        let entry = TcpNatEntry {
+            host_stream: stream,
+            state: TcpNatState::Connecting,
+            our_seq: rand_seq(),
+            guest_ack: 1,
+            last_activity: Instant::now(),
+            bytes_in_flight: 0,
+            flow_token: token,
+            last_state_change: Instant::now(),
+            our_fin_sent: false,
+            guest_isn: 1000,
+        };
+        self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
+        self.token_to_key.insert(token, flow_key);
+        // Register for EPOLLOUT so the synthetic entry looks like a real
+        // in-progress connect from the epoll dispatcher's perspective.
+        let _ = self.epoll.register(host_fd, token, RegisterMode::Write);
+        // listener is dropped here but stream keeps the connection alive.
     }
 }
 

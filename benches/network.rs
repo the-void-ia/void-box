@@ -1032,4 +1032,41 @@ mod linux_benches {
             &[],
         )
     }
+
+    /// Measure `process_guest_frame` cost as a function of pending-connect
+    /// backlog size.
+    ///
+    /// A correct implementation inserts into the flow table and registers one
+    /// epoll fd per SYN — both O(1) operations — so the cost should be flat
+    /// across all parametric arms.  Regression in any arm indicates the SYN
+    /// handler accidentally iterates the flow table or the Connecting backlog.
+    #[cfg(feature = "bench-helpers")]
+    #[divan::bench(args = [0usize, 10, 100, 1000])]
+    fn process_syn_during_pending_connects(bencher: Bencher, n_pending: usize) {
+        // Pre-bind a real listener so the "good" SYN below has somewhere to
+        // connect.  We don't need to accept — the test measures the
+        // process_guest_frame fast path only.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good_port = listener.local_addr().unwrap().port();
+
+        let mut stack = SlirpBackend::new().unwrap();
+
+        // Pre-populate with n_pending synthetic Connecting entries on distinct
+        // guest source ports so they don't collide with the bench SYN below
+        // (which uses guest_src_port 49152).
+        // TEST-NET-1 (192.0.2.0/24) is reserved for documentation — not
+        // routable, so an actual connect would hang on SYN retransmits.
+        let bad_dst_ip = smoltcp::wire::Ipv4Address::new(192, 0, 2, 1);
+        for i in 0..n_pending {
+            let guest_src_port = 60000u16.wrapping_add(i as u16);
+            stack.insert_synthetic_connecting_entry(guest_src_port, bad_dst_ip, 80);
+        }
+
+        // The SYN frame to time: fresh guest source port, real destination.
+        let frame = build_syn(49152, good_port);
+
+        bencher.bench_local(|| {
+            let _ = divan::black_box(&mut stack).process_guest_frame(divan::black_box(&frame));
+        });
+    }
 } // mod linux_benches

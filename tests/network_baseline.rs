@@ -1641,3 +1641,160 @@ fn tcp_last_ack_timeout_reaps_stale_entry() {
         "LastAck entry past LAST_ACK_TIMEOUT must be reaped by drain_to_guest"
     );
 }
+
+/// Phase 6.2 pin: a SYN to an unreachable destination must NOT block the
+/// vCPU thread inside `process_guest_frame`.  The synchronous
+/// `connect_timeout(3s)` that lived in `handle_tcp_frame` froze every
+/// other flow for the full 3-second window.  Async connect returns
+/// immediately (`EINPROGRESS`); completion arrives via EPOLLOUT on the
+/// net-poll thread.
+#[test]
+fn tcp_connect_to_unreachable_does_not_block_other_flows() {
+    use std::time::Instant;
+
+    // Good destination — bind a listener.
+    let good_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let good_port = good_listener.local_addr().unwrap().port();
+
+    // Bad destination — TEST-NET-1 (RFC 5737, 192.0.2.0/24) is reserved
+    // for documentation and is not routable on the public Internet, so the
+    // kernel's connect will hang on SYN retransmits rather than returning
+    // an immediate ECONNREFUSED. This is exactly the path that today's
+    // synchronous `connect_timeout(3s)` would block on.
+    let bad_ip = Ipv4Address::new(192, 0, 2, 1);
+    let bad_port: u16 = 80;
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    let our_seq_bad = 1000u32;
+    let our_seq_good = 2000u32;
+
+    let bad_syn_at = Instant::now();
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            bad_ip,
+            GUEST_EPHEMERAL_PORT,
+            bad_port,
+            our_seq_bad,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+    let bad_syn_returned = bad_syn_at.elapsed();
+
+    // process_guest_frame must return quickly — sub-100 ms even though
+    // the kernel is still issuing SYNs against the dead port.
+    assert!(
+        bad_syn_returned < std::time::Duration::from_millis(100),
+        "process_guest_frame for unreachable dest blocked vCPU for {bad_syn_returned:?}; \
+         must return immediately and let the connect complete asynchronously"
+    );
+
+    // Now SYN to the good destination.
+    let good_syn_at = Instant::now();
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT + 1,
+            good_port,
+            our_seq_good,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+    let good_syn_returned = good_syn_at.elapsed();
+    assert!(
+        good_syn_returned < std::time::Duration::from_millis(100),
+        "second process_guest_frame blocked: {good_syn_returned:?}"
+    );
+
+    // Drive drain_to_guest until we see the good destination's SYN-ACK.
+    // It must arrive well within 1 s; if we ever wait the full 3 s
+    // CONNECT_TIMEOUT, the test fails.
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let mut saw_good_synack = false;
+    while Instant::now() < deadline {
+        let frames = drain_n(&mut stack, 1);
+        for f in frames {
+            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(f.as_slice()) {
+                let ip =
+                    Ipv4Packet::new_checked(EthernetFrame::new_unchecked(f.as_slice()).payload())
+                        .unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                if tcp.dst_port() == GUEST_EPHEMERAL_PORT + 1 && matches!(ctrl, TcpControl::Syn) {
+                    saw_good_synack = true;
+                    break;
+                }
+            }
+        }
+        if saw_good_synack {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        saw_good_synack,
+        "good-destination SYN-ACK must arrive even while bad destination is still connecting"
+    );
+
+    // Accept the good connection so the test cleans up cleanly.
+    let _ = good_listener.set_nonblocking(true);
+    let _ = good_listener.accept();
+}
+
+/// Phase 6.2 pin: when an async connect to a dropped-listener port fails,
+/// the guest must eventually receive a RST.  The RST is delivered once
+/// `drain_to_guest` drives `relay_pending_connects` and `getsockopt(SO_ERROR)`
+/// returns a non-zero error code.
+#[test]
+fn tcp_connect_async_eventual_rst_on_failure() {
+    use std::time::Instant;
+
+    let mut stack = SlirpBackend::new().unwrap();
+
+    // Bind+drop a listener: the OS assigns a port and then closes it, so a
+    // subsequent connect will receive ECONNREFUSED from the kernel quickly.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let our_seq = 1000u32;
+    stack
+        .process_guest_frame(&build_tcp_frame(
+            SLIRP_GATEWAY_IP,
+            GUEST_EPHEMERAL_PORT,
+            bad_port,
+            our_seq,
+            0,
+            TcpControl::Syn,
+            &[],
+        ))
+        .unwrap();
+
+    // Drive drain_to_guest until we see a RST or the deadline passes.
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    let mut saw_rst = false;
+    while Instant::now() < deadline {
+        let frames = drain_n(&mut stack, 1);
+        for f in frames {
+            if let Some((_, _, ctrl, _)) = parse_tcp_to_guest(f.as_slice()) {
+                if matches!(ctrl, TcpControl::Rst) {
+                    saw_rst = true;
+                    break;
+                }
+            }
+        }
+        if saw_rst {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        saw_rst,
+        "guest must eventually receive RST when async connect to dropped-listener port fails"
+    );
+}

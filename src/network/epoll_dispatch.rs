@@ -147,6 +147,36 @@ impl EpollDispatch {
         Ok(())
     }
 
+    /// Modify the readiness interest for a previously-registered `fd` to the
+    /// new `mode`.  Uses `EPOLL_CTL_MOD` which atomically replaces the event
+    /// mask without removing and re-adding the FD — no window where a ready
+    /// event could be lost between a DEL and ADD.
+    ///
+    /// Thread-safe: concurrent calls with `register`, `unregister`, and
+    /// `wait_with_timeout` are serialized by the kernel's per-epoll-fd lock.
+    pub fn modify(&self, fd: RawFd, token: FlowToken, mode: RegisterMode) -> io::Result<()> {
+        let events: u32 = match mode {
+            RegisterMode::Read => libc::EPOLLIN as u32,
+            RegisterMode::Write => libc::EPOLLOUT as u32,
+            RegisterMode::ReadWrite => (libc::EPOLLIN | libc::EPOLLOUT) as u32,
+        };
+        let mut ev = libc::epoll_event { events, u64: token };
+        // SAFETY: epoll_ctl MOD reads `ev` and modifies the registration for
+        // `fd`; the fd must already be registered (caller's contract).
+        let epoll_ctl_result = unsafe {
+            libc::epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_MOD,
+                fd,
+                &mut ev as *mut _,
+            )
+        };
+        if epoll_ctl_result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Thread-safe: concurrent calls with `register` and `wait_with_timeout`
     /// are serialized by the kernel's per-epoll-fd lock.
     pub fn unregister(&self, fd: RawFd) -> io::Result<()> {
@@ -329,6 +359,69 @@ mod tests {
     fn register_invalid_fd_returns_error() {
         let dispatch = EpollDispatch::new().expect("EpollDispatch::new");
         let result = dispatch.register(-1, 0, RegisterMode::Read);
+        assert!(result.is_err());
+    }
+
+    /// Verify that `modify` switches a registration from Write to Read
+    /// interest and that the new mode fires correctly.
+    #[test]
+    fn modify_changes_event_mode() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        // Connect two sockets so we have a readable stream.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"hello").unwrap();
+        });
+        let stream = TcpStream::connect(addr).expect("connect");
+        server.join().unwrap();
+
+        let dispatch = EpollDispatch::new().expect("new");
+        let token: FlowToken = 0x1234;
+
+        // Register initially for Write — a connected socket is immediately
+        // writable, so this fires right away.
+        dispatch
+            .register(stream.as_raw_fd(), token, RegisterMode::Write)
+            .expect("register");
+
+        let mut events: Vec<EpollEvent> = Vec::new();
+        let _ = dispatch
+            .wait_with_timeout(&mut events, Duration::from_millis(100))
+            .expect("wait (Write)");
+        assert!(
+            events.iter().any(|e| e.token == token && e.writable),
+            "expected writable event before modify"
+        );
+
+        // Now modify to Read.
+        dispatch
+            .modify(stream.as_raw_fd(), token, RegisterMode::Read)
+            .expect("modify");
+
+        // The stream has data ("hello") buffered — should get a readable event.
+        events.clear();
+        let n = dispatch
+            .wait_with_timeout(&mut events, Duration::from_millis(200))
+            .expect("wait (Read)");
+        assert!(n > 0, "expected at least one event after modify to Read");
+        assert!(
+            events.iter().any(|e| e.token == token && e.readable),
+            "expected readable event after modify; events={events:?}"
+        );
+    }
+
+    /// Verify that `modify` on an unregistered fd returns an error.
+    #[test]
+    fn modify_unregistered_fd_returns_error() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dispatch = EpollDispatch::new().expect("new");
+        // fd was never registered — MOD should return ENOENT.
+        let result = dispatch.modify(listener.as_raw_fd(), 0, RegisterMode::Read);
         assert!(result.is_err());
     }
 
