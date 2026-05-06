@@ -1751,6 +1751,22 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         }
     }
 
+    // Lock-free hand-off queue + direct backend Arc, pulled out of the
+    // device once at thread startup so the per-cycle hot path doesn't
+    // need to acquire the VirtioNetDevice mutex just to read backend
+    // frames.  The vCPU thread drains `pending_rx` on each MMIO entry
+    // (see vmm/cpu.rs), so this thread only needs to push frames.
+    type PendingRxArc = std::sync::Arc<crossbeam_queue::SegQueue<Vec<u8>>>;
+    type BackendArc = std::sync::Arc<Mutex<dyn crate::network::NetworkBackend>>;
+    let (pending_rx_arc, slirp_arc): (Option<PendingRxArc>, Option<BackendArc>) =
+        match net_dev.lock() {
+            Ok(g) => (Some(g.pending_rx()), Some(g.slirp_arc())),
+            Err(_) => (None, None),
+        };
+
+    // Reusable buffer for frames pulled from the backend each cycle.
+    let mut rx_scratch: Vec<Vec<u8>> = Vec::new();
+
     while running.load(Ordering::Relaxed) {
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
@@ -1820,14 +1836,43 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
         }
 
-        let (frames_injected, has_interrupt) = {
-            let mut guard = match net_dev.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            let injected = guard.try_inject_rx(guest_memory).unwrap_or(0);
-            (injected, guard.has_pending_interrupt())
+        // Drain backend frames into the pending_rx SegQueue WITHOUT
+        // touching the VirtioNetDevice mutex.  The vCPU thread will
+        // materialise them into RX descriptors on its next MMIO entry
+        // via VirtioNetDevice::flush_pending_rx (see vmm/cpu.rs).
+        //
+        // This breaks the old contention pattern where the net-poll
+        // thread held the VirtioNetDevice lock for the duration of
+        // try_inject_rx (descriptor walk + memory writes), forcing the
+        // vCPU thread to wait on every MMIO exit that overlapped with
+        // a poll cycle.
+        let frames_pushed: usize = match (&pending_rx_arc, &slirp_arc) {
+            (Some(pending_rx), Some(slirp)) => {
+                rx_scratch.clear();
+                if let Ok(mut backend) = slirp.lock() {
+                    backend.drain_to_guest(&mut rx_scratch);
+                }
+                let n = rx_scratch.len();
+                for frame in rx_scratch.drain(..) {
+                    let mut packet = Vec::with_capacity(
+                        crate::devices::virtio_net::VirtioNetHeader::SIZE + frame.len(),
+                    );
+                    packet.extend_from_slice(
+                        &crate::devices::virtio_net::VirtioNetHeader::new().to_bytes(),
+                    );
+                    packet.extend_from_slice(&frame);
+                    pending_rx.push(packet);
+                }
+                n
+            }
+            _ => 0,
         };
+        let has_interrupt = frames_pushed > 0
+            || match net_dev.lock() {
+                Ok(g) => g.has_pending_interrupt(),
+                Err(_) => false,
+            };
+        let frames_injected = frames_pushed;
 
         // Pulse IRQ10 only when there is *new* work for the guest:
         //   - frames just injected this cycle, OR

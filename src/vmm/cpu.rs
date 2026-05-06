@@ -249,8 +249,14 @@ fn vcpu_run_loop(
                     }
                     VcpuExit::MmioRead(addr, data) => {
                         let handled = if let Some(ref dev) = mmio_devices.virtio_net {
-                            let guard = dev.lock().unwrap();
+                            let mut guard = dev.lock().unwrap();
                             if guard.handles_mmio(addr) {
+                                // Materialise any frames the net-poll thread
+                                // pushed into pending_rx since our last MMIO
+                                // entry — writes them into the guest's RX
+                                // descriptors in our context, no cross-thread
+                                // lock contention.
+                                let _ = guard.flush_pending_rx(guest_memory);
                                 let offset = addr - guard.mmio_base();
                                 guard.mmio_read(offset, data);
                                 true
@@ -305,6 +311,11 @@ fn vcpu_run_loop(
                         let handled = if let Some(ref dev) = mmio_devices.virtio_net {
                             let mut guard = dev.lock().unwrap();
                             if guard.handles_mmio(addr) {
+                                // Same pre-flush as the MMIO-read path: the
+                                // guest may write INTERRUPT_ACK or another
+                                // register before reading INTERRUPT_STATUS,
+                                // so we materialise pending frames here too.
+                                let _ = guard.flush_pending_rx(guest_memory);
                                 let offset = addr - guard.mmio_base();
                                 guard.mmio_write(offset, data, Some(guest_memory));
                                 true

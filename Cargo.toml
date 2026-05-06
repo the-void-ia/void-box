@@ -113,6 +113,11 @@ socket2 = { version = "0.5", features = ["all"] }
 # path of a NAT keyed by guest-side ports the guest itself chooses.
 rustc-hash = "2"
 
+# Lock-free MPMC queue used to hand virtio-net RX frames from the
+# net-poll thread to the vCPU thread without taking the
+# `Arc<Mutex<VirtioNetDevice>>` device lock on the hot path.
+crossbeam-queue = "0.3"
+
 # --- macOS-only dependencies ---
 [target.'cfg(target_os = "macos")'.dependencies]
 # Objective-C 2.0 bindings (auto-generated from Apple frameworks)

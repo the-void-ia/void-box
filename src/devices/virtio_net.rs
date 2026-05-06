@@ -10,6 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crossbeam_queue::SegQueue;
 use tracing::{debug, trace, warn};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 
@@ -181,6 +182,16 @@ pub struct VirtioNetDevice {
     rx_avail_idx: u16,
     /// RX queue: next used index we'll write
     rx_used_idx: u16,
+    /// Lock-free queue of frames waiting to be written into the guest's
+    /// RX descriptors.  The net-poll thread pushes frames here without
+    /// taking the device lock; the vCPU thread drains them on its next
+    /// MMIO exit (via [`Self::flush_pending_rx`]) and writes the
+    /// descriptors in its own context.
+    ///
+    /// Eliminates the `Arc<Mutex<VirtioNetDevice>>` contention that
+    /// previously serialised every net-poll-side `try_inject_rx` call
+    /// against vCPU MMIO exits.
+    pending_rx: Arc<SegQueue<Vec<u8>>>,
 }
 
 impl VirtioNetDevice {
@@ -218,7 +229,28 @@ impl VirtioNetDevice {
             tx_used_idx: 0,
             rx_avail_idx: 0,
             rx_used_idx: 0,
+            pending_rx: Arc::new(SegQueue::new()),
         })
+    }
+
+    /// Returns a clone of the lock-free RX frame queue Arc.
+    ///
+    /// The net-poll thread holds this clone and pushes frames to it
+    /// without ever taking the [`VirtioNetDevice`] mutex.  The vCPU
+    /// thread (which already holds the device mutex during MMIO
+    /// dispatch) drains it via [`Self::flush_pending_rx`].
+    pub fn pending_rx(&self) -> Arc<SegQueue<Vec<u8>>> {
+        Arc::clone(&self.pending_rx)
+    }
+
+    /// Returns a clone of the [`NetworkBackend`] arc.
+    ///
+    /// Lets the net-poll thread call `drain_to_guest` directly without
+    /// going through the device mutex.  Combined with [`Self::pending_rx`],
+    /// this removes the `Arc<Mutex<VirtioNetDevice>>` contention point
+    /// from the per-packet RX hot path.
+    pub fn slirp_arc(&self) -> Arc<Mutex<dyn NetworkBackend>> {
+        Arc::clone(&self.slirp)
     }
 
     /// Set the MMIO base address
@@ -547,6 +579,28 @@ impl VirtioNetDevice {
         Ok(())
     }
 
+    /// Drain frames pushed into [`Self::pending_rx`] by the net-poll
+    /// thread and write them into the guest's RX descriptors.
+    ///
+    /// Same descriptor-walking shape as [`Self::try_inject_rx`], but
+    /// the input frames come from the lock-free SegQueue instead of
+    /// going through the (locked) network backend.  The vCPU thread
+    /// calls this on every MMIO entry to virtio-net, materialising any
+    /// frames the net-poll thread queued since the last MMIO exit.
+    ///
+    /// Returns the number of frames written to the RX ring this call.
+    pub fn flush_pending_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<usize> {
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Some(f) = self.pending_rx.pop() {
+            frames.push(f);
+        }
+        if !frames.is_empty() {
+            self.write_frames_to_rx_ring(frames, mem)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Try to inject received frames from SLIRP into guest RX queue. Call from vCPU loop or after RX notify.
     ///
     /// Returns the number of frames the guest now has visible in its RX
@@ -559,7 +613,20 @@ impl VirtioNetDevice {
         if frames.is_empty() {
             return Ok(0);
         }
+        self.write_frames_to_rx_ring(frames, mem)
+    }
 
+    /// Write a batch of fully-formed frames (already including the
+    /// virtio-net header) into the guest's RX descriptor ring.
+    ///
+    /// Shared between [`Self::try_inject_rx`] (frames pulled from the
+    /// network backend) and [`Self::flush_pending_rx`] (frames pushed
+    /// by the net-poll thread into the lock-free SegQueue).
+    fn write_frames_to_rx_ring<M: GuestMemory + ?Sized>(
+        &mut self,
+        frames: Vec<Vec<u8>>,
+        mem: &M,
+    ) -> Result<usize> {
         let q = &self.rx_queue;
         if !q.ready || q.num == 0 {
             // Queue not ready - buffer frames for later
