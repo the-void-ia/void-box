@@ -1656,6 +1656,33 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     // still set from an un-acked earlier pulse.
     let mut prev_pending: bool = false;
 
+    // KVM_IRQFD: register an eventfd that asserts IRQ 10 when written.
+    // Writing 8 bytes to the eventfd is one syscall; the kernel signals
+    // the in-kernel irqchip directly.  This replaces the pair of
+    // KVM_IRQ_LINE ioctls (assert level=1 / deassert level=0) with a
+    // single write.  If setup fails (kernel without irqfd, broken irqchip
+    // routing) we fall back to the ioctl path below.
+    let irq_eventfd: Option<vmm_sys_util::eventfd::EventFd> =
+        match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+            Ok(fd) => match vm.vm_fd().register_irqfd(&fd, 10) {
+                Ok(()) => Some(fd),
+                Err(e) => {
+                    debug!(
+                        "net-poll: KVM_IRQFD register failed; falling back to KVM_IRQ_LINE: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(
+                    "net-poll: eventfd create failed; falling back to KVM_IRQ_LINE: {}",
+                    e
+                );
+                None
+            }
+        };
+
     while running.load(Ordering::Relaxed) {
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
@@ -1721,16 +1748,22 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         let pulse = frames_injected > 0 || (now_pending && !prev_pending);
         prev_pending = now_pending;
         if pulse {
-            let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
-            // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
-            // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
-            // for the lifetime of `vm`.
-            unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
-            }
-            let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
-            unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
+            if let Some(ref efd) = irq_eventfd {
+                // Fast path: KVM_IRQFD.  One 8-byte write to the eventfd;
+                // the kernel asserts IRQ 10 directly.  No ioctl pair.
+                let _ = efd.write(1);
+            } else {
+                let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
+                // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
+                // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
+                // for the lifetime of `vm`.
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
+                }
+                let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
+                }
             }
         }
     }
