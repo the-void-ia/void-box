@@ -1607,6 +1607,77 @@ fn vsock_irq_thread(
 ///
 /// When the network backend does not provide an epoll instance
 /// (non-SlirpBackend), the thread falls back to a fixed 5 ms sleep.
+/// Registers a host eventfd with KVM via `KVM_IOEVENTFD` for the
+/// virtio-net TX-queue notify MMIO and adds it to the supplied
+/// [`EpollDispatch`] under `token` so the net-poll thread can drain
+/// it.  Returns the eventfd on success, or `None` and logs a
+/// `debug!` on any failure (eventfd creation, epoll registration,
+/// `KVM_IOEVENTFD` registration); callers fall back to the
+/// MMIO-exit TX path when this returns `None`.
+///
+/// Both pieces (epoll registration and `KVM_IOEVENTFD`
+/// registration) must succeed together: if KVM consumes the guest's
+/// TX MMIO writes in-kernel but no userspace path drains the
+/// eventfd, guest TX hangs silently.  This helper rolls back the
+/// epoll registration if the `KVM_IOEVENTFD` half fails.
+///
+/// # Errors
+///
+/// Returns `None` on any of: missing epoll dispatcher, eventfd
+/// creation failure, epoll registration failure, or
+/// `KVM_IOEVENTFD` registration failure.  Each failure is logged at
+/// `debug!` level with the underlying error.
+fn setup_tx_notify_ioeventfd(
+    vm: &Vm,
+    epoll_arc: Option<&Arc<crate::network::epoll_dispatch::EpollDispatch>>,
+    mmio_addr: u64,
+    queue_idx: u32,
+    token: u64,
+) -> Option<vmm_sys_util::eventfd::EventFd> {
+    let Some(ep_arc) = epoll_arc else {
+        debug!(
+            "net-poll: no epoll dispatcher; falling back to MMIO-exit TX path (KVM_IOEVENTFD requires an async drain)"
+        );
+        return None;
+    };
+    let fd = match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+        Ok(fd) => fd,
+        Err(e) => {
+            debug!(
+                "net-poll: eventfd create for tx-notify failed; falling back to MMIO-exit TX path: {}",
+                e
+            );
+            return None;
+        }
+    };
+    if let Err(e) = ep_arc.register(
+        fd.as_raw_fd(),
+        token,
+        crate::network::epoll_dispatch::RegisterMode::Read,
+    ) {
+        debug!(
+            "net-poll: failed to register tx-notify eventfd with epoll dispatch ({e}); falling back to MMIO-exit TX path"
+        );
+        return None;
+    }
+    let kvm_addr = kvm_ioctls::IoEventAddress::Mmio(mmio_addr);
+    if let Err(e) = vm.vm_fd().register_ioevent(&fd, &kvm_addr, queue_idx) {
+        // KVM didn't take the ioevent.  Roll the epoll registration
+        // back so the eventfd doesn't stay armed without a service
+        // path on it.
+        let _ = ep_arc.unregister(fd.as_raw_fd());
+        debug!(
+            "net-poll: KVM_IOEVENTFD register failed ({e}); TX notifies will continue to take MMIO exits"
+        );
+        return None;
+    }
+    debug!(
+        "net-poll: KVM_IOEVENTFD active for TX notify @ MMIO {:#x} queue_idx={queue_idx}",
+        mmio_addr,
+    );
+    Some(fd)
+}
+
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
@@ -1704,52 +1775,18 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     const VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
     const VIRTIO_NET_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
     const TX_NOTIFY_QUEUE_IDX: u32 = 1;
-    let tx_notify_eventfd: Option<vmm_sys_util::eventfd::EventFd> =
-        match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
-            Ok(fd) => {
-                let mmio_addr = kvm_ioctls::IoEventAddress::Mmio(
-                    VIRTIO_NET_MMIO_BASE + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
-                );
-                match vm
-                    .vm_fd()
-                    .register_ioevent(&fd, &mmio_addr, TX_NOTIFY_QUEUE_IDX)
-                {
-                    Ok(()) => Some(fd),
-                    Err(e) => {
-                        debug!(
-                            "net-poll: KVM_IOEVENTFD register failed; TX notifies will continue to take MMIO exits: {}",
-                            e
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                debug!(
-                    "net-poll: eventfd create for tx-notify failed; falling back to MMIO-exit TX path: {}",
-                    e
-                );
-                None
-            }
-        };
     // Token used to identify the TX-notify eventfd in epoll readiness
     // events.  Lives in a tag space that doesn't collide with the
     // PROTO_TAG_* values SlirpBackend uses for flow tokens.
     const TX_NOTIFY_TOKEN: u64 = 0x4000_0000_0000_0000;
-    if let Some(ref fd) = tx_notify_eventfd {
-        if let Some(ref ep_arc) = epoll_arc {
-            if let Err(e) = ep_arc.register(
-                fd.as_raw_fd(),
-                TX_NOTIFY_TOKEN,
-                crate::network::epoll_dispatch::RegisterMode::Read,
-            ) {
-                debug!(
-                    "net-poll: failed to register tx-notify eventfd with epoll dispatch: {}",
-                    e
-                );
-            }
-        }
-    }
+
+    let tx_notify_eventfd = setup_tx_notify_ioeventfd(
+        vm.as_ref(),
+        epoll_arc.as_ref(),
+        VIRTIO_NET_MMIO_BASE + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
+        TX_NOTIFY_QUEUE_IDX,
+        TX_NOTIFY_TOKEN,
+    );
 
     // Lock-free hand-off queue + direct backend Arc, pulled out of the
     // device once at thread startup so the per-cycle hot path doesn't

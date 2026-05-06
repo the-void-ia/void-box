@@ -14,7 +14,6 @@
 //!   VOID_BOX_KERNEL, VOID_BOX_INITRAMFS
 
 use std::net::TcpListener;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -62,25 +61,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let host_port = listener.local_addr()?.port();
+    listener.set_nonblocking(true)?;
 
     let iterations = cli.iterations;
     let server_thread = thread::spawn(move || {
+        // Non-blocking accept with a tight poll, deadline-checked.  With
+        // a blocking accept the deadline never fires if the guest never
+        // connects (boot failure, SLIRP rate limit, etc.) and the
+        // example's later `server_thread.join()` would hang forever.
+        // The accept-pickup latency directly inflates each guest CRR
+        // sample, so the wait is kept short — `from_micros(50)` adds
+        // at most ~50 µs of jitter on top of a ~280 µs baseline, while
+        // still letting the deadline check fire every ~50 µs.
         let mut accepted = 0u32;
-        listener.set_nonblocking(false).ok();
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        let (done_tx, _done_rx) = mpsc::channel::<()>();
         while accepted < iterations && std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut conn, _)) => {
+                    conn.set_nonblocking(false).ok();
                     let mut buf = [0u8; 1];
                     let _ = std::io::Read::read(&mut conn, &mut buf);
                     let _ = std::io::Write::write_all(&mut conn, b"x");
                     accepted += 1;
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_micros(50));
+                }
                 Err(_) => break,
             }
         }
-        drop(done_tx);
         accepted
     });
 

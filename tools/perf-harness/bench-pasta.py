@@ -60,12 +60,27 @@ def _resolve_pasta() -> str:
 
 
 def detect_host_gateway() -> str:
+    """Return the host's IPv4 default-route gateway address.
+
+    Parses ``ip -4 route show default`` for ``default via <GW> ...`` lines
+    and returns the address after ``via``.  Routes of the form
+    ``default dev <IFACE> ...`` (no ``via``) are skipped — they don't
+    name a usable IP for pasta's ``--map-host-loopback`` translation.
+    """
     out = subprocess.check_output(["ip", "-4", "route", "show", "default"], text=True)
     for line in out.splitlines():
         parts = line.split()
-        if parts and parts[0] == "default":
-            return parts[2]
-    raise RuntimeError("no default gateway found")
+        if not parts or parts[0] != "default":
+            continue
+        try:
+            via_index = parts.index("via")
+        except ValueError:
+            continue
+        if via_index + 1 < len(parts):
+            return parts[via_index + 1]
+    raise RuntimeError(
+        "no IPv4 default gateway with a 'via' field found in `ip route show default` output"
+    )
 
 
 def pasta_version(pasta: str) -> str:
@@ -257,11 +272,19 @@ def measure_crr_latency(
         def host_accept_loop() -> None:
             samples: list[float] = []
             for _ in range(samples_per_iter):
+                # Start the timer BEFORE accept() so each sample includes
+                # the TCP connect + accept latency, matching
+                # voidbox-network-bench's measure_crr_latency semantics
+                # (its crr_echo_server starts the timer before
+                # accept_with_deadline).  Without this, the two
+                # harnesses report different metrics under the same
+                # name and the side-by-side comparison becomes
+                # meaningless.
+                start = time.perf_counter_ns()
                 try:
                     conn, _ = srv.accept()
                 except socket.timeout:
                     break
-                start = time.perf_counter_ns()
                 with conn:
                     # one read + one write keeps it a true CRR round-trip
                     try:

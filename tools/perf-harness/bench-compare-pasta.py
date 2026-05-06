@@ -47,9 +47,6 @@ def fmt_delta(voidbox: Any, pasta: Any, latency: bool) -> str:
     if pasta == 0:
         return "—"
     ratio = voidbox / pasta
-    # For latency: voidbox > pasta means voidbox is *slower* (positive ratio is bad).
-    # For throughput: voidbox > pasta means voidbox is *faster* (positive ratio is good).
-    sign = "slower" if (latency and ratio > 1) or (not latency and ratio < 1) else "faster"
     if latency:
         if ratio >= 1:
             return f"voidbox {ratio:.1f}× slower"

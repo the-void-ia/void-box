@@ -51,7 +51,21 @@ while [ $i -lt 30 ] && ! busybox ifconfig eth0 >/dev/null 2>&1; do
   i=$((i+1))
 done
 
-busybox ifconfig eth0 "${addr_mask%/*}" netmask 255.255.255.0 up
+# Derive the netmask from the /N suffix instead of hard-coding /24:
+# crr_net is documented as ADDR/MASK,GW and a future call site might
+# reasonably use /16 or /29.  Falls back to /24 if the suffix isn't
+# parseable so existing setups keep working.
+addr="${addr_mask%/*}"
+prefix="${addr_mask#*/}"
+case "$prefix" in
+  8)  mask=255.0.0.0 ;;
+  16) mask=255.255.0.0 ;;
+  24) mask=255.255.255.0 ;;
+  29) mask=255.255.255.248 ;;
+  30) mask=255.255.255.252 ;;
+  *)  mask=255.255.255.0 ;;
+esac
+busybox ifconfig eth0 "$addr" netmask "$mask" up
 busybox route add default gw "$gw"
 
 echo "===CRR-START==="

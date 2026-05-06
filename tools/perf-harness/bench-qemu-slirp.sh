@@ -137,16 +137,23 @@ trap "rm -f $INITRD; ${cleanup_rootfs:-true}" EXIT
 (cd "$ROOTFS_DIR" && find . | cpio -H newc -o 2>/dev/null | gzip > "$INITRD")
 
 # ---------------------------------------------------------------------------
-# Host-side echo server.  Host port can be passed in via env; pick a free one
-# if the default is in use.
+# Host-side echo server.  The script's outer EXIT trap kills it, so the
+# server stays alive for the entire qemu run rather than racing against a
+# fixed-duration sleep.  HOST_PORT must be free; the script fails fast if
+# bind() refuses (no fallback to ephemeral — the guest's kernel cmdline
+# carries the port and changing it after launch isn't useful).
 # ---------------------------------------------------------------------------
 SERVER_PIDFILE=$(mktemp)
 python3 - <<PY &
-import os, signal, socket, threading, sys, time
+import os, signal, socket, sys, threading
 port = int(os.environ.get("HOST_PORT", "$HOST_PORT"))
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", port))
+try:
+    s.bind(("127.0.0.1", port))
+except OSError as e:
+    sys.stderr.write(f"echo-server: bind 127.0.0.1:{port} failed: {e}\n")
+    sys.exit(2)
 s.listen(64)
 sys.stderr.write(f"echo-server: bound 127.0.0.1:{port}\n"); sys.stderr.flush()
 def loop():
@@ -158,7 +165,11 @@ def loop():
         except OSError: pass
         finally: c.close()
 threading.Thread(target=loop, daemon=True).start()
-time.sleep(60)
+# Block on an event that nothing ever sets — the parent script's EXIT
+# trap kills us when qemu finishes (or when SIGTERM fires on outer
+# timeout).  Before this fix the server exited after 60s while qemu's
+# own boot+run could approach that limit, racing the harness.
+threading.Event().wait()
 PY
 SERVER_PID=$!
 echo "$SERVER_PID" > "$SERVER_PIDFILE"

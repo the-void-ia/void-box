@@ -1,6 +1,6 @@
 # passt head-to-head comparison harness
 
-Two scripts under `scripts/` produce a side-by-side comparison of voidbox
+Tools under `tools/perf-harness/` produce a side-by-side comparison of voidbox
 (real KVM VM + SLIRP) against passt's [`pasta`](https://passt.top/passt/about/)
 running in a network namespace.
 
