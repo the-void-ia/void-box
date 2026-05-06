@@ -1661,12 +1661,24 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         // adaptive timeout in the active 5 ms cadence even though
         // `epoll_events.is_empty()`.
         let mut raw_kernel_events: usize = 0;
+        let crr_trace_wait_start = std::time::Instant::now();
+        let crr_trace_timeout_used = epoll_wait_timeout;
         if let Some(ref ep_arc) = epoll_arc {
             raw_kernel_events = ep_arc
                 .wait_with_timeout(&mut epoll_events, epoll_wait_timeout)
                 .unwrap_or(0);
         } else {
             std::thread::sleep(FALLBACK_SLEEP);
+        }
+        if raw_kernel_events > 0 {
+            tracing::trace!(
+                target: "slirp_crr",
+                raw_events = raw_kernel_events,
+                visible_events = epoll_events.len(),
+                wait_us = crr_trace_wait_start.elapsed().as_micros() as u64,
+                timeout_ms = crr_trace_timeout_used.as_millis() as u64,
+                "net_poll_thread: epoll_wait returned"
+            );
         }
 
         // Adapt the next-cycle timeout based on this cycle's outcome.
@@ -1692,6 +1704,7 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             }
         }
 
+        let crr_trace_inject_start = std::time::Instant::now();
         let has_interrupt = {
             let mut guard = match net_dev.lock() {
                 Ok(g) => g,
@@ -1715,6 +1728,11 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             unsafe {
                 libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
             }
+            tracing::trace!(
+                target: "slirp_crr",
+                inject_us = crr_trace_inject_start.elapsed().as_micros() as u64,
+                "net_poll_thread: try_inject_rx + IRQ raised"
+            );
         }
     }
 

@@ -912,6 +912,7 @@ impl SlirpBackend {
             Err(_) => return Ok(()),
         };
 
+        let crr_trace_enter = Instant::now();
         // Track inject_to_guest growth so we can wake the net-poll
         // thread if this call queued any frames. The poll thread blocks
         // in epoll_wait waiting on FD readiness; an ACK queued during
@@ -933,8 +934,18 @@ impl SlirpBackend {
             }
         }
 
-        if self.inject_to_guest.len() > inject_len_before {
+        let queued = self.inject_to_guest.len() > inject_len_before;
+        if queued {
             self.epoll_waker.wake();
+        }
+        if queued {
+            tracing::trace!(
+                target: "slirp_crr",
+                ethertype = ?eth.ethertype(),
+                queued = self.inject_to_guest.len() - inject_len_before,
+                process_us = crr_trace_enter.elapsed().as_micros() as u64,
+                "process_guest_frame: queued frames + waker.wake()"
+            );
         }
         Ok(())
     }
@@ -942,8 +953,14 @@ impl SlirpBackend {
     /// Drain frames destined to the guest into `out`, reusing the caller's
     /// buffer across calls and avoiding a fresh allocation on every tick.
     ///
+    /// crr-trace: emits a `slirp_crr` event when ≥1 frame is drained, so the
+    /// timeline shows when the net-poll thread actually picks the frames up
+    /// after a `epoll_waker.wake()`.
+    ///
     /// See [`crate::network::NetworkBackend::drain_to_guest`].
     pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        let crr_trace_enter = Instant::now();
+        let crr_trace_inject_before = self.inject_to_guest.len();
         // Check rx_queue size before polling.
         let rx_count = {
             let q = self.queue.lock().unwrap();
@@ -1029,7 +1046,18 @@ impl SlirpBackend {
             }
             out.append(&mut q.tx_queue);
         }
+        let inject_drained = self.inject_to_guest.len();
         out.append(&mut self.inject_to_guest);
+        if inject_drained > 0 || crr_trace_inject_before > 0 {
+            tracing::trace!(
+                target: "slirp_crr",
+                inject_drained,
+                inject_before = crr_trace_inject_before,
+                ready_events = ready.len(),
+                drain_us = crr_trace_enter.elapsed().as_micros() as u64,
+                "drain_to_guest: emitted to net-poll"
+            );
+        }
     }
 
     /// Poll the stack and return ethernet frames to send to the guest.
@@ -1693,6 +1721,13 @@ impl SlirpBackend {
                         &[],
                     );
                     self.inject_to_guest.push(syn_ack);
+                    tracing::trace!(
+                        target: "slirp_crr",
+                        guest_port = key.guest_src_port,
+                        dst_port = key.dst_port,
+                        host_fd,
+                        "syn_ack queued (immediate connect path)"
+                    );
                     debug!(
                         "SLIRP TCP: SYN-ACK sent for {}:{} (immediate connect)",
                         dst_ip, dst_port
