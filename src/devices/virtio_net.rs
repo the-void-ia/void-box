@@ -8,8 +8,10 @@
 //! - Integration with SLIRP stack for NAT
 //! - No root/TAP required
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crossbeam_queue::SegQueue;
 use tracing::{debug, trace, warn};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 
@@ -157,8 +159,16 @@ pub struct VirtioNetDevice {
     queue_sel: u32,
     /// Device status
     status: u32,
-    /// Interrupt status
-    interrupt_status: u32,
+    /// Interrupt status, accessed concurrently from the vCPU thread
+    /// (MMIO read of `INTERRUPT_STATUS`, MMIO write of `INTERRUPT_ACK`)
+    /// and the net-poll thread (sets bit 0 when new RX frames are
+    /// queued, polls on idle cycles).
+    ///
+    /// Wrapped in [`Arc<AtomicU32>`] so the net-poll thread can hold
+    /// its own clone and read/update the value without taking the
+    /// device mutex.  The vCPU thread accesses it via the device
+    /// guard during MMIO dispatch; both sides see the same atomic.
+    interrupt_status: Arc<AtomicU32>,
     /// Configuration generation counter
     config_generation: u32,
     /// Receive queue state
@@ -181,6 +191,21 @@ pub struct VirtioNetDevice {
     rx_avail_idx: u16,
     /// RX queue: next used index we'll write
     rx_used_idx: u16,
+    /// Lock-free queue of frames waiting to be written into the guest's
+    /// RX descriptors.  The net-poll thread pushes frames here without
+    /// taking the device lock; the vCPU thread drains them on its next
+    /// MMIO exit (via [`Self::flush_pending_rx`]) and writes the
+    /// descriptors in its own context.
+    ///
+    /// Eliminates the `Arc<Mutex<VirtioNetDevice>>` contention that
+    /// previously serialised every net-poll-side `try_inject_rx` call
+    /// against vCPU MMIO exits.
+    pending_rx: Arc<SegQueue<Vec<u8>>>,
+    /// Scratch buffer reused across `flush_pending_rx` calls so the
+    /// per-MMIO-exit `Vec<Vec<u8>>` doesn't grow from cap=0 every
+    /// time.  Heaptrack measured the previous local-Vec allocation as
+    /// 173 calls / 108 MB peak on the CRR microbench.
+    flush_scratch: Vec<Vec<u8>>,
 }
 
 impl VirtioNetDevice {
@@ -200,7 +225,7 @@ impl VirtioNetDevice {
             features_sel: 0,
             queue_sel: 0,
             status: 0,
-            interrupt_status: 0,
+            interrupt_status: Arc::new(AtomicU32::new(0)),
             config_generation: 0,
             rx_queue: QueueState {
                 num_max: 256,
@@ -218,7 +243,36 @@ impl VirtioNetDevice {
             tx_used_idx: 0,
             rx_avail_idx: 0,
             rx_used_idx: 0,
+            pending_rx: Arc::new(SegQueue::new()),
+            flush_scratch: Vec::new(),
         })
+    }
+
+    /// Returns a clone of the lock-free RX frame queue Arc.
+    ///
+    /// The net-poll thread holds this clone and pushes frames to it
+    /// without ever taking the [`VirtioNetDevice`] mutex.  The vCPU
+    /// thread (which already holds the device mutex during MMIO
+    /// dispatch) drains it via [`Self::flush_pending_rx`].
+    pub fn pending_rx(&self) -> Arc<SegQueue<Vec<u8>>> {
+        Arc::clone(&self.pending_rx)
+    }
+
+    /// Returns a clone of the [`NetworkBackend`] arc.
+    ///
+    /// Lets the net-poll thread call `drain_to_guest` directly without
+    /// going through the device mutex.  Combined with [`Self::pending_rx`],
+    /// this removes the `Arc<Mutex<VirtioNetDevice>>` contention point
+    /// from the per-packet RX hot path.
+    pub fn slirp_arc(&self) -> Arc<Mutex<dyn NetworkBackend>> {
+        Arc::clone(&self.slirp)
+    }
+
+    /// Returns a clone of the [`Arc<AtomicU32>`] backing
+    /// `interrupt_status`.  The net-poll thread holds this clone and
+    /// reads/updates the ISR without ever taking the device mutex.
+    pub fn interrupt_status_arc(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.interrupt_status)
     }
 
     /// Set the MMIO base address
@@ -264,7 +318,7 @@ impl VirtioNetDevice {
                 let queue = self.current_queue();
                 queue.ready as u32
             }
-            mmio::INTERRUPT_STATUS => self.interrupt_status,
+            mmio::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Relaxed),
             mmio::STATUS => self.status,
             mmio::CONFIG_GENERATION => self.config_generation,
             // Device config (MAC address at offset 0x100)
@@ -339,7 +393,7 @@ impl VirtioNetDevice {
                 self.handle_queue_notify(value, guest_memory);
             }
             mmio::INTERRUPT_ACK => {
-                self.interrupt_status &= !value;
+                self.interrupt_status.fetch_and(!value, Ordering::Relaxed);
             }
             mmio::STATUS => {
                 self.status = value;
@@ -434,6 +488,17 @@ impl VirtioNetDevice {
         }
     }
 
+    /// Process the TX queue from outside the vCPU thread.
+    ///
+    /// Called by `net_poll_thread` when the KVM_IOEVENTFD registered for
+    /// the virtio-net QUEUE_NOTIFY MMIO fires.  Same body as the
+    /// synchronous TX-queue handler used from the MMIO write path,
+    /// just exposed under a different name so callers outside this
+    /// module can drive it.
+    pub fn process_tx_queue_external<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
+        self.process_tx_queue(mem)
+    }
+
     /// Process TX queue: read descriptor chains from guest, send frames to SLIRP, update used ring.
     fn process_tx_queue<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
         let q = &self.tx_queue;
@@ -451,6 +516,16 @@ impl VirtioNetDevice {
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
+        let initial_tx_used_idx = self.tx_used_idx;
+
+        // Reusable per-call packet buffer.  Capacity carried across
+        // iterations within this call so chained-descriptor frames don't
+        // re-grow the buffer; cleared between frames so each
+        // process_tx_frame sees only this frame's bytes.  Pre-size to
+        // a typical MTU + virtio-net header so the common single-segment
+        // path needs no realloc.
+        let mut packet: Vec<u8> = Vec::with_capacity(1600);
+
         while self.tx_avail_idx != avail_idx {
             // Ring entry: 2 bytes, at avail_addr + 4 + (tx_avail_idx % queue_size)*2
             let ring_offset = 4 + ((self.tx_avail_idx as usize) % queue_size) * 2;
@@ -462,8 +537,7 @@ impl VirtioNetDevice {
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
-            // Walk descriptor chain and collect packet
-            let mut packet = Vec::new();
+            packet.clear();
             let mut next = head_idx;
             loop {
                 if next >= queue_size {
@@ -478,10 +552,14 @@ impl VirtioNetDevice {
                 let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
                 let next_desc = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
                 if len > 0 && addr != 0 {
-                    let mut buf = vec![0u8; len];
-                    mem.read(&mut buf, GuestAddress(addr))
+                    // Read directly into the packet's tail instead of
+                    // allocating an intermediate `Vec<u8>` and then
+                    // `extend_from_slice`-ing it in.  Saves one alloc
+                    // and one full memcpy per descriptor segment.
+                    let off = packet.len();
+                    packet.resize(off + len, 0);
+                    mem.read(&mut packet[off..off + len], GuestAddress(addr))
                         .map_err(|e| crate::Error::Memory(e.to_string()))?;
-                    packet.extend_from_slice(&buf);
                 }
                 if (flags & VIRTQ_DESC_F_NEXT) == 0 {
                     break;
@@ -493,36 +571,96 @@ impl VirtioNetDevice {
                 self.process_tx_frame(&packet)?;
             }
 
-            // Write used ring: used->ring[tx_used_idx % queue_size] = { id: head_idx, len: 0 }
+            // Used-ring entry: 8 bytes (head_idx as u32, 0 as u32).
+            // Built on the stack to avoid heap-alloc-per-frame from
+            // `[...].concat()`.  TX descriptors carry no return data
+            // so the length field is always 0.
             let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * 8;
-            let used_elem = [
-                (head_idx as u32).to_le_bytes(),
-                0u32.to_le_bytes(), // len for TX typically 0
-            ]
-            .concat();
+            let mut used_elem = [0u8; 8];
+            used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
+            // bytes [4..8] stay zero (the length field).
             mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.tx_used_idx = self.tx_used_idx.wrapping_add(1);
             self.tx_avail_idx = self.tx_avail_idx.wrapping_add(1);
+        }
 
-            // Update used.idx so guest sees progress
+        // Publish used.idx ONCE per batch instead of after every frame.
+        // virtio spec: the device updates the used-ring entries first,
+        // then bumps used.idx; the guest reads used.idx with a memory
+        // barrier and iterates new entries.  Per-frame writes are
+        // redundant for correctness and waste one mem.write per frame.
+        if self.tx_used_idx != initial_tx_used_idx {
             let used_idx_bytes = self.tx_used_idx.to_le_bytes();
             mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
-        self.interrupt_status |= 1;
+        self.interrupt_status.fetch_or(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Try to inject received frames from SLIRP into guest RX queue. Call from vCPU loop or after RX notify.
-    pub fn try_inject_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<()> {
-        let frames = self.get_rx_frames();
-        if frames.is_empty() {
-            return Ok(());
+    /// Drain frames pushed into [`Self::pending_rx`] by the net-poll
+    /// thread and write them into the guest's RX descriptors.
+    ///
+    /// Same descriptor-walking shape as [`Self::try_inject_rx`], but
+    /// the input frames come from the lock-free SegQueue instead of
+    /// going through the (locked) network backend.  The vCPU thread
+    /// calls this on every MMIO entry to virtio-net, materialising any
+    /// frames the net-poll thread queued since the last MMIO exit.
+    ///
+    /// Returns the number of frames written to the RX ring this call.
+    pub fn flush_pending_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<usize> {
+        // Move the scratch out so we can mutate self while populating
+        // it.  The post-write `clear()` keeps capacity, so subsequent
+        // calls reuse the buffer instead of growing from cap=0.
+        let mut frames = std::mem::take(&mut self.flush_scratch);
+        frames.clear();
+        while let Some(frame) = self.pending_rx.pop() {
+            frames.push(frame);
         }
+        let result = if !frames.is_empty() {
+            self.write_frames_to_rx_ring(&mut frames, mem)
+        } else {
+            Ok(0)
+        };
+        frames.clear();
+        self.flush_scratch = frames;
+        result
+    }
 
+    /// Try to inject received frames from SLIRP into guest RX queue. Call from vCPU loop or after RX notify.
+    ///
+    /// Returns the number of frames the guest now has visible in its RX
+    /// ring after this call.  Callers can use this to decide whether to
+    /// raise an IRQ — pulsing the line is only useful when the guest
+    /// has new work to do, not on every poll cycle while interrupt_status
+    /// is still set from an earlier (un-acked) injection.
+    pub fn try_inject_rx<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<usize> {
+        let mut frames = self.get_rx_frames();
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        let result = self.write_frames_to_rx_ring(&mut frames, mem);
+        // Stash drained Vec back as scratch so the next call reuses
+        // its capacity instead of allocating from cap=0.
+        frames.clear();
+        self.rx_scratch = frames;
+        result
+    }
+
+    /// Write a batch of fully-formed frames (already including the
+    /// virtio-net header) into the guest's RX descriptor ring.
+    ///
+    /// Shared between [`Self::try_inject_rx`] (frames pulled from the
+    /// network backend) and [`Self::flush_pending_rx`] (frames pushed
+    /// by the net-poll thread into the lock-free SegQueue).
+    fn write_frames_to_rx_ring<M: GuestMemory + ?Sized>(
+        &mut self,
+        frames: &mut Vec<Vec<u8>>,
+        mem: &M,
+    ) -> Result<usize> {
         let q = &self.rx_queue;
         if !q.ready || q.num == 0 {
             // Queue not ready - buffer frames for later
@@ -532,31 +670,32 @@ impl VirtioNetDevice {
                 q.num,
                 frames.len()
             );
-            self.rx_buffer.extend(frames);
-            return Ok(());
+            self.rx_buffer.append(frames);
+            return Ok(0);
         }
         let desc_addr = GuestAddress(q.desc_addr);
         let avail_addr = GuestAddress(q.driver_addr);
         let used_addr = GuestAddress(q.device_addr);
         let queue_size = q.num as usize;
 
-        for frame in frames {
-            // Read available ring: how many buffers has driver given us?
-            let mut idx_buf = [0u8; 2];
-            mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
-                .map_err(|e| crate::Error::Memory(e.to_string()))?;
-            let avail_idx = u16::from_le_bytes(idx_buf);
+        // avail_idx is monotonically increasing; the driver bumps it
+        // whenever it adds new buffers.  Read it once per try_inject_rx
+        // call rather than per frame — saves one mem.read per frame in
+        // the hot path.  If the device runs out of available buffers
+        // mid-batch the remaining frames are buffered for the next
+        // call, which is the same correctness contract as before.
+        let mut idx_buf = [0u8; 2];
+        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+        let avail_idx = u16::from_le_bytes(idx_buf);
+
+        let mut frames_injected: u16 = 0;
+
+        for frame in frames.drain(..) {
             if self.rx_avail_idx == avail_idx {
-                debug!("virtio-net: RX no available buffers (avail_idx={}, our_idx={}), buffering frame ({} bytes)",
-                    avail_idx, self.rx_avail_idx, frame.len());
                 self.rx_buffer.push(frame);
                 continue;
             }
-            debug!(
-                "virtio-net: RX injecting frame ({} bytes), avail_idx={}",
-                frame.len(),
-                avail_idx
-            );
 
             let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
             let mut desc_id_buf = [0u8; 2];
@@ -599,32 +738,45 @@ impl VirtioNetDevice {
                 next = next_desc;
             }
 
+            // Used-ring entry is exactly 8 bytes (2x u32, little-endian).
+            // Build it on the stack instead of allocating a Vec via
+            // `[...].concat()` — the previous code did a heap alloc per
+            // frame in the hot path.
             let used_ring_off = 4 + ((self.rx_used_idx as usize) % queue_size) * 8;
-            let used_elem = [
-                (head_idx as u32).to_le_bytes(),
-                (written as u32).to_le_bytes(),
-            ]
-            .concat();
+            let mut used_elem = [0u8; 8];
+            used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
+            used_elem[4..8].copy_from_slice(&(written as u32).to_le_bytes());
             mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.rx_used_idx = self.rx_used_idx.wrapping_add(1);
             self.rx_avail_idx = self.rx_avail_idx.wrapping_add(1);
+            frames_injected = frames_injected.wrapping_add(1);
+        }
 
+        // Publish the new used.idx ONCE at the end of the batch.  The
+        // virtio spec only requires the device to update used.idx after
+        // it has written all corresponding used-ring entries; the guest
+        // reads used.idx with a memory barrier and then iterates new
+        // entries.  Per-frame writes are redundant — saves one
+        // mem.write per frame on the hot path.
+        if frames_injected > 0 {
             let used_idx_bytes = self.rx_used_idx.to_le_bytes();
             mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
-        self.interrupt_status |= 1;
-        Ok(())
+        if frames_injected > 0 {
+            self.interrupt_status.fetch_or(1, Ordering::Relaxed);
+        }
+        Ok(frames_injected as usize)
     }
 
     /// Reset device to initial state
     fn reset(&mut self) {
         debug!("virtio-net: device reset");
         self.status = 0;
-        self.interrupt_status = 0;
+        self.interrupt_status.store(0, Ordering::Relaxed);
         self.driver_features = 0;
         self.tx_avail_idx = 0;
         self.tx_used_idx = 0;
@@ -691,7 +843,7 @@ impl VirtioNetDevice {
         self.rx_buffer.push(packet);
 
         // Set interrupt
-        self.interrupt_status |= 1;
+        self.interrupt_status.fetch_or(1, Ordering::Relaxed);
     }
 
     /// Capture device state for snapshot.
@@ -726,7 +878,7 @@ impl VirtioNetDevice {
             features_sel: self.features_sel,
             queue_sel: self.queue_sel,
             status: self.status,
-            interrupt_status: self.interrupt_status,
+            interrupt_status: self.interrupt_status.load(Ordering::Relaxed),
             config_generation: self.config_generation,
             mac: self.mac,
             queues,
@@ -740,7 +892,8 @@ impl VirtioNetDevice {
         self.features_sel = state.features_sel;
         self.queue_sel = state.queue_sel;
         self.status = state.status;
-        self.interrupt_status = state.interrupt_status;
+        self.interrupt_status
+            .store(state.interrupt_status, Ordering::Relaxed);
         self.config_generation = state.config_generation;
         self.mac = state.mac;
 
@@ -776,9 +929,13 @@ impl VirtioNetDevice {
         );
     }
 
-    /// Check if there are pending interrupts
+    /// Check if there are pending interrupts.
+    ///
+    /// Atomic load — safe to call from any thread without holding the
+    /// device mutex.  The net-poll thread uses this to decide whether
+    /// to pulse the IRQ line.
     pub fn has_pending_interrupt(&self) -> bool {
-        self.interrupt_status != 0
+        self.interrupt_status.load(Ordering::Relaxed) != 0
     }
 
     /// Get the MAC address

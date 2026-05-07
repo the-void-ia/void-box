@@ -192,6 +192,14 @@ FAST SMOKE RUN\n\
             .from_env()?
             .memory_mb(BENCH_MEMORY_MB)
             .network(true)
+            // Production SLIRP defaults (50 connect/s, 64 concurrent)
+            // are anti-DoS limits sized for real workloads.  The CRR
+            // bench intentionally opens hundreds of connections per
+            // second; without this lift it gets RST'd at the 51st
+            // connect, which manifests as a 2 s `crr echo channel
+            // receive error` instead of a real number.
+            .network_max_connections_per_second(u32::MAX)
+            .network_max_concurrent_connections(usize::MAX)
             .build()?;
 
         // Prime the VM (triggers boot + vsock handshake) before any timed work.

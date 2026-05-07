@@ -59,6 +59,12 @@ struct PendingDnsQuery {
 /// while keeping the implementation simple.
 const DNS_CACHE_TTL_SECS: u64 = 60;
 
+/// Initial capacity for the ready-event scratch buffers.  Sized to
+/// `EpollDispatch`'s typical per-wait batch so the buffers fit a
+/// busy-loop wakeup without reallocating; oversized batches grow
+/// once and stabilize.
+const EVENTS_PRESIZE: usize = 128;
+
 use ipnet::Ipv4Net;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -689,6 +695,26 @@ pub struct SlirpBackend {
     /// keep the fallback so synthetic harnesses still observe
     /// readiness.
     has_external_poller: AtomicBool,
+    /// Per-call scratch buffer for the events `drain_to_guest`
+    /// processes.  Owned by `SlirpBackend` so its capacity persists
+    /// across calls — `mem::take`-into-local would discard the
+    /// allocation and force the next round to grow from cap=0,
+    /// which heaptrack measured as ~half of all per-CRR
+    /// allocations.
+    ready_scratch: Vec<EpollEvent>,
+    /// Per-call scratch for `relay_tcp_nat_data`'s deferred frame
+    /// pushes.  The relay can't push directly to `inject_to_guest`
+    /// while iterating `flow_table` (borrow conflict); reusing
+    /// this buffer keeps the per-cycle Vec from growing from cap=0.
+    relay_frames_scratch: Vec<Vec<u8>>,
+    /// Shared scratch for the per-cycle `Vec<FlowKey>` snapshots
+    /// that `relay_tcp_nat_data`, `relay_icmp_echo`, and
+    /// `relay_udp_flows` build to side-step `&mut self` /
+    /// `flow_table` borrow conflicts.  All three relays run
+    /// sequentially inside `drain_to_guest`, so one buffer
+    /// suffices — each callsite takes it, fills it, drains it,
+    /// and stashes it back via `clear()` (capacity preserved).
+    flow_keys_scratch: Vec<FlowKey>,
 }
 
 impl SlirpBackend {
@@ -793,9 +819,12 @@ impl SlirpBackend {
             accept_sender: accept_tx,
             epoll,
             epoll_waker,
-            pending_events: Mutex::new(Vec::new()),
+            pending_events: Mutex::new(Vec::with_capacity(EVENTS_PRESIZE)),
             pending_close: Vec::new(),
             has_external_poller: AtomicBool::new(false),
+            ready_scratch: Vec::with_capacity(EVENTS_PRESIZE),
+            relay_frames_scratch: Vec::new(),
+            flow_keys_scratch: Vec::new(),
         })
     }
 
@@ -1033,26 +1062,33 @@ impl SlirpBackend {
         //
         // Then, only if no net-poll thread has populated the queue
         // (unit tests / benches), fall back to a non-blocking poll on
-        // the epoll FD ourselves. `try_lock` keeps that fallback safe
-        // under contention.
-        let ready: Vec<EpollEvent> = {
-            let mut events: Vec<EpollEvent> = {
-                let mut queue = self.pending_events.lock().unwrap();
-                std::mem::take(&mut *queue)
-            };
-            // Fallback non-blocking poll only when no external poller
-            // (net_poll_thread) is feeding us events — otherwise we'd
-            // pay one mutex op + one epoll_wait syscall per call
-            // (~310 ns) for nothing. The flag is one-way: set by the
-            // first push_ready_events and stays set for the backend's
-            // lifetime.
-            if events.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
-                let _ = self
-                    .epoll
-                    .wait_with_timeout(&mut events, std::time::Duration::ZERO);
-            }
-            events
-        };
+        // the epoll FD ourselves.
+        //
+        // The local `ready` Vec is taken from `self.ready_scratch`,
+        // populated by copying out of the locked queue (which is
+        // `clear()`-ed in place to keep its capacity), processed,
+        // then cleared and stashed back.  The previous `mem::take`
+        // pattern dropped the queue's allocation every cycle —
+        // heaptrack measured that as ~half of all per-CRR
+        // allocations on this hot path.
+        let mut ready: Vec<EpollEvent> = std::mem::take(&mut self.ready_scratch);
+        ready.clear();
+        {
+            let mut queue = self.pending_events.lock().unwrap();
+            ready.extend_from_slice(&queue);
+            queue.clear();
+        }
+        // Fallback non-blocking poll only when no external poller
+        // (net_poll_thread) is feeding us events — otherwise we'd
+        // pay one mutex op + one epoll_wait syscall per call
+        // (~310 ns) for nothing. The flag is one-way: set by the
+        // first push_ready_events and stays set for the backend's
+        // lifetime.
+        if ready.is_empty() && !self.has_external_poller.load(Ordering::Relaxed) {
+            let _ = self
+                .epoll
+                .wait_with_timeout(&mut ready, std::time::Duration::ZERO);
+        }
 
         // 0a. Accept any newly-ready listener connections (may push into
         //     accept_sender for the next step).
@@ -1091,6 +1127,12 @@ impl SlirpBackend {
             out.append(&mut q.tx_queue);
         }
         out.append(&mut self.inject_to_guest);
+
+        // Stash the local `ready` Vec back as scratch.  `clear()`
+        // preserves capacity, so the next `drain_to_guest` reuses
+        // the buffer instead of allocating from cap=0.
+        ready.clear();
+        self.ready_scratch = ready;
     }
 
     /// Poll the stack and return ethernet frames to send to the guest.
@@ -2321,8 +2363,13 @@ impl SlirpBackend {
     /// only the flow table entries directly, avoiding a separate Vec allocation.
     /// Data relay is restricted to flows with an EPOLLIN event in `ready`.
     fn relay_tcp_nat_data(&mut self, ready: &[EpollEvent]) {
-        // Collect frames to inject (built separately to avoid borrow issues)
-        let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
+        // Collect frames to inject in the SlirpBackend-owned scratch
+        // so the buffer's capacity carries across calls.  Pushes
+        // can't go straight to `inject_to_guest` because we're
+        // about to iterate `flow_table` and `inject_to_guest` is
+        // also `&mut self`.
+        let mut frames_to_inject = std::mem::take(&mut self.relay_frames_scratch);
+        frames_to_inject.clear();
 
         // Seed removal set from flows already marked Closed by handle_tcp_frame
         // (FIN/RST path) via the pending_close queue. HashSet gives O(1)
@@ -2382,7 +2429,8 @@ impl SlirpBackend {
             }
         }
 
-        let mut tcp_flow_keys: Vec<FlowKey> = Vec::new();
+        let mut tcp_flow_keys = std::mem::take(&mut self.flow_keys_scratch);
+        tcp_flow_keys.clear();
         for event in ready {
             if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_TCP {
                 continue;
@@ -2396,7 +2444,7 @@ impl SlirpBackend {
             tcp_flow_keys.push(flow_key);
         }
 
-        for flow_key in tcp_flow_keys {
+        for flow_key in tcp_flow_keys.drain(..) {
             let FlowKey::Tcp(key) = flow_key else {
                 continue;
             };
@@ -2607,6 +2655,12 @@ impl SlirpBackend {
             self.flow_table.remove(&flow_key);
         }
         self.inject_to_guest.append(&mut frames_to_inject);
+        // Both `append` calls drained `frames_to_inject` but
+        // preserved its capacity; restore the buffer to the
+        // backend so the next cycle reuses it.  The flow-key
+        // buffer was already drained by the iteration above.
+        self.relay_frames_scratch = frames_to_inject;
+        self.flow_keys_scratch = tcp_flow_keys;
     }
 
     /// Drain replies from each active ICMP echo socket and emit echo-reply
@@ -2619,7 +2673,8 @@ impl SlirpBackend {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
         let now = Instant::now();
 
-        let mut ready_flow_keys: Vec<FlowKey> = Vec::new();
+        let mut ready_flow_keys = std::mem::take(&mut self.flow_keys_scratch);
+        ready_flow_keys.clear();
         for event in ready {
             if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_ICMP {
                 continue;
@@ -2681,6 +2736,8 @@ impl SlirpBackend {
             }
             self.flow_table.remove(&flow_key);
         }
+        ready_flow_keys.clear();
+        self.flow_keys_scratch = ready_flow_keys;
     }
 
     /// Build an Ethernet/IPv4/ICMP echo-reply frame addressed to the guest.
@@ -2751,18 +2808,20 @@ impl SlirpBackend {
     fn relay_udp_flows(&mut self, ready: &[EpollEvent]) {
         let now = Instant::now();
         // Per-flow connected sockets are closed by Drop when the entry leaves
-        // flow_table.
-        let mut stale: Vec<FlowKey> = Vec::new();
+        // flow_table.  The two flow-key Vecs here share `flow_keys_scratch`:
+        // the stale-sweep drains it, then the readiness loop refills it.
+        let mut flow_keys = std::mem::take(&mut self.flow_keys_scratch);
+        flow_keys.clear();
         for (flow_key, entry) in &self.flow_table {
             let FlowKey::Udp(_) = flow_key else { continue };
             let FlowEntry::Udp(udp_entry) = entry else {
                 continue;
             };
             if now.duration_since(udp_entry.last_activity) > UDP_IDLE_TIMEOUT {
-                stale.push(*flow_key);
+                flow_keys.push(*flow_key);
             }
         }
-        for flow_key in stale {
+        for flow_key in flow_keys.drain(..) {
             if let Some(FlowEntry::Udp(entry)) = self.flow_table.get(&flow_key) {
                 self.token_to_key.remove(&entry.flow_token);
                 self.epoll.unregister(entry.sock.as_raw_fd()).ok();
@@ -2770,7 +2829,6 @@ impl SlirpBackend {
             self.flow_table.remove(&flow_key);
         }
 
-        let mut flow_keys: Vec<FlowKey> = Vec::new();
         for event in ready {
             if !event.readable || event.token & PROTO_TAG_MASK != PROTO_TAG_UDP {
                 continue;
@@ -2780,7 +2838,7 @@ impl SlirpBackend {
             };
             flow_keys.push(flow_key);
         }
-        for flow_key in flow_keys {
+        for flow_key in flow_keys.drain(..) {
             let FlowKey::Udp(key) = flow_key else {
                 continue;
             };
@@ -2807,6 +2865,7 @@ impl SlirpBackend {
                 self.inject_to_guest.push(frame_bytes);
             }
         }
+        self.flow_keys_scratch = flow_keys;
     }
 
     /// Build an Ethernet/IPv4/UDP frame addressed to the guest, carrying a

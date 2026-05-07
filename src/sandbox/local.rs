@@ -91,8 +91,14 @@ impl LocalSandbox {
                 session_secret: SessionSecret::new(session_secret_bytes),
                 command_allowlist: Vec::new(), // Set via provisioning
                 network_deny_list: default_network_deny_list(),
-                max_connections_per_second: DEFAULT_MAX_CONNECTIONS_PER_SECOND,
-                max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+                max_connections_per_second: self
+                    .config
+                    .network_max_connections_per_second
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_SECOND),
+                max_concurrent_connections: self
+                    .config
+                    .network_max_concurrent_connections
+                    .unwrap_or(DEFAULT_MAX_CONCURRENT_CONNECTIONS),
                 seccomp: true,
             },
             snapshot: self.config.snapshot.clone(),

@@ -1607,6 +1607,77 @@ fn vsock_irq_thread(
 ///
 /// When the network backend does not provide an epoll instance
 /// (non-SlirpBackend), the thread falls back to a fixed 5 ms sleep.
+/// Registers a host eventfd with KVM via `KVM_IOEVENTFD` for the
+/// virtio-net TX-queue notify MMIO and adds it to the supplied
+/// [`EpollDispatch`] under `token` so the net-poll thread can drain
+/// it.  Returns the eventfd on success, or `None` and logs a
+/// `debug!` on any failure (eventfd creation, epoll registration,
+/// `KVM_IOEVENTFD` registration); callers fall back to the
+/// MMIO-exit TX path when this returns `None`.
+///
+/// Both pieces (epoll registration and `KVM_IOEVENTFD`
+/// registration) must succeed together: if KVM consumes the guest's
+/// TX MMIO writes in-kernel but no userspace path drains the
+/// eventfd, guest TX hangs silently.  This helper rolls back the
+/// epoll registration if the `KVM_IOEVENTFD` half fails.
+///
+/// # Errors
+///
+/// Returns `None` on any of: missing epoll dispatcher, eventfd
+/// creation failure, epoll registration failure, or
+/// `KVM_IOEVENTFD` registration failure.  Each failure is logged at
+/// `debug!` level with the underlying error.
+fn setup_tx_notify_ioeventfd(
+    vm: &Vm,
+    epoll_arc: Option<&Arc<crate::network::epoll_dispatch::EpollDispatch>>,
+    mmio_addr: u64,
+    queue_idx: u32,
+    token: u64,
+) -> Option<vmm_sys_util::eventfd::EventFd> {
+    let Some(ep_arc) = epoll_arc else {
+        debug!(
+            "net-poll: no epoll dispatcher; falling back to MMIO-exit TX path (KVM_IOEVENTFD requires an async drain)"
+        );
+        return None;
+    };
+    let fd = match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+        Ok(fd) => fd,
+        Err(e) => {
+            debug!(
+                "net-poll: eventfd create for tx-notify failed; falling back to MMIO-exit TX path: {}",
+                e
+            );
+            return None;
+        }
+    };
+    if let Err(e) = ep_arc.register(
+        fd.as_raw_fd(),
+        token,
+        crate::network::epoll_dispatch::RegisterMode::Read,
+    ) {
+        debug!(
+            "net-poll: failed to register tx-notify eventfd with epoll dispatch ({e}); falling back to MMIO-exit TX path"
+        );
+        return None;
+    }
+    let kvm_addr = kvm_ioctls::IoEventAddress::Mmio(mmio_addr);
+    if let Err(e) = vm.vm_fd().register_ioevent(&fd, &kvm_addr, queue_idx) {
+        // KVM didn't take the ioevent.  Roll the epoll registration
+        // back so the eventfd doesn't stay armed without a service
+        // path on it.
+        let _ = ep_arc.unregister(fd.as_raw_fd());
+        debug!(
+            "net-poll: KVM_IOEVENTFD register failed ({e}); TX notifies will continue to take MMIO exits"
+        );
+        return None;
+    }
+    debug!(
+        "net-poll: KVM_IOEVENTFD active for TX notify @ MMIO {:#x} queue_idx={queue_idx}",
+        mmio_addr,
+    );
+    Some(fd)
+}
+
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
     #[repr(C)]
     struct KvmIrqLevel {
@@ -1649,6 +1720,98 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
 
     let mut epoll_events: Vec<crate::network::epoll_dispatch::EpollEvent> = Vec::new();
 
+    // Tracks whether the device's interrupt_status was non-zero on the
+    // previous cycle.  Used to decide whether to pulse the IRQ line:
+    // we pulse only on transitions clear→pending (or when new RX frames
+    // are injected this cycle), not on every cycle where pending is
+    // still set from an un-acked earlier pulse.
+    let mut prev_pending: bool = false;
+
+    // KVM_IRQFD: register an eventfd that asserts IRQ 10 when written.
+    // Writing 8 bytes to the eventfd is one syscall; the kernel signals
+    // the in-kernel irqchip directly.  This replaces the pair of
+    // KVM_IRQ_LINE ioctls (assert level=1 / deassert level=0) with a
+    // single write.  If setup fails (kernel without irqfd, broken irqchip
+    // routing) we fall back to the ioctl path below.
+    let irq_eventfd: Option<vmm_sys_util::eventfd::EventFd> =
+        match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+            Ok(fd) => match vm.vm_fd().register_irqfd(&fd, 10) {
+                Ok(()) => Some(fd),
+                Err(e) => {
+                    debug!(
+                        "net-poll: KVM_IRQFD register failed; falling back to KVM_IRQ_LINE: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(
+                    "net-poll: eventfd create failed; falling back to KVM_IRQ_LINE: {}",
+                    e
+                );
+                None
+            }
+        };
+
+    // KVM_IOEVENTFD for the virtio-net TX queue notify.
+    //
+    // Without this, every guest TX (write to QUEUE_NOTIFY MMIO with value=1)
+    // forces a KVM_RUN exit, the vCPU thread dispatches into virtio-net's
+    // MMIO write handler, then calls process_tx_queue and re-enters KVM_RUN.
+    // ~1–5 µs per packet of pure VM-exit overhead.
+    //
+    // With KVM_IOEVENTFD: the guest's MMIO write is consumed in-kernel,
+    // KVM signals the eventfd, and the vCPU thread continues running.
+    // The net-poll thread sees the eventfd as another epoll source, drains
+    // it, and calls process_tx_queue asynchronously.  No vCPU exit.
+    //
+    // Address: virtio-net mmio_base (0xd000_0000) + QUEUE_NOTIFY offset
+    // (0x050) = 0xd000_0050.  Datamatch=1 triggers only on TX queue
+    // notifies (value=1 → queue index 1 = transmit queue).  Notifies for
+    // queue 0 (RX) still take the slow path through MMIO; they're rare
+    // (only when guest adds new RX buffers) so the optimisation isn't
+    // needed there.
+    const VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
+    const VIRTIO_NET_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
+    const TX_NOTIFY_QUEUE_IDX: u32 = 1;
+    // Token used to identify the TX-notify eventfd in epoll readiness
+    // events.  Lives in a tag space that doesn't collide with the
+    // PROTO_TAG_* values SlirpBackend uses for flow tokens.
+    const TX_NOTIFY_TOKEN: u64 = 0x4000_0000_0000_0000;
+
+    let tx_notify_eventfd = setup_tx_notify_ioeventfd(
+        vm.as_ref(),
+        epoll_arc.as_ref(),
+        VIRTIO_NET_MMIO_BASE + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
+        TX_NOTIFY_QUEUE_IDX,
+        TX_NOTIFY_TOKEN,
+    );
+
+    // Lock-free hand-off queue + direct backend Arc, pulled out of the
+    // device once at thread startup so the per-cycle hot path doesn't
+    // need to acquire the VirtioNetDevice mutex just to read backend
+    // frames.  The vCPU thread drains `pending_rx` on each MMIO entry
+    // (see vmm/cpu.rs), so this thread only needs to push frames.
+    type PendingRxArc = std::sync::Arc<crossbeam_queue::SegQueue<Vec<u8>>>;
+    type BackendArc = std::sync::Arc<Mutex<dyn crate::network::NetworkBackend>>;
+    type InterruptStatusArc = std::sync::Arc<std::sync::atomic::AtomicU32>;
+    let (pending_rx_arc, slirp_arc, interrupt_status_arc): (
+        Option<PendingRxArc>,
+        Option<BackendArc>,
+        Option<InterruptStatusArc>,
+    ) = match net_dev.lock() {
+        Ok(g) => (
+            Some(g.pending_rx()),
+            Some(g.slirp_arc()),
+            Some(g.interrupt_status_arc()),
+        ),
+        Err(_) => (None, None, None),
+    };
+
+    // Reusable buffer for frames pulled from the backend each cycle.
+    let mut rx_scratch: Vec<Vec<u8>> = Vec::new();
+
     while running.load(Ordering::Relaxed) {
         // Block outside the device lock: either on epoll readiness or a short
         // sleep.  This lets the vCPU thread acquire the device lock without
@@ -1681,39 +1844,115 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
             IDLE_TIMEOUT
         };
 
-        // Push ready events into the backend's queue before acquiring the
-        // device lock for inject/IRQ work. drain_to_guest will consume them
-        // without re-locking EpollDispatch, eliminating mutex contention
-        // between the net-poll thread's 50 ms blocking wait and the vCPU
-        // thread's process_guest_frame → drain_to_guest path.
+        // Filter out the TX-notify eventfd event (if any) before pushing
+        // the rest to the SLIRP backend.  When the guest writes to the
+        // virtio-net QUEUE_NOTIFY MMIO with value=1, KVM consumes it
+        // in-kernel and signals our eventfd; we drain it here and call
+        // process_tx_queue ourselves — the vCPU thread never exits for
+        // that MMIO write.
+        let mut tx_notify_fired = false;
+        if tx_notify_eventfd.is_some() {
+            epoll_events.retain(|e| {
+                if e.token == TX_NOTIFY_TOKEN {
+                    tx_notify_fired = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if tx_notify_fired {
+            if let Some(ref efd) = tx_notify_eventfd {
+                let _ = efd.read();
+            }
+            if let Ok(mut guard) = net_dev.lock() {
+                let _ = guard.process_tx_queue_external(guest_memory);
+            }
+        }
+
+        // Push remaining (flow) events into the backend's queue before
+        // acquiring the device lock for inject/IRQ work.  drain_to_guest
+        // will consume them without re-locking EpollDispatch, eliminating
+        // mutex contention between the net-poll thread's blocking wait and
+        // the vCPU thread's process_guest_frame → drain_to_guest path.
         if !epoll_events.is_empty() {
             if let Ok(guard) = net_dev.lock() {
                 guard.push_events_to_backend(&epoll_events);
             }
         }
 
-        let has_interrupt = {
-            let mut guard = match net_dev.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            let _ = guard.try_inject_rx(guest_memory);
-            guard.has_pending_interrupt()
-        };
-
-        // Always pulse IRQ10 while pending; this prevents RX stalls if
-        // an earlier edge was missed by the guest.
-        if has_interrupt {
-            let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
-            // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
-            // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
-            // for the lifetime of `vm`.
-            unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
+        // Drain backend frames into the pending_rx SegQueue WITHOUT
+        // touching the VirtioNetDevice mutex.  The vCPU thread will
+        // materialise them into RX descriptors on its next MMIO entry
+        // via VirtioNetDevice::flush_pending_rx (see vmm/cpu.rs).
+        //
+        // This breaks the old contention pattern where the net-poll
+        // thread held the VirtioNetDevice lock for the duration of
+        // try_inject_rx (descriptor walk + memory writes), forcing the
+        // vCPU thread to wait on every MMIO exit that overlapped with
+        // a poll cycle.
+        let frames_pushed: usize = match (&pending_rx_arc, &slirp_arc) {
+            (Some(pending_rx), Some(slirp)) => {
+                rx_scratch.clear();
+                if let Ok(mut backend) = slirp.lock() {
+                    backend.drain_to_guest(&mut rx_scratch);
+                }
+                let n = rx_scratch.len();
+                for frame in rx_scratch.drain(..) {
+                    let mut packet = Vec::with_capacity(
+                        crate::devices::virtio_net::VirtioNetHeader::SIZE + frame.len(),
+                    );
+                    packet.extend_from_slice(
+                        &crate::devices::virtio_net::VirtioNetHeader::new().to_bytes(),
+                    );
+                    packet.extend_from_slice(&frame);
+                    pending_rx.push(packet);
+                }
+                n
             }
-            let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
-            unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
+            _ => 0,
+        };
+        // Lock-free check: read interrupt_status via the AtomicU32 we
+        // cached at thread startup.  Avoids one device-mutex acquisition
+        // per cycle on idle paths (the hot RX path skips this branch
+        // because frames_pushed > 0 already implies interrupt_status
+        // is about to be set when the vCPU drains pending_rx).
+        let has_interrupt = frames_pushed > 0
+            || match interrupt_status_arc {
+                Some(ref isr) => isr.load(std::sync::atomic::Ordering::Relaxed) != 0,
+                None => false,
+            };
+        let frames_injected = frames_pushed;
+
+        // Pulse IRQ10 only when there is *new* work for the guest:
+        //   - frames just injected this cycle, OR
+        //   - interrupt_status went from clear → pending (TX completion
+        //     by the vCPU thread between cycles).
+        // Skipping pulses when the guest hasn't acknowledged a previous
+        // pulse saves two ioctl(KVM_IRQ_LINE) calls per cycle (~5–10 µs
+        // on the CRR hot path).  If we pulse once and the guest's
+        // ISR services the queue, has_pending_interrupt will be false
+        // on the next cycle and `prev_pending` resets.
+        let now_pending = has_interrupt;
+        let pulse = frames_injected > 0 || (now_pending && !prev_pending);
+        prev_pending = now_pending;
+        if pulse {
+            if let Some(ref efd) = irq_eventfd {
+                // Fast path: KVM_IRQFD.  One 8-byte write to the eventfd;
+                // the kernel asserts IRQ 10 directly.  No ioctl pair.
+                let _ = efd.write(1);
+            } else {
+                let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
+                // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
+                // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
+                // for the lifetime of `vm`.
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
+                }
+                let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
+                unsafe {
+                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
+                }
             }
         }
     }
