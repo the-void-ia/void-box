@@ -702,6 +702,11 @@ pub struct SlirpBackend {
     /// which heaptrack measured as ~half of all per-CRR
     /// allocations.
     ready_scratch: Vec<EpollEvent>,
+    /// Per-call scratch for `relay_tcp_nat_data`'s deferred frame
+    /// pushes.  The relay can't push directly to `inject_to_guest`
+    /// while iterating `flow_table` (borrow conflict); reusing
+    /// this buffer keeps the per-cycle Vec from growing from cap=0.
+    relay_frames_scratch: Vec<Vec<u8>>,
 }
 
 impl SlirpBackend {
@@ -810,6 +815,7 @@ impl SlirpBackend {
             pending_close: Vec::new(),
             has_external_poller: AtomicBool::new(false),
             ready_scratch: Vec::with_capacity(EVENTS_PRESIZE),
+            relay_frames_scratch: Vec::new(),
         })
     }
 
@@ -2348,8 +2354,13 @@ impl SlirpBackend {
     /// only the flow table entries directly, avoiding a separate Vec allocation.
     /// Data relay is restricted to flows with an EPOLLIN event in `ready`.
     fn relay_tcp_nat_data(&mut self, ready: &[EpollEvent]) {
-        // Collect frames to inject (built separately to avoid borrow issues)
-        let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
+        // Collect frames to inject in the SlirpBackend-owned scratch
+        // so the buffer's capacity carries across calls.  Pushes
+        // can't go straight to `inject_to_guest` because we're
+        // about to iterate `flow_table` and `inject_to_guest` is
+        // also `&mut self`.
+        let mut frames_to_inject = std::mem::take(&mut self.relay_frames_scratch);
+        frames_to_inject.clear();
 
         // Seed removal set from flows already marked Closed by handle_tcp_frame
         // (FIN/RST path) via the pending_close queue. HashSet gives O(1)
@@ -2634,6 +2645,10 @@ impl SlirpBackend {
             self.flow_table.remove(&flow_key);
         }
         self.inject_to_guest.append(&mut frames_to_inject);
+        // Both `append` calls drained `frames_to_inject` but
+        // preserved its capacity; restore the buffer to the
+        // backend so the next cycle reuses it.
+        self.relay_frames_scratch = frames_to_inject;
     }
 
     /// Drain replies from each active ICMP echo socket and emit echo-reply
