@@ -118,6 +118,12 @@ rustc-hash = "2"
 # `Arc<Mutex<VirtioNetDevice>>` device lock on the hot path.
 crossbeam-queue = "0.3"
 
+# Linux io_uring bindings.  Gated behind the `io-uring` Cargo
+# feature so the baseline epoll+read/write path remains the
+# default; the experiment branch toggles this on to A/B against
+# the user-space alloc reductions from PR #81.
+io-uring = { version = "0.7", optional = true }
+
 # --- macOS-only dependencies ---
 [target.'cfg(target_os = "macos")'.dependencies]
 # Objective-C 2.0 bindings (auto-generated from Apple frameworks)
@@ -149,6 +155,11 @@ opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetr
 # Expose internal SlirpBackend helpers (insert_synthetic_synsent_entry, etc.)
 # for use in benches/. Never enable in production builds.
 bench-helpers = []
+# Use io_uring for SLIRP host-socket recv/send batching instead of
+# per-syscall read/write.  Linux-only; falls back to the standard
+# path on macOS or when the running kernel lacks io_uring support.
+# Off by default while the experiment is being measured.
+io-uring = ["dep:io-uring"]
 
 [[bin]]
 name = "voidbox"
