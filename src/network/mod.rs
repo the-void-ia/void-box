@@ -9,6 +9,8 @@
 pub(crate) mod epoll_dispatch;
 pub mod nat;
 pub mod slirp;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) mod uring;
 
 use std::ffi::CString;
 use std::io;

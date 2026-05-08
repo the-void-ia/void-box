@@ -715,6 +715,23 @@ pub struct SlirpBackend {
     /// suffices — each callsite takes it, fills it, drains it,
     /// and stashes it back via `clear()` (capacity preserved).
     flow_keys_scratch: Vec<FlowKey>,
+    /// Per-cycle wall-clock cache used by every hot-path call site
+    /// that previously issued its own `Instant::now()`.
+    ///
+    /// Refreshed at the top of [`Self::drain_to_guest`] and
+    /// [`Self::process_guest_frame`].  All downstream callers read
+    /// [`Self::now`] instead of `Instant::now()`, which collapses
+    /// dozens of `clock_gettime` syscalls per CRR cycle into one.
+    /// The off-CPU profile measured `clock_gettime` at ~12 % of
+    /// total CPU before this cache landed; passt's design
+    /// already does this, which is part of the gap to close.
+    ///
+    /// The wall-clock staleness this introduces (≤ one cycle, in
+    /// practice ≤ a few hundred microseconds) is well below every
+    /// timeout the relay watches — TCP idle ≥ 60 s, ICMP idle
+    /// ≥ 60 s, UDP idle, DNS cache TTL ≥ seconds — so consumers
+    /// see no behavioral change.
+    cached_now: Instant,
 }
 
 impl SlirpBackend {
@@ -825,13 +842,36 @@ impl SlirpBackend {
             ready_scratch: Vec::with_capacity(EVENTS_PRESIZE),
             relay_frames_scratch: Vec::new(),
             flow_keys_scratch: Vec::new(),
+            cached_now: Instant::now(),
         })
+    }
+
+    /// Returns the wall-clock instant captured at the start of the
+    /// current relay cycle.
+    ///
+    /// Refreshed by [`Self::refresh_now`] at the entry points
+    /// ([`Self::drain_to_guest`] and [`Self::process_guest_frame`]).
+    /// Hot-path callers read this instead of issuing their own
+    /// [`Instant::now()`] — the savings are measured in the
+    /// commit message that introduced this field.
+    #[inline]
+    fn now(&self) -> Instant {
+        self.cached_now
+    }
+
+    /// Refreshes [`Self::cached_now`] with a single
+    /// [`Instant::now()`] call.  Invoked at relay cycle entry
+    /// points so all downstream callers within the same cycle
+    /// share one wall-clock reading.
+    #[inline]
+    fn refresh_now(&mut self) {
+        self.cached_now = Instant::now();
     }
 
     /// Check if a new connection is allowed by the rate limiter.
     /// Returns true if the connection is allowed.
     fn check_rate_limit(&mut self) -> bool {
-        let now = Instant::now();
+        let now = self.now();
         let window = Duration::from_secs(1);
 
         // Remove timestamps older than 1 second
@@ -950,10 +990,10 @@ impl SlirpBackend {
                 state: TcpNatState::SynSent,
                 our_seq: our_isn,
                 guest_ack: 0,
-                last_activity: Instant::now(),
+                last_activity: self.cached_now,
                 bytes_in_flight: 0,
                 flow_token: token,
-                last_state_change: Instant::now(),
+                last_state_change: self.cached_now,
                 our_fin_sent: false,
                 // Inbound port-forward entries never enter Connecting; the
                 // EPOLLOUT-driven completion path only reads guest_isn for
@@ -962,7 +1002,7 @@ impl SlirpBackend {
                 guest_window: 65535,
                 guest_window_scale: 0,
                 cached_recv_window,
-                cached_recv_window_at: Instant::now(),
+                cached_recv_window_at: self.cached_now,
             };
             let host_fd = entry.host_stream.as_raw_fd();
             let flow_key = FlowKey::Tcp(key);
@@ -993,6 +1033,7 @@ impl SlirpBackend {
 
     /// Process an ethernet frame from the guest
     pub fn process_guest_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.refresh_now();
         if frame.len() < 14 {
             return Ok(());
         }
@@ -1034,16 +1075,29 @@ impl SlirpBackend {
     ///
     /// See [`crate::network::NetworkBackend::drain_to_guest`].
     pub fn drain_to_guest(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.refresh_now();
         // Check rx_queue size before polling.
         let rx_count = {
             let q = self.queue.lock().unwrap();
             q.rx_queue.len()
         };
 
-        // 1. Let smoltcp handle ARP.
-        let ts = smol_instant_now();
-        let mut dev = VirtualDevice::new(self.queue.clone());
-        let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
+        // 1. Let smoltcp handle ARP — but only when the guest has
+        //    actually pushed frames into the RX queue.  Our smoltcp
+        //    `SocketSet` is empty (we use smoltcp solely for ARP
+        //    request/reply, which is RX-driven), so a `poll` on a
+        //    cycle with no incoming frames is pure cost.  The deep
+        //    CPU profile attributed ~228 ms of `<unknown>` work
+        //    under `drain_to_guest` to this branch on the M=4
+        //    workload — it amounts to several percent of total
+        //    CPU on cycles where there is no smoltcp work to do.
+        let changed = if rx_count > 0 {
+            let ts = smol_instant_now();
+            let mut dev = VirtualDevice::new(self.queue.clone());
+            self.iface.poll(ts, &mut dev, &mut self.sockets)
+        } else {
+            false
+        };
 
         // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
@@ -1211,10 +1265,11 @@ impl SlirpBackend {
     /// `/etc/resolv.conf` (falls back to 8.8.8.8 / 1.1.1.1).  Timeout is
     /// kept short (2 s) so that tool preflight checks don't stall.
     fn forward_dns_query(&mut self, query: &[u8]) -> Option<Vec<u8>> {
+        let now = self.cached_now;
         // ── Check cache ────────────────────────────────────────────
         if let Some(key) = Self::dns_cache_key(query) {
             if let Some(entry) = self.dns_cache.get(&key) {
-                if Instant::now() < entry.expires {
+                if now < entry.expires {
                     // Patch the cached response with the caller's
                     // transaction ID (first 2 bytes) so the guest
                     // matches it to its pending request.
@@ -1246,7 +1301,7 @@ impl SlirpBackend {
                             key,
                             DnsCacheEntry {
                                 response: resp.clone(),
-                                expires: Instant::now() + Duration::from_secs(DNS_CACHE_TTL_SECS),
+                                expires: now + Duration::from_secs(DNS_CACHE_TTL_SECS),
                             },
                         );
                     }
@@ -1390,7 +1445,7 @@ impl SlirpBackend {
         // Fast path: serve from cache (safe on vCPU thread)
         if let Some(key) = Self::dns_cache_key(query) {
             if let Some(entry) = self.dns_cache.get(&key) {
-                if Instant::now() < entry.expires {
+                if self.cached_now < entry.expires {
                     let mut resp = entry.response.clone();
                     if resp.len() >= 2 && query.len() >= 2 {
                         resp[0] = query[0];
@@ -1477,7 +1532,7 @@ impl SlirpBackend {
                 new_token = token;
                 match v.insert(FlowEntry::Udp(UdpFlowEntry {
                     sock,
-                    last_activity: Instant::now(),
+                    last_activity: self.cached_now,
                     flow_token: token,
                 })) {
                     FlowEntry::Udp(e) => e,
@@ -1485,7 +1540,7 @@ impl SlirpBackend {
                 }
             }
         };
-        entry.last_activity = Instant::now();
+        entry.last_activity = self.cached_now;
 
         if let Some(host_fd) = new_host_fd {
             self.token_to_key.insert(new_token, flow_key);
@@ -1565,7 +1620,7 @@ impl SlirpBackend {
                 match vacant.insert(FlowEntry::IcmpEcho(IcmpEchoEntry {
                     sock,
                     guest_id: ident,
-                    last_activity: Instant::now(),
+                    last_activity: self.cached_now,
                     flow_token: token,
                 })) {
                     FlowEntry::IcmpEcho(e) => e,
@@ -1573,7 +1628,7 @@ impl SlirpBackend {
                 }
             }
         };
-        entry.last_activity = Instant::now();
+        entry.last_activity = self.cached_now;
 
         if let Some(host_fd) = new_icmp_fd {
             self.token_to_key.insert(new_token, flow_key);
@@ -1654,7 +1709,7 @@ impl SlirpBackend {
         // error paths (ACK-driven read failure, write failure) set this flag.
         let mut closed_by_error = false;
 
-        entry.last_activity = Instant::now();
+        entry.last_activity = self.cached_now;
 
         // Track the most recent window advertisement from the guest.  Runs for
         // every frame (data, ACK, FIN, RST) so `guest_window` always reflects
@@ -1681,7 +1736,7 @@ impl SlirpBackend {
                 tcp.seq_number().0.wrapping_add(1) as u32, // ack — guest ISN + 1
                 TcpControl::None,
                 &[],
-                cached_host_recv_window(entry),
+                cached_host_recv_window(entry, self.cached_now),
                 None,
             );
             self.inject_to_guest.push(ack_frame);
@@ -1828,7 +1883,7 @@ impl SlirpBackend {
                     entry.guest_ack,
                     TcpControl::None,
                     &[],
-                    cached_host_recv_window(entry),
+                    cached_host_recv_window(entry, self.cached_now),
                     None,
                 );
                 self.inject_to_guest.push(ack_frame);
@@ -1864,7 +1919,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
-                        cached_host_recv_window(entry),
+                        cached_host_recv_window(entry, self.cached_now),
                         None,
                     );
                     self.inject_to_guest.push(ack_frame);
@@ -1881,7 +1936,7 @@ impl SlirpBackend {
                     }
 
                     entry.state = TcpNatState::FinWait1;
-                    entry.last_state_change = Instant::now();
+                    entry.last_state_change = self.cached_now;
                     trace!(
                         "SLIRP TCP: state Established → FinWait1 for {}:{}",
                         dst_ip,
@@ -1906,7 +1961,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::None,
                         &[],
-                        cached_host_recv_window(entry),
+                        cached_host_recv_window(entry, self.cached_now),
                         None,
                     );
                     self.inject_to_guest.push(ack_frame);
@@ -1916,7 +1971,7 @@ impl SlirpBackend {
                         trace!("SLIRP TCP: shutdown(Write) in CloseWait (non-fatal): {}", e);
                     }
                     entry.state = TcpNatState::LastAck;
-                    entry.last_state_change = Instant::now();
+                    entry.last_state_change = self.cached_now;
                     trace!(
                         "SLIRP TCP: state CloseWait → LastAck for {}:{}",
                         dst_ip,
@@ -2115,16 +2170,16 @@ impl SlirpBackend {
                     state: TcpNatState::SynReceived,
                     our_seq,
                     guest_ack: seq + 1,
-                    last_activity: Instant::now(),
+                    last_activity: self.cached_now,
                     bytes_in_flight: 0,
                     flow_token: token,
-                    last_state_change: Instant::now(),
+                    last_state_change: self.cached_now,
                     our_fin_sent: false,
                     guest_isn: seq,
                     guest_window: syn_window,
                     guest_window_scale: syn_window_scale,
                     cached_recv_window,
-                    cached_recv_window_at: Instant::now(),
+                    cached_recv_window_at: self.cached_now,
                 };
                 self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                 self.token_to_key.insert(token, flow_key);
@@ -2169,16 +2224,16 @@ impl SlirpBackend {
                     state: TcpNatState::Connecting,
                     our_seq,
                     guest_ack: seq + 1,
-                    last_activity: Instant::now(),
+                    last_activity: self.cached_now,
                     bytes_in_flight: 0,
                     flow_token: token,
-                    last_state_change: Instant::now(),
+                    last_state_change: self.cached_now,
                     our_fin_sent: false,
                     guest_isn: seq,
                     guest_window: syn_window,
                     guest_window_scale: syn_window_scale,
                     cached_recv_window,
-                    cached_recv_window_at: Instant::now(),
+                    cached_recv_window_at: self.cached_now,
                 };
                 self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
                 self.token_to_key.insert(token, flow_key);
@@ -2313,7 +2368,7 @@ impl SlirpBackend {
                 self.inject_to_guest.push(rst);
                 if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
                     entry.state = TcpNatState::Closed;
-                    entry.last_state_change = Instant::now();
+                    entry.last_state_change = self.cached_now;
                 }
                 self.pending_close.push(flow_key);
                 continue;
@@ -2334,7 +2389,7 @@ impl SlirpBackend {
             // Transition to SynReceived and send SYN-ACK.
             if let Some(FlowEntry::Tcp(entry)) = self.flow_table.get_mut(&flow_key) {
                 entry.state = TcpNatState::SynReceived;
-                entry.last_state_change = Instant::now();
+                entry.last_state_change = self.cached_now;
             }
             let syn_ack = build_tcp_packet_static(
                 key.dst_ip,
@@ -2383,21 +2438,26 @@ impl SlirpBackend {
         // Timeout sweep: one pass over the flow table handles two independent
         // timeout conditions without a separate Vec or extra allocation.
         // Uses to_remove_set (HashSet) for O(1) membership checks.
+        // The cycle's cached `now` replaces per-entry `Instant::elapsed()`
+        // calls — each `.elapsed()` issues `clock_gettime`, and at M=4
+        // with thousands of cycles per second this was the single largest
+        // source of `clock_gettime` traffic measured in the profile.
         const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+        let now = self.cached_now;
         for (flow_key, entry) in &self.flow_table {
             if let FlowEntry::Tcp(tcp_entry) = entry {
                 if to_remove_set.contains(flow_key) {
                     continue;
                 }
                 // Standard idle-timeout: 300 s of inactivity in any state.
-                if tcp_entry.last_activity.elapsed() > TCP_IDLE_TIMEOUT {
+                if now.duration_since(tcp_entry.last_activity) > TCP_IDLE_TIMEOUT {
                     to_remove_set.insert(*flow_key);
                     continue;
                 }
                 // LastAck-timeout: final guest ACK never arrived. Reap so a
                 // misbehaving or crashed guest doesn't leak entries forever.
                 if tcp_entry.state == TcpNatState::LastAck
-                    && tcp_entry.last_state_change.elapsed() > LAST_ACK_TIMEOUT
+                    && now.duration_since(tcp_entry.last_state_change) > LAST_ACK_TIMEOUT
                 {
                     warn!(
                         "SLIRP TCP: LastAck timeout for guest_port={}, reaping",
@@ -2411,10 +2471,10 @@ impl SlirpBackend {
                 }
                 // Connecting-timeout: the kernel is still issuing SYNs (silent
                 // firewall drop) and EPOLLOUT has not fired within CONNECT_TIMEOUT.
-                // Send RST to guest and reap.  This matches the pre-Phase-6.2
-                // synchronous connect_timeout(3 s) behavior.
+                // Send RST to the guest and reap the flow so stalled connect
+                // attempts fail promptly instead of lingering indefinitely.
                 if tcp_entry.state == TcpNatState::Connecting
-                    && tcp_entry.last_state_change.elapsed() > CONNECT_TIMEOUT
+                    && now.duration_since(tcp_entry.last_state_change) > CONNECT_TIMEOUT
                 {
                     warn!(
                         "SLIRP TCP: Connecting timeout for guest_port={}, reaping",
@@ -2488,7 +2548,7 @@ impl SlirpBackend {
                                 // already — that's a guest write failure, not our
                                 // concern).
                                 entry.state = TcpNatState::CloseWait;
-                                entry.last_state_change = Instant::now();
+                                entry.last_state_change = self.cached_now;
                                 trace!(
                                     "SLIRP TCP: Established → CloseWait for guest_port={}",
                                     key.guest_src_port
@@ -2499,7 +2559,7 @@ impl SlirpBackend {
                                 // Guest closed first; now host has finished writing.
                                 // Send FIN to guest, transition to LastAck.
                                 entry.state = TcpNatState::LastAck;
-                                entry.last_state_change = Instant::now();
+                                entry.last_state_change = self.cached_now;
                                 trace!(
                                     "SLIRP TCP: FinWait1 → LastAck for guest_port={}",
                                     key.guest_src_port
@@ -2517,7 +2577,7 @@ impl SlirpBackend {
                         if peek_n > in_flight {
                             let new_bytes = &peek_buf[in_flight..peek_n];
                             let mut sent_total: usize = 0;
-                            let our_window = cached_host_recv_window(entry);
+                            let our_window = cached_host_recv_window(entry, self.cached_now);
                             for chunk in new_bytes.chunks(MTU - 54) {
                                 // Honour the guest's advertised receive window.
                                 // `bytes_in_flight` tracks how many bytes the
@@ -2555,7 +2615,7 @@ impl SlirpBackend {
                                     entry.bytes_in_flight.wrapping_add(chunk.len() as u32);
                                 sent_total += chunk.len();
                             }
-                            entry.last_activity = Instant::now();
+                            entry.last_activity = self.cached_now;
                             trace!(
                                 "SLIRP TCP relay: peeked {} bytes (in_flight before={}, sent now={})",
                                 peek_n,
@@ -2592,7 +2652,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
-                        cached_host_recv_window(entry),
+                        cached_host_recv_window(entry, self.cached_now),
                         None,
                     ));
                     entry.our_seq = entry.our_seq.wrapping_add(1);
@@ -2611,7 +2671,7 @@ impl SlirpBackend {
                         entry.guest_ack,
                         TcpControl::Fin,
                         &[],
-                        cached_host_recv_window(entry),
+                        cached_host_recv_window(entry, self.cached_now),
                         None,
                     ));
                 }
@@ -2671,7 +2731,7 @@ impl SlirpBackend {
     /// readiness event for that flow.
     fn relay_icmp_echo(&mut self, ready: &[EpollEvent]) {
         const ICMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-        let now = Instant::now();
+        let now = self.now();
 
         let mut ready_flow_keys = std::mem::take(&mut self.flow_keys_scratch);
         ready_flow_keys.clear();
@@ -2806,7 +2866,7 @@ impl SlirpBackend {
     /// source port is `key.dst_port`; the destination is the guest IP and
     /// `key.guest_src_port`.
     fn relay_udp_flows(&mut self, ready: &[EpollEvent]) {
-        let now = Instant::now();
+        let now = self.now();
         // Per-flow connected sockets are closed by Drop when the entry leaves
         // flow_table.  The two flow-key Vecs here share `flow_keys_scratch`:
         // the stale-sweep drains it, then the readiness loop refills it.
@@ -3017,13 +3077,14 @@ const RECV_WINDOW_TTL: Duration = Duration::from_millis(5);
 /// Reads the cached value from `entry` and refreshes it via a real
 /// `getsockopt(TCP_INFO)` only when it is older than [`RECV_WINDOW_TTL`].
 /// At line-rate this drops the syscall from "every outgoing frame" to
-/// "every few milliseconds", which profiling identified as the dominant
-/// per-frame cost in Phase 6.3.
+/// "every few milliseconds", avoiding what would otherwise be a
+/// dominant per-frame cost while keeping the advertised window well
+/// within any realistic RTT.
 #[cfg(target_os = "linux")]
-fn cached_host_recv_window(entry: &mut TcpNatEntry) -> u16 {
-    if entry.cached_recv_window_at.elapsed() >= RECV_WINDOW_TTL {
+fn cached_host_recv_window(entry: &mut TcpNatEntry, now: Instant) -> u16 {
+    if now.duration_since(entry.cached_recv_window_at) >= RECV_WINDOW_TTL {
         entry.cached_recv_window = host_recv_window(entry.host_stream.as_raw_fd());
-        entry.cached_recv_window_at = Instant::now();
+        entry.cached_recv_window_at = now;
     }
     entry.cached_recv_window
 }
@@ -3031,10 +3092,10 @@ fn cached_host_recv_window(entry: &mut TcpNatEntry) -> u16 {
 /// Non-Linux stub: same shape as the Linux version, but `host_recv_window`
 /// is itself a constant on non-Linux so caching is moot.
 #[cfg(not(target_os = "linux"))]
-fn cached_host_recv_window(entry: &mut TcpNatEntry) -> u16 {
-    if entry.cached_recv_window_at.elapsed() >= RECV_WINDOW_TTL {
+fn cached_host_recv_window(entry: &mut TcpNatEntry, now: Instant) -> u16 {
+    if now.duration_since(entry.cached_recv_window_at) >= RECV_WINDOW_TTL {
         entry.cached_recv_window = host_recv_window(entry.host_stream.as_raw_fd());
-        entry.cached_recv_window_at = Instant::now();
+        entry.cached_recv_window_at = now;
     }
     entry.cached_recv_window
 }
@@ -3401,16 +3462,16 @@ impl SlirpBackend {
             state: TcpNatState::SynSent,
             our_seq: our_isn,
             guest_ack: 0,
-            last_activity: Instant::now(),
+            last_activity: self.cached_now,
             bytes_in_flight: 0,
             flow_token: token,
-            last_state_change: Instant::now(),
+            last_state_change: self.cached_now,
             our_fin_sent: false,
             guest_isn: 0,
             guest_window: 65535,
             guest_window_scale: 0,
             cached_recv_window,
-            cached_recv_window_at: Instant::now(),
+            cached_recv_window_at: self.cached_now,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
@@ -3525,16 +3586,16 @@ impl SlirpBackend {
             state: TcpNatState::LastAck,
             our_seq: 1,
             guest_ack: 1,
-            last_activity: Instant::now(),
+            last_activity: self.cached_now,
             bytes_in_flight: 0,
             flow_token: token,
-            last_state_change: Instant::now(),
+            last_state_change: self.cached_now,
             our_fin_sent: true,
             guest_isn: 0,
             guest_window: 65535,
             guest_window_scale: 0,
             cached_recv_window,
-            cached_recv_window_at: Instant::now(),
+            cached_recv_window_at: self.cached_now,
         };
         self.flow_table
             .insert(FlowKey::Tcp(key), FlowEntry::Tcp(entry));
@@ -3599,16 +3660,16 @@ impl SlirpBackend {
             state: TcpNatState::Connecting,
             our_seq: rand_seq(),
             guest_ack: 1,
-            last_activity: Instant::now(),
+            last_activity: self.cached_now,
             bytes_in_flight: 0,
             flow_token: token,
-            last_state_change: Instant::now(),
+            last_state_change: self.cached_now,
             our_fin_sent: false,
             guest_isn: 1000,
             guest_window: 65535,
             guest_window_scale: 0,
             cached_recv_window,
-            cached_recv_window_at: Instant::now(),
+            cached_recv_window_at: self.cached_now,
         };
         self.flow_table.insert(flow_key, FlowEntry::Tcp(entry));
         self.token_to_key.insert(token, flow_key);
