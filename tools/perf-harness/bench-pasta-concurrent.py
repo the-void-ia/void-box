@@ -25,13 +25,26 @@ import socket
 import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
-HOST_GATEWAY_FROM_NETNS = "169.254.0.1"
 HOST_LISTEN_BACKLOG = 1024
+
+
+def positive_int(value: str) -> int:
+    """Argparse type that rejects non-positive integers.
+
+    `--concurrency 0` would expand the shell `for i in {flow_ids}`
+    to an empty body and the harness would silently report zero
+    flows; better to fail at parse time.
+    """
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive integer (got {value!r})"
+        )
+    return parsed
 
 
 def resolve_pasta() -> str:
@@ -138,8 +151,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Multi-flow concurrent CRR microbench against pasta."
     )
-    parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument("--concurrency", type=positive_int, default=4)
+    parser.add_argument("--iterations", type=positive_int, default=2000)
     parser.add_argument(
         "--crr-client",
         default="/tmp/crr-client",

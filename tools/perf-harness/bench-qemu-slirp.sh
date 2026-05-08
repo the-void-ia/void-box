@@ -43,7 +43,18 @@ KEEP_ROOTFS=${KEEP_ROOTFS:-0}
 
 usage() {
   cat <<EOF
-Usage: $0 [--backend libslirp|passt] [--iterations N] [--kernel PATH] [--port PORT]
+Usage: $0 [--backend libslirp|passt] [--iterations N] [--concurrency M]
+          [--kernel PATH] [--port PORT]
+
+Options:
+  --backend       libslirp | passt                 (default: libslirp)
+  --iterations    CRRs per flow                    (default: 30)
+  --concurrency   number of concurrent crr-client  (default: 1)
+                  flows in the guest
+  --kernel        path to a Linux bzImage          (default: host distro kernel)
+  --port          host TCP listener port           (default: 18877)
+  --rootfs-dir    pre-built rootfs dir to reuse    (default: mktemp)
+  --keep          keep the rootfs after the run    (default: cleanup)
 
 Env vars:
   KERNEL          path to a Linux bzImage (default: host distro kernel)
@@ -53,7 +64,10 @@ Env vars:
   GUEST_ADDR      IPv4 to assign to the guest (default: 10.0.2.15)
   GUEST_GATEWAY   IPv4 the guest treats as host loopback (default: 10.0.2.2)
 
-Output: one line "n p50_ns p99_ns mean_ns" on stdout.
+Output:
+  --concurrency 1: one line "n p50_ns p99_ns mean_ns" on stdout.
+  --concurrency M (M>1): one line "<flow_id> n p50_ns p99_ns mean_ns" per flow
+                  on stdout, plus the aggregate summary on stderr.
 EOF
 }
 
@@ -263,7 +277,10 @@ echo "$RESULT" | sort -n | while read -r flow_id n p50_ns p99_ns mean_ns; do
 done
 median_p50_us=$(echo "$RESULT" | awk '{print $3}' | sort -n | awk '
   { lines[NR] = $1 }
-  END { print int(lines[int((NR + 1) / 2)] / 1000) }
+  # awk arrays are 1-indexed; matches the Rust/Python convention of
+  # `len // 2` (upper middle on even-length sequences) so the
+  # cross-stack comparison reports the same statistic.
+  END { print int(lines[int(NR / 2) + 1] / 1000) }
 ')
 max_p99_us=$(echo "$RESULT" | awk '{print $4}' | sort -n | tail -1 | awk '{print int($1 / 1000)}')
 mean_of_means_us=$(echo "$RESULT" | awk '{ sum += $5; n += 1 } END { if (n > 0) print int(sum / n / 1000); else print 0 }')

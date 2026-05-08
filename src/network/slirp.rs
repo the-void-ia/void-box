@@ -2471,8 +2471,8 @@ impl SlirpBackend {
                 }
                 // Connecting-timeout: the kernel is still issuing SYNs (silent
                 // firewall drop) and EPOLLOUT has not fired within CONNECT_TIMEOUT.
-                // Send RST to guest and reap.  This matches the pre-Phase-6.2
-                // synchronous connect_timeout(3 s) behavior.
+                // Send RST to the guest and reap the flow so stalled connect
+                // attempts fail promptly instead of lingering indefinitely.
                 if tcp_entry.state == TcpNatState::Connecting
                     && now.duration_since(tcp_entry.last_state_change) > CONNECT_TIMEOUT
                 {
@@ -3077,8 +3077,9 @@ const RECV_WINDOW_TTL: Duration = Duration::from_millis(5);
 /// Reads the cached value from `entry` and refreshes it via a real
 /// `getsockopt(TCP_INFO)` only when it is older than [`RECV_WINDOW_TTL`].
 /// At line-rate this drops the syscall from "every outgoing frame" to
-/// "every few milliseconds", which profiling identified as the dominant
-/// per-frame cost in Phase 6.3.
+/// "every few milliseconds", avoiding what would otherwise be a
+/// dominant per-frame cost while keeping the advertised window well
+/// within any realistic RTT.
 #[cfg(target_os = "linux")]
 fn cached_host_recv_window(entry: &mut TcpNatEntry, now: Instant) -> u16 {
     if now.duration_since(entry.cached_recv_window_at) >= RECV_WINDOW_TTL {
