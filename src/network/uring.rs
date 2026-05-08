@@ -96,9 +96,9 @@ pub(crate) struct UringCompletion {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// # #[cfg(all(target_os = "linux", feature = "io-uring"))] {
-/// use void_box::network::uring::{UringBatch, UringOp};
+/// ```ignore
+/// // (This example is `ignore`d because the type is `pub(crate)`
+/// // and not reachable from the doctest's external compilation.)
 /// let mut batch = UringBatch::new().expect("kernel supports io_uring");
 /// let mut buf = vec![0u8; 1500];
 /// // SAFETY: caller guarantees `buf` lives until the matching CQE drains.
@@ -109,7 +109,6 @@ pub(crate) struct UringCompletion {
 /// }
 /// batch.submit_and_wait(0).expect("kernel reachable");
 /// while let Some(_completion) = batch.drain_one() { /* … */ }
-/// # }
 /// ```
 pub(crate) struct UringBatch {
     ring: IoUring,
