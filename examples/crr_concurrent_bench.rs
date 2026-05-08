@@ -56,6 +56,11 @@ struct Cli {
     /// Memory size for the guest VM (MB).
     #[arg(long, default_value_t = 1024)]
     memory_mb: usize,
+    /// Number of vCPUs.  Multi-queue / multi-poll-thread experiments
+    /// need >1 vCPU for the guest to spread connections across cores;
+    /// single-vCPU runs are the baseline shape.
+    #[arg(long, default_value_t = 1)]
+    vcpus: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = Sandbox::local()
         .from_env()?
         .memory_mb(cli.memory_mb)
+        .vcpus(cli.vcpus)
         .network(true)
         // Same SLIRP-default lift as `crr_singleproc_bench` — at M=4
         // concurrency × 100 iterations the bench would otherwise trip

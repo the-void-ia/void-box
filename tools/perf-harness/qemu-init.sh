@@ -4,6 +4,10 @@
 # Used by tools/perf-harness/bench-qemu-slirp.sh.  Read /proc/cmdline for:
 #   crr_target=HOST:PORT:N      target server + iteration count
 #   crr_net=ADDR/MASK,GW        static network config
+#   crr_concurrency=M           number of concurrent crr-client processes
+#                               (default 1; >1 forks M backgrounded
+#                               clients and concatenates their summary
+#                               lines as `<flow_id> n p50 p99 mean`)
 #
 # Bring up eth0 with the static IP, run /tmp/crr-client, and halt.
 # The script is paranoid about busybox-vs-distro variations: virtio-net
@@ -17,10 +21,12 @@ mount -t sysfs sysfs /sys 2>/dev/null
 cmdline="$(cat /proc/cmdline)"
 target=""
 net=""
+concurrency=1
 for tok in $cmdline; do
   case "$tok" in
-    crr_target=*) target="${tok#crr_target=}" ;;
-    crr_net=*)    net="${tok#crr_net=}" ;;
+    crr_target=*)      target="${tok#crr_target=}" ;;
+    crr_net=*)         net="${tok#crr_net=}" ;;
+    crr_concurrency=*) concurrency="${tok#crr_concurrency=}" ;;
   esac
 done
 
@@ -69,9 +75,38 @@ busybox ifconfig eth0 "$addr" netmask "$mask" up
 busybox route add default gw "$gw"
 
 echo "===CRR-START==="
-echo "addr=${addr_mask} gw=${gw} target=${host}:${port} n=${n}"
-/tmp/crr-client "$host" "$port" "$n"
-rc=$?
+echo "addr=${addr_mask} gw=${gw} target=${host}:${port} n=${n} M=${concurrency}"
+if [ "$concurrency" = "1" ]; then
+  # Backwards-compatible single-flow path: emit the same one-line
+  # `n p50 p99 mean` shape bench-qemu-slirp.sh already parses.
+  /tmp/crr-client "$host" "$port" "$n"
+  rc=$?
+else
+  # Multi-flow: spawn M background clients, each writing its own
+  # summary line; emit one `<flow_id> n p50 p99 mean` per flow so
+  # the host parser keeps the per-flow attribution it needs to
+  # report median-of-p50s / max-p99 / aggregate qps.
+  rm -rf /tmp/crr_results
+  mkdir -p /tmp/crr_results
+  i=1
+  while [ "$i" -le "$concurrency" ]; do
+    /tmp/crr-client "$host" "$port" "$n" > "/tmp/crr_results/$i.txt" &
+    i=$((i + 1))
+  done
+  wait
+  rc=0
+  i=1
+  while [ "$i" -le "$concurrency" ]; do
+    line="$(cat /tmp/crr_results/$i.txt 2>/dev/null)"
+    if [ -z "$line" ]; then
+      echo "ERROR: empty result for flow $i"
+      rc=2
+    else
+      echo "$i $line"
+    fi
+    i=$((i + 1))
+  done
+fi
 echo "===CRR-END (rc=$rc)==="
 
 poweroff -f

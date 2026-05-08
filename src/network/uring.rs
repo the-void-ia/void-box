@@ -153,7 +153,33 @@ impl UringBatch {
         buf: &mut [u8],
         correlation_id: u32,
     ) -> io::Result<()> {
+        // SAFETY: forwards the caller's safety contract to
+        // [`Self::submit_recv_with_flags`]; `0` flags means a
+        // standard `recv()` with no `MSG_*` modifiers.
+        unsafe { self.submit_recv_with_flags(fd, buf, correlation_id, 0) }
+    }
+
+    /// Submits an `IORING_OP_RECV` with explicit `recv(2)` flags
+    /// (`libc::MSG_*`), e.g. [`libc::MSG_PEEK`] to inspect kernel
+    /// buffer contents without consuming them.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::submit_recv`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::submit_recv`]: `buf` must remain
+    /// valid until the matching CQE drains via [`Self::drain_one`].
+    pub(crate) unsafe fn submit_recv_with_flags(
+        &mut self,
+        fd: RawFd,
+        buf: &mut [u8],
+        correlation_id: u32,
+        flags: i32,
+    ) -> io::Result<()> {
         let entry = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+            .flags(flags)
             .build()
             .user_data(UringOp::Recv.encode(correlation_id));
         let mut sq = self.ring.submission();

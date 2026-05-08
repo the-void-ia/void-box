@@ -21,6 +21,7 @@ set -euo pipefail
 
 BACKEND=libslirp
 ITERATIONS=30
+CONCURRENCY=1
 KERNEL=${KERNEL:-/boot/vmlinuz-$(uname -r)}
 # NB: must be the `passt` binary (VM/socket mode), NOT the `pasta` symlink
 # (namespace mode).  The two modes are the same code keyed on argv[0].
@@ -58,14 +59,15 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --backend)    BACKEND="$2"; shift 2 ;;
-    --iterations) ITERATIONS="$2"; shift 2 ;;
-    --kernel)     KERNEL="$2"; shift 2 ;;
-    --port)       HOST_PORT="$2"; shift 2 ;;
-    --rootfs-dir) ROOTFS_DIR="$2"; shift 2 ;;
-    --keep)       KEEP_ROOTFS=1; shift ;;
-    -h|--help)    usage; exit 0 ;;
-    *)            echo "unknown arg: $1" >&2; usage; exit 1 ;;
+    --backend)     BACKEND="$2"; shift 2 ;;
+    --iterations)  ITERATIONS="$2"; shift 2 ;;
+    --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --kernel)      KERNEL="$2"; shift 2 ;;
+    --port)        HOST_PORT="$2"; shift 2 ;;
+    --rootfs-dir)  ROOTFS_DIR="$2"; shift 2 ;;
+    --keep)        KEEP_ROOTFS=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             echo "unknown arg: $1" >&2; usage; exit 1 ;;
   esac
 done
 
@@ -114,7 +116,7 @@ cp "$INIT_TEMPLATE" "$ROOTFS_DIR/init"
 chmod +x "$ROOTFS_DIR/init"
 cp "$CRR_CLIENT_BIN" "$ROOTFS_DIR/tmp/crr-client"
 
-for cmd in sh ifconfig route poweroff cat sleep echo mount find ls insmod; do
+for cmd in sh ifconfig route poweroff cat sleep echo mount find ls insmod rm mkdir; do
   ln -sf busybox "$ROOTFS_DIR/bin/$cmd"
 done
 
@@ -188,7 +190,13 @@ case "$BACKEND" in
     ;;
   passt)
     [[ -x "$PASST" ]] || { echo "ERROR: passt not executable: $PASST" >&2; exit 2; }
-    PASST_SOCK=$(mktemp -u -t voidbox-passt.XXXXXX.sock)
+    # Force /tmp regardless of $TMPDIR — passt's SELinux policy on
+    # Fedora (`passt_exec_t`) only allows it to bind UNIX sockets
+    # under standard system tmp paths.  When $TMPDIR points
+    # elsewhere (the void-box validation contract sets it to
+    # $PWD/target/tmp), passt fails with "Permission denied" on
+    # bind and the harness times out with no result.
+    PASST_SOCK=$(mktemp -u -p /tmp voidbox-passt.XXXXXX.sock)
     rm -f "$PASST_SOCK"
     "$PASST" -f -s "$PASST_SOCK" \
       -a "$GUEST_ADDR" -n 24 -g "$GUEST_GATEWAY" \
@@ -209,17 +217,23 @@ QEMU_LOG=$(mktemp -t voidbox-qemu.XXXXXX.log)
 trap "kill ${SERVER_PID} ${PASST_PID:-} 2>/dev/null; rm -f $INITRD $SERVER_PIDFILE $QEMU_LOG ${PASST_SOCK:-}; ${cleanup_rootfs:-true}" EXIT
 
 # shellcheck disable=SC2086
-HOST_PORT="$HOST_PORT" timeout 60 qemu-system-x86_64 \
+HOST_PORT="$HOST_PORT" timeout 600 qemu-system-x86_64 \
   -enable-kvm -cpu host -m 512 -smp 1 \
   -kernel "$KERNEL" \
   -initrd "$INITRD" \
   -nographic -no-reboot \
-  -append "console=ttyS0 reboot=t panic=1 quiet crr_target=${GUEST_GATEWAY}:${HOST_PORT}:${ITERATIONS} crr_net=${GUEST_ADDR}/24,${GUEST_GATEWAY}" \
+  -append "console=ttyS0 reboot=t panic=1 quiet crr_target=${GUEST_GATEWAY}:${HOST_PORT}:${ITERATIONS} crr_net=${GUEST_ADDR}/24,${GUEST_GATEWAY} crr_concurrency=${CONCURRENCY}" \
   $NETDEV_ARGS \
   > "$QEMU_LOG" 2>&1 || true
 
-# Extract the one-line crr-client output between sentinels.
-RESULT=$(sed -n '/===CRR-START===/,/===CRR-END/p' "$QEMU_LOG" | grep -E '^[0-9]+ [0-9]+ [0-9]+ [0-9]+$' | head -1 || true)
+if [[ "$CONCURRENCY" -eq 1 ]]; then
+  # Single-flow path emits exactly one summary line `n p50 p99 mean`.
+  RESULT=$(sed -n '/===CRR-START===/,/===CRR-END/p' "$QEMU_LOG" | grep -E '^[0-9]+ [0-9]+ [0-9]+ [0-9]+$' | head -1 || true)
+else
+  # Multi-flow path emits M lines `<flow_id> n p50 p99 mean` between
+  # the sentinels.  Capture all of them; aggregation happens below.
+  RESULT=$(sed -n '/===CRR-START===/,/===CRR-END/p' "$QEMU_LOG" | grep -E '^[0-9]+ [0-9]+ [0-9]+ [0-9]+ [0-9]+$' || true)
+fi
 
 if [[ -z "$RESULT" ]]; then
   echo "ERROR: no result from guest (qemu log tail follows):" >&2
@@ -227,9 +241,41 @@ if [[ -z "$RESULT" ]]; then
   exit 4
 fi
 
-read -r N P50_NS P99_NS MEAN_NS <<<"$RESULT"
-P50_US=$((P50_NS / 1000))
-P99_US=$((P99_NS / 1000))
-MEAN_US=$((MEAN_NS / 1000))
-echo "qemu+${BACKEND} CRR over $N iterations: p50=${P50_US} µs, p99=${P99_US} µs, mean=${MEAN_US} µs" >&2
+if [[ "$CONCURRENCY" -eq 1 ]]; then
+  read -r N P50_NS P99_NS MEAN_NS <<<"$RESULT"
+  P50_US=$((P50_NS / 1000))
+  P99_US=$((P99_NS / 1000))
+  MEAN_US=$((MEAN_NS / 1000))
+  echo "qemu+${BACKEND} CRR over $N iterations: p50=${P50_US} µs, p99=${P99_US} µs, mean=${MEAN_US} µs" >&2
+  echo "$RESULT"
+  exit 0
+fi
+
+# Multi-flow aggregation: report median-of-p50s, max-p99,
+# mean-of-means, aggregate qps — same shape as
+# `examples/crr_concurrent_bench` and `bench-pasta-concurrent.py`.
+echo "qemu+${BACKEND} concurrent CRR: $CONCURRENCY flows × $ITERATIONS iterations" >&2
+flow_count=0
+total_iters=0
+total_mean_ns=0
+echo "$RESULT" | sort -n | while read -r flow_id n p50_ns p99_ns mean_ns; do
+  echo "  flow $flow_id ($n iters): p50=$((p50_ns / 1000)) µs  p99=$((p99_ns / 1000)) µs  mean=$((mean_ns / 1000)) µs" >&2
+done
+median_p50_us=$(echo "$RESULT" | awk '{print $3}' | sort -n | awk '
+  { lines[NR] = $1 }
+  END { print int(lines[int((NR + 1) / 2)] / 1000) }
+')
+max_p99_us=$(echo "$RESULT" | awk '{print $4}' | sort -n | tail -1 | awk '{print int($1 / 1000)}')
+mean_of_means_us=$(echo "$RESULT" | awk '{ sum += $5; n += 1 } END { if (n > 0) print int(sum / n / 1000); else print 0 }')
+total_completed=$(echo "$RESULT" | awk '{ sum += $2 } END { print sum }')
+
+# Note: aggregate qps is approximated by total_completed / qemu_wall.
+# We don't capture qemu_wall precisely here (the timeout wraps the
+# whole run including initramfs build + boot), so the per-flow p50
+# is the more reliable comparison metric.
+echo "  median-of-p50s:  ${median_p50_us} µs" >&2
+echo "  max p99:         ${max_p99_us} µs" >&2
+echo "  mean-of-means:   ${mean_of_means_us} µs" >&2
+echo "  total CRRs:      ${total_completed}" >&2
+# Stdout: machine-readable per-flow lines (already in $RESULT).
 echo "$RESULT"
