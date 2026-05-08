@@ -1082,10 +1082,22 @@ impl SlirpBackend {
             q.rx_queue.len()
         };
 
-        // 1. Let smoltcp handle ARP.
-        let ts = smol_instant_now();
-        let mut dev = VirtualDevice::new(self.queue.clone());
-        let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
+        // 1. Let smoltcp handle ARP — but only when the guest has
+        //    actually pushed frames into the RX queue.  Our smoltcp
+        //    `SocketSet` is empty (we use smoltcp solely for ARP
+        //    request/reply, which is RX-driven), so a `poll` on a
+        //    cycle with no incoming frames is pure cost.  The deep
+        //    CPU profile attributed ~228 ms of `<unknown>` work
+        //    under `drain_to_guest` to this branch on the M=4
+        //    workload — it amounts to several percent of total
+        //    CPU on cycles where there is no smoltcp work to do.
+        let changed = if rx_count > 0 {
+            let ts = smol_instant_now();
+            let mut dev = VirtualDevice::new(self.queue.clone());
+            self.iface.poll(ts, &mut dev, &mut self.sockets)
+        } else {
+            false
+        };
 
         // 2. Resolve pending DNS queries (off vCPU thread).
         self.resolve_pending_dns();
