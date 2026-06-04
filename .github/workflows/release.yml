@@ -271,11 +271,25 @@ jobs:
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Darwin tarball SHA256: $SHA256"
 
+      # Token scoped to the tap repo so createCommitOnBranch (below) can sign
+      # the formula update with GitHub's key — verified under the org ruleset.
+      # The App must be installed on the-void-ia/homebrew-tap with
+      # contents:write; once it is, this replaces the HOMEBREW_TAP_TOKEN PAT
+      # for both checkout and commit.
+      - name: Generate GitHub App token (homebrew-tap)
+        id: tap-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: the-void-ia
+          repositories: homebrew-tap
+
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
           repository: the-void-ia/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
           path: homebrew-tap
 
       - name: Update formula
@@ -324,10 +338,68 @@ jobs:
           RUBY
 
       - name: Push formula update
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/voidbox.rb
-          git commit -m "voidbox ${{ github.ref_name }}"
-          git push
+          set -euo pipefail
+          version="${{ github.ref_name }}"
+          repo="the-void-ia/homebrew-tap"
+
+          # No-op guard: re-running an already-published tag leaves the
+          # formula unchanged, so there is nothing to commit.
+          if git -C homebrew-tap diff --quiet -- Formula/voidbox.rb; then
+            echo "Formula already at ${version}; nothing to push."
+            exit 0
+          fi
+
+          # The tap's default branch (main/master) is whatever checkout landed
+          # on; resolve it rather than hard-coding.
+          branch="$(git -C homebrew-tap rev-parse --abbrev-ref HEAD)"
+          base_sha="$(git -C homebrew-tap rev-parse HEAD)"
+
+          # Commit the formula via the GraphQL API so GitHub signs it
+          # server-side (Verified). `git commit` would be unsigned and the org
+          # ruleset would reject it. This commits straight to the tap's default
+          # branch, matching the previous direct push. expectedHeadOid pins the
+          # commit to the checked-out tip so a concurrent push fails loudly.
+          payload="$(mktemp)"
+          REPO="$repo" BRANCH="$branch" \
+          HEADLINE="voidbox ${version}" \
+          BASE_SHA="$base_sha" \
+          CONTENTS="$(base64 -w0 homebrew-tap/Formula/voidbox.rb)" \
+          python3 > "$payload" <<'PY'
+          import json, os
+          print(json.dumps({
+              "query": (
+                  "mutation($input: CreateCommitOnBranchInput!) {"
+                  "  createCommitOnBranch(input: $input) { commit { oid } }"
+                  "}"
+              ),
+              "variables": {"input": {
+                  "branch": {
+                      "repositoryNameWithOwner": os.environ["REPO"],
+                      "branchName": os.environ["BRANCH"],
+                  },
+                  "message": {"headline": os.environ["HEADLINE"]},
+                  "expectedHeadOid": os.environ["BASE_SHA"],
+                  "fileChanges": {"additions": [{
+                      "path": "Formula/voidbox.rb",
+                      "contents": os.environ["CONTENTS"],
+                  }]},
+              }},
+          }))
+          PY
+
+          resp="$(gh api graphql --input "$payload")"
+          # GraphQL returns HTTP 200 even on error; inspect the errors array.
+          oid="$(RESP="$resp" python3 <<'PY'
+          import json, os, sys
+          d = json.loads(os.environ["RESP"])
+          if d.get("errors"):
+              sys.stderr.write("createCommitOnBranch failed: "
+                               + json.dumps(d["errors"]) + "\n")
+              sys.exit(1)
+          print(d["data"]["createCommitOnBranch"]["commit"]["oid"])
+          PY
+          )"
+          echo "Pushed verified commit ${oid} to ${repo}@${branch}"
