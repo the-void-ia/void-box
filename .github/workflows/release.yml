@@ -214,7 +214,7 @@ jobs:
         run: ls -lhR release-artifacts/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           files: release-artifacts/*
           body: |
@@ -271,11 +271,24 @@ jobs:
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Darwin tarball SHA256: $SHA256"
 
+      # Token scoped to the tap repo, used for both checkout and the formula
+      # PR below, so the formula commit carries GitHub's signature (verified
+      # under the org ruleset). The App is installed on
+      # the-void-ia/homebrew-tap with contents:write + pull_requests:write.
+      - name: Generate GitHub App token (homebrew-tap)
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ secrets.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: the-void-ia
+          repositories: homebrew-tap
+
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
           repository: the-void-ia/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
           path: homebrew-tap
 
       - name: Update formula
@@ -323,11 +336,109 @@ jobs:
           end
           RUBY
 
+      # The tap's default branch requires changes go through a PR (org
+      # ruleset), so the formula bump can't be pushed directly. It is committed
+      # to a short-lived branch via the GraphQL API (GitHub signs it), opened
+      # as a PR, and squash-merged immediately — the tap requires zero
+      # approving reviews, so this runs unattended, and the squash commit
+      # GitHub writes onto the default branch is itself verified, satisfying
+      # the signature + linear-history rules without any ruleset bypass.
       - name: Push formula update
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/voidbox.rb
-          git commit -m "voidbox ${{ github.ref_name }}"
-          git push
+          set -euo pipefail
+          version="${{ github.ref_name }}"
+          repo="the-void-ia/homebrew-tap"
+
+          # Skip if the formula is already current — nothing to do.
+          if git -C homebrew-tap diff --quiet -- Formula/voidbox.rb; then
+            echo "Formula already at ${version}; nothing to push."
+            exit 0
+          fi
+
+          # Resolve the tap's default branch rather than hard-coding main.
+          base_branch="$(git -C homebrew-tap rev-parse --abbrev-ref HEAD)"
+          base_sha="$(git -C homebrew-tap rev-parse HEAD)"
+          head="automation/voidbox-${version}"
+
+          # Create (or reset) the formula branch at the tap's current tip. It
+          # is not the default branch, so the org ruleset does not gate commits
+          # to it.
+          if ! gh api -X POST "repos/${repo}/git/refs" \
+                -f ref="refs/heads/${head}" -f sha="${base_sha}" >/dev/null 2>&1; then
+            echo "Branch ${head} already exists; resetting it to ${base_sha}"
+            gh api -X PATCH "repos/${repo}/git/refs/heads/${head}" \
+              -f sha="${base_sha}" -F force=true >/dev/null
+          fi
+
+          # Commit the formula onto that branch via createCommitOnBranch so the
+          # commit is signed by GitHub. expectedHeadOid pins it to the tip we
+          # just reset to.
+          payload="$(mktemp)"
+          REPO="$repo" BRANCH="$head" \
+          HEADLINE="voidbox ${version}" \
+          BASE_SHA="$base_sha" \
+          CONTENTS="$(base64 -w0 homebrew-tap/Formula/voidbox.rb)" \
+          python3 > "$payload" <<'PY'
+          import json, os
+          print(json.dumps({
+              "query": (
+                  "mutation($input: CreateCommitOnBranchInput!) {"
+                  "  createCommitOnBranch(input: $input) { commit { oid } }"
+                  "}"
+              ),
+              "variables": {"input": {
+                  "branch": {
+                      "repositoryNameWithOwner": os.environ["REPO"],
+                      "branchName": os.environ["BRANCH"],
+                  },
+                  "message": {"headline": os.environ["HEADLINE"]},
+                  "expectedHeadOid": os.environ["BASE_SHA"],
+                  "fileChanges": {"additions": [{
+                      "path": "Formula/voidbox.rb",
+                      "contents": os.environ["CONTENTS"],
+                  }]},
+              }},
+          }))
+          PY
+
+          resp="$(gh api graphql --input "$payload")"
+          # GraphQL returns HTTP 200 even on error; inspect the errors array.
+          oid="$(RESP="$resp" python3 <<'PY'
+          import json, os, sys
+          d = json.loads(os.environ["RESP"])
+          if d.get("errors"):
+              sys.stderr.write("createCommitOnBranch failed: "
+                               + json.dumps(d["errors"]) + "\n")
+              sys.exit(1)
+          print(d["data"]["createCommitOnBranch"]["commit"]["oid"])
+          PY
+          )"
+          echo "Committed ${oid} to ${repo}@${head}"
+
+          # Open the PR only if one isn't already open for this branch.
+          if ! gh pr view "$head" --repo "$repo" --json number >/dev/null 2>&1; then
+            gh pr create --repo "$repo" \
+              --base "$base_branch" --head "$head" \
+              --title "voidbox ${version}" \
+              --body "Automated Homebrew formula bump for voidbox ${version}."
+          fi
+
+          # Squash-merge → a single GitHub-signed commit on the default branch.
+          # GitHub computes mergeability asynchronously after the PR is opened,
+          # so retry briefly until it reports mergeable.
+          merged=
+          for attempt in 1 2 3 4 5 6; do
+            if gh pr merge "$head" --repo "$repo" --squash --delete-branch; then
+              merged=1
+              break
+            fi
+            echo "merge attempt ${attempt} not ready; retrying in 5s..."
+            sleep 5
+          done
+          if [[ -z "$merged" ]]; then
+            echo "::error::failed to merge tap formula PR ${head}"
+            exit 1
+          fi
+          echo "Merged ${head} into ${repo}@${base_branch}"

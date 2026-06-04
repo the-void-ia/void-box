@@ -40,28 +40,45 @@ on:
           - claude-code
           - codex
 
+# The default GITHUB_TOKEN only reads here (checkout + upstream version
+# discovery). All writes — branch ref, the signed bump commit, and the PR —
+# go through a GitHub App installation token (see the "Generate GitHub App
+# token" step) so the commit lands "Verified" under the org ruleset and the
+# resulting PR still triggers downstream CI (a GITHUB_TOKEN-created PR does
+# not).
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   discover:
     name: Discover (${{ matrix.agent }})
     runs-on: ubuntu-latest
-    # Matrix-level filter: when invoked via workflow_dispatch with
-    # `inputs.agent` set, expand the matrix to just that agent so the
-    # unwanted leg is never scheduled. Using a job-level `if` here would
-    # fail validation — `matrix` is not in scope at job-level `if`. A
-    # previous shape used a step-level `if` + `exit 0`, which only ended
-    # the first step — every subsequent step (download, hash, open PR)
-    # still ran for the non-selected agent and could open an unintended
-    # PR. Filtering at the strategy level avoids both pitfalls.
+    # Filter the matrix itself so a workflow_dispatch run for one agent never
+    # schedules the other leg. A job-level `if` can't do this — `matrix` is
+    # not in scope there. A step-level `if` + `exit 0` only ends one step;
+    # later steps (download, hash, open PR) would still run for the
+    # non-selected agent and could open an unintended PR.
     strategy:
       fail-fast: false
       matrix:
         agent: ${{ (inputs.agent == '' || inputs.agent == 'all') && fromJSON('["claude-code", "codex"]') || fromJSON(format('["{0}"]', inputs.agent)) }}
     steps:
       - uses: actions/checkout@v4
+
+      # Mint a short-lived installation token for the GitHub App that owns
+      # the bump-agents identity. createCommitOnBranch (below) signs commits
+      # with GitHub's key on the token holder's behalf, so commits made with
+      # this token are "Verified" without managing a GPG keypair. Unlike the
+      # default GITHUB_TOKEN, a PR opened with an App token also triggers the
+      # repo's CI workflows. Requires repo/org secrets AUTOMATION_APP_ID and
+      # AUTOMATION_APP_PRIVATE_KEY, and the App installed with contents:write
+      # + pull_requests:write.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ secrets.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
 
       - name: Discover latest upstream version
         id: latest
@@ -280,45 +297,89 @@ jobs:
       - name: Open PR
         if: steps.plan.outputs.has_bumps == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           PLAN_FILE: ${{ steps.plan.outputs.plan_file }}
         run: |
           set -euo pipefail
           agent="${{ matrix.agent }}"
           version="${{ steps.latest.outputs.latest_version }}"
-
           branch="bump-agents/${agent}-${version}"
-          git config user.name "voidbox-bump-agents[bot]"
-          git config user.email "voidbox-bump-agents@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add scripts/agents/manifest.toml
-          # `git diff --cached --quiet` exits 0 when there are no staged
-          # changes. Corner case: a previous weekly run already bumped this
-          # same (agent, version) pair *and the PR was merged*. The plan
-          # short-circuit at `has_bumps` will almost always catch that
-          # first, but a race — upstream advertises the new version,
-          # prior PR merges in the same window — could still reach here
-          # with nothing to commit. Exit cleanly rather than failing on an
-          # empty `git commit`.
-          if git diff --cached --quiet; then
+          repo="$GITHUB_REPOSITORY"
+
+          # The org ruleset requires verified signatures. `git commit` would
+          # produce an unsigned commit that is rejected at merge time, so the
+          # bump commit is created through the GitHub GraphQL API instead —
+          # GitHub signs API commits server-side, so they land "Verified".
+          # Only scripts/agents/manifest.toml changes, so the commit payload
+          # is a single-file addition.
+
+          # Skip if the manifest is already current — nothing to commit.
+          if git diff --quiet -- scripts/agents/manifest.toml; then
             echo "[$agent] manifest already matches ${version} — prior PR already merged, nothing to push."
             exit 0
           fi
-          git commit -m "chore(agents): bump ${agent} to ${version}"
 
-          # Plain push for a fresh branch. If a previous run of this job
-          # already opened a branch with the same name (e.g. the prior PR
-          # was closed without merging), fall back to --force-with-lease
-          # so we don't silently overwrite unrelated work. The shallow
-          # checkout never fetched the bump branch, so a bare
-          # --force-with-lease has no baseline to compare and fails with
-          # "stale info"; fetch the remote ref first so the lease has
-          # something concrete to expect.
-          if ! git push origin "$branch"; then
-            echo "Branch exists on remote; fetching it for --force-with-lease baseline"
-            git fetch origin "$branch":"refs/remotes/origin/$branch"
-            git push --force-with-lease="$branch:refs/remotes/origin/$branch" origin "$branch"
+          base_sha="$(git rev-parse HEAD)"
+
+          # Create (or reset) the bump branch at the base commit, so a branch
+          # left over from an earlier run is overwritten with a clean single
+          # commit.
+          if ! gh api -X POST "repos/${repo}/git/refs" \
+                -f ref="refs/heads/${branch}" -f sha="${base_sha}" >/dev/null 2>&1; then
+            echo "Branch ${branch} already exists; resetting it to ${base_sha}"
+            gh api -X PATCH "repos/${repo}/git/refs/heads/${branch}" \
+              -f sha="${base_sha}" -F force=true >/dev/null
           fi
+
+          # Commit the patched manifest via createCommitOnBranch. The commit
+          # is authored by the App identity and signed by GitHub, so it lands
+          # "Verified". expectedHeadOid pins it to the base commit we just
+          # reset the branch to; a concurrent push to that branch makes the
+          # mutation fail loudly instead of silently clobbering.
+          payload="$(mktemp)"
+          REPO="$repo" BRANCH="$branch" \
+          HEADLINE="chore(agents): bump ${agent} to ${version}" \
+          BASE_SHA="$base_sha" \
+          CONTENTS="$(base64 -w0 scripts/agents/manifest.toml)" \
+          python3 > "$payload" <<'PY'
+          import json, os
+          print(json.dumps({
+              "query": (
+                  "mutation($input: CreateCommitOnBranchInput!) {"
+                  "  createCommitOnBranch(input: $input) { commit { oid } }"
+                  "}"
+              ),
+              "variables": {"input": {
+                  "branch": {
+                      "repositoryNameWithOwner": os.environ["REPO"],
+                      "branchName": os.environ["BRANCH"],
+                  },
+                  "message": {"headline": os.environ["HEADLINE"]},
+                  "expectedHeadOid": os.environ["BASE_SHA"],
+                  "fileChanges": {"additions": [{
+                      "path": "scripts/agents/manifest.toml",
+                      "contents": os.environ["CONTENTS"],
+                  }]},
+              }},
+          }))
+          PY
+
+          resp="$(gh api graphql --input "$payload")"
+          # GraphQL returns HTTP 200 even on error; inspect the errors array
+          # explicitly so a failed mutation fails the job instead of opening
+          # a PR with no commit.
+          oid="$(RESP="$resp" python3 <<'PY'
+          import json, os, sys
+          d = json.loads(os.environ["RESP"])
+          if d.get("errors"):
+              sys.stderr.write("createCommitOnBranch failed: "
+                               + json.dumps(d["errors"]) + "\n")
+              sys.exit(1)
+          print(d["data"]["createCommitOnBranch"]["commit"]["oid"])
+          PY
+          )"
+          echo "Created verified commit ${oid} on ${branch}"
 
           body_file="$(mktemp)"
           python3 > "$body_file" <<'PY'
@@ -383,8 +444,14 @@ jobs:
           print("once, pre-release tag) is its own signal worth a second look.")
           PY
 
-          gh pr create \
-            --base main \
-            --head "$branch" \
-            --title "chore(agents): bump ${agent} to ${version}" \
-            --body-file "$body_file"
+          # Open a PR only if none exists for this branch; the commit above
+          # already updates an open one in place.
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo "PR for ${branch} already open; updated it with the new commit."
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(agents): bump ${agent} to ${version}" \
+              --body-file "$body_file"
+          fi
