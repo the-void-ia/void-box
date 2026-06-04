@@ -53,14 +53,11 @@ jobs:
   discover:
     name: Discover (${{ matrix.agent }})
     runs-on: ubuntu-latest
-    # Matrix-level filter: when invoked via workflow_dispatch with
-    # `inputs.agent` set, expand the matrix to just that agent so the
-    # unwanted leg is never scheduled. Using a job-level `if` here would
-    # fail validation — `matrix` is not in scope at job-level `if`. A
-    # previous shape used a step-level `if` + `exit 0`, which only ended
-    # the first step — every subsequent step (download, hash, open PR)
-    # still ran for the non-selected agent and could open an unintended
-    # PR. Filtering at the strategy level avoids both pitfalls.
+    # Filter the matrix itself so a workflow_dispatch run for one agent never
+    # schedules the other leg. A job-level `if` can't do this — `matrix` is
+    # not in scope there. A step-level `if` + `exit 0` only ends one step;
+    # later steps (download, hash, open PR) would still run for the
+    # non-selected agent and could open an unintended PR.
     strategy:
       fail-fast: false
       matrix:
