@@ -317,12 +317,7 @@ jobs:
           # Only scripts/agents/manifest.toml changes, so the commit payload
           # is a single-file addition.
 
-          # Corner case: a previous weekly run already bumped this same
-          # (agent, version) pair *and the PR merged*. `has_bumps` almost
-          # always catches that first, but a race — upstream advertises the
-          # new version while the prior PR merges in the same window — could
-          # reach here with the manifest already current. Exit cleanly rather
-          # than committing an empty diff.
+          # Skip if the manifest is already current — nothing to commit.
           if git diff --quiet -- scripts/agents/manifest.toml; then
             echo "[$agent] manifest already matches ${version} — prior PR already merged, nothing to push."
             exit 0
@@ -330,10 +325,9 @@ jobs:
 
           base_sha="$(git rev-parse HEAD)"
 
-          # Create (or hard-reset) the bump branch at the base commit. A
-          # prior run may have left the branch behind (PR closed unmerged);
-          # resetting to base reproduces a clean single-commit branch — the
-          # same intent the previous --force-with-lease push carried.
+          # Create (or reset) the bump branch at the base commit, so a branch
+          # left over from an earlier run is overwritten with a clean single
+          # commit.
           if ! gh api -X POST "repos/${repo}/git/refs" \
                 -f ref="refs/heads/${branch}" -f sha="${base_sha}" >/dev/null 2>&1; then
             echo "Branch ${branch} already exists; resetting it to ${base_sha}"
@@ -453,9 +447,8 @@ jobs:
           print("once, pre-release tag) is its own signal worth a second look.")
           PY
 
-          # A re-run reuses the branch name, and createCommitOnBranch above
-          # already pushed the new commit onto it — so an open PR is updated
-          # in place. Only create a PR when none exists for this head branch.
+          # Open a PR only if none exists for this branch; the commit above
+          # already updates an open one in place.
           if gh pr view "$branch" --json number >/dev/null 2>&1; then
             echo "PR for ${branch} already open; updated it with the new commit."
           else

@@ -271,11 +271,10 @@ jobs:
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Darwin tarball SHA256: $SHA256"
 
-      # Token scoped to the tap repo so the formula PR (below) is committed
-      # with GitHub's signature — verified under the org ruleset. The App is
-      # installed on the-void-ia/homebrew-tap with contents:write +
-      # pull_requests:write, replacing the HOMEBREW_TAP_TOKEN PAT for both
-      # checkout and the formula PR.
+      # Token scoped to the tap repo, used for both checkout and the formula
+      # PR below, so the formula commit carries GitHub's signature (verified
+      # under the org ruleset). The App is installed on
+      # the-void-ia/homebrew-tap with contents:write + pull_requests:write.
       - name: Generate GitHub App token (homebrew-tap)
         id: tap-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
@@ -352,8 +351,7 @@ jobs:
           version="${{ github.ref_name }}"
           repo="the-void-ia/homebrew-tap"
 
-          # No-op guard: re-running an already-published tag leaves the
-          # formula unchanged, so there is nothing to do.
+          # Skip if the formula is already current — nothing to do.
           if git -C homebrew-tap diff --quiet -- Formula/voidbox.rb; then
             echo "Formula already at ${version}; nothing to push."
             exit 0
@@ -364,9 +362,9 @@ jobs:
           base_sha="$(git -C homebrew-tap rev-parse HEAD)"
           head="automation/voidbox-${version}"
 
-          # Create (or hard-reset) the formula branch at the tap's current tip.
-          # A prior partial run may have left it behind. This branch is not the
-          # default branch, so the org ruleset does not gate it.
+          # Create (or reset) the formula branch at the tap's current tip. It
+          # is not the default branch, so the org ruleset does not gate commits
+          # to it.
           if ! gh api -X POST "repos/${repo}/git/refs" \
                 -f ref="refs/heads/${head}" -f sha="${base_sha}" >/dev/null 2>&1; then
             echo "Branch ${head} already exists; resetting it to ${base_sha}"
@@ -419,7 +417,7 @@ jobs:
           )"
           echo "Committed ${oid} to ${repo}@${head}"
 
-          # Open the PR (idempotent: a prior run may have opened it already).
+          # Open the PR only if one isn't already open for this branch.
           if ! gh pr view "$head" --repo "$repo" --json number >/dev/null 2>&1; then
             gh pr create --repo "$repo" \
               --base "$base_branch" --head "$head" \
