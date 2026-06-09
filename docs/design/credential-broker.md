@@ -1,216 +1,194 @@
-# Design: host-mediated credential injection for the guest agent
+# Design: host-mediated credential containment for the guest agent
 
-Status: proposal.
+Status: proposal. The host-side credential store and the downstream-egress proxy
+are the committed substrate; the **LLM-provider delivery mechanism (token
+injection vs. proxy injection) is decided after the feasibility spikes S-A/S-B**
+(see Validation order).
 
-Provider integration reflects Claude Code 2.1.170 and the codex version pinned in
-`scripts/agents/manifest.toml`; the behaviors it depends on must be re-verified on
-version bumps (see Risk register).
+Provider behaviors referenced below are confirmed against Claude Code 2.1.170 and
+the codex version pinned in `scripts/agents/manifest.toml`; they must be
+re-verified on version bumps (R9).
 
-## North star
+## Trust model
+
+This design assumes the **host operator is authorized to see all guest plaintext**
+— it already owns the guest's RAM, filesystem, and network. The guest (the agent,
+uid 1000) is untrusted and is the expected adversary (prompt injection, supply-
+chain compromise of a dependency). This is a single-tenant model: operator ==
+data owner. It is **not** suitable, as written, for deployments where the host
+operator must not read tenant data — proxy TLS termination (below) would expose
+that data to the operator. Such a deployment needs an explicit additional control
+and is out of scope here.
+
+## North star and invariant
 
 void-box is a secure runtime for AI agents that handle sensitive data and reach
-sensitive downstream services. A prompt-injected or compromised agent is the
-expected adversary, so the runtime lets an agent **use** credentials without
-**holding** them.
+sensitive downstream services. The runtime lets an agent **use** credentials
+without **holding** the durable ones.
 
-The governing invariant:
-
-> Durable secrets live on the host. The guest never holds a credential — the host
-> injects it into the agent's outbound request at egress. The guest sees only
-> non-secret placeholders.
-
-## Mechanism
-
-A single host-side component provides this for the LLM providers and for arbitrary
-downstream services:
-
-> A host-side, TLS-terminating, header-injecting egress proxy, backed by a host
-> credential store. The guest's client is pointed at the proxy and trusts a CA
-> installed in the guest image; the proxy rewrites the `Authorization` header (and
-> any credential-bearing headers) with a host-held secret and forwards to the real
-> upstream. The durable secret — and, for OAuth, the refresh token and rotation —
-> never leave the host.
-
-### How a request flows
-
-```
-guest agent client (claude / codex / git / curl)
-   │  points at the proxy: ANTHROPIC_BASE_URL / openai_base_url / HTTPS_PROXY
-   │  trusts the proxy CA: NODE_EXTRA_CA_CERTS / CODEX_CA_CERTIFICATE
-   │  carries only a PLACEHOLDER token
-   ▼ (guest network → SLIRP)
-host injection proxy ── TLS-terminate (proxy CA) ── rewrite Authorization +
-   │                                                provider headers with the
-   │                                                host-held real credential
-   ▼ re-encrypt to the real upstream (TLS intact on the external wire)
-provider token endpoints / downstream services
-   ▲
-host credential store: holds OAuth refresh tokens & downstream secrets; refreshes
-   against the provider; mints short-lived access tokens; sole rotation owner.
-```
-
-Everything the guest holds — placeholder token, CA certificate, base-URL value —
-is non-secret. The real credential exists only in the host proxy/credential store.
-
-### Why TLS termination is required, and why it is safe
-
-The `Authorization: Bearer …` header lives inside the TLS stream; rewriting it
-requires decrypting the request, so the proxy must terminate TLS. There is no
-cryptographic way to modify an encrypted header without termination.
-
-Termination is not a confidentiality regression: the host is the trusted party
-and already owns the guest's RAM, filesystem, and network, so it can already read
-everything the agent sends. Termination grants no new visibility. The design
-minimizes exposure regardless: the proxy streams bodies through without inspecting
-or logging them, touching only credential headers; TLS to the upstream is
-re-established so the external wire stays encrypted; and the guest trusts only a CA
-installed in its own image — a scoped, deliberate trust, not a general
-interception capability.
+- **Required invariant:** durable credentials — OAuth **refresh** tokens and
+  downstream service secrets — never enter the guest. The host holds them,
+  performs all refresh, and is the sole rotation owner. Any token the guest does
+  hold is short-lived and host-revocable.
+- **Stronger property (proxy injection):** the guest holds **no** credential at
+  all — only non-secret placeholders. Downstream egress always uses this stronger
+  tier (there is no short-lived-token equivalent for arbitrary downstream
+  secrets); the LLM providers use it only if the proxy path is chosen.
 
 ## The risk this addresses
 
 The `claude-personal` and `codex` providers stage host-side OAuth credentials —
-including the **refresh** token — into the guest: an RW bind-mount of the
+**including the refresh token** — into the guest: an RW bind-mount of the
 credential file at `/home/sandbox/.claude` or `/home/sandbox/.codex`
-(`src/runtime.rs`), or a privileged WriteFile copy into guest tmpfs
-(`src/agent_box.rs:464`). A uid-1000 agent can read the file and exfiltrate the
-refresh token, yielding account access that outlives the run. Both CLIs self-
-refresh in-process and rotate single-use refresh tokens, so host-only ownership is
-also the only correct design — two refreshers invalidate each other's token.
+(`src/runtime.rs:234-247`, `1399-1408`), or a privileged WriteFile copy into guest
+tmpfs (`src/agent_box.rs:464`). A uid-1000 agent can read the file and exfiltrate
+the refresh token, yielding account access that outlives the run. Both CLIs
+self-refresh in-process and rotate single-use refresh tokens, so host-only
+ownership is also the only correct design — two refreshers invalidate each
+other's token.
 
-## Non-goals
+A leaked **short-lived access token** (auto-expiring, host-re-mintable, not
+durable account access) is an accepted, bounded residual, not the target.
 
-- Preventing a guest process from *using* the proxy to make authenticated calls
-  (e.g. spending the operator's LLM quota). The proxy hands out use, not the
-  credential; abuse is bounded by the destination allow-list and a per-run proxy
-  token, not eliminated.
-- Per-process isolation inside the guest, which is a single trust domain.
-- Delivering any real secret into the guest (see Alternatives considered).
-- Non-HTTP credential schemes and a general operator surface (deferred to M3).
+## Shared foundation: the host credential store
 
-## Attack surface
+Both provider mechanisms depend on one host component:
 
-The proxy is a host component in the hot path of all agent egress, holding tokens
-and terminating guest-originated TLS. It is hardened as untrusted-input-facing (it
-parses attacker-influenced HTTP with bounded resources) and is authenticated so
-only the intended guest can use it: it binds to a guest-only path (loopback behind
-SLIRP on Linux; the VZ-specific address on macOS) and requires a per-run proxy
-token injected into the guest. That token is low-stakes — it permits use of
-allow-listed destinations, not credential extraction — and is analogous to the
-vsock session secret. If the proxy or credential store is unavailable, egress
-fails rather than bypassing injection (fail-closed).
+> A host credential store that holds each provider's OAuth refresh token (read
+> from the host's `~/.claude`/`~/.codex`/Keychain), performs refresh against the
+> provider's token endpoint, mints short-lived access tokens, and is the sole
+> rotation owner — serialized refresh, rate-capped independently of request
+> volume. The refresh token lives only here, in host process memory, `mlock`ed and
+> zeroized via `secrecy`.
 
-## Milestones
+**The store's central premise is unproven and existential:** that a *host* process
+(not the original client, off-device) can replay the OAuth refresh and have the
+provider's token endpoint accept it, and that doing so on a *personal
+subscription* does not trip anti-abuse/ban heuristics. These are spikes S-A and
+S-B and gate all build work.
 
-One mechanism, sequenced from the provider risk outward.
+## LLM-provider delivery — two candidates, decided after S-A/S-B
 
-### M1 — injection proxy + credential store, applied to the LLM providers
+Both satisfy the required invariant (refresh token off the guest). They differ in
+what else the guest holds and what the host must run.
 
-Build the host proxy and credential store and route both `claude-personal` and
-`codex` through them. Remove both providers' RW credential mounts and the
-`src/agent_box.rs:464` WriteFile copy.
+### Candidate A — token injection
 
-Shared host components:
-- **Credential store**: holds each provider's OAuth refresh token, refreshes
-  against the provider, mints short-lived access tokens, and is the sole rotation
-  owner (serialized refresh, rate-capped independently of request volume).
-- **Injection proxy**: terminates TLS with a cert chaining to the guest-installed
-  CA, rewrites the credential header(s), and forwards to the real upstream.
+The store mints a short-lived access token; the guest receives it through each
+client's native injection point and refreshes by re-fetching from the host. TLS
+stays end-to-end; no host CA, no termination, no hot-path proxy.
 
-**Claude (`claude-personal`).** Guest configuration: `ANTHROPIC_BASE_URL=<proxy>`,
-`NODE_EXTRA_CA_CERTS=<proxy CA PEM>`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, a
-placeholder `ANTHROPIC_AUTH_TOKEN`, and no credentials file. Only `/v1/messages`
-(inference) is a blocking call and it honors `ANTHROPIC_BASE_URL`; a missing
-credentials file resolves to null rather than an error; `PROVIDER_MANAGED_BY_HOST`
-suppresses the hardcoded OAuth-refresh recovery and force-login; the placeholder
-Bearer reaches the proxy, which injects the real one. Claude Code applies
-`NODE_EXTRA_CA_CERTS` additively and does not pin certificates.
+- **Claude:** inject via `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` (OAuth-Bearer
+  tier, passed by inherited fd — not in `/proc/environ` or on disk). ~24 h tokens
+  cover task-mode; a spawned CLI has **no** clean mid-run refresh hook, so
+  long/service runs need re-mint-and-relaunch or are unsupported under this
+  candidate.
+- **codex:** a guest loopback endpoint behind `CODEX_REFRESH_TOKEN_URL_OVERRIDE`
+  proxies the OAuth refresh to the store; the guest's `auth.json` holds a
+  short-lived access token (refresh token never present). codex sends the token as
+  `Authorization: Bearer`; `ChatGPT-Account-ID` comes from the real
+  `account_id`/`id_token` it holds.
 
-**codex (`codex`).** Guest configuration in `$CODEX_HOME/config.toml`:
-`openai_base_url=<proxy>` (overrides the chatgpt-mode inference base) and
-`[auth] credentials_store="file"`; env `CODEX_CA_CERTIFICATE=<proxy CA PEM>`; and a
-placeholder `auth.json` — `tokens.id_token` a structurally valid 3-part JWT with a
-minimal payload, `tokens.access_token` an arbitrary non-JWT placeholder,
-`tokens.refresh_token` a placeholder, `tokens.account_id` the real account id, and
-`last_refresh` recent — so codex loads, sends the placeholder Bearer, and does not
-proactively refresh. The proxy rewrites `Authorization` to the real Bearer, injects
-the real `ChatGPT-Account-ID`, and passes through `originator: codex_cli_rs`. codex
-trusts `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE` additively (rustls) and does not pin
-certificates.
+Residual: a short-lived, auto-expiring access token (and, for codex, the real
+`id_token`/`account_id`) is at rest in the guest for its lifetime — bounded, but
+not zero.
 
-The clients reach the proxy over the guest network (SLIRP); the proxy binds
-guest-only per platform and requires the per-run proxy token.
+### Candidate B — proxy injection
 
-Gate: `e2e_agent_mcp` (Claude) and the codex smoke specs authenticate; tests assert
-the guest holds only placeholders and no credentials file.
+A host-side, TLS-terminating, header-injecting egress proxy: the client is pointed
+at the proxy and trusts a per-run CA installed in the guest; the proxy rewrites the
+credential header(s) with the host-held token and forwards to the real upstream.
+The guest holds **no** credential.
 
-### M2 — credential-less downstream HTTP egress
+```
+guest client ──▶ host injection proxy ──▶ real upstream
+ placeholder token,  TLS-terminate (per-run, name-constrained CA),
+ base-URL redirect,  rewrite Authorization (+ provider headers),
+ trusts proxy CA     re-encrypt to upstream (external wire stays encrypted)
+```
 
-Apply the same proxy to allow-listed downstream services (e.g. GitHub API, internal
-APIs): the host injects the destination's credential and the secret never enters
-the guest. Two interception forms reuse M1's proxy — explicit, for tools that honor
-`HTTPS_PROXY` (curl, git, most HTTP libraries; the common case); and transparent,
-network-level interception (`src/network/slirp.rs`) with per-destination certs, for
-tools that ignore `HTTPS_PROXY`. Adds operator-declared per-destination credential
-and injection policy; these credentials are typically static (no OAuth refresh).
+- **Claude:** `ANTHROPIC_BASE_URL=<proxy>`, `NODE_EXTRA_CA_CERTS=<CA PEM>`,
+  `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` (confirmed in 2.1.170 to suppress the
+  hardcoded OAuth-refresh recovery and force-login), placeholder
+  `ANTHROPIC_AUTH_TOKEN`, no credentials file. Only `/v1/messages` is a blocking
+  call and it honors `ANTHROPIC_BASE_URL` (confirmed); a missing credentials file
+  resolves to null, not an error.
+- **codex:** `openai_base_url=<proxy>` and `credentials_store="file"` in
+  `$CODEX_HOME/config.toml`, `CODEX_CA_CERTIFICATE=<CA PEM>`, and a placeholder
+  `auth.json` (structurally-valid **dummy** `id_token`, placeholder `access_token`
+  and `account_id`, recent `last_refresh`). The proxy injects the real Bearer
+  **and the real `ChatGPT-Account-ID`**, so real identity material stays host-side;
+  it passes `originator: codex_cli_rs` through. codex defaults to
+  Responses-over-WebSocket — force plain HTTPS via a custom provider
+  `supports_websockets=false` (default for M1), or inject on the WS upgrade and
+  pipe frames (R8).
 
-### M3 — broader downstream and operator surface
+Neither client pins certificates; both honor an additive CA via the env above
+(PEM file; neither honors `SSL_CERT_DIR`).
 
-Non-HTTP mediation (database/mTLS via a host-mediated tunnel), an operator-facing
-surface to register downstream credentials and policy, and per-consumer scoping if
-intra-guest compartmentalization comes into scope.
+Residual: the host decrypts inference traffic at the proxy (benign under the
+trust model), and the proxy is a hot-path dependency (R4).
 
-## Alternatives considered
+### Decision criteria
 
-**Token in the guest (mode 1).** The guest receives a short-lived access token and
-a way to refresh it, rather than routing through a proxy — for codex via a loopback
-endpoint behind `CODEX_REFRESH_TOKEN_URL_OVERRIDE` that proxies the OAuth refresh to
-the host, and for Claude via a host-minted token through the
-`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` injector. This is not used: it leaves a
-real short-lived token at rest in the guest (readable by uid 1000, captured in
-snapshots for its lifetime), it requires a guest-initiated fetch channel (a vsock
-RPC with its own multiplex inversion and a guest-side helper), and Claude offers no
-clean mid-run refresh hook for a spawned CLI. The proxy removes the in-guest token
-and that machinery at once. Mode 1 remains a fallback only for a hypothetical tool
-that can be pointed at neither a proxy nor a custom CA; no supported agent is such a
-tool.
+Choose after S-A/S-B/S-C/V1. The proxy carries more standing risk (CA custody,
+streaming correctness, SSRF, hot-path) but yields zero in-guest credential and is
+**built regardless** for downstream egress; token injection is lighter and
+sufficient for the finding but leaves a bounded token in the guest and has no
+clean Claude long-run refresh. If the proxy is built for downstream anyway,
+routing providers through it unifies the mechanism; otherwise token injection is
+the smaller provider-only footprint.
 
-**Guest-side decryption / no host TLS termination.** Terminating TLS in the guest
-to inject the header would keep the proxy off the host but reintroduces a real token
-in the guest. Operating at L4 (TCP pass-through) cannot modify HTTP headers. mTLS
-client-cert injection would avoid decryption but applies only to upstreams that
-authenticate by client certificate, which the supported providers do not.
+## Downstream egress (M2/M3): proxy injection
+
+For allow-listed downstream services (GitHub API, internal APIs, later
+database/mTLS) the proxy is the only mechanism — the host injects the
+destination's (usually static) credential and the secret never enters the guest.
+Two interception forms reuse the proxy: **explicit**, for tools honoring
+`HTTPS_PROXY` (curl, git, most libraries; the common case, and the only form where
+the per-run proxy token authenticates the client); and **transparent**,
+network-level interception (`src/network/slirp.rs`) with per-destination certs for
+tools that ignore `HTTPS_PROXY` (no place for a proxy token — relies on network
+isolation). The proxy injects a credential only on **exact upstream host+path
+match**, never on agent-controlled redirects or `Host` headers, and follows no
+credentialed redirects (SSRF/confused-deputy — R7).
+
+## Egress enforcement (required for the "bounded abuse" properties)
+
+VoidBox's network is **default-allow with a deny-list** (`src/network/nat.rs`);
+there is no allow-list today. The proxy is therefore **advisory** until a
+**default-deny egress allow-list that pins the guest to the proxy address** (and
+blocks direct `:443` to provider/destination IPs) is built. Without it, a
+compromised agent can bypass the proxy and reach the internet directly — it cannot
+leak the credential (a direct call carries no valid token), so containment holds,
+but the "bounded abuse" and "fail-closed-for-usage" properties do **not** hold.
+Building this allow-list is scoped as M1 work, not assumed.
 
 ## Security properties
 
-- **No credential in the guest** — only non-secret placeholders, a CA, and a
-  base-URL value; the real access token and OAuth refresh token live only on the
-  host.
-- **Nothing real in snapshots, `/proc`, or crash dumps** — there is no secret in
-  guest memory to capture.
-- **Single rotation owner** — only the host refreshes, eliminating the
-  rotation-conflict failure mode.
-- **Fail-closed** — proxy or credential store unavailable ⇒ egress fails; never an
-  un-injected call.
-- **Bounded abuse, not credential theft** — a guest process can use the proxy for
-  allow-listed destinations but cannot extract the secret; bounded by the
-  allow-list and the per-run proxy token.
-- **External wire stays encrypted** — TLS is re-established to the upstream; only a
-  host-internal hop is plaintext, inside the already-trusted host.
-- **Redaction and zeroization** for host-held secrets via `secrecy`; opt-in, with no
-  behavior change for providers that do not stage OAuth.
+- **Refresh token / durable secret never in the guest** (both candidates) — held
+  and rotated only on the host.
+- **No credential at all in the guest** (proxy candidate; downstream always).
+- **Single rotation owner** — only the host refreshes, removing the rotation-
+  conflict failure mode.
+- **Containment is bypass-safe** — a guest that ignores the proxy/injector cannot
+  obtain a credential.
+- **Bounded abuse / fail-closed-for-usage** — only once the egress allow-list
+  exists (above); otherwise advisory.
+- **External wire stays encrypted** — for the proxy, TLS is re-established to the
+  upstream; only a host-internal hop is plaintext.
+- Opt-in; no behavior change for providers that do not stage OAuth.
 
 ### Residual risks
 
-- The host decrypts inference traffic at the proxy — inherent to header injection
-  and benign, since the host already sees the guest's data; the proxy streams
-  bodies without inspecting them.
-- The proxy is a hot-path dependency — a defect or outage stops all egress
-  (fail-closed is the correct posture, but it is an availability coupling).
-- The per-run proxy token lives in the guest — low-stakes (use, not theft), needed
-  so a LAN or other-guest process cannot drive the proxy.
-- codex's placeholder `auth.json` still contains a real `id_token`/`account_id` —
-  identity material, not a bearer or refresh token.
+- The refresh token now lives in **host** process memory for the whole run (vs.
+  today's 0600 temp file dropped on teardown) — wider host-side surface on a
+  shared host; mitigated by `mlock`/zeroize and per-run process isolation.
+- Token-injection candidate: a short-lived access token (+ codex `id_token`/
+  `account_id`) at rest in the guest for its lifetime.
+- Proxy candidate: host decrypts inference traffic (trust-model dependent);
+  hot-path availability coupling; per-run proxy token is guest-readable (use, not
+  theft — guards against neighbors, not the in-guest adversary).
 
 ## Risk register
 
@@ -218,67 +196,72 @@ Ordered by how much each could disrupt implementation.
 
 | # | Risk | Likelihood | Impact | Mitigation / fallback |
 |---|------|-----------|--------|-----------------------|
-| R1 | **Server-side acceptance of host-reproduced auth** — the provider's token endpoint accepting the host-side refresh, and the inference endpoint accepting the host-minted token injected as a plain Bearer (the subscription-scope client path is not active for a proxied placeholder). Cannot be confirmed by static analysis; needs a live account. | Medium (some header reproduction may be required) | High (could force rework of provider integration) | Validate first (V1). The injected token is a genuine subscription token, and the `CLAUDE_CODE_OAUTH_TOKEN` env path demonstrates the inference endpoint accepts an externally-supplied subscription Bearer. The headers the subscription/ChatGPT clients send are known and can be reproduced at the proxy. |
-| R2 | **Proxy streaming/lifecycle correctness** — TLS termination plus SSE (Claude) and WebSocket (codex) streaming, backpressure, connection reuse, timeouts, partial failures, fail-closed. | Medium (bugs likely) | Medium–High (degrades all egress) | Standard reverse-proxy patterns; dedicated streaming tests; primary engineering budget. |
-| R3 | **codex WebSocket transport** — codex defaults to Responses-over-WebSocket; a header-rewriting proxy must inject on the (plaintext) WS upgrade handshake and pipe frames. | Low | Low–Medium (codex only) | Two fallbacks: inject on the upgrade then pipe frames, or force plain HTTPS via a custom provider with `supports_websockets=false`. Version pinning controls change. |
-| R4 | **macOS/VZ proxy reachability** — binding the proxy guest-only without LAN exposure. | Low–Medium | Medium (capped) | Per-run proxy token caps the downside (use only, no credential theft); bind to the VZ-specific address. |
-| R5 | **Provider version drift** — a bundled Claude/codex version changing the redirect, refresh, header, or transport behavior the design relies on. | Low | Low–Medium | Pin versions; re-verify R1/R3 facts on bump (the agent-bump workflow gates version changes). |
-| R6 | **M2 transparent cert generation** — on-the-fly per-destination leaf certs under the proxy CA. | Low | Low (M2 only) | Deferred; explicit `HTTPS_PROXY` avoids it; established SSL-bump pattern. |
+| R1 | **Host-side OAuth refresh acceptance** — the token endpoint accepting a refresh performed by the host, off-device (refresh grant has no PKCE, but tokens may be binding/attestation-bound). Existential for both candidates. | Medium | High | **Spike S-A first**, throwaway account. If rejected, the whole approach needs rethink (e.g. API-key-only). |
+| R2 | **Provider ToS / personal-subscription abuse-detection** — server-side refresh + injection from a host IP tripping automation/sharing heuristics → account flag/ban (worse than the theft prevented). | Medium | High | **Spike S-B first**, throwaway account + read ToS. May restrict this path to API-key/commercial tiers. |
+| R3 | **Inference acceptance of a host-supplied subscription Bearer** (the easier half of auth). | Low–Med | High | V1. Precedent: the `CLAUDE_CODE_OAUTH_TOKEN` env path is an externally-supplied subscription Bearer the inference endpoint accepts. |
+| R4 | **Proxy streaming/lifecycle correctness** — TLS-terminate + SSE + WS + backpressure + reuse + fail-closed, on every call in the hot path; a bug degrades all output. | Medium | High | Standard reverse-proxy patterns + dedicated streaming tests; primary engineering budget. Proxy candidate only. |
+| R5 | **No egress allow-list** — "bounded abuse"/"fail-closed-for-usage" require a default-deny allow-list pinning guest→proxy; absent today. | High (absent) | Medium | Build it as M1 work; until then mark those properties advisory. Containment itself is unaffected. |
+| R6 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, generated at boot, destroyed on teardown; **Name-Constrained** to the injected upstreams; never expose the key to the guest. |
+| R7 | **SSRF / confused-deputy** via the credential-injecting proxy (acute in M2). | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`. |
+| R8 | **codex WebSocket transport** vs header injection. | Low | Low–Med | Default to `supports_websockets=false` (plain HTTPS); inject-on-upgrade as optional. |
+| R9 | **Provider version drift** changing redirect/refresh/header/transport behavior. | Low | Low–Med | Pin versions; re-verify R1/R3/redirect facts on bump (bump workflow gates it). |
+| R10 | **M2 transparent per-destination cert generation.** | Low | Low | Deferred; explicit `HTTPS_PROXY` avoids it; established SSL-bump pattern. |
 
-## Implementation plan and validation order
+## Validation order and implementation plan
 
-Validation is front-loaded so the highest-impact unknown (R1) is resolved before
-the surrounding machinery is built. Each validation step is a gate for the work
-that follows.
+Front-loaded so the existential unknowns retire before any milestone work.
 
-**V1 — auth smoke test (gate for everything).** A minimal TLS-terminating proxy
-with a hardcoded real token: perform one host-side OAuth refresh and inject the
-minted token as a Bearer on one inference request, for both Claude and codex,
-against a live account. Confirm `200` and a usable completion. Resolves R1. If extra
-headers are required, capture them here.
+**S-A — host-side refresh feasibility (gate for everything).** On a throwaway
+account, have a host process replay the OAuth refresh (`client_id` +
+`refresh_token` + `grant_type=refresh_token`) for Claude and codex and confirm the
+token endpoint returns a usable access token. Resolves R1. If it fails, stop and
+re-scope.
 
-**V2 — CA trust.** Confirm each client trusts the proxy CA via its env mechanism
-(`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`, PEM file — neither
-honors `SSL_CERT_DIR`).
+**S-B — provider ToS posture (gate for everything).** On a throwaway account,
+exercise sustained proxied/server-refreshed subscription use and read each
+provider's ToS for programmatic/proxied subscription auth. Resolves R2. If
+prohibitive, restrict to API-key/commercial auth.
 
-**V3 — streaming.** Drive a full streamed response through the proxy: SSE for
-Claude, and codex over its default transport (resolving R3: inject-on-upgrade or
-forced HTTPS).
+**S-C — redirect/suppress assumptions on the pinned versions.** Point the pinned
+clients at a dumb logging proxy; confirm `ANTHROPIC_BASE_URL`/`openai_base_url`
+redirect, `PROVIDER_MANAGED_BY_HOST` suppresses refresh/force-login, the CA env
+vars are honored, and only inference blocks (no retry-storm on the other Claude
+endpoints).
 
-Then build M1 against these gates:
+**V1 — inference acceptance.** Inject a host-minted Bearer on one real inference
+request per provider; confirm a usable completion (R3).
 
-1. **Credential store** — per-provider OAuth refresh, short-lived-token minting,
-   serialized rotation, rate-capping. (`src/credentials.rs` becomes host-retained;
-   `reqwest` + rustls are already vendored.)
-2. **Injection proxy** — TLS termination, header rewrite, streaming, fail-closed.
-   Validated by V2/V3.
-3. **Guest provisioning** — install the proxy CA into the guest image; set the
-   base-URL/config, placeholder tokens / `auth.json`, and `PROVIDER_MANAGED_BY_HOST`;
-   delete the RW mount and the `src/agent_box.rs:464` WriteFile copy.
-   (`src/runtime.rs` `~234`, `~1352-1408`; `src/llm.rs` provider wiring.)
-4. **Reachability and scoping** — bind the proxy guest-only per platform and require
-   the per-run token; verify on both KVM and VZ. Resolves R4.
-5. **Long-run refresh/rotation** — token expiry handled host-side with no guest
-   involvement across a service-mode run.
+**Mode decision point.** With S-A/S-B/S-C/V1 green, choose token injection vs.
+proxy per the decision criteria.
 
-M1 exit gate: `e2e_agent_mcp` (Claude) and the codex smoke specs pass with the guest
-holding only placeholders.
+**Then build, split into smaller milestones:**
+- **M1a** — credential store (refresh/mint/rotation) + the chosen provider
+  mechanism for **Claude only**, single platform, inference path. Proves the spine.
+  If proxy: + the per-run name-constrained CA and the streaming proxy (R4/R6).
+- **M1b** — codex (WS handling), long-run rotation, and KVM+VZ parity.
+- **Egress allow-list** (R5) — default-deny, guest pinned to the proxy (if proxy
+  chosen) — so the bounded-abuse/fail-closed properties become real.
+- **M2/M3** — downstream egress (proxy), per-destination policy, SSRF hardening
+  (R7), transparent form (R10).
 
-M2 and M3 follow once the M1 substrate exists; M2 adds the per-destination policy
-and the explicit/transparent interception forms (R6 applies only to the transparent
-form).
+Remove the RW credential mounts and the `src/agent_box.rs:464` WriteFile copy as
+each provider migrates. Exit gate: `e2e_agent_mcp` (Claude) and the codex smoke
+specs pass with no refresh token in the guest.
 
 ## Affected code
 
-- New host modules — the injection proxy (TLS-terminating, header-rewriting,
-  streaming) and the credential store (OAuth refresh/mint/rotation).
-- `src/credentials.rs` — host-retained OAuth credential, refresh/rotation, and
-  short-lived-token minting; staging is host-only.
+- New host modules — the credential store (OAuth refresh/mint/rotation) and, if
+  the proxy is chosen, the injection proxy (TLS-terminating, header-rewriting,
+  streaming) plus the per-run CA.
+- `src/credentials.rs` — host-retained OAuth credential, host-side refresh/
+  rotation, short-lived-token minting; staging is host-only.
 - `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — remove the
-  RW mount and the privileged WriteFile copy; provision the guest with the proxy
-  base-URL, CA PEM, placeholder tokens / `auth.json`, and `PROVIDER_MANAGED_BY_HOST`.
-- `src/llm.rs` — provider → proxy/credential wiring.
-- Guest image — install the proxy CA into the trust stores the clients honor.
-- `src/network/slirp.rs` — host-side interception point for M2's transparent form.
-- `scripts/agents/manifest.toml` — the pinned codex version against which the
-  redirect and transport behavior are verified.
+  RW mount and the WriteFile copy; provision the guest per the chosen mechanism.
+- `src/llm.rs` — provider → store/proxy/injector wiring.
+- `src/network/nat.rs` / `src/network/slirp.rs` — the default-deny egress
+  allow-list (R5) and the M2 transparent interception point.
+- Guest image — install the per-run CA into the trust stores the clients honor
+  (`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`; and the system
+  store for M2 tools) — a per-image checklist across initramfs and OCI-rootfs.
+- `scripts/agents/manifest.toml` — the pinned versions the behaviors are verified
+  against.
