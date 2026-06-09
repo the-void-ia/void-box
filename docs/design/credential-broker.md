@@ -26,10 +26,10 @@ void-box is a secure runtime for AI agents that handle sensitive data and reach
 sensitive downstream services. The runtime lets an agent **use** credentials
 without **holding** the durable ones.
 
-- **Required invariant:** durable credentials — OAuth **refresh** tokens and
-  downstream service secrets — never enter the guest. The host holds them,
-  performs all refresh, and is the sole rotation owner. Any token the guest does
-  hold is short-lived and host-revocable.
+- **Required invariant:** durable credentials — OAuth **refresh** tokens,
+  long-lived **API keys**, and downstream service secrets — never enter the guest.
+  The host holds them, performs all refresh, and is the sole rotation owner. Any
+  token the guest does hold is short-lived and host-revocable.
 - **Stronger property (proxy injection):** the guest holds **no** credential at
   all — only non-secret placeholders. Downstream egress always uses this stronger
   tier (there is no short-lived-token equivalent for arbitrary downstream
@@ -46,6 +46,15 @@ the refresh token, yielding account access that outlives the run. Both CLIs
 self-refresh in-process and rotate single-use refresh tokens, so host-only
 ownership is also the only correct design — two refreshers invalidate each
 other's token.
+
+**API-key auth carries the same exposure, and worse.** The default `Claude`
+provider forwards a host `ANTHROPIC_API_KEY`, `codex` falls back to
+`OPENAI_API_KEY` when the host is not OAuth-logged-in, and `Custom` providers
+forward their key — all injected into the guest exec environment today
+(`src/llm.rs:427,474,480`), readable by uid 1000 and snapshot-captured. An API key
+is a worse leak than a refresh token: it is long-lived, non-rotating, and grants
+full programmatic/billing access. It is in scope here. (Local providers — Ollama,
+LM Studio — pass only non-secret placeholders and need no containment.)
 
 A leaked **short-lived access token** (auto-expiring, host-re-mintable, not
 durable account access) is an accepted, bounded residual, not the target.
@@ -129,15 +138,34 @@ Neither client pins certificates; both honor an additive CA via the env above
 Residual: the host decrypts inference traffic at the proxy (benign under the
 trust model), and the proxy is a hot-path dependency (R4).
 
+### API-key auth — proxy only
+
+`Claude` (Anthropic API key), `codex` (`OPENAI_API_KEY` fallback), and `Custom`
+providers authenticate with a static, long-lived API key. There is no short-lived
+token to mint, so **token injection cannot contain them** — injecting the raw key
+is no better than today's env forwarding. Containment is the proxy: the host holds
+the key and the proxy injects it (`x-api-key` for Anthropic; `Authorization:
+Bearer` for OpenAI/codex; the Custom provider's configured header) while the guest
+carries only a placeholder. This path has **no OAuth, no refresh, no rotation**, so
+the credential store reduces to a static secret and **S-A/S-B do not apply** — the
+static-key proxy is the simplest, lowest-risk slice and the natural first proof of
+the proxy spine (see Validation). For codex the base is `api.openai.com/v1` (not
+the ChatGPT backend), redirected the same way via `openai_base_url`.
+
 ### Decision criteria
+
+This choice applies to **OAuth** auth only (`claude-personal`, codex ChatGPT). For
+**API-key** providers the proxy is the only containment, since injection cannot
+contain a static key; absent the proxy, API keys remain forwarded into the guest as
+today.
 
 Choose after S-A/S-B/S-C/V1. The proxy carries more standing risk (CA custody,
 streaming correctness, SSRF, hot-path) but yields zero in-guest credential and is
-**built regardless** for downstream egress; token injection is lighter and
-sufficient for the finding but leaves a bounded token in the guest and has no
-clean Claude long-run refresh. If the proxy is built for downstream anyway,
-routing providers through it unifies the mechanism; otherwise token injection is
-the smaller provider-only footprint.
+**built regardless** for downstream egress and API-key containment; token injection
+is lighter and sufficient for the OAuth finding but leaves a bounded token in the
+guest and has no clean Claude long-run refresh. If the proxy is built anyway,
+routing OAuth providers through it unifies the mechanism; otherwise token injection
+is the smaller OAuth-only footprint.
 
 ## Downstream egress (M2/M3): proxy injection
 
@@ -235,9 +263,16 @@ request per provider; confirm a usable completion (R3).
 proxy per the decision criteria.
 
 **Then build, split into smaller milestones:**
+- **M0** (if containing API keys) — static-key proxy for the **API-key** providers
+  (Anthropic `x-api-key`, OpenAI/codex Bearer, Custom). No credential store,
+  refresh, or rotation — the host holds the static key and the proxy injects it.
+  **Ungated by S-A/S-B and by the OAuth mode decision** (the proxy is the only
+  containment for a static key); needs only S-C (redirect + CA trust) plus the
+  per-run name-constrained CA and the streaming proxy. The lowest-risk proof of the
+  proxy spine, so it can lead.
 - **M1a** — credential store (refresh/mint/rotation) + the chosen provider
   mechanism for **Claude only**, single platform, inference path. Proves the spine.
-  If proxy: + the per-run name-constrained CA and the streaming proxy (R4/R6).
+  If proxy: reuses M0's CA + streaming proxy (R4/R6).
 - **M1b** — codex (WS handling), long-run rotation, and KVM+VZ parity.
 - **Egress allow-list** (R5) — default-deny, guest pinned to the proxy (if proxy
   chosen) — so the bounded-abuse/fail-closed properties become real.
@@ -257,7 +292,9 @@ specs pass with no refresh token in the guest.
   rotation, short-lived-token minting; staging is host-only.
 - `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — remove the
   RW mount and the WriteFile copy; provision the guest per the chosen mechanism.
-- `src/llm.rs` — provider → store/proxy/injector wiring.
+- `src/llm.rs` — provider → store/proxy/injector wiring, replacing the API-key
+  env forwarding in `env_vars()` (`~417`; `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/
+  Custom key) with host-side injection.
 - `src/network/nat.rs` / `src/network/slirp.rs` — the default-deny egress
   allow-list (R5) and the M2 transparent interception point.
 - Guest image — install the per-run CA into the trust stores the clients honor
