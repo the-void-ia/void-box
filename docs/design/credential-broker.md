@@ -352,10 +352,15 @@ no PID-1/root involvement in credential materialization.
   requests the token, sets it in the child's env, and `exec`s. The token lives
   in exactly one process, never in the run-wide env or a pre-launch snapshot.
 - **access-token file** — for `File` delivery, `void-cred` (uid 1000) writes a
-  0600 file containing only `key_allowlist` keys, refreshes it in place before
-  `expires_at`, and removes it on exit. This **replaces** both the whole-run RW
-  mount and the privileged `WriteFile`-RPC credential copy
-  (`src/agent_box.rs:464`), which are deleted once both providers are migrated.
+  0600 file containing only `key_allowlist` keys. Before `expires_at` it
+  **re-requests a fresh access token from the broker over vsock** and overwrites
+  the file; it removes the file on exit. `void-cred` never performs the OAuth
+  exchange and never sees the refresh token — "refreshing the file" means
+  "ask the broker again and rewrite," not "exchange a refresh token." The
+  refresh-token→access-token exchange against the provider happens only on the
+  host, inside the broker (§2). This **replaces** both the whole-run RW mount
+  and the privileged `WriteFile`-RPC credential copy (`src/agent_box.rs:464`),
+  which are deleted once both providers are migrated.
 - **helper protocols** — a git credential helper / npm token script / MCP
   server config that shells out to `void-cred get --name …` at the moment of
   network use.
