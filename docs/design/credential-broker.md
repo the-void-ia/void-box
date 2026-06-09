@@ -1,511 +1,345 @@
-# Design: on-demand credential broker for the guest agent
+# Design: host-side OAuth credential broker for the guest agent
 
 Status: **proposal** (no code yet). Owner: runtime. Target branch:
-`claude/vm-agent-credentials-syz9c2`. This revision incorporates the project's
-STRIDE security review, whose top residual finding is credential exfiltration:
-a prompt-injected or compromised in-guest agent can read the OAuth **refresh**
-tokens we mount today and take over the operator's provider account for the
-lifetime of that token. Containing that is the headline requirement here, not a
-nice-to-have generalization.
+`claude/vm-agent-credentials-syz9c2`.
 
-## Problem
+This doc is scoped to **one security finding**: a prompt-injected or compromised
+in-guest agent (uid 1000) can read the OAuth **refresh** tokens we mount today
+for the `claude-personal` and `codex` providers and take over the operator's
+provider account for the lifetime of that token — well beyond the run. The
+durable fix is to keep refresh tokens on the host and hand the guest only
+short-lived access tokens.
 
-The agent running inside the VM needs credentials — the LLM provider's API key
-or OAuth tokens, but increasingly also the *task's* own secrets: a GitHub token
-to push, an npm/cargo registry token, cloud keys, an SSH key, a database URL,
-the OpenClaw gateway's Telegram token. Today three uncoordinated paths carry
-that material into the guest, none of them general and all of them leaving the
-secret **at rest** inside the sandbox for the whole run — including, for the
-`claude-personal` and `codex` providers, the long-lived refresh token.
+A broader, decoupled "any-secret-from-any-source" credential mechanism is
+desirable but **deliberately deferred** — it is sketched as future work at the
+end so this proposal does not inflate its risk or commit to speculative
+generality before a second, non-OAuth consumer exists.
 
-We want one mechanism that is:
+## The finding, precisely
 
-- **secure by construction** — for the high-value case (OAuth tokens) the
-  refresh token never crosses into the guest at all; the guest only ever holds
-  a short-lived access token whose blast radius is time-bounded. For other
-  secrets, the default delivery keeps them off the guest filesystem, out of the
-  exec environment, out of `/proc/<pid>/environ`, and out of snapshots; the
-  host stays the single point of allow-listing, auditing, and revocation;
-- **flexible** — any secret, from any host-side source, for any consumer
-  (LLM runtime, task tooling, MCP servers, skills), not just the two LLM
-  providers wired today;
-- **decoupled** — adding a new source (Vault, 1Password, a host command)
-  or a new consumer must not touch the call sites that deliver credentials.
+Today (`src/credentials.rs`, `src/runtime.rs`, `src/agent_box.rs`):
 
-The direction is **on-demand delivery via a host-side credential broker**: the
-host hands material to the guest only when the guest asks, over the existing
-authenticated host↔guest channel, and — for OAuth — performs token refresh
-host-side so the refresh token is structurally absent from the guest.
+- `codex` (always) and sandbox-mode `claude-personal` **RW-bind-mount** a 0600
+  staged temp dir containing the full OAuth credential — **including the refresh
+  token** — at `/home/sandbox/.codex` or `/home/sandbox/.claude`.
+- service/agent-mode `claude-personal` instead does a **privileged WriteFile-RPC
+  copy** of the full `.credentials.json` into guest tmpfs (`src/agent_box.rs:464`).
 
-## Goals / non-goals
+In both shapes the uid-1000 agent can `cat` the file and exfiltrate the
+access **and refresh** tokens. The existing mitigations (0600 staging, temp-dir
+drop at run end) only limit guest-side *tampering* persistence; they do nothing
+for *exfiltration*. Read-tightening doesn't help either — a valid token is
+usable wherever it's read.
 
-Goals:
+Two facts make this worse and shape the fix:
 
-1. **OAuth refresh tokens never enter the guest.** For `claude-personal` and
-   `codex`, the host holds the refresh token, performs refresh against the
-   provider, and returns only a short-lived access token with an explicit
-   expiry. This is the primary, must-ship goal.
-2. A single declarative credential model (`CredentialSpec`) covering *what*
-   secret is needed, *where* it comes from on the host, and *how* the guest
-   receives it — with source and delivery as orthogonal, open sets — so the
-   OAuth case and ordinary task secrets share one pipeline.
-3. A host-side broker that resolves/refreshes at request time and returns over
-   the vsock control channel, so the default delivery never writes the secret
-   to guest-resident state, and **fails closed** when unavailable.
-4. Make LLM-provider auth an *instance* of this model — data, not branching
-   code — collapsing the duplicated staging in `src/credentials.rs` and the
-   hardcoded env in `src/llm.rs`.
-5. Per-name allow-list + audit log + rate limit on the host; opt-in, no
-   implicit behavior, consistent with the snapshot/messaging design principles
-   in `AGENTS.md`.
+- **Both CLIs self-refresh in-process.** codex (confirmed) refreshes proactively
+  before expiry and reactively on 401, writing rotated tokens back to
+  `auth.json`; the RW mount exists *specifically* so it can. claude-code's
+  personal OAuth is structurally the same (a `.credentials.json` with
+  `accessToken`/`refreshToken`/`expiresAt`).
+- **OpenAI uses refresh-token rotation** — each refresh consumes the old refresh
+  token and issues a new one. Two parties refreshing the same token invalidate
+  each other ("refresh token was already used"). So there can be only **one**
+  refresh owner. Today that's ambiguous (the guest's CLI rotates inside an
+  ephemeral mount we then discard), which is not just insecure but a latent
+  correctness bug across repeated runs.
 
-Non-goals (for this proposal):
+## Goal / non-goals
 
-- **Preventing use of a leaked access token during its validity window.** A
-  compromised agent that copies its short-lived access token and uses it from
-  outside the VM before expiry is expected to succeed. The broker bounds blast
-  radius *by time*; it does not make a live access token unusable.
-- Per-process isolation *inside* the guest. The guest is one trust domain;
-  anything in it that can reach the channel can request an allow-listed
-  credential. The broker's value is "refresh token absent / not at rest" +
-  "host-mediated," not intra-guest compartmentalization. (A capability-token
-  extension is sketched under Residual risks.)
-- A general host-side secret manager. The broker *reads from* and *refreshes
-  against* managers and providers; it is not one.
+Goal: for `claude-personal` and `codex`, the **refresh token never enters the
+guest**. The host is the sole holder and sole refresher; the guest only ever
+sees a short-lived access token with an explicit expiry. Fail closed if the
+broker is unavailable.
 
-## Threat model and why on-demand
+Non-goals:
 
-The sandbox boundary protects the host *from* the guest. Credentials invert
-that: we hand the guest something valuable, so the question is blast radius if
-the guest workload (or a dependency it pulls, or a prompt injection it obeys)
-turns hostile.
+- **Preventing use of a leaked *access* token during its validity window.** The
+  bound is temporal (≤ provider default, ~60 min), not preventive. A compromised
+  agent that copies its access token and uses it before expiry is expected to
+  succeed.
+- Per-process isolation inside the guest. Any guest process reaching the broker
+  can request an allow-listed credential; the guest is one trust domain. The
+  win is "refresh token absent" + "host-mediated + time-bounded", not
+  intra-guest compartmentalization.
+- The plain `claude` (API-key) and `OPENAI_API_KEY` paths — those forward a
+  static key, a separate concern from OAuth refresh-token containment.
+- A general multi-source credential framework (see Future work).
 
-At-rest delivery (today) means the credential is readable for the whole run by
-any process in the guest (exec env / `/proc/<pid>/environ`), anything that can
-read the mounted credential file, **any snapshot** taken during the run (the
-secret is serialized into guest RAM and persists in the snapshot image on disk,
-`src/vmm/snapshot.rs`), and crash/core dumps inside the guest. For OAuth the
-mounted file holds the **refresh** token — so exfiltration is not bounded by the
-run: it grants account access until the operator manually rotates.
+## Why on-demand, and the new surface it creates
 
-On-demand delivery, plus host-side refresh for OAuth:
+At-rest delivery leaks the credential to every guest process, the mounted file,
+**any snapshot** taken during the run (guest RAM is dumped wholesale to disk,
+`src/vmm/snapshot.rs:187`), and crash dumps. Host-side refresh removes the
+refresh token entirely and bounds a leaked access token to its short lifetime.
 
-- removes the refresh token from the guest entirely — it is never written, never
-  resident, never snapshot-captured;
-- bounds a leaked access token to its short upstream lifetime;
-- removes ordinary secrets from snapshots (never resident when no request is in
-  flight) and gives the host a chokepoint to allow-list names, rate-limit, and
-  audit every access.
+The cost is a **genuinely new host-side attack surface**: the broker makes the
+host *respond to guest-initiated requests*. Until now guest→host traffic is only
+telemetry, and even that is host-initiated (the host sends `SubscribeTelemetry`
+and owns the `request_id`; the guest merely streams frames tagged with the
+host's id). **There is no existing precedent for the guest originating a
+request.** The broker introduces one, so its handler is designed as untrusted-
+input-facing from the start (bounded fields, allow-list check before any work,
+DoS budget — see below), not as an afterthought.
 
-Note the **new host-side attack surface** this introduces: the broker makes the
-host parse guest-initiated requests. Until now the guest→host traffic is
-essentially telemetry; a guest-driven credential RPC is exactly the
-"arbitrary-code-in-guest attacking host backends" adversary. The broker handler
-must treat every request field as untrusted, bound allocation, and be a fuzz
-target alongside the existing virtio/multiplex parsers (see Security
-properties).
-
-## Use-case taxonomy
-
-The model must cover four orthogonal axes. Every existing and anticipated case
-is a point in this space.
-
-| Axis | Values |
-|---|---|
-| **Consumer** | LLM runtime · task tooling (git/npm/aws/ssh) · in-guest MCP server / skill · sidecar bridge |
-| **Source** | managed OAuth (host refreshes) · host env var · host file · OS keychain (macOS today; Linux Secret Service later) · spec literal · host command stdout · external manager (Vault / 1Password / AWS-SM) |
-| **Delivery** | broker pull (default) · short-lived access-token file (for path-bound CLIs) · exec env (compat, non-secret or low-value only) |
-| **Lifetime** | static for run · host-refreshed short-lived access token (≤ provider default) · minted per request |
-
-Worked examples:
-
-- *Claude personal (OAuth)* — **priority case.** Source = managed OAuth; the
-  host keeps `~/.claude/.credentials.json` (refresh token included) and
-  performs refresh. The guest's `claude` process obtains an access token via
-  the broker (env-on-demand shim or access-token file). The refresh token is
-  never delivered.
-- *Codex (OAuth)* — same. Codex expects `~/.codex/auth.json` on disk, so this
-  is the path-bound variant: the guest-side shim writes an access-token-only
-  `auth.json` (no `refresh_token` key) just before launch and refreshes it in
-  place by re-asking the broker before expiry. Which exact shape codex
-  tolerates is the open decision below.
-- *Claude API key (`claude`)* — source = host env `ANTHROPIC_API_KEY`;
-  delivery = broker pull via the env-on-demand shim, so the key lives in one
-  process, not the run-wide env or a pre-launch snapshot. (Static, not
-  refreshed.)
-- *GitHub push token* — source = host env or `gh auth token` (command);
-  delivery = broker pull behind a git credential helper that calls the broker
-  at network-use time.
-- *Vault-issued DB password* — source = Vault (future plugin); minted per
-  request; broker pull each time the task opens a connection.
-
-## Current state (what we unify)
-
-| Path | Mechanism | Code |
-|---|---|---|
-| LLM provider env | `LlmProvider::env_vars()` hardcodes passthrough + injected base-url/token per provider | `src/llm.rs:417` |
-| Spec env | `SandboxSpec.env` map, `$VAR` host expansion | `src/spec.rs:52`, `src/runtime.rs:1262` |
-| OAuth file staging | `discover_*` → 0600 tempdir → **RW mount of the refresh-token file** at a fixed guest path; also a privileged `WriteFile`-RPC copy for service/agent-mode claude-personal; Claude and Codex are near-duplicate copies | `src/credentials.rs`, `src/runtime.rs:234,1399`, `src/agent_box.rs:464` |
-
-All three become *delivery instances* of `CredentialSpec`. The OAuth staging in
-particular is replaced — not merely re-expressed — by the managed-OAuth flow,
-which is the whole point.
-
-## Proposed architecture
+## Architecture
 
 ```
-┌────────────────────────── host ──────────────────────────┐
-│  CredentialSpec[]  ──►  CredentialResolver                │
-│       (provider-required + spec.credentials)              │
-│                              │                            │
-│                     ┌────────▼─────────┐  resolve / OAuth- │
-│                     │ CredentialBroker │  refresh at        │
-│                     │  - allow-list    │  request time;     │
-│                     │  - rate limit    │  refresh token      │
-│                     │  - audit log     │  stays here         │
-│                     └────────┬─────────┘                  │
-│                              │ vsock control channel      │
-└──────────────────────────────┼───────────────────────────┘
-                               │  (authenticated, multiplexed)
-┌──────────────────────────────▼─── guest ─────────────────┐
-│  void-cred shim / git helper / MCP / skill (uid 1000)     │
-│   CredentialRequest{name} ─► CredentialResponse           │
-│                               {access_token, expires_at}  │
-│   access token only; lives in the requesting process /     │
-│   a 0600 file the shim writes and refreshes before expiry  │
+provider token endpoints
+   (auth.openai.com / Anthropic)
+            ▲ HTTPS (real, rotating refresh token — host only)
+            │
+┌───────────┴──────────────── host ────────────────────────┐
+│  OAuthBroker                                              │
+│   - holds the real rotating refresh token per run         │
+│   - mints/refreshes access tokens; serializes refresh     │
+│   - enforces <= CEIL promised expiry; rate/DoS budget     │
+│   - audit log                                             │
+└───────────┬──────────────────────────────────────────────┘
+            │ dedicated CID-scoped vsock port (guest→host),
+            │ authenticated by a fresh session-secret handshake
+┌───────────▼──────────────── guest (uid 1000) ────────────┐
+│  void-cred                                                │
+│   role A: fetch access token  → env-on-demand / 0600 file │
+│   role B: codex refresh shim  → 127.0.0.1 HTTP → vsock     │
+│  consumers: claude-code, codex                            │
 └───────────────────────────────────────────────────────────┘
 ```
 
-### 1. The declarative model
+The host holds and refreshes; the guest only ever holds access tokens. `reqwest`
++ rustls is already a workspace dependency, so the host-side HTTPS refresh is
+cheap to add.
 
-```rust
-/// One credential the guest may obtain. Source and delivery are independent.
-pub struct CredentialSpec {
-    /// Logical name: the broker key, and the env-var name / file basename
-    /// the guest expects.
-    pub name: String,
-    pub source: CredentialSource,
-    pub delivery: CredentialDelivery,
-    /// If true and the source is absent, the credential is simply omitted
-    /// (today's soft-fail for codex). If false, absence is fatal at resolve
-    /// time. Independent of broker availability, which always fails closed.
-    pub optional: bool,
-}
+### Transport (the dominant cost of P1)
 
-pub enum CredentialSource {
-    /// Host holds the full OAuth credential (incl. refresh token) and exchanges
-    /// it for short-lived access tokens against the provider. The refresh token
-    /// never leaves the host. This is the variant the security review requires
-    /// for `claude-personal` and `codex`.
-    ManagedOAuth { provider: OAuthProvider },
-    HostEnv { var: String },
-    HostFile { path: PathBuf },
-    OsKeychain { service: String, account: Option<String> },
-    Command { program: String, args: Vec<String> },
-    Literal(SecretString),
-    // future, behind the same enum — no call-site changes:
-    // Vault { .. }, AwsSecretsManager { .. }, OnePassword { .. }
-}
+The guest must initiate requests to the host. The two options, settled here:
 
-pub enum CredentialDelivery {
-    /// Default. Held on the host; returned over vsock on request, keyed by name.
-    /// For `ManagedOAuth`, the response carries an access token + expiry only.
-    Broker,
-    /// A short-lived 0600 file the *uid-1000* guest shim writes just before the
-    /// consumer starts (never the host via a privileged WriteFile), removes on
-    /// exit, and — for `ManagedOAuth` — rewrites with a refreshed access token
-    /// before `expires_at`. `key_allowlist` names exactly which JSON keys may
-    /// appear, so a refresh-token key can never be written.
-    File { guest_path: PathBuf, mode: u32, key_allowlist: Vec<String> },
-    /// Injected into the exec env. Compat shape; restricted to non-secret or
-    /// low-value values (base URLs, placeholder tokens). Not for OAuth.
-    Env,
-}
-```
+- **Chosen: a dedicated, CID-scoped vsock port** the host listens on and the
+  guest connects out to, authenticated by a **fresh** session-secret handshake
+  (reusing `connect_with_handshake_sync` semantics). It does **not** inherit the
+  existing control channel's authenticated state — a new listener must
+  re-handshake — so we don't claim that. It must be **vsock (CID-scoped), never
+  a TCP port on the SLIRP gateway**, or it inherits the sidecar's macOS
+  `UNSPECIFIED`-bind LAN-exposure problem (`src/sidecar/server.rs`,
+  `guest_accessible_bind_addr` in `src/backend/mod.rs`).
+- **Rejected: reverse-RPC on the existing multiplex channel.** The multiplex
+  stack assumes *host allocates `request_id`, guest responds*; an unsolicited
+  guest frame is dropped (`src/backend/multiplex.rs`). Supporting guest-as-caller
+  means building a second caller/responder role, an outbound id allocator, and a
+  pending-slot table on both ends — duplicating the machinery in reverse. Larger
+  and riskier than the dedicated port.
 
-Every value is wrapped through the `secrecy` crate (`SecretString`), as
-`ApiKey` and the staged credentials already are, so it auto-redacts in `Debug`
-and zeroizes on drop. The existing `is_sensitive_env_key` redaction in
-`ExecRequest::Debug` (`void-box-protocol/src/lib.rs:454`) still backstops the
-`Env` shape.
+Platform note: the guest-outbound vsock connection exercises the **listen** side
+of the VZ connector (GCD-callback based), a different path from today's
+host-initiated connect. This is real work to validate on macOS/VZ, not a
+checkbox.
 
-### 2. Managed OAuth — the priority flow
+**Transport-free initial slice.** For **task-mode** runs shorter than the access-
+token TTL, the host can mint a fresh access token and inject it at launch
+through the *existing* host→guest `ExecRequest` env/launch path — no guest-
+initiated transport at all. The vsock broker is needed only for **mid-run
+refresh** (long/service runs) and for codex's refresh shim. So an initial slice
+can close the finding for the common task-mode case before the transport lands.
 
-This is the part that closes the headline finding. For `claude-personal` and
-`codex`:
+### Wire protocol
 
-1. The host discovers the full OAuth credential as today (`src/credentials.rs`)
-   but **does not stage the refresh token into the guest**. It keeps it
-   host-side, wrapped in `SecretString`, keyed by run.
-2. On a guest `CredentialRequest`, the broker returns a **short-lived access
-   token plus an `expires_at`**. If the host's cached upstream token has
-   > the ceiling remaining, it returns it; otherwise it refreshes against the
-   provider and returns the fresh one.
-3. **Expiry ceiling (blast-radius bound, not ergonomics).** The broker never
-   promises the guest an `expires_at` beyond `now + CEIL`, where `CEIL` is at
-   or below the provider's default access-token lifetime (~60 min for both
-   Anthropic and OpenAI today). A signed JWT's internal `exp` can't be
-   rewritten, so the ceiling is enforced behaviorally on the broker's promised
-   `expires_at`; the guest shim trusts that field, not the token's claims, and
-   re-requests before it. Staying at/below the provider default means the
-   ceiling never changes operational behavior — long runs already
-   re-authenticate at that cadence.
-4. **Refresh-token absence is a tested invariant.** Any `File` delivery for a
-   managed-OAuth credential declares a `key_allowlist`; the shim writes only
-   those keys. No key whose name contains "refresh" (case-insensitive) may ever
-   appear in the guest-visible file. This is verified independently of the
-   expiry check.
-5. **Fail closed.** If the broker is unreachable or refuses, the consumer's
-   credential acquisition fails and the run errors — there is no silent
-   fallback to mounting the refresh-token file.
-
-`OAuthProvider` encapsulates the per-provider refresh endpoint and token shape,
-so adding a provider is a new arm there, not in the broker or transport.
-
-### 3. Provider auth as data
-
-`LlmProvider::env_vars()` and the `prepare_claude_personal` / `prepare_codex` /
-`apply_codex_credential_mount` functions are replaced by one method:
-
-```rust
-impl LlmProvider {
-    fn required_credentials(&self) -> Vec<CredentialSpec> { /* table */ }
-}
-```
-
-- `claude-personal` → `ManagedOAuth{Anthropic}` with `Broker` delivery (the
-  CLI reads `ANTHROPIC_API_KEY`/credentials from env or file; the shim supplies
-  an access token).
-- `codex` → `ManagedOAuth{OpenAI}` with `File{ guest:"~/.codex/auth.json",
-  key_allowlist: [access-token keys only] }`, plus an optional `HostEnv` for
-  `OPENAI_API_KEY` (api-key mode).
-- `claude` (API key) → `HostEnv{ANTHROPIC_API_KEY}` with `Broker` delivery.
-- Ollama / LM-Studio / custom → `Literal`/`HostEnv` with `Env` delivery (their
-  values are non-secret base URLs and placeholder tokens, so broker delivery
-  buys nothing).
-
-A new provider adds a table row, not a `match` arm in two files.
-
-### 4. The broker and its transport
-
-The broker is a host-side service holding the resolved `CredentialSpec` set,
-the host-retained OAuth credentials, an allow-list of obtainable names, a
-per-name rate limit, and an audit log. It answers guest requests by
-resolving/refreshing the source *then* and returning the access token or secret.
-
-**Transport: extend the vsock control channel**, not the sidecar HTTP server:
-
-- The control channel exists for *every* run, is authenticated by the Ping/Pong
-  session-secret handshake, and is multiplexed (`src/backend/multiplex.rs`).
-- The sidecar (`src/sidecar/server.rs`) only runs when `messaging.enabled`,
-  has **no auth on any route**, and on macOS binds `UNSPECIFIED` (every host
-  interface, per `guest_accessible_bind_addr`) — the security review flags it
-  as reachable by any local/LAN process. Routing secret traffic through it
-  would inherit that exposure.
-- Telemetry already shows guest→host-initiated frames
-  (`MessageType::TelemetryData`), so guest-initiated requests are not a new
-  direction in principle — but see the caller/responder inversion below.
-
-The auth is whatever the channel uses; the design must **not** hard-code the
-current static cmdline secret, because that secret is itself a known weakness
-(visible via `/proc/<pid>/cmdline`) slated to be replaced by a per-boot
-handshake-derived key. The broker inherits that improvement for free as long as
-it reuses the channel's established session rather than re-reading the cmdline.
-
-The one real cost: today the host is the multiplex *caller* and the guest the
-responder. A guest-initiated request inverts roles. Two options, settled in the
-plan:
-
-- **(a) reverse RPC on the existing channel** — teach the multiplex reader on
-  both ends to dispatch peer-initiated requests (guest allocates the
-  `request_id`, host registers a handler). Tidiest long-term; touches
-  `multiplex.rs` and `guest-agent` dispatch.
-- **(b) a dedicated broker vsock port** — guest connects out to a host-listening
-  port, same handshake. Smaller blast radius, simpler to reason about and to
-  fuzz in isolation; one more listener.
-
-Wire additions (append-only, matching the protocol's append-only discipline):
+Append-only, matching the protocol's discipline:
 
 ```text
 MessageType::CredentialRequest  = 28
-  // { name: String }                       -- guest asks by logical name
+  // { name: String, nonce: [u8;16] }     -- nonce reserved for future
+  //                                          per-consumer capability binding
 MessageType::CredentialResponse = 29
   // { status: ok|denied|unavailable|expired,
-  //   secret?: bytes,                      -- access token / secret value
-  //   expires_at?: u64,                    -- unix secs; broker-promised ceiling
+  //   secret?: bytes,        -- access token / token-endpoint response body
+  //   expires_at?: u64,      -- unix secs; broker-promised ceiling
   //   error?: String }
 ```
 
 `MAX_MESSAGE_SIZE` bounds payloads; the handler additionally bounds `name`
-length and validates it against the allow-list before any work. Responses are
-JSON like the rest of the protocol; secret bytes are zeroized on the guest side
-after use. `unavailable`/`denied` are terminal for the consumer (fail closed).
+length and checks the allow-list before any source work. `unavailable`/`denied`
+are terminal — the consumer fails closed, never falling back to a mount. The
+`nonce` is included now because the append-only format makes it expensive to add
+later (replay/capability binding is otherwise deferred).
 
-### 5. Guest-side integration (`void-cred`)
+### Host-side OAuth refresh
 
-A small guest binary, `void-cred`, runs as uid 1000 and is the only component
-that speaks the broker protocol; consumers never embed it. It is the same
-mechanism the broader plan to demote privileged file RPCs to uid 1000 wants —
-no PID-1/root involvement in credential materialization.
+- The broker holds the real OAuth credential per run, wrapped in `SecretString`,
+  and is the **only** refresher. Upstream refreshes are **serialized** and
+  rate-capped independently of guest-facing requests: refresh at most once per
+  ~TTL/2, otherwise serve the cached access token. This both respects rotation
+  (no concurrent "already used" failures) and blunts a guest that spams requests
+  to burn the provider's rate limit or force rotation.
+- **Expiry ceiling** is enforced on the broker-*promised* `expires_at`, not the
+  token's internal claims (a signed JWT's `exp` can't be rewritten). The broker
+  never promises beyond `now + CEIL`, `CEIL ≤` the provider default (~60 min for
+  both); the guest shim trusts `expires_at` and re-requests before it. Staying at
+  or below the provider default means the ceiling never changes operational
+  behavior.
 
-- **env-on-demand** — `void-cred exec --name ANTHROPIC_API_KEY -- claude …`
-  requests the token, sets it in the child's env, and `exec`s. The token lives
-  in exactly one process, never in the run-wide env or a pre-launch snapshot.
-- **access-token file** — for `File` delivery, `void-cred` (uid 1000) writes a
-  0600 file containing only `key_allowlist` keys. Before `expires_at` it
-  **re-requests a fresh access token from the broker over vsock** and overwrites
-  the file; it removes the file on exit. `void-cred` never performs the OAuth
-  exchange and never sees the refresh token — "refreshing the file" means
-  "ask the broker again and rewrite," not "exchange a refresh token." The
-  refresh-token→access-token exchange against the provider happens only on the
-  host, inside the broker (§2). This **replaces** both the whole-run RW mount
-  and the privileged `WriteFile`-RPC credential copy (`src/agent_box.rs:464`),
-  which are deleted once both providers are migrated.
-- **helper protocols** — a git credential helper / npm token script / MCP
-  server config that shells out to `void-cred get --name …` at the moment of
-  network use.
+### Guest-side shim (`void-cred`, uid 1000)
 
-### 6. Source plugins
+`void-cred` is the only component speaking the broker protocol; it runs as uid
+1000 (no PID-1/root involvement, consistent with the broader goal of demoting
+privileged file RPCs). Two roles:
 
-`CredentialSource` resolution lives behind a `trait SourceResolver { fn
-resolve(&self) -> Result<Issued>; }` (where `Issued` carries the secret and an
-optional `expires_at`) with one impl per variant. `discover_oauth_credentials`
-and `discover_codex_credentials` feed the `ManagedOAuth` resolver (which also
-owns refresh); a future Vault impl is a new variant; the broker, transport, and
-guest are untouched.
+- **Role A — token fetch.** `void-cred exec --name … -- <program>` requests an
+  access token and either sets it in the child's env and `execve`s, or writes a
+  0600 file the consumer reads. For mid-run refresh it re-requests before
+  `expires_at` and overwrites the file. "Refreshing the file" means *ask the
+  broker again and rewrite* — `void-cred` never performs an OAuth exchange and
+  never holds a refresh token.
+- **Role B — codex refresh shim.** `void-cred` listens on `127.0.0.1:<port>`
+  inside the guest; codex's `CODEX_REFRESH_TOKEN_URL_OVERRIDE` points at it.
+  codex POSTs its refresh request (`grant_type=refresh_token`, `client_id`,
+  `refresh_token=<opaque sentinel>`); `void-cred` forwards over vsock to the
+  broker, which uses the **real** host-held refresh token to refresh against the
+  provider and returns a normal token response. The HTTP stays loopback-only;
+  the real refresh token stays host-side.
 
-### 7. Spec surface
+**Delivery-selection rule** (which shape for which case):
 
-A new opt-in block lets the task declare its own (non-LLM) secrets declaratively
-instead of plaintext `env:`:
+| Case | Delivery |
+|---|---|
+| Static key (`claude` API key, `OPENAI_API_KEY`) — out of finding scope | env injection |
+| OAuth, task-mode shorter than TTL | host-mint at launch (no transport) |
+| OAuth, long/service run, consumer self-refreshes via overridable endpoint (codex) | refresh shim (Role B) |
+| OAuth, long/service run, file-based without override | 0600 access-token file + Role-A refresher |
 
-```yaml
-sandbox:
-  credentials:
-    - { name: GITHUB_TOKEN, from: { env: GH_PAT } }            # delivery defaults to broker
-    - { name: NPM_TOKEN,    from: { command: { program: gh, args: [auth, token] } } }
-    - name: id_ed25519
-      from: { file: ~/.ssh/id_ed25519 }
-      to:   { file: /home/sandbox/.ssh/id_ed25519, mode: 0600 }
-```
+When a background refresher is needed it is a small `void-cred` sleep loop
+(renew at ~80% TTL with jitter), **not cron** (absent from the minimal
+initramfs), tied to the agent's lifetime via `PR_SET_PDEATHSIG` so it dies with
+the run. Prefer demand-driven refresh (Role B / on-401) over timers where the
+consumer allows it.
 
-`BoxSandboxOverride` gets the same field for per-box scoping in pipelines,
-mirroring how `env`/`mounts` are already overridable (`src/spec.rs:152`).
-Absent the block, behavior is identical to today.
+### File contents allow-list
+
+Any guest-visible credential file declares a **positive `key_allowlist`**; the
+shim writes only those keys. There is no "reject keys containing 'refresh'"
+denylist (bypassable by alternate field names) — correctness rests on the
+positive allow-list plus a test asserting the emitted JSON's key set is a subset
+of it. A refresh-token-shaped key therefore cannot appear.
+
+## Milestones (all within this P1 finding)
+
+- **M0 — broker foundation.** `OAuthBroker` (host-held refresh token, serialized
+  refresh, expiry ceiling, rate/DoS budget, audit), the dedicated CID-scoped
+  vsock port + handshake, the `CredentialRequest/Response` wire types, and
+  `void-cred` Role A. Includes the transport-free host-mint-at-launch path so a
+  first slice can land.
+- **M1 — `claude-personal`.** Contain claude-personal: delete its RW mount and
+  the `agent_box.rs:464` WriteFile copy; deliver access tokens via host-mint
+  (task mode) and Role-A file refresher (long runs). **Spike:** confirm
+  claude-code's personal-OAuth refresh behavior and whether it exposes a
+  refresh-endpoint override (if yes, it can use a Role-B-style shim like codex;
+  if not, it uses the file+refresher path). Regression gate: `e2e_agent_mcp`
+  (Claude) still authenticates; tests assert no refresh-token key and ≤ ceiling
+  expiry in the guest-visible credential.
+- **M2 — `codex`.** Contain codex via the refresh shim: delete its RW mount;
+  seed `auth.json` with a host-minted access token + sentinel refresh token; set
+  `CODEX_REFRESH_TOKEN_URL_OVERRIDE` to `void-cred`'s loopback endpoint.
+  **Spike:** confirm, against the pinned codex version, the exact request body /
+  headers codex sends to the override URL and the response JSON fields it parses
+  (`access_token` / `id_token` / `refresh_token` / `expires_in` / `account_id`).
+  Regression gate: the codex smoke specs still authenticate; same
+  no-refresh-token / bounded-expiry assertions.
 
 ## Security properties
 
-- **No refresh token in the guest.** For OAuth, the refresh token stays
-  host-side; the guest only ever holds a short-lived access token. Enforced
-  structurally (managed-OAuth never delivers it) and by a `key_allowlist` test
-  that fails if any "refresh"-named key appears in a guest-visible file.
-- **Time-bounded blast radius.** A leaked access token is unusable after
-  `expires_at` ≤ `now + CEIL` (≤ provider default).
-- **Fail closed.** Broker unavailable/denied ⇒ the run errors; never a silent
-  fall back to mounting the credential.
-- **Not at rest by default.** Non-OAuth broker delivery keeps secrets out of the
-  guest env, fs, `/proc`, and snapshots; they exist only transiently in the
-  requesting process.
-- **Host chokepoint.** Per-name allow-list, **per-name rate limit**, and an
-  audit line per request (name, time, status). The guest cannot enumerate
-  beyond the allow-list.
-- **Untrusted-input handling on the host.** The broker handler treats every
-  request field as hostile (the guest may be running arbitrary code): bounded
-  `name`, allow-list check before any source work, no unbounded allocation. It
-  is a fuzz target alongside the virtio/multiplex parsers; option (b)'s
-  dedicated listener keeps that surface isolated.
-- **Auth inherits the channel.** Reuses the established session, not a re-read
-  of the cmdline secret, so it composes with the planned move to a
-  handshake-derived session key.
+- **No refresh token in the guest** for OAuth providers — held and rotated only
+  on the host; enforced structurally + by the positive `key_allowlist` test.
+- **Time-bounded blast radius** — a leaked access token is unusable after
+  `expires_at ≤ now + CEIL`.
+- **Fail closed** — broker unavailable/denied ⇒ the run errors; never a silent
+  mount fallback.
+- **Single rotation owner** — only the host refreshes, eliminating the
+  "refresh token already used" conflict and fixing the latent repeated-run bug.
+- **Host treats guest input as hostile** — bounded `name`, allow-list before any
+  work, a concrete DoS budget (max concurrent broker requests per channel,
+  bounded handler memory, serialized + rate-capped upstream refresh). The
+  dedicated listener keeps this surface isolated and independently fuzzable.
+- **Loopback-only codex HTTP** — the refresh shim binds `127.0.0.1`; no host
+  HTTP port is exposed on the NAT gateway.
 - **Redaction + zeroize** end to end via `secrecy`.
-- **Opt-in.** No broker traffic or `credentials:` semantics unless configured.
+- **Opt-in / no behavior change** for providers that don't stage OAuth today.
 
-## Residual risks
+### Honest residual risks
 
-- **Live access-token use during its window.** Explicitly out of scope — the
-  bound is temporal, not preventive (see Non-goals).
-- **Intra-guest sharing.** Any guest process reaching the channel can request an
-  allow-listed name. Mitigation path (future): a per-consumer capability token
-  the host mints and hands to a single launched process, required in
-  `CredentialRequest`. Noted so the wire format leaves room.
-- **Local host user with the session secret.** On Linux the vsock rendezvous
-  socket is `0o600`, so a foreign uid cannot reach the channel; a same-uid
-  process is already equivalent to the operator. The broker doesn't widen this,
-  and the planned handshake-derived key removes the cmdline-secret leak that
-  makes it theoretically reachable.
-- **Access-token file window.** The short-lived file is a brief at-rest window
-  for path-bound CLIs, uid-1000 and 0600, refresh-token-free — strictly better
-  than today's whole-run refresh-token mount.
+- **Live access-token use during its window** — out of scope by design (temporal
+  bound, not preventive).
+- **Access-token *file* is snapshot-captured for its lifetime.** The "out of
+  snapshots" property holds for broker-pull/env, **not** for the file delivery
+  codex (and possibly claude) needs — a mid-run snapshot captures the live access
+  token from the file's page cache and the consumer process. Acceptable only
+  because it is ≤ CEIL and refresh-token-free; stated plainly rather than
+  glossed.
+- **Intra-guest sharing** — any guest process reaching the broker can request an
+  allow-listed name; the `nonce` field reserves room for future per-consumer
+  capability tokens.
+- **Rate-limit as self-DoS** — too-tight a limit starves the legitimate consumer;
+  the legit path therefore *delays* rather than *denies*, with burst+steady
+  values to be set from real cadence.
 
 ## Coverage of the security-review findings
 
-The review's credential-exfiltration item (its highest-priority hardening) and
-its acceptance criteria map onto this design as follows:
-
 | Review criterion | Where addressed |
 |---|---|
-| Refresh tokens never enter the guest | §2 managed OAuth; `ManagedOAuth` source; `key_allowlist` |
-| Host performs refresh; returns only access token + expiry | §2; `SourceResolver`/`Issued`; `CredentialResponse.expires_at` |
-| ≤ provider-default (~60 min) ceiling, re-request before expiry | §2 step 3; guest shim trusts `expires_at` |
-| Fail closed, no silent mount fallback | §2 step 5; Security properties |
-| Remove RW mount **and** privileged `WriteFile` copy | §5 access-token file; §"Current state" deletion note |
-| New vsock RPC, auth reuses session | §4 wire additions + auth note |
-| Rate limits | §4 broker; Security properties |
-| Per-provider allowed-key list for guest files | `key_allowlist`; §2 step 4 |
-| Don't use the unauthenticated sidecar | §4 transport rationale |
-| Codex clean-injection vs shim-intercept | Open question 1 |
-
-Adjacent review items this design also touches: it does **not** widen the host
-process's attack surface uncontrolled — it adds one bounded, fuzzable handler
-(Security properties) — and it composes with, rather than depends on, the
-planned replacement of the static cmdline session secret.
+| Refresh tokens never enter the guest | host-side refresh; positive `key_allowlist` |
+| Host performs refresh; returns access token + expiry | OAuthBroker; `CredentialResponse.expires_at` |
+| ≤ provider-default ceiling; re-request before expiry | expiry ceiling; shim trusts `expires_at` |
+| Fail closed, no silent mount fallback | wire `denied`/`unavailable` terminal; Security properties |
+| Remove RW mount **and** privileged WriteFile copy | M1/M2 deletions |
+| New vsock RPC; auth via fresh handshake (not cmdline-secret-dependent long-term) | Transport; wire protocol |
+| Rate limits / DoS budget (decoupled guest vs upstream) | Host-side refresh; Security properties |
+| Per-provider allowed-key list for guest files | positive `key_allowlist` |
+| Don't use the unauthenticated sidecar; CID-scoped only | Transport |
+| Codex clean-injection vs self-refresh unknown | resolved: refresh shim via official override; M2 spike for exact contract |
+| New host-side attack surface treated as design | "Why on-demand" + DoS budget |
 
 ## Open questions
 
-1. **Codex token shape (blocks the codex slice).** Does current codex tolerate
-   an `auth.json` containing only an access token (clean injection), or must we
-   intercept its in-process refresh (shim-intercept)? The first is far cheaper;
-   the answer decides the guest-side surface for codex. Both branches keep the
-   refresh token host-side.
-2. **Transport:** reverse-RPC on the existing channel (a) vs. a dedicated broker
-   vsock port (b)? Leaning (b) for blast-radius isolation and isolated fuzzing.
-3. **Env delivery:** keep it as a documented, lower-security shape for
-   non-secret values, or deprecate once the env-on-demand shim lands?
-4. **macOS/VZ parity:** the broker is transport-only and platform-neutral, but
-   `void-cred` and the access-token-file path must be validated on both KVM and
-   VZ (`e2e_mount`, `e2e_agent_mcp` patterns).
-
-## Phasing
-
-- **P1 — managed-OAuth broker (closes the headline finding).** `CredentialSpec`
-  /`Source`/`Delivery` with `ManagedOAuth`, the broker over vsock (transport
-  chosen in the plan), host-side refresh + expiry ceiling, `void-cred` with
-  env-on-demand + access-token file, fail-closed. Migrate `claude-personal` and
-  `codex`; delete the RW mount and the privileged `WriteFile` credential copy.
-  Regression gate: `e2e_agent_mcp` (Claude) and the codex smoke specs still
-  authenticate; new tests assert no refresh-token key and ≤ceiling expiry in the
-  guest-visible credential.
-- **P2 — unify the rest.** Re-express the API-key/env and provider-injected
-  values through the model; collapse `env_vars()` and the prepare-helpers.
-- **P3 — task secrets.** `sandbox.credentials:` + `BoxSandboxOverride`,
-  git/npm/MCP helper shapes.
-- **P4 — pluggable sources.** `Command`, Linux Secret Service, external managers
-  behind `SourceResolver`.
-- **P5 — capability tokens** (optional) for intra-guest scoping.
+1. **claude-personal refresh behavior (M1 spike).** Does claude-code self-refresh
+   personal OAuth in-process, and does it expose a refresh-endpoint override
+   (codex-style) or accept an access-token-only `.credentials.json` for short
+   tasks? Decides M1's exact mechanism.
+2. **codex override contract (M2 spike).** Exact request/response shape codex
+   uses with `CODEX_REFRESH_TOKEN_URL_OVERRIDE` at the pinned version.
+3. **`Env` delivery** for static keys: keep as a documented lower-security shape,
+   or route everything through the shim?
+4. **macOS/VZ listen-side** validation for the guest-outbound vsock connection.
 
 ## Affected code (for the implementation plan)
 
 - `void-box-protocol/src/lib.rs` — `MessageType` 28/29 + request/response types
-  (with `expires_at`).
-- `src/backend/multiplex.rs`, `src/backend/control_channel.rs`,
-  `guest-agent/src/main.rs` — transport for guest-initiated broker RPC.
-- `src/credentials.rs` — becomes `SourceResolver`/`ManagedOAuth` impls (refresh
-  logic, expiry); staging shrinks to the host-retained credential.
-- `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — remove
-  RW mount + privileged `WriteFile` credential copy; wire the broker.
-- `src/llm.rs` — `required_credentials()` replaces `env_vars()` + the
-  provider-prepare helpers.
-- `src/spec.rs` — `CredentialSpec` YAML + `SandboxSpec`/`BoxSandboxOverride`
-  fields.
-- new `void-cred/` crate (guest, uid 1000) + `DEFAULT_COMMAND_ALLOWLIST`
+  (with `nonce`, `expires_at`).
+- `src/backend/` — new dedicated vsock listener + handshake for guest-initiated
+  requests (host side).
+- `guest-agent/` and a new `void-cred/` crate (guest, uid 1000) — broker client,
+  Role-A fetch, Role-B loopback refresh shim; `DEFAULT_COMMAND_ALLOWLIST`
   (`src/backend/mod.rs`).
+- `src/credentials.rs` — host-retained OAuth credential + refresh logic
+  (rotation handling, expiry); staging shrinks to host-only.
+- `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — delete
+  RW mount + privileged WriteFile copy; wire the broker.
+- `src/llm.rs` — provider → required-credential mapping (data, replacing the
+  hardcoded `env_vars()` arms for the OAuth providers).
+
+## Future work (explicitly NOT built here)
+
+A general, decoupled credential mechanism — the original broader goal — builds
+*on* this broker once a real second, non-OAuth consumer exists (task secrets:
+GitHub/npm/cloud/SSH tokens). When justified, it would generalize to:
+
+- a declarative `CredentialSpec` with orthogonal **source** (host env / file /
+  OS keychain / command stdout / external managers like Vault, 1Password,
+  AWS-SM) and **delivery** (broker pull / file / env) axes, behind a
+  `SourceResolver` trait so new backends don't touch call sites;
+- a `sandbox.credentials:` spec surface (+ `BoxSandboxOverride`) for tasks to
+  declare their own secrets instead of plaintext `env:`;
+- per-consumer **capability tokens** (the reserved `nonce`) for intra-guest
+  scoping.
+
+These are deferred deliberately: none is required to close the finding, and
+building the generic framework before a second consumer exists is speculative
+generality. This section records the direction so the P1 work stays compatible
+with it (the broker, transport, and wire format are the shared substrate).
