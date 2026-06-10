@@ -5,8 +5,10 @@ committed substrate (required for API-key containment and downstream egress). Fo
 OAuth providers, the delivery mechanism — token injection vs. proxy injection — is
 left open and chosen against the criteria below.
 
-Provider behaviors here are confirmed against Claude Code 2.1.170 and the codex
-version pinned in `scripts/agents/manifest.toml`; re-verify on version bumps (R10).
+Provider behaviors here are confirmed against Claude Code 2.1.170 and openai/codex
+at commit `9e3081be9672c65f8a0cd958719065f49f47d839`; re-verify on version bumps
+(R10), including against the codex version actually bundled
+(`scripts/agents/manifest.toml`) if it differs.
 
 ## Trust model
 
@@ -237,16 +239,36 @@ Ordered by how much each could disrupt implementation.
 Two technical gates retire the feasibility unknowns before milestone work; provider
 policy is settled by reading the terms (ToS section), not by a spike.
 
-**V1 — redirect/CA/suppress on the pinned versions (no account).** Point the pinned
-clients at a dumb logging proxy; confirm `ANTHROPIC_BASE_URL`/`openai_base_url`
-redirect, `PROVIDER_MANAGED_BY_HOST` suppresses refresh/force-login, the CA env vars
-are honored, and only inference blocks (no retry-storm on the other Claude
-endpoints). Gates all proxy provisioning (API-key and OAuth).
+**V1 — redirect / CA / suppression on the pinned versions (no account, gates all
+proxy provisioning).**
 
-**V2 — OAuth acceptance (throwaway account).** Have a host process replay the OAuth
-refresh (`client_id` + `refresh_token` + `grant_type=refresh_token`) and inject the
-minted Bearer on one real inference request, for Claude and codex; confirm a usable
-completion. Resolves R5/R6. OAuth path only; the API-key path does not need it.
+1. Stand up a throwaway HTTPS proxy with a self-signed CA that logs requests and
+   forwards upstream.
+2. Claude: set `ANTHROPIC_BASE_URL=<proxy>`, `NODE_EXTRA_CA_CERTS=<CA PEM>`,
+   `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, a placeholder `ANTHROPIC_AUTH_TOKEN`,
+   and no credentials file; run `claude -p "hi"`.
+3. codex: set `openai_base_url=<proxy>` + `credentials_store="file"` in
+   `config.toml`, `CODEX_CA_CERTIFICATE=<CA PEM>`, and a placeholder `auth.json`;
+   run `codex exec "hi"` (set `supports_websockets=false` to force plain HTTPS).
+4. **Pass:** both clients route inference through the proxy, trust the CA, do not
+   hard-fail on the missing real credential, and trigger no force-login or
+   retry-storm against hardcoded endpoints. Confirm codex emits `ChatGPT-Account-ID`
+   + `originator`. Resolves nothing on its own but unblocks M0 and the proxy path.
+
+**V2 — OAuth acceptance (throwaway account, OAuth path only; the API-key path skips
+this).**
+
+1. On a throwaway Claude Pro/Max and a throwaway ChatGPT Plus account, log in
+   normally and capture the real refresh token.
+2. Host-side, replay the refresh (`client_id` + `grant_type=refresh_token` +
+   `refresh_token`) against each token endpoint; confirm a usable access token comes
+   back, and **store the rotated refresh token host-side** (R5).
+3. Inject the minted Bearer through the proxy on one real inference request per
+   provider; confirm a usable completion (R6).
+4. **Pass:** host-minted tokens authenticate inference for both providers. Watch for
+   any extra required header/param or a `401/403` indicating token binding/
+   attestation. **Fail → the credential-store premise needs a rethink** (fall back
+   to API-key-only, or re-evaluate token injection).
 
 **Then build, smallest-risk first:**
 - **M0** — static-key proxy for the **API-key** providers (Anthropic `x-api-key`,
@@ -267,6 +289,38 @@ Remove the RW credential mounts and the `src/agent_box.rs:464` WriteFile copy as
 provider migrates. Exit gate: `e2e_agent_mcp` (Claude) and the codex smoke specs pass
 with no refresh token in the guest (and, on the proxy path, no credential at all).
 
+## Implementation readiness
+
+What an implementer can take as settled versus what they must still design.
+
+**Settled — do not re-derive:** the invariant, trust model, and ToS boundary; the
+mechanism (host injection proxy + credential store; API keys and downstream via the
+proxy); the per-provider client knobs (env vars, config, headers) and their verified
+behavior; the milestone order (M0 leads); the risk register and the V1/V2 gates.
+
+**The implementer must design (within the chosen approach):**
+- **Guest→proxy data path and binding** — how the client reaches the proxy (host
+  listener reachable via SLIRP `10.0.2.2`, or a vsock-bridged port), bound guest-only
+  per platform (loopback on KVM; a VZ-specific address on macOS, not `UNSPECIFIED`).
+- **Per-run proxy token** — generation, injection into the guest, the proxy-side
+  check, and stripping it before forwarding upstream.
+- **Per-run CA** — generation, name-constraint to the injected upstreams, install
+  into the guest trust stores per image (`NODE_EXTRA_CA_CERTS`,
+  `CODEX_CA_CERTIFICATE`, and the system store for M2), and teardown.
+- **Lifecycle placement** — which host process runs the proxy and store, one per
+  sandbox, started/stopped on which VM hook.
+- **Credential store internals** — reuse the discovery in `src/credentials.rs`;
+  per-provider refresh-request construction; token cache + serialized refresh.
+
+**Decisions to escalate (do not guess):**
+- The OAuth delivery mechanism (token injection vs. proxy), after V2.
+- Whether to contain personal-subscription OAuth at all given the ToS tradeoff, or
+  to steer programmatic use to API keys.
+
+**Suggested first session:** run V1, then build M0 (which needs the proxy data path,
+per-run token, CA install, and lifecycle placement — all reusable by M1). Defer the
+credential store until V2 passes; bring the OAuth-mode decision to a human.
+
 ## Affected code
 
 - New host modules — the credential store (durable secret custody; OAuth
@@ -283,5 +337,5 @@ with no refresh token in the guest (and, on the proxy path, no credential at all
 - Guest image — install the per-run CA into the trust stores the clients honor
   (`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`; and the system store
   for M2 tools) — a per-image checklist across initramfs and OCI-rootfs.
-- `scripts/agents/manifest.toml` — the pinned versions the behaviors are verified
-  against.
+- `scripts/agents/manifest.toml` — the bundled provider versions; re-verify these
+  behaviors against them on bumps (R10).
