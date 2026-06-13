@@ -125,9 +125,11 @@ egress:
     - 169.254.0.0/16
 ```
 
-**Default profile:** an unresolved product decision — `open` (max compatibility) vs
-`monitored` (compatible + observable, recommended for a security runtime) vs
-`proxy-only` (secure-by-default, higher friction). See Open question 1.
+**Default profile:** an unresolved product decision. Performance favors `open` with
+selective credential routing as the out-of-box default (only the credentialed flows
+traverse the proxy); `monitored` (CONNECT-tunnel, no content decryption) is the
+recommended secure default *where audit is required*; never default to TLS-MITM. See
+Open question 1.
 
 ### Extend the deny-list, or redesign?
 
@@ -197,8 +199,10 @@ Two layers, with a clean division of labor:
   profiles fail closed (egress denied), never open.
 - **Proxy layer — fine-grained, name-based policy + audit.** When traffic is routed
   through the proxy (`monitored`/`allowlist`/`proxy-only`), the proxy enforces the
-  **domain allow-list by hostname** (CONNECT host / SNI), with **fresh per-connection
-  DNS resolution** so rotating/multiple CDN IPs are handled automatically. It also
+  **domain allow-list by hostname** (CONNECT host / SNI), with **per-connection DNS
+  resolution cached short-TTL** (mirroring the SLIRP resolver's 60 s and storing the
+  resolved-and-validated IP for SSRF pinning) so rotating/multiple CDN IPs are handled
+  without a resolver RTT on every connection. It also
   produces the **audit log**, applies rate-limits, and is the kill-switch. For
   credentialed endpoints it hands off to the injection path
   (`docs/design/credential-broker.md`); for plain allow-listed endpoints it
@@ -248,9 +252,11 @@ Each component below needs a concrete design.
   redaction.
 - **Rate-limit / kill-switch.** Per-run egress caps and a runtime cut, integrated with
   the existing SLIRP connection limits.
-- **Transparent interception (for tools ignoring `HTTPS_PROXY`).** SNI inspection at
-  the network layer; per-destination cert generation if termination is needed; the ECH
-  caveat (SNI may become unavailable). DNS-learned-IP fallback for raw TCP.
+- **Transparent interception (for tools ignoring `HTTPS_PROXY`).** The network layer
+  does only coarse pin-to-proxy (a CIDR check); **all SNI parsing happens in the proxy
+  process, never in the per-ns-optimized SLIRP relay loop** (`slirp.rs`/`nat.rs`).
+  Per-destination cert generation if termination is needed; the ECH caveat (SNI may
+  become unavailable); DNS-learned-IP fallback for raw TCP.
 - **Spec / config plumbing.** `EgressSpec` in `src/spec.rs`, runtime resolution, and
   per-box overrides, mirroring existing spec patterns.
 - **Platform parity.** KVM (SLIRP/smoltcp) vs macOS/VZ NAT — confirm the pinning and
@@ -259,8 +265,10 @@ Each component below needs a concrete design.
 ## Open questions
 
 1. **Default profile** — `open`, `monitored`, or `proxy-only`?
-2. **One proxy or two** — does egress reuse the credential proxy as its chokepoint, or
-   run a separate egress proxy that delegates credentialed endpoints to it?
+2. **One proxy or two, and shared vs per-sandbox** — does egress reuse the credential
+   proxy as its chokepoint? Performance strongly favors a single **shared**
+   low-privilege proxy multiplexed across sandboxes (per-run token + name-constrained
+   CA isolate runs) over a process per sandbox, which fights VM density.
 3. **`Rules` redesign vs. extend** — final shape of the network-layer policy model and
    how the deny-list folds in.
 4. **Content visibility in `monitored`** — CONNECT-tunnel (destinations only) by

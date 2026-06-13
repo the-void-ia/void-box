@@ -114,7 +114,8 @@ guest client ──▶ host injection proxy ──▶ real upstream
 
 **Credential store.** Holds each provider's durable secret — read from
 `~/.claude`/`~/.codex`/Keychain, or the host env for API keys. For OAuth it refreshes
-against the provider's token endpoint, mints short-lived access tokens, is the sole
+against the provider's token endpoint, mints short-lived access tokens **lazily on
+first use, overlapped with VM boot** (never a serial pre-boot RTT), is the sole
 rotation owner (serialized refresh, rate-capped), and **persists the rotated refresh
 token back to the host** so subsequent runs stay valid. Write-back must be atomic
 (temp + `rename`), `0600`, and locked across any processes/runs sharing the durable
@@ -177,8 +178,10 @@ and what the host runs.
 injection), so routing OAuth through it unifies the mechanism and yields zero
 in-guest credential. Token injection is lighter and preserves the client's TLS
 fingerprint (R7 — relevant if a subscription endpoint fingerprints TLS), but leaves a
-bounded token in the guest and lacks a clean Claude long-run refresh. For personal
-subscriptions, weigh the policy tradeoff (ToS, above). Decide after V1/V2.
+bounded token in the guest and lacks a clean Claude long-run refresh; **performance
+also favors it for high-volume inference** — proxy injection terminates TLS and pays
+per-byte crypto on the whole stream (see Performance). For personal subscriptions,
+weigh the policy tradeoff (ToS, above). Decide after V1/V2.
 
 ## Downstream credential injection
 
@@ -221,6 +224,27 @@ concern of the separate egress design (`docs/design/egress-policy.md`).
   hot-path availability coupling; the per-run proxy token is guest-readable (use, not
   theft — guards against neighbors, not the in-guest adversary).
 
+## Performance
+
+void-box gates cold boot at p50 ≤ 252 ms (≤ 400 ms threshold) and values VM density;
+this design must not regress either. Required cheap defaults:
+
+- **No host crypto on the inference stream.** Proxy injection terminates TLS and so
+  pays per-byte crypto on the whole stream, both legs — the busiest flow in the
+  system; token injection keeps inference end-to-end at zero host crypto. Prefer token
+  injection for high-volume inference; when the proxy is used it re-originates without
+  parsing the body (no content/DLP inspection by default).
+- **Shared proxy, not per-sandbox.** One low-privilege host proxy multiplexed across
+  sandboxes (per-run token + name-constrained CA isolate runs); a process + `mlock`ed
+  store per sandbox fights density (KSM/balloon) and scales linearly with VM count.
+- **Cheap startup.** ECDSA P-256 per-run CA (not RSA — keygen is on the cold budget),
+  installed via the additive env-var/single-PEM path (no `ca-certificates`/initramfs
+  rebuild); OAuth refresh lazy on first use, overlapped with boot, never a serial
+  pre-boot RTT. Add this feature to the startup-bench gate.
+- **Selective routing + CONNECT-tunnel.** Only credentialed endpoints traverse the
+  proxy; non-credentialed egress and plain allow-listing use a CONNECT-tunnel (no
+  decryption). Routing defaults are owned by `docs/design/egress-policy.md`.
+
 ## Risk register
 
 Severity is in-column; mitigations are required, not optional.
@@ -236,7 +260,7 @@ Severity is in-column; mitigations are required, not optional.
 | R7 | **TLS fingerprint** — proxy termination changes the upstream-visible JA3/JA4; on subscription endpoints a client mismatch could be a signal. | Low | Low–Med | Low signal on API endpoints (diverse clients expected); token injection preserves the client fingerprint; uTLS-style impersonation if needed. |
 | R8 | **codex WebSocket transport** vs header injection. | Low | Low–Med | Default `supports_websockets=false` (plain HTTPS); inject-on-upgrade optional. |
 | R9 | **Provider version drift** changing redirect/refresh/header/transport behavior. | Low | Low–Med | Pin versions; re-verify V1/V2 facts on bump (bump workflow gates it). |
-| R10 | **Guest→host parser surface** — the proxy parses attacker-controlled HTTP/CONNECT/WS/TLS-ClientHello on the host, in the hot path before any auth gate; qualitatively wider than today's narrow authenticated vsock protocol. | Medium | High | Memory-safe parser (`hyper`/`rustls`), strict size/lifetime limits, and run the proxy in a **separate low-privilege process** so a parser compromise is not a host-runtime compromise. |
+| R10 | **Guest→host parser surface** — the proxy parses attacker-controlled HTTP/CONNECT/WS/TLS-ClientHello on the host, in the hot path before any auth gate; qualitatively wider than today's narrow authenticated vsock protocol. | Medium | High | Memory-safe parser (`hyper`/`rustls`), strict size/lifetime limits, and run the proxy in a **separate low-privilege process** — one shared process across sandboxes (the isolation boundary is daemon-vs-proxy; per-run token + CA isolate runs), so a parser compromise is not a host-runtime compromise. |
 | R11 | **Snapshot/restore reuse of per-run material** — a snapshot persists guest RAM + auth state and restore reuses it verbatim (verified: `src/vmm/mod.rs:646-665` reuses the stored session secret on restore), so a proxy token or CA the guest holds is carried into every restored instance, defeating "per-run ephemeral." | Low–Med | Medium–High | The resumed guest keeps the original token/CA in restored RAM and does not re-read the cmdline, so re-minting requires **re-installing the new material into the running guest over the control channel**, not a host-side swap; otherwise restored instances reuse it (bounded by treating the snapshot as confidential). Keep the CA **private key** and the store in the host proxy process — outside the snapshot — regardless; only the public cert is ever in the guest. |
 | R12 | **Rotated-token write-back safety** — a non-atomic or raced write to the on-disk durable credential corrupts a single-use refresh token → account lockout. | Low–Med | Medium–High | Atomic temp + `rename`, `0600`, cross-process/run lock on the credential file. |
 | R13 | **Intra-guest token harvesting** (token-injection path) — the codex loopback shim / FD injector is reachable by sibling uid-1000 processes. | Medium | Medium | The loopback shim requires a per-consumer secret; prefer the proxy path (zero in-guest credential). |
@@ -315,15 +339,19 @@ gates.
   (loopback on KVM; a VZ-specific address on macOS, not `UNSPECIFIED`).
 - **Per-run proxy token** — generation, injection into the guest, the proxy-side
   check, and stripping it before forwarding upstream.
-- **Per-run CA** — generation, name-constraint, install into the guest trust stores
-  per image (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`), and teardown; the private
-  key stays in the host proxy process only.
+- **Per-run CA** — **ECDSA P-256** (not RSA — keygen is on the cold-start budget),
+  name-constrained, installed via the additive env-var/single-PEM path
+  (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`) — never a `ca-certificates` bundle or
+  initramfs rebuild; teardown on exit; the private key stays in the host proxy process
+  only.
+- **Lifecycle placement** — a **shared, multiplexed** low-privilege proxy/store process
+  (per-run token + name-constrained CA isolate runs), started once and kept warm;
+  per-sandbox only if a tenant-isolation requirement forces it (a process per sandbox
+  fights VM density).
 - **Snapshot/restore re-mint** — regenerate the per-run CA and re-mint the proxy token
   on restore; keep both out of any guest-visible or snapshot-persisted channel (R11).
 - **Proxy process isolation** — run the TLS-terminating/header-injecting parser in a
   separate low-privilege host process (R10).
-- **Lifecycle placement** — which host process runs the proxy and store, one per
-  sandbox, started/stopped on which VM hook.
 - **Credential store internals** — reuse the discovery in `src/credentials.rs`;
   per-provider refresh-request construction; token cache + serialized refresh; host
   write-back of rotated tokens.
