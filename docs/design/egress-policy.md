@@ -82,7 +82,7 @@ than a bespoke DSL.
   `ALLOW_ANY` (open): the profile/mode framing (`allowlist`/`proxy-only` ≈
   REGISTRY_ONLY; `open` ≈ ALLOW_ANY).
 - **AWS Network Firewall** — stateful domain allow/deny lists matched on TLS SNI / HTTP
-  Host — our enforcement point.
+  Host — the same enforcement signal used here.
 - **Squid** — `dstdomain .example.com` (leading-dot = domain + subdomains), ordered
   first-match — the older suffix-match convention.
 - **`HTTPS_PROXY` / `NO_PROXY`** — the de-facto convention for routing to a proxy and
@@ -137,6 +137,49 @@ and RFC-1918 unless explicitly allowed), rather than as the top-level model. **O
 question** — exact `Rules` shape and migration.
 
 ## 4. High-level design
+
+### How a request reaches the proxy
+
+Two routing modes deliver guest egress to the proxy. **Enforcement never depends on
+the client cooperating:** `HTTPS_PROXY` is a convenience for clients that support it;
+the network layer is the enforcement floor.
+
+- **Explicit (cooperative).** Clients that honour `HTTPS_PROXY` (curl, git, pip, npm,
+  most HTTP libraries) connect to the proxy and issue `CONNECT <host>:443`. The proxy
+  reads the hostname from the CONNECT request, applies policy, and tunnels the
+  client's end-to-end TLS to the upstream — no decryption, no CA. Preferred path: the
+  hostname is explicit and survives Encrypted-SNI.
+- **Transparent (catch-all).** Traffic that does not use the proxy — a client that
+  ignores `HTTPS_PROXY`, or an agent attempting to bypass it — is redirected to the
+  proxy by the network layer (DNAT), which recovers the destination from the TLS SNI
+  and applies the same policy.
+
+A client that omits `HTTPS_PROXY` and one that deliberately bypasses it are
+indistinguishable at the network layer and are treated identically — intent is
+invisible in the packets and a hostile client could spoof either. The design
+therefore does not branch on it: in the restrictive profiles the network layer
+**default-denies every destination except the proxy** (pinning), so a non-cooperative
+client either is transparently captured or cannot egress at all. A bypass attempt has
+no direct route because every path terminates at the proxy.
+
+```mermaid
+flowchart LR
+  subgraph Guest
+    C[client / agent]
+  end
+  subgraph Host
+    N[network layer<br/>SLIRP / NAT]
+    P{egress proxy<br/>policy + audit}
+  end
+  C -->|explicit: CONNECT host:443| P
+  C -.->|direct to IP| N
+  N -.->|transparent: DNAT + read SNI| P
+  N -->|pinned: default-deny| B[blocked]
+  P -->|host allowed| U[upstream<br/>resolved per-connection]
+  P -->|host denied| D[deny + log]
+```
+
+### Two enforcement layers
 
 Two layers, with a clean division of labor:
 
