@@ -1,9 +1,10 @@
 # Design: host-mediated credential containment for the guest agent
 
 Status: proposal. The host credential store and the injection proxy are the
-committed substrate (required for API-key containment and downstream credential
-injection). For OAuth providers, the delivery mechanism — token injection vs. proxy
-injection — is left open and chosen against the criteria below.
+**single committed mechanism** for all credential delivery — API keys, OAuth, and
+downstream injection. Token injection is retained only as a detection-safety fallback
+for personal OAuth subscriptions, to be dropped if validation (V2 + the ToS/detection
+check) shows that proxying a personal subscription does not risk the account.
 
 Provider behaviors here are confirmed against Claude Code 2.1.170 and openai/codex
 at commit `9e3081be9672c65f8a0cd958719065f49f47d839`. The bundled versions
@@ -39,8 +40,9 @@ void-box lets an agent **use** credentials without **holding** the durable ones.
   them, performs all refresh, and is the sole rotation owner. Any token the guest
   holds is short-lived and host-revocable.
 - **Stronger tier (proxy):** the guest holds no credential at all, only non-secret
-  placeholders. API keys and downstream injection always use this tier; OAuth
-  providers use it only if the proxy path is chosen.
+  placeholders. API keys, downstream injection, and OAuth all use this tier by
+  default; the token-injection fallback (personal subscriptions only, pending
+  validation) instead leaves a bounded short-lived token.
 
 ## The risk this addresses
 
@@ -153,35 +155,29 @@ targets `api.openai.com/v1`, redirected the same way.
 Neither client pins certificates; both honor an additive CA via the env above (PEM
 file; not `SSL_CERT_DIR`).
 
-## OAuth-provider delivery: token injection vs. proxy
+## OAuth-provider delivery: proxy by default, token injection as a fallback
 
-Both keep the refresh token off the guest; they differ in what else the guest holds
-and what the host runs.
+The proxy is the **default and preferred** mechanism for OAuth providers too — it
+unifies all credential delivery on one mechanism and leaves zero credential in the
+guest.
 
-- **Token injection.** The store mints a short-lived access token delivered through
-  the client's native injector; TLS stays end-to-end (no host CA, termination, or
-  hot-path). Claude: `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` (Bearer tier,
-  inherited fd — not in `/proc/environ` or on disk); ~24 h tokens cover task-mode,
-  but a spawned CLI has no clean mid-run refresh hook, so long/service runs need
-  re-mint-and-relaunch. codex: a loopback endpoint behind
-  `CODEX_REFRESH_TOKEN_URL_OVERRIDE` proxies the refresh to the store; `auth.json`
-  holds only a short-lived access token. The loopback shim is reachable by **any**
-  uid-1000 process, so it must require a secret only codex holds or it is a
-  token-vending machine for the whole guest; the FD injector is better but
-  `/proc/<pid>/fd` is same-uid readable, so intra-guest harvesting is reduced, not
-  eliminated (R13). Residual: a short-lived access token (and codex's real
-  `id_token`/`account_id`) at rest in the guest.
-- **Proxy injection.** Zero credential in the guest, at the cost of CA custody (R2),
-  streaming correctness (R1), SSRF surface (R3), and a hot-path dependency.
+**Token injection** is retained for one case: **personal subscriptions**. The proxy
+terminates TLS, so the provider sees the *proxy's* fingerprint under a
+`claude-code`/`codex` user-agent, and the *host* — not the genuine client — makes the
+call. For a personal account under anti-abuse heuristics, that risks the provider
+**flagging or banning the user's own account** — worse than the in-guest token it
+avoids. Token injection keeps the genuine client making end-to-end-TLS calls (its own
+fingerprint, no host crypto), at the cost of a bounded short-lived token in the guest
+(R13), no clean Claude long-run refresh, and the codex loopback shim. Mechanics:
+Claude via `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` (inherited fd; ~24 h tokens cover
+task-mode, long/service runs need re-mint-and-relaunch); codex via a loopback endpoint
+behind `CODEX_REFRESH_TOKEN_URL_OVERRIDE`. It never applies to API keys — a static key
+cannot be minted short-lived.
 
-**Decision criteria.** The proxy is built regardless (API keys, downstream
-injection), so routing OAuth through it unifies the mechanism and yields zero
-in-guest credential. Token injection is lighter and preserves the client's TLS
-fingerprint (R7 — relevant if a subscription endpoint fingerprints TLS), but leaves a
-bounded token in the guest and lacks a clean Claude long-run refresh; **performance
-also favors it for high-volume inference** — proxy injection terminates TLS and pays
-per-byte crypto on the whole stream (see Performance). For personal subscriptions,
-weigh the policy tradeoff (ToS, above). Decide after V1/V2.
+**Decision — gated, biased to drop it.** Ship the proxy for all providers. **Drop
+token injection entirely if V2 + the ToS/detection check (above) show that proxying a
+personal subscription is detection-safe and policy-tolerable**; keep it only if
+personal accounts get flagged.
 
 ## Downstream credential injection
 
@@ -310,9 +306,9 @@ this).**
   V2 and by the OAuth decision; needs only V1 plus the per-run name-constrained CA
   (R2) and the streaming proxy (R1). The lowest-risk proof of the proxy spine, so it
   leads.
-- **M1a** — credential store (refresh/mint/rotation + host write-back) + the chosen
-  OAuth mechanism for **Claude only**, single platform, inference path. If proxy:
-  reuses M0's CA and streaming proxy.
+- **M1a** — credential store (refresh/mint/rotation + host write-back) + the **proxy**
+  OAuth path for **Claude only** (the token-injection fallback only if retained),
+  single platform, inference path. Reuses M0's CA and streaming proxy.
 - **M1b** — codex (WS handling, R8), long-run rotation, and KVM+VZ parity.
 - **M2** — downstream credential injection for named services (e.g. GitHub), explicit
   routing, per-destination policy, SSRF hardening (R3).
@@ -357,14 +353,16 @@ gates.
   write-back of rotated tokens.
 
 **Decisions to escalate (do not guess):**
-- The OAuth delivery mechanism (token injection vs. proxy), after V2.
+- Whether to **drop token injection** (proxy-only). The design defaults to proxy-only;
+  keep token injection only if V2 + the ToS/detection check show proxying a personal
+  subscription flags the account.
 - Whether to contain personal-subscription OAuth at all given the ToS tradeoff, or to
   steer programmatic use to API keys.
 
 **Suggested first session:** run V1, then build M0 (which needs the proxy
 reachability, per-run token, CA install, and lifecycle placement — all reusable by
-M1). Defer the credential store until V2 passes; bring the OAuth-mode decision to a
-human.
+M1). Defer the credential store until V2 passes; bring the drop-token-injection
+decision to a human.
 
 ## Affected code
 
