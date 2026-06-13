@@ -116,8 +116,11 @@ guest client ──▶ host injection proxy ──▶ real upstream
 `~/.claude`/`~/.codex`/Keychain, or the host env for API keys. For OAuth it refreshes
 against the provider's token endpoint, mints short-lived access tokens, is the sole
 rotation owner (serialized refresh, rate-capped), and **persists the rotated refresh
-token back to the host** so subsequent runs stay valid. Secrets live only here, in
-host memory, `mlock`ed and zeroized via `secrecy`.
+token back to the host** so subsequent runs stay valid. Write-back must be atomic
+(temp + `rename`), `0600`, and locked across any processes/runs sharing the durable
+credential file — a corrupt or raced write loses the single-use refresh token and can
+lock the account out (R12). Secrets live only here, in host memory, `mlock`ed,
+zeroized via `secrecy`, and shielded from core dumps (`PR_SET_DUMPABLE=0`).
 
 **Why TLS termination, and why it is safe.** The credential header lives inside the
 TLS stream; rewriting it requires terminating TLS. Under the trust model this exposes
@@ -161,8 +164,12 @@ and what the host runs.
   but a spawned CLI has no clean mid-run refresh hook, so long/service runs need
   re-mint-and-relaunch. codex: a loopback endpoint behind
   `CODEX_REFRESH_TOKEN_URL_OVERRIDE` proxies the refresh to the store; `auth.json`
-  holds only a short-lived access token. Residual: a short-lived access token (and
-  codex's real `id_token`/`account_id`) at rest in the guest.
+  holds only a short-lived access token. The loopback shim is reachable by **any**
+  uid-1000 process, so it must require a secret only codex holds or it is a
+  token-vending machine for the whole guest; the FD injector is better but
+  `/proc/<pid>/fd` is same-uid readable, so intra-guest harvesting is reduced, not
+  eliminated (R13). Residual: a short-lived access token (and codex's real
+  `id_token`/`account_id`) at rest in the guest.
 - **Proxy injection.** Zero credential in the guest, at the cost of CA custody (R2),
   streaming correctness (R1), SSRF surface (R3), and a hot-path dependency.
 
@@ -216,19 +223,24 @@ concern of the separate egress design (`docs/design/egress-policy.md`).
 
 ## Risk register
 
-Ordered by how much each could disrupt implementation.
+Severity is in-column; mitigations are required, not optional.
 
 | # | Risk | Likelihood | Impact | Mitigation / fallback |
 |---|------|-----------|--------|-----------------------|
 | R1 | **Proxy streaming/lifecycle correctness** — TLS-terminate + SSE + WS + backpressure + reuse + fail-closed, on every routed call; a bug degrades all output. | Medium | High | Standard reverse-proxy patterns + dedicated streaming tests; primary engineering budget. Proxy path only. |
-| R2 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, **Name-Constrained** to the injected upstreams, generated at boot and destroyed on teardown; never exposed to the guest. |
-| R3 | **SSRF / confused-deputy** via the credential-injecting proxy. | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`; resolve-and-pin the upstream IP and reject RFC-1918/link-local results (DNS-rebinding). |
+| R2 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, **Name-Constrained** to the injected upstreams, generated at boot and destroyed on teardown; the private key never reaches the guest, the cmdline, or a snapshot (R11). Confirm each client **enforces** name constraints (V1) — a client that ignores them turns the CA into a universal MITM anchor. |
+| R3 | **SSRF / confused-deputy** via the credential-injecting proxy. | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`; resolve **once** and pin that exact IP for the connection (no connect-time re-resolve); reject RFC-1918/link-local, IPv6 ULA/`::1`, CGNAT `100.64/10`, and the SLIRP gateway→host-loopback mapping. |
 | R4 | **Host-side OAuth refresh acceptance** — the token endpoint accepting an off-client refresh (refresh grant has no PKCE, but tokens could be binding-bound). | Low–Med | Medium–High | Confirm in V2 (throwaway). Evidence: standard refresh shape, plain Bearer, no DPoP observed; same egress IP via NAT. |
 | R5 | **Inference acceptance of a host-supplied subscription Bearer.** | Low–Med | Medium–High | V2. Precedent: `CLAUDE_CODE_OAUTH_TOKEN` is an externally-supplied subscription Bearer the inference endpoint accepts. |
 | R6 | **Provider ToS** — personal-subscription OAuth used outside the native client, or multi-tenant routing of subscription credentials, is restricted. | — | High (policy) | API keys for programmatic/hosted use; personal-OAuth is single-tenant ordinary use, user-owned (see ToS section). |
 | R7 | **TLS fingerprint** — proxy termination changes the upstream-visible JA3/JA4; on subscription endpoints a client mismatch could be a signal. | Low | Low–Med | Low signal on API endpoints (diverse clients expected); token injection preserves the client fingerprint; uTLS-style impersonation if needed. |
 | R8 | **codex WebSocket transport** vs header injection. | Low | Low–Med | Default `supports_websockets=false` (plain HTTPS); inject-on-upgrade optional. |
 | R9 | **Provider version drift** changing redirect/refresh/header/transport behavior. | Low | Low–Med | Pin versions; re-verify V1/V2 facts on bump (bump workflow gates it). |
+| R10 | **Guest→host parser surface** — the proxy parses attacker-controlled HTTP/CONNECT/WS/TLS-ClientHello on the host, in the hot path before any auth gate; qualitatively wider than today's narrow authenticated vsock protocol. | Medium | High | Memory-safe parser (`hyper`/`rustls`), strict size/lifetime limits, and run the proxy in a **separate low-privilege process** so a parser compromise is not a host-runtime compromise. |
+| R11 | **Snapshot/restore reuse of per-run material** — snapshots persist guest RAM + cmdline-delivered state and restore reuses it verbatim (`src/vmm/snapshot.rs`, `src/vmm/mod.rs`), so a proxy token or CA delivered via cmdline/env would be snapshot-captured and reused across runs, defeating "per-run ephemeral." | Low–Med | High | **Re-mint the per-run CA and proxy token on restore**; never deliver the CA private key or proxy token through a snapshot-persisted channel; keep the store and CA key in the host proxy process, which is outside the VM snapshot. |
+| R12 | **Rotated-token write-back safety** — a non-atomic or raced write to the on-disk durable credential corrupts a single-use refresh token → account lockout. | Low–Med | Medium–High | Atomic temp + `rename`, `0600`, cross-process/run lock on the credential file. |
+| R13 | **Intra-guest token harvesting** (token-injection path) — the codex loopback shim / FD injector is reachable by sibling uid-1000 processes. | Medium | Medium | The loopback shim requires a per-consumer secret; prefer the proxy path (zero in-guest credential). |
+| R14 | **Half-migration** — a provider routed to the proxy while `src/llm.rs` still forwards its real env key leaves both the placeholder routing and the real credential in the guest. | Low | High | An **automated "no real credential in the guest" assertion** (env, files, mounts) gates each provider migration — not manual review. |
 
 ## Validation order and implementation plan
 
@@ -249,7 +261,9 @@ proxy provisioning).**
 4. **Pass:** both clients route inference through the proxy, trust the CA, do not
    hard-fail on the missing real credential, and trigger no force-login or
    retry-storm against hardcoded endpoints. Confirm codex emits `ChatGPT-Account-ID`
-   + `originator`. Unblocks M0 and the proxy path.
+   + `originator`, and that each client **enforces** the CA's name constraints (a cert
+   under the per-run CA for an out-of-constraint host is rejected — R2/R11). Unblocks
+   M0 and the proxy path.
 
 **V2 — OAuth acceptance (throwaway account, OAuth path only; the API-key path skips
 this).**
@@ -280,8 +294,10 @@ this).**
   routing, per-destination policy, SSRF hardening (R3).
 
 Remove the RW credential mounts and the `src/agent_box.rs:464` WriteFile copy as each
-provider migrates. Exit gate: `e2e_agent_mcp` (Claude) and the codex smoke specs pass
-with no refresh token in the guest (and, on the proxy path, no credential at all).
+provider migrates. Exit gate: `e2e_agent_mcp` (Claude) and the codex smoke specs pass,
+plus an **automated assertion that the guest holds no real credential** — env, files,
+and mounts — gating each provider migration so a half-migrated provider cannot leave
+both the proxy routing and the real key in the guest (R14).
 
 ## Implementation readiness
 
@@ -300,7 +316,12 @@ gates.
 - **Per-run proxy token** — generation, injection into the guest, the proxy-side
   check, and stripping it before forwarding upstream.
 - **Per-run CA** — generation, name-constraint, install into the guest trust stores
-  per image (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`), and teardown.
+  per image (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`), and teardown; the private
+  key stays in the host proxy process only.
+- **Snapshot/restore re-mint** — regenerate the per-run CA and re-mint the proxy token
+  on restore; keep both out of any guest-visible or snapshot-persisted channel (R11).
+- **Proxy process isolation** — run the TLS-terminating/header-injecting parser in a
+  separate low-privilege host process (R10).
 - **Lifecycle placement** — which host process runs the proxy and store, one per
   sandbox, started/stopped on which VM hook.
 - **Credential store internals** — reuse the discovery in `src/credentials.rs`;
@@ -330,6 +351,8 @@ human.
   forwarding in `env_vars()` (`~417`).
 - `src/network/*` — the credential proxy is reached by the configured clients via the
   SLIRP gateway; it does **not** change egress policy (owned by the egress design).
+- `src/vmm/snapshot.rs` / `src/vmm/mod.rs` — exclude the CA private key and store from
+  the snapshot, and re-mint the per-run CA + proxy token on restore (R11).
 - Guest image — install the per-run CA into the trust stores the clients honor
   (`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`) — a per-image
   checklist across initramfs and OCI-rootfs.

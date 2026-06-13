@@ -192,7 +192,9 @@ Two layers, with a clean division of labor:
   the restrictive profiles = **default-deny, pinning the guest to the proxy** (only
   the proxy endpoint + DNS reachable). This is what makes the name-based policy
   non-bypassable: the guest cannot open a socket to an arbitrary IP, so it cannot
-  sidestep the proxy. CIDR-level enforcement only.
+  sidestep the proxy. CIDR-level enforcement only. Pinning is enforced here
+  **independently of proxy liveness** — if the proxy or store crashes, the restrictive
+  profiles fail closed (egress denied), never open.
 - **Proxy layer — fine-grained, name-based policy + audit.** When traffic is routed
   through the proxy (`monitored`/`allowlist`/`proxy-only`), the proxy enforces the
   **domain allow-list by hostname** (CONNECT host / SNI), with **fresh per-connection
@@ -232,7 +234,10 @@ Each component below needs a concrete design.
   destinations.
 - **Egress proxy component.** The host-side proxy that accepts guest connections,
   reads the destination name (CONNECT host / SNI), checks the domain allow-list,
-  re-resolves per connection, and tunnels or hands off to credential injection.
+  re-resolves per connection, and tunnels or hands off to credential injection. It
+  parses untrusted, guest-emitted HTTP/CONNECT and TLS ClientHellos in the hot path,
+  so use a memory-safe parser and run it as a separate low-privilege process — the
+  same untrusted-input surface as the credential proxy.
   Reuse-vs-separate from the credential proxy (Open question 2). Binding (guest-only,
   per platform — KVM loopback; VZ-specific address). Per-run auth so only the guest
   can use it.
