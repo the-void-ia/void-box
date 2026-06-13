@@ -61,6 +61,43 @@ bounded use cases.
 
 ## 3. Egress profiles and configuration
 
+### Prior art and conventions to adopt
+
+Egress firewalling is well-trodden; adopt established conventions rather than invent a
+DSL.
+
+- **Stripe Smokescreen** — an HTTP CONNECT egress proxy purpose-built as a firewall for
+  untrusted workloads (the closest precedent). Default-deny **allow-list of
+  hostnames**, **`report` vs `enforce`** modes, and resolve-each-domain-then-**block
+  internal/RFC-1918 IPs** (SSRF protection), with role-based ACLs in YAML. Strong
+  reference design; the session should decide whether to port the pattern to Rust or
+  evaluate reusing it (it is Go). [README](https://github.com/stripe/smokescreen/blob/master/README.md),
+  [sample ACL](https://github.com/stripe/smokescreen/blob/master/pkg/smokescreen/acl/v1/testdata/sample_config.yaml).
+- **Cilium `toFQDNs`** — the DNS-aware egress convention: `matchName` (exact) +
+  `matchPattern` (wildcard `*` that does **not** cross `.`, so `*.x.com` ≠ `x.com`).
+  The matching vocabulary to mirror.
+  [DNS policies](https://docs.cilium.io/en/stable/security/dns/),
+  [policy language](https://docs.cilium.io/en/stable/security/policy/language/).
+- **Istio `OutboundTrafficPolicy`** — `REGISTRY_ONLY` (default-deny to known hosts) vs
+  `ALLOW_ANY` (open): the profile/mode framing (`allowlist`/`proxy-only` ≈
+  REGISTRY_ONLY; `open` ≈ ALLOW_ANY).
+- **AWS Network Firewall** — stateful domain allow/deny lists matched on TLS SNI / HTTP
+  Host — our enforcement point.
+- **Squid** — `dstdomain .example.com` (leading-dot = domain + subdomains), ordered
+  first-match — the older suffix-match convention.
+- **`HTTPS_PROXY` / `NO_PROXY`** — the de-facto convention for routing to a proxy and
+  expressing bypass.
+
+What to take: a **default-deny allow-list of FQDNs with wildcards** as the user
+language; **`report` then `enforce`** (run `monitored`/report, harvest the
+destinations a workflow actually used, promote to an `allowlist`, switch to enforce —
+the answer to "you can't allow-list open-ended research up front"); the SSRF
+**resolve-and-block-internal** baseline; and a **deliberate wildcard/suffix
+semantics** choice (open question below). Do not invent new syntax — these vocabularies
+are already familiar to the cloud-native audience.
+
+### Profiles
+
 Model egress as a **per-run profile** (an enum/closed set), set in the spec, with a
 default. Proposed profiles:
 
@@ -76,11 +113,12 @@ Configuration sketch (spec):
 
 ```yaml
 egress:
-  mode: monitored                      # open | monitored | allowlist | proxy-only | none
-  # for mode: allowlist
+  mode: allowlist        # open(ALLOW_ANY) | monitored(report) | allowlist(enforce) | proxy-only | none
   allow:
-    - api.github.com
-    - "*.pypi.org"
+    - api.github.com     # exact host (Cilium matchName)
+    - "*.pypi.org"       # wildcard (Cilium matchPattern)
+  deny:                  # optional override; baseline always denies metadata / RFC-1918
+    - 169.254.0.0/16
 ```
 
 **Default:** open product question — `open` (max compatibility) vs `monitored`
@@ -180,6 +218,11 @@ Outline for the dedicated session; each item needs a concrete design.
 6. **ECH / encrypted-SNI** — fallback when SNI inspection stops working for transparent
    mode.
 7. **macOS/VZ** — pinning + proxy reachability without LAN exposure.
+8. **Wildcard/suffix semantics** — Cilium's `*`-does-not-cross-`.` (explicit `x.com`
+   *and* `*.x.com`) vs Squid's leading-dot "domain + all subdomains." Pick one.
+9. **Reference implementation** — port the Smokescreen pattern to Rust, reuse/embed
+   Smokescreen (Go), or build fresh; reconcile with the credential proxy (Open
+   question 2).
 
 ## Inputs to carry into the design session
 
