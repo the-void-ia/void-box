@@ -41,14 +41,15 @@ Cross-cutting needs:
 ## 2. What void-box has today
 
 - **SLIRP userspace network** (`src/network/slirp.rs`): guest `10.0.2.15`, gateway
-  `10.0.2.2` (→ host loopback), DNS `10.0.2.3`. Only TCP/UDP are relayed; ARP/ICMP
-  are not forwarded.
+  `10.0.2.2` (→ host loopback), DNS `10.0.2.3`. TCP, UDP, and ICMP-echo are relayed;
+  ARP is answered locally by the gateway; other protocols are dropped.
 - **Stateless NAT with a deny-list** (`src/network/nat.rs`): `translate_outbound`
   checks `Rules.deny_cidrs` first (return `None` = blocked), then forwards everything
   else (gateway IP → loopback; other IPs pass through). `Rules::default()` has an
-  **empty deny-list → default-allow** (`empty_deny_list_allows_all`). There is **no
-  allow-list** and no per-name (domain) capability — translation is purely
-  IP/CIDR-based.
+  **empty deny-list → default-allow** (`empty_deny_list_allows_all`); the deployed
+  `SlirpBackend::new()` seeds a `169.254.0.0/16` deny, so link-local/metadata is
+  already blocked. There is **no allow-list** and no per-name (domain) capability —
+  translation is purely IP/CIDR-based.
 - **Connection limits** exist in the SLIRP layer (`max_concurrent_connections`,
   `max_connections_per_second`) — a coarse rate control.
 - **No egress audit/log** of destinations, no domain awareness, no host-side egress
@@ -106,8 +107,11 @@ default. Proposed profiles:
 | `open` | full internet, direct | none (direct via NAT) | none |
 | `monitored` | full internet | all egress via the host proxy (CONNECT-tunnel; destinations seen, content not decrypted) | full (destinations, volume) + rate-limit + kill-switch |
 | `allowlist` | only listed domains (+ any credentialed endpoints) | via the proxy, gated by hostname | full |
-| `proxy-only` / `minimal` | credentialed endpoints only (LLM providers) | via the proxy | full |
+| `proxy-only` | credentialed endpoints only (LLM providers) | via the proxy | full |
 | `none` | no external egress (local providers only) | n/a | n/a |
+
+`none` is valid only with local providers (Ollama, LM Studio); pairing it with a
+cloud LLM provider, which needs egress to reach the provider, is a config error.
 
 Configuration sketch (spec):
 

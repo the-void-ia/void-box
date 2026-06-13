@@ -6,9 +6,10 @@ injection). For OAuth providers, the delivery mechanism — token injection vs. 
 injection — is left open and chosen against the criteria below.
 
 Provider behaviors here are confirmed against Claude Code 2.1.170 and openai/codex
-at commit `9e3081be9672c65f8a0cd958719065f49f47d839`; re-verify on version bumps
-(R9), including against the codex version actually bundled
-(`scripts/agents/manifest.toml`) if it differs.
+at commit `9e3081be9672c65f8a0cd958719065f49f47d839`. The bundled versions
+(`scripts/agents/manifest.toml`) currently differ — claude-code 2.1.143, codex
+0.137.0 — so re-verify these behaviors against the bundled binaries before relying on
+them, and on every version bump (R9).
 
 **Scope.** This design covers *credential containment* — keeping durable credentials
 off the guest and injecting them at egress for the endpoints that need them. It uses
@@ -207,7 +208,8 @@ concern of the separate egress design (`docs/design/egress-policy.md`).
   0600 temp file dropped on teardown) — a wider host-side surface on a shared host;
   mitigated by `mlock`/zeroize and per-run process isolation.
 - Token-injection candidate: a short-lived access token (+ codex `id_token`/
-  `account_id`) at rest in the guest for its lifetime.
+  `account_id`) at rest in the guest for its lifetime, and captured in any snapshot
+  taken during it.
 - Proxy candidate: the host decrypts inference traffic (trust-model dependent); a
   hot-path availability coupling; the per-run proxy token is guest-readable (use, not
   theft — guards against neighbors, not the in-guest adversary).
@@ -220,7 +222,7 @@ Ordered by how much each could disrupt implementation.
 |---|------|-----------|--------|-----------------------|
 | R1 | **Proxy streaming/lifecycle correctness** — TLS-terminate + SSE + WS + backpressure + reuse + fail-closed, on every routed call; a bug degrades all output. | Medium | High | Standard reverse-proxy patterns + dedicated streaming tests; primary engineering budget. Proxy path only. |
 | R2 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, **Name-Constrained** to the injected upstreams, generated at boot and destroyed on teardown; never exposed to the guest. |
-| R3 | **SSRF / confused-deputy** via the credential-injecting proxy. | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`. |
+| R3 | **SSRF / confused-deputy** via the credential-injecting proxy. | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`; resolve-and-pin the upstream IP and reject RFC-1918/link-local results (DNS-rebinding). |
 | R4 | **Host-side OAuth refresh acceptance** — the token endpoint accepting an off-client refresh (refresh grant has no PKCE, but tokens could be binding-bound). | Low–Med | Medium–High | Confirm in V2 (throwaway). Evidence: standard refresh shape, plain Bearer, no DPoP observed; same egress IP via NAT. |
 | R5 | **Inference acceptance of a host-supplied subscription Bearer.** | Low–Med | Medium–High | V2. Precedent: `CLAUDE_CODE_OAUTH_TOKEN` is an externally-supplied subscription Bearer the inference endpoint accepts. |
 | R6 | **Provider ToS** — personal-subscription OAuth used outside the native client, or multi-tenant routing of subscription credentials, is restricted. | — | High (policy) | API keys for programmatic/hosted use; personal-OAuth is single-tenant ordinary use, user-owned (see ToS section). |
@@ -322,8 +324,8 @@ human.
   header-rewriting, streaming) plus the per-run CA.
 - `src/credentials.rs` — host-retained credential, host-side refresh/rotation,
   short-lived-token minting; staging is host-only.
-- `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — remove the RW
-  mount and the WriteFile copy; provision the guest per the chosen mechanism.
+- `src/runtime.rs` (`~234-247`, `~1399-1408`), `src/agent_box.rs` (`~464`) — remove the
+  RW mount and the WriteFile copy; provision the guest per the chosen mechanism.
 - `src/llm.rs` — provider → store/proxy/injector wiring, replacing the API-key env
   forwarding in `env_vars()` (`~417`).
 - `src/network/*` — the credential proxy is reached by the configured clients via the
