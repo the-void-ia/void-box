@@ -1,0 +1,191 @@
+# Design (DRAFT): guest egress policy and profiles
+
+Status: **draft / skeleton** — intended to be developed in a dedicated session. This
+document captures the use cases, today's mechanism, and the high-level shape of a
+configurable egress policy; the low-level component design is an outline with open
+questions to resolve.
+
+Egress policy is **orthogonal to credential containment**
+(`docs/design/credential-broker.md`). Credential containment keeps durable secrets
+off the guest and injects them for specific endpoints via selective routing; it holds
+under any egress policy. This document governs **which destinations the agent may
+reach at all, how that traffic is audited, and how it is routed** — independent of
+whether a credential is injected.
+
+## 1. Use cases
+
+The egress need varies widely per workflow; the policy must span the range, not pick
+one point.
+
+- **Open research / browse.** "Investigate something on the web and write a report."
+  The agent fetches arbitrary, *unknown-in-advance* domains (search results, articles,
+  docs). Cannot be allow-listed ahead of time → needs an open (or open-but-monitored)
+  reach.
+- **Bounded to a known set of public services.** A workflow that uses, say, PyPI +
+  npm + a few documentation sites. Allow-listable by domain.
+- **LLM provider only.** Pure codegen/reasoning with no external data. Tightest reach.
+- **LLM provider + one or two services.** e.g. provider + `api.github.com` for a PR
+  workflow. Allow-list of a small set.
+- **Internal/enterprise.** Reach only specific internal hosts (behind the operator's
+  network), nothing else.
+- **Air-gapped-ish / no network.** Local providers (Ollama/LM Studio) only; deny all
+  external egress.
+
+Cross-cutting needs:
+- **Audit / observability** — a record of what the agent contacted (destinations,
+  volume, timing), regardless of profile, for review and incident response.
+- **Rate-limiting / kill-switch** — bound or cut egress without killing the run.
+- **Data-exfiltration containment** — for tasks handling sensitive input, bound where
+  the agent can send data.
+
+## 2. What void-box has today
+
+- **SLIRP userspace network** (`src/network/slirp.rs`): guest `10.0.2.15`, gateway
+  `10.0.2.2` (→ host loopback), DNS `10.0.2.3`. Only TCP/UDP are relayed; ARP/ICMP
+  are not forwarded.
+- **Stateless NAT with a deny-list** (`src/network/nat.rs`): `translate_outbound`
+  checks `Rules.deny_cidrs` first (return `None` = blocked), then forwards everything
+  else (gateway IP → loopback; other IPs pass through). `Rules::default()` has an
+  **empty deny-list → default-allow** (`empty_deny_list_allows_all`). There is **no
+  allow-list** and no per-name (domain) capability — translation is purely
+  IP/CIDR-based.
+- **Connection limits** exist in the SLIRP layer (`max_concurrent_connections`,
+  `max_connections_per_second`) — a coarse rate control.
+- **No egress audit/log** of destinations, no domain awareness, no host-side egress
+  proxy for general traffic (the credential proxy, when built, handles only the
+  credentialed endpoints it is pointed at).
+
+**Gap:** today's model can only *block named CIDRs*; it cannot *restrict to* a set,
+cannot express *domains*, and cannot audit. It is the wrong shape for any of the
+bounded use cases.
+
+## 3. Egress profiles and configuration
+
+Model egress as a **per-run profile** (an enum/closed set), set in the spec, with a
+default. Proposed profiles:
+
+| Profile | Reach | Routing | Audit |
+|---|---|---|---|
+| `open` | full internet, direct | none (direct via NAT) | none |
+| `monitored` | full internet | all egress via the host proxy (CONNECT-tunnel; destinations seen, content not decrypted) | full (destinations, volume) + rate-limit + kill-switch |
+| `allowlist` | only listed domains (+ any credentialed endpoints) | via the proxy, gated by hostname | full |
+| `proxy-only` / `minimal` | credentialed endpoints only (LLM providers) | via the proxy | full |
+| `none` | no external egress (local providers only) | n/a | n/a |
+
+Configuration sketch (spec):
+
+```yaml
+egress:
+  mode: monitored                      # open | monitored | allowlist | proxy-only | none
+  # for mode: allowlist
+  allow:
+    - api.github.com
+    - "*.pypi.org"
+```
+
+**Default:** open product question — `open` (max compatibility) vs `monitored`
+(compatible + observable, recommended for a security runtime) vs `proxy-only`
+(secure-by-default, higher friction). **Decision pending** (see Open questions).
+
+### Extend the deny-list, or redesign?
+
+The deny-list (`Rules.deny_cidrs`) is too weak to extend into this (CIDR-only, can't
+express allow or domains). The recommended direction is to **redesign `Rules` around
+a policy enum** that subsumes the deny-list: a `proxy-only`/`allowlist`/`monitored`
+policy default-denies and pins to the proxy; `open` retains today's default-allow
+(optionally still honoring a deny-list for metadata/link-local). Keep the deny-list as
+a sub-feature of the `open`/`monitored` profiles (e.g. always deny `169.254.0.0/16`
+and RFC-1918 unless explicitly allowed), rather than as the top-level model. **Open
+question** — exact `Rules` shape and migration.
+
+## 4. High-level design
+
+Two layers, with a clean division of labor:
+
+- **Network layer (`nat.rs`/`slirp.rs`) — coarse reach + pinning.** Enforces the
+  profile's *reach*: `open` = allow-all (minus a baseline deny of metadata/RFC-1918);
+  the restrictive profiles = **default-deny, pinning the guest to the proxy** (only
+  the proxy endpoint + DNS reachable). This is what makes the name-based policy
+  non-bypassable: the guest cannot open a socket to an arbitrary IP, so it cannot
+  sidestep the proxy. CIDR-level enforcement only.
+- **Proxy layer — fine-grained, name-based policy + audit.** When traffic is routed
+  through the proxy (`monitored`/`allowlist`/`proxy-only`), the proxy enforces the
+  **domain allow-list by hostname** (CONNECT host / SNI), with **fresh per-connection
+  DNS resolution** so rotating/multiple CDN IPs are handled automatically. It also
+  produces the **audit log**, applies rate-limits, and is the kill-switch. For
+  credentialed endpoints it hands off to the injection path
+  (`docs/design/credential-broker.md`); for plain allow-listed endpoints it
+  CONNECT-tunnels (no TLS termination, no CA needed).
+
+**Why name-at-the-proxy, not IP-at-the-network:** a domain resolves to many,
+rotating IPs (CDNs); a network CIDR allow-list can't keep up. The proxy resolves each
+name itself per connection, so it always reaches a currently-valid IP for an *allowed
+name*, and the guest never deals in IPs.
+
+**Relationship to the credential proxy (selective vs. full routing).** Credential
+injection needs only **selective** routing (point the provider/GitHub clients at the
+proxy). Egress *audit and enforcement* want **full** routing (all egress through the
+proxy). The same proxy component can serve both roles — selective when the profile is
+`open`, full when `monitored`/`allowlist`/`proxy-only`. Trade-off: full routing buys
+audit + granular control + kill-switch at the cost of hot-path load and either
+CONNECT-tunnel (destination-only visibility) or TLS-MITM (content visibility, heavier,
+more sensitive). **Open question** — is egress's chokepoint the *same* process as the
+credential proxy, or a separate egress proxy that delegates credentialed endpoints to
+it?
+
+## 5. Low-level design (component per component) — to be developed
+
+Outline for the dedicated session; each item needs a concrete design.
+
+- **`Rules` / policy model (`src/network/nat.rs`).** Replace the deny-only `Rules`
+  with a policy that expresses open/default-deny + pin-to-proxy; keep a baseline deny
+  (metadata, RFC-1918). Define `translate_outbound` behavior per profile. Migration of
+  existing `deny_cidrs` callers.
+- **Proxy-pinning (`src/network/slirp.rs`).** In the restrictive profiles, allow only
+  gateway/proxy + DNS; deny direct `:443`. Ensure DNS goes only through `10.0.2.3`
+  (block DoH/DoT/out-of-band 53) so the proxy is the only path that can reach named
+  destinations.
+- **Egress proxy component.** The host-side proxy that accepts guest connections,
+  reads the destination name (CONNECT host / SNI), checks the domain allow-list,
+  re-resolves per connection, and tunnels or hands off to credential injection. Decide
+  reuse-vs-separate from the credential proxy. Binding (guest-only, per platform — KVM
+  loopback; VZ-specific address). Per-run auth so only the guest can use it.
+- **Domain policy engine.** Allow-list matching (exact + wildcard/suffix), the
+  operator config surface, defaults, and the baseline always-deny set.
+- **Audit/observability.** What to record (destination, bytes, timing, allow/deny
+  decision), where it goes (the structured logging pipeline, `src/observe/`), and
+  redaction.
+- **Rate-limit / kill-switch.** Per-run egress caps and a runtime cut, integrated with
+  the existing SLIRP connection limits.
+- **Transparent interception (for tools ignoring `HTTPS_PROXY`).** SNI inspection at
+  the network layer; per-destination cert generation if termination is needed; the ECH
+  caveat (SNI may become unavailable). DNS-learned-IP fallback for raw TCP.
+- **Spec / config plumbing.** `EgressSpec` in `src/spec.rs`, runtime resolution, and
+  per-box overrides, mirroring existing spec patterns.
+- **Platform parity.** KVM (SLIRP/smoltcp) vs macOS/VZ NAT — confirm the pinning and
+  proxy reachability work on both.
+
+## Open questions
+
+1. **Default profile** — `open`, `monitored`, or `proxy-only`?
+2. **One proxy or two** — does egress reuse the credential proxy as its chokepoint, or
+   run a separate egress proxy that delegates credentialed endpoints to it?
+3. **`Rules` redesign vs. extend** — final shape of the network-layer policy model and
+   how the deny-list folds in.
+4. **Content visibility in `monitored`** — CONNECT-tunnel (destinations only) by
+   default, with optional TLS-MITM for content/DLP? The latter needs the guest-trusted
+   CA and has the same trust-model implications as the credential proxy.
+5. **Raw-TCP named egress** — SOCKS5 (carries hostname) vs DNS-pinned IPs vs
+   per-service tunnel.
+6. **ECH / encrypted-SNI** — fallback when SNI inspection stops working for transparent
+   mode.
+7. **macOS/VZ** — pinning + proxy reachability without LAN exposure.
+
+## Inputs to carry into the design session
+
+- The selective-vs-full routing trade-off table and the "credential containment is
+  orthogonal" framing from `docs/design/credential-broker.md`.
+- The domain-at-the-proxy reliability argument (fresh per-connection resolution beats
+  IP allow-listing).
+- Today's mechanism facts in §2 (verified against `src/network/nat.rs`,
+  `src/network/slirp.rs`).

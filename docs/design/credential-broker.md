@@ -1,14 +1,22 @@
 # Design: host-mediated credential containment for the guest agent
 
 Status: proposal. The host credential store and the injection proxy are the
-committed substrate (required for API-key containment and downstream egress). For
-OAuth providers, the delivery mechanism — token injection vs. proxy injection — is
-left open and chosen against the criteria below.
+committed substrate (required for API-key containment and downstream credential
+injection). For OAuth providers, the delivery mechanism — token injection vs. proxy
+injection — is left open and chosen against the criteria below.
 
 Provider behaviors here are confirmed against Claude Code 2.1.170 and openai/codex
 at commit `9e3081be9672c65f8a0cd958719065f49f47d839`; re-verify on version bumps
-(R10), including against the codex version actually bundled
+(R9), including against the codex version actually bundled
 (`scripts/agents/manifest.toml`) if it differs.
+
+**Scope.** This design covers *credential containment* — keeping durable credentials
+off the guest and injecting them at egress for the endpoints that need them. It uses
+**selective routing**: only the clients that need a host-held credential (the LLM
+providers; later GitHub) are pointed at the proxy. Network **egress policy** — which
+destinations the agent may reach at all, audit, allow-lists, and routing profiles —
+is **orthogonal and specified separately** (`docs/design/egress-policy.md`).
+Credential containment holds under any egress policy.
 
 ## Trust model
 
@@ -18,8 +26,8 @@ guest agent (uid 1000) is untrusted, the expected adversary (prompt injection, a
 compromised dependency). The design is **not** suitable as-is where the operator
 must not read tenant data — proxy TLS termination would expose it; that deployment
 needs an additional control and is out of scope. This boundary also tracks provider
-policy (below): a user running their own subscription is "ordinary use"; an
-operator routing other users' subscription credentials is not.
+policy (below): a user running their own subscription is "ordinary use"; an operator
+routing other users' subscription credentials is not.
 
 ## North star and invariant
 
@@ -30,14 +38,14 @@ void-box lets an agent **use** credentials without **holding** the durable ones.
   them, performs all refresh, and is the sole rotation owner. Any token the guest
   holds is short-lived and host-revocable.
 - **Stronger tier (proxy):** the guest holds no credential at all, only non-secret
-  placeholders. Downstream egress and API keys always use this tier; OAuth
+  placeholders. API keys and downstream injection always use this tier; OAuth
   providers use it only if the proxy path is chosen.
 
 ## The risk this addresses
 
 The `claude-personal` and `codex` providers stage the OAuth credential —
-**including the refresh token** — into the guest: an RW bind-mount of the
-credential file at `/home/sandbox/.claude` or `/home/sandbox/.codex`
+**including the refresh token** — into the guest: an RW bind-mount of the credential
+file at `/home/sandbox/.claude` or `/home/sandbox/.codex`
 (`src/runtime.rs:234-247`, `1399-1408`), or a privileged WriteFile copy
 (`src/agent_box.rs:464`). A uid-1000 agent can read it and exfiltrate the refresh
 token, yielding account access that outlives the run. Both CLIs self-refresh
@@ -90,12 +98,11 @@ linked terms for their use case.
 
 ## Mechanism: the host injection proxy
 
-A host-side, TLS-terminating, header-injecting egress proxy, backed by the
-credential store. The client is pointed at the proxy and trusts a per-run CA
-installed in the guest; the proxy rewrites the credential header(s) with the
-host-held secret and forwards to the real upstream. The guest holds only
-placeholders. This serves API-key containment and downstream egress, and is the
-optional OAuth proxy path.
+A host-side, TLS-terminating, header-injecting proxy, backed by the credential
+store. Only the clients that need a host-held credential are pointed at it (selective
+routing — see Scope); the client trusts a per-run CA installed in the guest, the
+proxy rewrites the credential header(s) with the host-held secret, and forwards to
+the real upstream. The guest holds only placeholders.
 
 ```
 guest client ──▶ host injection proxy ──▶ real upstream
@@ -106,22 +113,23 @@ guest client ──▶ host injection proxy ──▶ real upstream
 
 **Credential store.** Holds each provider's durable secret — read from
 `~/.claude`/`~/.codex`/Keychain, or the host env for API keys. For OAuth it refreshes
-against the provider's token endpoint, mints short-lived access tokens, and is the
-sole rotation owner (serialized refresh, rate-capped). Secrets live only here, in
+against the provider's token endpoint, mints short-lived access tokens, is the sole
+rotation owner (serialized refresh, rate-capped), and **persists the rotated refresh
+token back to the host** so subsequent runs stay valid. Secrets live only here, in
 host memory, `mlock`ed and zeroized via `secrecy`.
 
 **Why TLS termination, and why it is safe.** The credential header lives inside the
-TLS stream; rewriting it requires terminating TLS. Under the trust model this
-exposes nothing new — the host already sees the guest's data. The proxy streams
-bodies through without inspecting them, re-establishes TLS to the upstream (the
-external wire stays encrypted), and trusts only a per-run CA installed in the guest
-image (a scoped trust, not general interception). The one non-transparent effect:
-the upstream sees the proxy's TLS fingerprint, not the client's (R8).
+TLS stream; rewriting it requires terminating TLS. Under the trust model this exposes
+nothing new — the host already sees the guest's data. The proxy streams bodies
+through without inspecting them, re-establishes TLS to the upstream (the external
+wire stays encrypted), and trusts only a per-run CA installed in the guest image (a
+scoped trust, not general interception). The one non-transparent effect: the upstream
+sees the proxy's TLS fingerprint, not the client's (R7).
 
 **API keys (`Claude`, `codex` env-key, `Custom`).** A static secret: the proxy
-injects `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI/codex; the
-Custom provider's configured header). No refresh, no rotation, no policy tension —
-the simplest slice and the first proof of the proxy spine (M0). codex API-key mode
+injects `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI/codex; the Custom
+provider's configured header). No refresh, no rotation, no policy tension — the
+simplest slice and the first proof of the proxy spine (M0). codex API-key mode
 targets `api.openai.com/v1`, redirected the same way.
 
 **OAuth via the proxy (Claude/codex ChatGPT).**
@@ -135,7 +143,7 @@ targets `api.openai.com/v1`, redirected the same way.
   `last_refresh`). The proxy injects the real Bearer and `ChatGPT-Account-ID` (real
   identity stays host-side) and passes `originator` through. codex defaults to
   Responses-over-WebSocket — force plain HTTPS (`supports_websockets=false`) or
-  inject on the WS upgrade (R9).
+  inject on the WS upgrade (R8).
 
 Neither client pins certificates; both honor an additive CA via the env above (PEM
 file; not `SSL_CERT_DIR`).
@@ -154,53 +162,41 @@ and what the host runs.
   `CODEX_REFRESH_TOKEN_URL_OVERRIDE` proxies the refresh to the store; `auth.json`
   holds only a short-lived access token. Residual: a short-lived access token (and
   codex's real `id_token`/`account_id`) at rest in the guest.
-- **Proxy injection.** Zero credential in the guest, at the cost of CA custody (R3),
-  streaming correctness (R1), SSRF surface (R4), and a hot-path dependency.
+- **Proxy injection.** Zero credential in the guest, at the cost of CA custody (R2),
+  streaming correctness (R1), SSRF surface (R3), and a hot-path dependency.
 
-**Decision criteria.** The proxy is built regardless (API keys, downstream), so
-routing OAuth through it unifies the mechanism and yields zero in-guest credential.
-Token injection is lighter and preserves the client's TLS fingerprint (R8 — relevant
-if a subscription endpoint fingerprints TLS), but leaves a bounded token in the guest
-and lacks a clean Claude long-run refresh. For personal subscriptions, weigh the
-policy tradeoff (ToS, above). Decide after V1/V2.
+**Decision criteria.** The proxy is built regardless (API keys, downstream
+injection), so routing OAuth through it unifies the mechanism and yields zero
+in-guest credential. Token injection is lighter and preserves the client's TLS
+fingerprint (R7 — relevant if a subscription endpoint fingerprints TLS), but leaves a
+bounded token in the guest and lacks a clean Claude long-run refresh. For personal
+subscriptions, weigh the policy tradeoff (ToS, above). Decide after V1/V2.
 
-## Downstream egress (M2/M3)
+## Downstream credential injection
 
-For allow-listed downstream services (GitHub API, internal APIs, later
-database/mTLS) the proxy is the only mechanism — the host injects the destination's
-(usually static) credential and the secret never enters the guest. Two interception
-forms reuse the proxy: **explicit**, for tools honoring `HTTPS_PROXY` (curl, git,
-most libraries — the common case, and the only form where the per-run proxy token
-authenticates the client); and **transparent**, network-level interception
-(`src/network/slirp.rs`) with per-destination certs for tools that ignore
-`HTTPS_PROXY` (no place for a proxy token — relies on network isolation). The proxy
-injects a credential only on **exact upstream host+path match**, never on
-agent-controlled redirects or `Host` headers, and follows no credentialed redirects
-(R4).
+Some named downstream services need a host-held secret injected (e.g. a GitHub token
+for `api.github.com`). The same proxy injects it: the service is routed to the proxy
+by **explicit client config** (a `git` credential helper, or a scoped `HTTPS_PROXY`
+for that host), and the proxy rewrites the auth header with the host-held credential.
+These are usually static secrets (no OAuth refresh). The proxy injects a credential
+only on **exact upstream host+path match**, never on agent-controlled redirects or
+`Host` headers, and follows no credentialed redirects (R3). Per-destination injection
+policy is operator-declared.
 
-## Egress enforcement
-
-VoidBox's network is **default-allow with a deny-list** (`src/network/nat.rs`); there
-is no allow-list today. The proxy is therefore **advisory** until a default-deny
-egress allow-list that pins the guest to the proxy (and blocks direct `:443` to
-provider/destination IPs) is built (R2). Without it a compromised agent can bypass
-the proxy and reach the internet directly — it cannot leak a credential (a direct
-call carries no valid token), so containment holds, but the "bounded abuse" and
-"fail-closed-for-usage" properties do not. This allow-list is scoped as M1 work, not
-assumed.
+How the agent's *general* (non-credentialed) egress is permitted, audited, or
+restricted — including transparent interception and domain allow-lists — is the
+concern of the separate egress design (`docs/design/egress-policy.md`).
 
 ## Security properties
 
 - **Refresh token / durable secret never in the guest** (both candidates) — held and
   rotated only on the host.
-- **No credential at all in the guest** (proxy candidate; downstream and API keys
+- **No credential at all in the guest** (proxy candidate; API keys and downstream
   always).
 - **Single rotation owner** — only the host refreshes, removing the rotation-conflict
   failure mode.
 - **Containment is bypass-safe** — a guest ignoring the proxy/injector cannot obtain
-  a credential.
-- **Bounded abuse / fail-closed-for-usage** — only once the egress allow-list exists
-  (R2); otherwise advisory.
+  a credential (a direct call to the upstream carries no valid token).
 - **External wire stays encrypted** — for the proxy, TLS is re-established to the
   upstream; only a host-internal hop is plaintext.
 - Opt-in; no behavior change for providers that do not stage a credential.
@@ -222,17 +218,15 @@ Ordered by how much each could disrupt implementation.
 
 | # | Risk | Likelihood | Impact | Mitigation / fallback |
 |---|------|-----------|--------|-----------------------|
-| R1 | **Proxy streaming/lifecycle correctness** — TLS-terminate + SSE + WS + backpressure + reuse + fail-closed, on every call in the hot path; a bug degrades all output. | Medium | High | Standard reverse-proxy patterns + dedicated streaming tests; primary engineering budget. Proxy path only. |
-| R2 | **No egress allow-list** — "bounded abuse"/"fail-closed-for-usage" need a default-deny allow-list pinning guest→proxy; absent today (`src/network/nat.rs`). | High (absent) | Medium | Build as M1 work; until then those properties are advisory. Containment is unaffected. |
-| R3 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, **Name-Constrained** to the injected upstreams, generated at boot and destroyed on teardown; never exposed to the guest. |
-| R4 | **SSRF / confused-deputy** via the credential-injecting proxy (acute in M2). | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`. |
-| R5 | **Host-side OAuth refresh acceptance** — the token endpoint accepting an off-client refresh (refresh grant has no PKCE, but tokens could be binding-bound). | Low–Med | Medium–High | Confirm in V2 (throwaway). Evidence: standard refresh shape, plain Bearer, no DPoP observed; same egress IP via NAT. |
-| R6 | **Inference acceptance of a host-supplied subscription Bearer.** | Low–Med | Medium–High | V2. Precedent: `CLAUDE_CODE_OAUTH_TOKEN` is an externally-supplied subscription Bearer the inference endpoint accepts. |
-| R7 | **Provider ToS** — personal-subscription OAuth used outside the native client, or multi-tenant routing of subscription credentials, is restricted. | — | High (policy) | API keys for programmatic/hosted use; personal-OAuth is single-tenant ordinary use, user-owned (see ToS section). |
-| R8 | **TLS fingerprint** — proxy termination changes the upstream-visible JA3/JA4; on subscription endpoints a client mismatch could be a signal. | Low | Low–Med | Low signal on API endpoints (diverse clients expected); token injection preserves the client fingerprint; uTLS-style impersonation if needed. |
-| R9 | **codex WebSocket transport** vs header injection. | Low | Low–Med | Default `supports_websockets=false` (plain HTTPS); inject-on-upgrade optional. |
-| R10 | **Provider version drift** changing redirect/refresh/header/transport behavior. | Low | Low–Med | Pin versions; re-verify V1/V2 facts on bump (bump workflow gates it). |
-| R11 | **M2 transparent per-destination cert generation.** | Low | Low | Deferred; explicit `HTTPS_PROXY` avoids it; established SSL-bump pattern. |
+| R1 | **Proxy streaming/lifecycle correctness** — TLS-terminate + SSE + WS + backpressure + reuse + fail-closed, on every routed call; a bug degrades all output. | Medium | High | Standard reverse-proxy patterns + dedicated streaming tests; primary engineering budget. Proxy path only. |
+| R2 | **CA private-key custody / blast radius** (proxy) — a leaked CA key impersonates sites to the guest. | Low | High | **Per-run ephemeral CA**, **Name-Constrained** to the injected upstreams, generated at boot and destroyed on teardown; never exposed to the guest. |
+| R3 | **SSRF / confused-deputy** via the credential-injecting proxy. | Medium | Medium–High | Exact host+path injection match; no credentialed redirects; no agent-controlled `Host`. |
+| R4 | **Host-side OAuth refresh acceptance** — the token endpoint accepting an off-client refresh (refresh grant has no PKCE, but tokens could be binding-bound). | Low–Med | Medium–High | Confirm in V2 (throwaway). Evidence: standard refresh shape, plain Bearer, no DPoP observed; same egress IP via NAT. |
+| R5 | **Inference acceptance of a host-supplied subscription Bearer.** | Low–Med | Medium–High | V2. Precedent: `CLAUDE_CODE_OAUTH_TOKEN` is an externally-supplied subscription Bearer the inference endpoint accepts. |
+| R6 | **Provider ToS** — personal-subscription OAuth used outside the native client, or multi-tenant routing of subscription credentials, is restricted. | — | High (policy) | API keys for programmatic/hosted use; personal-OAuth is single-tenant ordinary use, user-owned (see ToS section). |
+| R7 | **TLS fingerprint** — proxy termination changes the upstream-visible JA3/JA4; on subscription endpoints a client mismatch could be a signal. | Low | Low–Med | Low signal on API endpoints (diverse clients expected); token injection preserves the client fingerprint; uTLS-style impersonation if needed. |
+| R8 | **codex WebSocket transport** vs header injection. | Low | Low–Med | Default `supports_websockets=false` (plain HTTPS); inject-on-upgrade optional. |
+| R9 | **Provider version drift** changing redirect/refresh/header/transport behavior. | Low | Low–Med | Pin versions; re-verify V1/V2 facts on bump (bump workflow gates it). |
 
 ## Validation order and implementation plan
 
@@ -253,7 +247,7 @@ proxy provisioning).**
 4. **Pass:** both clients route inference through the proxy, trust the CA, do not
    hard-fail on the missing real credential, and trigger no force-login or
    retry-storm against hardcoded endpoints. Confirm codex emits `ChatGPT-Account-ID`
-   + `originator`. Resolves nothing on its own but unblocks M0 and the proxy path.
+   + `originator`. Unblocks M0 and the proxy path.
 
 **V2 — OAuth acceptance (throwaway account, OAuth path only; the API-key path skips
 this).**
@@ -262,9 +256,9 @@ this).**
    normally and capture the real refresh token.
 2. Host-side, replay the refresh (`client_id` + `grant_type=refresh_token` +
    `refresh_token`) against each token endpoint; confirm a usable access token comes
-   back, and **store the rotated refresh token host-side** (R5).
+   back, and **store the rotated refresh token host-side** (R4).
 3. Inject the minted Bearer through the proxy on one real inference request per
-   provider; confirm a usable completion (R6).
+   provider; confirm a usable completion (R5).
 4. **Pass:** host-minted tokens authenticate inference for both providers. Watch for
    any extra required header/param or a `401/403` indicating token binding/
    attestation. **Fail → the credential-store premise needs a rethink** (fall back
@@ -274,16 +268,14 @@ this).**
 - **M0** — static-key proxy for the **API-key** providers (Anthropic `x-api-key`,
   OpenAI/codex Bearer, Custom). No credential store, refresh, or rotation. Ungated by
   V2 and by the OAuth decision; needs only V1 plus the per-run name-constrained CA
-  (R3) and the streaming proxy (R1). The lowest-risk proof of the proxy spine, so it
+  (R2) and the streaming proxy (R1). The lowest-risk proof of the proxy spine, so it
   leads.
-- **M1a** — credential store (refresh/mint/rotation) + the chosen OAuth mechanism for
-  **Claude only**, single platform, inference path. If proxy: reuses M0's CA and
-  streaming proxy.
-- **M1b** — codex (WS handling, R9), long-run rotation, and KVM+VZ parity.
-- **Egress allow-list** (R2) — default-deny, guest pinned to the proxy — so the
-  bounded-abuse/fail-closed properties become real.
-- **M2/M3** — downstream egress, per-destination policy, SSRF hardening (R4),
-  transparent form (R11).
+- **M1a** — credential store (refresh/mint/rotation + host write-back) + the chosen
+  OAuth mechanism for **Claude only**, single platform, inference path. If proxy:
+  reuses M0's CA and streaming proxy.
+- **M1b** — codex (WS handling, R8), long-run rotation, and KVM+VZ parity.
+- **M2** — downstream credential injection for named services (e.g. GitHub), explicit
+  routing, per-destination policy, SSRF hardening (R3).
 
 Remove the RW credential mounts and the `src/agent_box.rs:464` WriteFile copy as each
 provider migrates. Exit gate: `e2e_agent_mcp` (Claude) and the codex smoke specs pass
@@ -294,48 +286,50 @@ with no refresh token in the guest (and, on the proxy path, no credential at all
 What an implementer can take as settled versus what they must still design.
 
 **Settled — do not re-derive:** the invariant, trust model, and ToS boundary; the
-mechanism (host injection proxy + credential store; API keys and downstream via the
-proxy); the per-provider client knobs (env vars, config, headers) and their verified
-behavior; the milestone order (M0 leads); the risk register and the V1/V2 gates.
+mechanism (host injection proxy + credential store; selective routing of credentialed
+endpoints); the per-provider client knobs (env vars, config, headers) and their
+verified behavior; the milestone order (M0 leads); the risk register and the V1/V2
+gates.
 
 **The implementer must design (within the chosen approach):**
-- **Guest→proxy data path and binding** — how the client reaches the proxy (host
-  listener reachable via SLIRP `10.0.2.2`, or a vsock-bridged port), bound guest-only
-  per platform (loopback on KVM; a VZ-specific address on macOS, not `UNSPECIFIED`).
+- **Guest→proxy reachability and binding** — how a configured client reaches the
+  proxy (host listener via the SLIRP gateway), bound guest-only per platform
+  (loopback on KVM; a VZ-specific address on macOS, not `UNSPECIFIED`).
 - **Per-run proxy token** — generation, injection into the guest, the proxy-side
   check, and stripping it before forwarding upstream.
-- **Per-run CA** — generation, name-constraint to the injected upstreams, install
-  into the guest trust stores per image (`NODE_EXTRA_CA_CERTS`,
-  `CODEX_CA_CERTIFICATE`, and the system store for M2), and teardown.
+- **Per-run CA** — generation, name-constraint, install into the guest trust stores
+  per image (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`), and teardown.
 - **Lifecycle placement** — which host process runs the proxy and store, one per
   sandbox, started/stopped on which VM hook.
 - **Credential store internals** — reuse the discovery in `src/credentials.rs`;
-  per-provider refresh-request construction; token cache + serialized refresh.
+  per-provider refresh-request construction; token cache + serialized refresh; host
+  write-back of rotated tokens.
 
 **Decisions to escalate (do not guess):**
 - The OAuth delivery mechanism (token injection vs. proxy), after V2.
-- Whether to contain personal-subscription OAuth at all given the ToS tradeoff, or
-  to steer programmatic use to API keys.
+- Whether to contain personal-subscription OAuth at all given the ToS tradeoff, or to
+  steer programmatic use to API keys.
 
-**Suggested first session:** run V1, then build M0 (which needs the proxy data path,
-per-run token, CA install, and lifecycle placement — all reusable by M1). Defer the
-credential store until V2 passes; bring the OAuth-mode decision to a human.
+**Suggested first session:** run V1, then build M0 (which needs the proxy
+reachability, per-run token, CA install, and lifecycle placement — all reusable by
+M1). Defer the credential store until V2 passes; bring the OAuth-mode decision to a
+human.
 
 ## Affected code
 
 - New host modules — the credential store (durable secret custody; OAuth
-  refresh/mint/rotation) and the injection proxy (TLS-terminating, header-rewriting,
-  streaming) plus the per-run CA.
+  refresh/mint/rotation + host write-back) and the injection proxy (TLS-terminating,
+  header-rewriting, streaming) plus the per-run CA.
 - `src/credentials.rs` — host-retained credential, host-side refresh/rotation,
   short-lived-token minting; staging is host-only.
 - `src/runtime.rs` (`~234`, `~1352-1408`), `src/agent_box.rs` (`~464`) — remove the RW
   mount and the WriteFile copy; provision the guest per the chosen mechanism.
 - `src/llm.rs` — provider → store/proxy/injector wiring, replacing the API-key env
   forwarding in `env_vars()` (`~417`).
-- `src/network/nat.rs` / `src/network/slirp.rs` — the default-deny egress allow-list
-  (R2) and the M2 transparent interception point.
+- `src/network/*` — the credential proxy is reached by the configured clients via the
+  SLIRP gateway; it does **not** change egress policy (owned by the egress design).
 - Guest image — install the per-run CA into the trust stores the clients honor
-  (`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`; and the system store
-  for M2 tools) — a per-image checklist across initramfs and OCI-rootfs.
+  (`NODE_EXTRA_CA_CERTS`; `CODEX_CA_CERTIFICATE`/`SSL_CERT_FILE`) — a per-image
+  checklist across initramfs and OCI-rootfs.
 - `scripts/agents/manifest.toml` — the bundled provider versions; re-verify these
-  behaviors against them on bumps (R10).
+  behaviors against them on bumps (R9).
