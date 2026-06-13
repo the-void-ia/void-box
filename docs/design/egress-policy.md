@@ -1,9 +1,9 @@
 # Design (DRAFT): guest egress policy and profiles
 
-Status: **draft / skeleton** — intended to be developed in a dedicated session. This
-document captures the use cases, today's mechanism, and the high-level shape of a
-configurable egress policy; the low-level component design is an outline with open
-questions to resolve.
+Status: **draft / skeleton** — to be developed into a full design. This document
+captures the use cases, today's mechanism, and the high-level shape of a configurable
+egress policy; the low-level component design is an outline with open questions to
+resolve.
 
 Egress policy is **orthogonal to credential containment**
 (`docs/design/credential-broker.md`). Credential containment keeps durable secrets
@@ -63,15 +63,15 @@ bounded use cases.
 
 ### Prior art and conventions to adopt
 
-Egress firewalling is well-trodden; adopt established conventions rather than invent a
-DSL.
+Egress firewalling is well-trodden; this design follows established conventions rather
+than a bespoke DSL.
 
 - **Stripe Smokescreen** — an HTTP CONNECT egress proxy purpose-built as a firewall for
   untrusted workloads (the closest precedent). Default-deny **allow-list of
   hostnames**, **`report` vs `enforce`** modes, and resolve-each-domain-then-**block
-  internal/RFC-1918 IPs** (SSRF protection), with role-based ACLs in YAML. Strong
-  reference design; the session should decide whether to port the pattern to Rust or
-  evaluate reusing it (it is Go). [README](https://github.com/stripe/smokescreen/blob/master/README.md),
+  internal/RFC-1918 IPs** (SSRF protection), with role-based ACLs in YAML. A strong
+  reference design (Go); port the pattern to Rust or reuse it (Open question 9).
+  [README](https://github.com/stripe/smokescreen/blob/master/README.md),
   [sample ACL](https://github.com/stripe/smokescreen/blob/master/pkg/smokescreen/acl/v1/testdata/sample_config.yaml).
 - **Cilium `toFQDNs`** — the DNS-aware egress convention: `matchName` (exact) +
   `matchPattern` (wildcard `*` that does **not** cross `.`, so `*.x.com` ≠ `x.com`).
@@ -88,13 +88,13 @@ DSL.
 - **`HTTPS_PROXY` / `NO_PROXY`** — the de-facto convention for routing to a proxy and
   expressing bypass.
 
-What to take: a **default-deny allow-list of FQDNs with wildcards** as the user
-language; **`report` then `enforce`** (run `monitored`/report, harvest the
-destinations a workflow actually used, promote to an `allowlist`, switch to enforce —
-the answer to "you can't allow-list open-ended research up front"); the SSRF
-**resolve-and-block-internal** baseline; and a **deliberate wildcard/suffix
-semantics** choice (open question below). Do not invent new syntax — these vocabularies
-are already familiar to the cloud-native audience.
+Adopt: a **default-deny allow-list of FQDNs with wildcards** as the user language;
+**`report` then `enforce`** (run `monitored`/report, harvest the destinations a
+workflow actually used, promote to an `allowlist`, switch to enforce — covering
+workflows whose destinations are not known in advance); the SSRF
+**resolve-and-block-internal** baseline; and a deliberate **wildcard/suffix
+semantics** choice (Open question 8). Prefer these established cloud-native
+conventions over a bespoke DSL.
 
 ### Profiles
 
@@ -121,9 +121,9 @@ egress:
     - 169.254.0.0/16
 ```
 
-**Default:** open product question — `open` (max compatibility) vs `monitored`
-(compatible + observable, recommended for a security runtime) vs `proxy-only`
-(secure-by-default, higher friction). **Decision pending** (see Open questions).
+**Default profile:** an unresolved product decision — `open` (max compatibility) vs
+`monitored` (compatible + observable, recommended for a security runtime) vs
+`proxy-only` (secure-by-default, higher friction). See Open question 1.
 
 ### Extend the deny-list, or redesign?
 
@@ -171,9 +171,9 @@ more sensitive). **Open question** — is egress's chokepoint the *same* process
 credential proxy, or a separate egress proxy that delegates credentialed endpoints to
 it?
 
-## 5. Low-level design (component per component) — to be developed
+## 5. Low-level design (component per component)
 
-Outline for the dedicated session; each item needs a concrete design.
+Each component below needs a concrete design.
 
 - **`Rules` / policy model (`src/network/nat.rs`).** Replace the deny-only `Rules`
   with a policy that expresses open/default-deny + pin-to-proxy; keep a baseline deny
@@ -185,9 +185,10 @@ Outline for the dedicated session; each item needs a concrete design.
   destinations.
 - **Egress proxy component.** The host-side proxy that accepts guest connections,
   reads the destination name (CONNECT host / SNI), checks the domain allow-list,
-  re-resolves per connection, and tunnels or hands off to credential injection. Decide
-  reuse-vs-separate from the credential proxy. Binding (guest-only, per platform — KVM
-  loopback; VZ-specific address). Per-run auth so only the guest can use it.
+  re-resolves per connection, and tunnels or hands off to credential injection.
+  Reuse-vs-separate from the credential proxy (Open question 2). Binding (guest-only,
+  per platform — KVM loopback; VZ-specific address). Per-run auth so only the guest
+  can use it.
 - **Domain policy engine.** Allow-list matching (exact + wildcard/suffix), the
   operator config surface, defaults, and the baseline always-deny set.
 - **Audit/observability.** What to record (destination, bytes, timing, allow/deny
@@ -219,16 +220,7 @@ Outline for the dedicated session; each item needs a concrete design.
    mode.
 7. **macOS/VZ** — pinning + proxy reachability without LAN exposure.
 8. **Wildcard/suffix semantics** — Cilium's `*`-does-not-cross-`.` (explicit `x.com`
-   *and* `*.x.com`) vs Squid's leading-dot "domain + all subdomains." Pick one.
+   *and* `*.x.com`) vs Squid's leading-dot "domain + all subdomains."
 9. **Reference implementation** — port the Smokescreen pattern to Rust, reuse/embed
    Smokescreen (Go), or build fresh; reconcile with the credential proxy (Open
    question 2).
-
-## Inputs to carry into the design session
-
-- The selective-vs-full routing trade-off table and the "credential containment is
-  orthogonal" framing from `docs/design/credential-broker.md`.
-- The domain-at-the-proxy reliability argument (fresh per-connection resolution beats
-  IP allow-listing).
-- Today's mechanism facts in §2 (verified against `src/network/nat.rs`,
-  `src/network/slirp.rs`).
