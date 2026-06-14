@@ -7,8 +7,9 @@ resolve.
 
 Egress policy is **orthogonal to credential containment**
 (`docs/design/credential-broker.md`). Credential containment keeps durable secrets
-off the guest and injects them for specific endpoints via selective routing; it holds
-under any egress policy. This document governs **which destinations the agent may
+off the guest and injects them for specific endpoints via selective routing (only the
+clients that hold a host credential are pointed at the proxy); it holds under any
+egress policy. This document governs **which destinations the agent may
 reach at all, how that traffic is audited, and how it is routed** — independent of
 whether a credential is injected.
 
@@ -157,7 +158,8 @@ the network layer is the enforcement floor.
   hostname is explicit and survives Encrypted-SNI.
 - **Transparent (catch-all).** Traffic that does not use the proxy — a client that
   ignores `HTTPS_PROXY`, or an agent attempting to bypass it — is redirected to the
-  proxy by the network layer (DNAT), which recovers the destination from the TLS SNI
+  proxy by the network layer (DNAT — destination rewriting), which recovers the
+  destination from the TLS SNI (the server name sent in the clear in the TLS handshake)
   and applies the same policy.
 
 A client that omits `HTTPS_PROXY` and one that deliberately bypasses it are

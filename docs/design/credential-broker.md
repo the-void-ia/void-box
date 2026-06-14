@@ -1,31 +1,46 @@
 # Design: host-mediated credential containment for the guest agent
 
-Status: proposal. The host credential store and the injection proxy are the
-**single committed mechanism** for all credential delivery — API keys, OAuth, and
-downstream injection. Token injection is retained only as a detection-safety fallback
-for personal OAuth subscriptions, to be dropped if validation (V2 + the ToS/detection
-check) shows that proxying a personal subscription does not risk the account.
+Status: proposal.
+
+**What this is.** A design for keeping durable credentials — API keys and OAuth
+refresh tokens — off the guest agent and injecting them only at the network egress
+that needs them. The mechanism is a host-side **injection proxy** (it rewrites the
+credential header at egress) backed by a host **credential store** (it holds the
+durable secret and performs OAuth refresh). A fallback, **token injection** (handing
+the guest a short-lived token instead of proxying), is a gated, drop-by-default
+option.
+
+The store and proxy are the **single committed mechanism** for all credential
+delivery. Token injection is retained only as a detection-safety fallback for personal
+OAuth subscriptions (a user's own Claude Pro/Max or ChatGPT plan, as opposed to an API
+key), to be dropped if validation (V2 + the ToS/detection check) shows that proxying a
+personal subscription does not risk the account.
 
 Provider behaviors here are confirmed against Claude Code 2.1.170 and openai/codex
-at commit `9e3081be9672c65f8a0cd958719065f49f47d839`. The bundled versions
+0.140.0 (pre-release `rust-v0.140.0-alpha.2`). The bundled versions
 (`scripts/agents/manifest.toml`) currently differ — claude-code 2.1.143, codex
 0.137.0 — so re-verify these behaviors against the bundled binaries before relying on
 them, and on every version bump (R9).
 
 **Scope.** This design covers *credential containment* — keeping durable credentials
 off the guest and injecting them at egress for the endpoints that need them. It uses
-**selective routing**: only the clients that need a host-held credential (the LLM
-providers; later GitHub) are pointed at the proxy. Network **egress policy** — which
+**selective routing**: the LLM-provider clients always go through the proxy, and any
+additional downstream service that needs a host-held credential can be routed through
+it too (GitHub, Slack, etc. — examples, not commitments). Network **egress policy** — which
 destinations the agent may reach at all, audit, allow-lists, and routing profiles —
 is **orthogonal and specified separately** (`docs/design/egress-policy.md`).
 Credential containment holds under any egress policy.
 
 ## Trust model
 
-Single-tenant: the host operator is the data owner and is authorized to see all
-guest plaintext — it already owns the guest's RAM, filesystem, and network. The
-guest agent (uid 1000) is untrusted, the expected adversary (prompt injection, a
-compromised dependency). The design is **not** suitable as-is where the operator
+**Single-tenant *for this feature*.** Credential containment assumes the host operator
+is the data owner, authorized to see all guest plaintext — the operator already owns
+the guest's RAM, filesystem, and network, and the injection proxy terminates TLS on
+the host. (void-box's VM isolation can host mutually-distrusting sandboxes; that is
+orthogonal — this feature assumes operator-as-data-owner, not that void-box is
+single-tenant overall.) The guest agent (uid 1000) is untrusted, the expected
+adversary (prompt injection, a compromised dependency). The design is **not** suitable
+as-is where the operator
 must not read tenant data — proxy TLS termination would expose it; that deployment
 needs an additional control and is out of scope. This boundary also tracks provider
 policy (below): a user running their own subscription is "ordinary use"; an operator
@@ -45,6 +60,17 @@ void-box lets an agent **use** credentials without **holding** the durable ones.
   validation) instead leaves a bounded short-lived token.
 
 ## The risk this addresses
+
+The broker addresses a family of credential-exfiltration risks, not one. Their common
+shape: a durable secret is staged into a guest the design treats as untrusted, where a
+uid-1000 agent (via prompt injection or a compromised dependency) can read and
+exfiltrate it for access that outlives the run. The secrets at risk span (1) **LLM-
+provider credentials** — OAuth refresh tokens for `claude-personal`/`codex`, and API
+keys for `Claude`/`codex`/`Custom` — and (2) **other downstream secrets** the workflow
+or its skills consume — a GitHub token, a Slack token, registry credentials — whichever
+the end user configures. Which risks are live depends on that configuration; the
+subsections below cover the provider credentials first (always present), then
+downstream secrets.
 
 The `claude-personal` and `codex` providers stage the OAuth credential —
 **including the refresh token** — into the guest: an RW bind-mount of the credential
@@ -103,16 +129,29 @@ linked terms for their use case.
 
 A host-side, TLS-terminating, header-injecting proxy, backed by the credential
 store. Only the clients that need a host-held credential are pointed at it (selective
-routing — see Scope); the client trusts a per-run CA installed in the guest, the
-proxy rewrites the credential header(s) with the host-held secret, and forwards to
-the real upstream. The guest holds only placeholders.
+routing — see Scope); the client trusts a per-run CA installed in the guest
+(name-constrained to the injected upstreams, so it can't impersonate arbitrary sites),
+the proxy rewrites the credential header(s) with the host-held secret, and forwards to
+the real upstream. The guest holds only placeholders (non-secret dummy values the
+proxy replaces).
 
+```mermaid
+flowchart LR
+  subgraph Guest["Guest (untrusted, uid 1000)"]
+    GC["client<br/>placeholder cred<br/>base-URL → proxy<br/>trusts per-run CA"]
+  end
+  subgraph Host["Host (data owner)"]
+    P["injection proxy<br/>TLS-terminate (per-run, name-constrained CA)<br/>rewrite credential header(s)<br/>relay body, no inspection"]
+    S[("credential store<br/>durable secret, mlocked<br/>OAuth refresh + rotation owner")]
+  end
+  U["real upstream<br/>api.anthropic.com / api.openai.com / …"]
+  GC -->|"placeholder + redirected request"| P
+  S -->|"injects real secret"| P
+  P -->|"re-encrypted TLS (external wire stays encrypted)"| U
 ```
-guest client ──▶ host injection proxy ──▶ real upstream
- placeholder cred,   TLS-terminate (per-run, name-constrained CA),
- base-URL redirect,  rewrite credential header(s),
- trusts proxy CA     re-encrypt to upstream (external wire stays encrypted)
-```
+
+One shared proxy/store process is multiplexed across sandboxes; the per-run token and
+name-constrained CA isolate runs.
 
 **Credential store.** Holds each provider's durable secret — read from
 `~/.claude`/`~/.codex`/Keychain, or the host env for API keys. For OAuth it refreshes
@@ -124,6 +163,11 @@ token back to the host** so subsequent runs stay valid. Write-back must be atomi
 credential file — a corrupt or raced write loses the single-use refresh token and can
 lock the account out (R12). Secrets live only here, in host memory, `mlock`ed,
 zeroized via `secrecy`, and shielded from core dumps (`PR_SET_DUMPABLE=0`).
+
+**Shared, not per-sandbox.** One low-privilege host proxy/store process is multiplexed
+across all sandboxes; the per-run token and name-constrained CA isolate runs from each
+other. The isolation boundary is daemon-vs-proxy, not proxy-vs-proxy — so its memory
+cost is fixed, not linear in VM count.
 
 **Why TLS termination, and why it is safe.** The credential header lives inside the
 TLS stream; rewriting it requires terminating TLS. Under the trust model this exposes
@@ -158,8 +202,15 @@ file; not `SSL_CERT_DIR`).
 ## OAuth-provider delivery: proxy by default, token injection as a fallback
 
 The proxy is the **default and preferred** mechanism for OAuth providers too — it
-unifies all credential delivery on one mechanism and leaves zero credential in the
-guest.
+unifies delivery and leaves zero credential in the guest. But for OAuth it carries two
+feasibility risks the API-key path does not: (1) **provider acceptance of host-side
+refresh** — the token endpoint may reject a refresh grant replayed by the host store
+rather than the genuine client (token binding/DPoP/attestation; R4); and (2)
+**fingerprint / ToS flagging of personal accounts** — because the proxy terminates TLS,
+the provider sees the proxy's fingerprint and a host-originated call under a
+`claude-code`/`codex` user-agent, which anti-abuse heuristics on a *personal*
+subscription may flag or ban (R7, R6). Both are retired by validation (V2 + the
+ToS/detection check); until then token injection is the fallback.
 
 **Token injection** is retained for one case: **personal subscriptions**. The proxy
 terminates TLS, so the provider sees the *proxy's* fingerprint under a
@@ -173,6 +224,24 @@ Claude via `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` (inherited fd; ~24 h tokens
 task-mode, long/service runs need re-mint-and-relaunch); codex via a loopback endpoint
 behind `CODEX_REFRESH_TOKEN_URL_OVERRIDE`. It never applies to API keys — a static key
 cannot be minted short-lived.
+
+```mermaid
+flowchart LR
+  subgraph Host["Host"]
+    CS[("credential store<br/>mints short-lived access token")]
+  end
+  subgraph Guest["Guest"]
+    INJ["token delivery<br/>Claude: inherited FD<br/>codex: loopback shim"]
+    GC["genuine client<br/>(claude-code / codex)"]
+  end
+  U["real upstream"]
+  CS -->|"short-lived token (bounded, re-mintable)"| INJ
+  INJ --> GC
+  GC -->|"end-to-end TLS, client fingerprint, no host crypto"| U
+```
+
+Trade-off vs. the proxy: preserves the genuine client's fingerprint and end-to-end TLS,
+at the cost of a bounded short-lived token at rest in the guest (R13).
 
 **Decision — gated, biased to drop it.** Ship the proxy for all providers. **Drop
 token injection entirely if V2 + the ToS/detection check (above) show that proxying a
@@ -190,15 +259,11 @@ only on **exact upstream host+path match**, never on agent-controlled redirects 
 `Host` headers, and follows no credentialed redirects (R3). Per-destination injection
 policy is operator-declared.
 
-How the agent's *general* (non-credentialed) egress is permitted, audited, or
-restricted — including transparent interception and domain allow-lists — is the
-concern of the separate egress design (`docs/design/egress-policy.md`).
-
 ## Security properties
 
-- **Refresh token / durable secret never in the guest** (both candidates) — held and
-  rotated only on the host.
-- **No credential at all in the guest** (proxy candidate; API keys and downstream
+- **Refresh token / durable secret never in the guest** (both delivery paths) — held
+  and rotated only on the host.
+- **No credential at all in the guest** (proxy path; API keys and downstream
   always).
 - **Single rotation owner** — only the host refreshes, removing the rotation-conflict
   failure mode.
@@ -213,12 +278,37 @@ concern of the separate egress design (`docs/design/egress-policy.md`).
 - The durable secret now lives in **host** process memory for the run (vs. today's
   0600 temp file dropped on teardown) — a wider host-side surface on a shared host;
   mitigated by `mlock`/zeroize and per-run process isolation.
-- Token-injection candidate: a short-lived access token (+ codex `id_token`/
+- Token-injection path: a short-lived access token (+ codex `id_token`/
   `account_id`) at rest in the guest for its lifetime, and captured in any snapshot
   taken during it.
-- Proxy candidate: the host decrypts inference traffic (trust-model dependent); a
+- Proxy path: the host decrypts inference traffic (trust-model dependent); a
   hot-path availability coupling; the per-run proxy token is guest-readable (use, not
   theft — guards against neighbors, not the in-guest adversary).
+
+## Snapshot / restore
+
+A snapshot persists guest RAM and auth state, and restore reuses them verbatim:
+`from_snapshot()` reconstructs the vsock device with the snapshot's stored session
+secret rather than minting a fresh one (`src/vmm/mod.rs:646-665` — only the socket-path
+`runtime_id` is regenerated). So any per-run material the guest holds is carried into
+every restored instance unless re-installed, which would defeat "per-run ephemeral" for
+the proxy token and CA (R11). Two parts to the solution:
+
+- **Reconnecting a restored VM to the proxy.** The resumed guest keeps the original
+  token and CA in restored RAM and does not re-read the kernel cmdline, so a host-side
+  swap is invisible to it. Re-minting therefore happens **in-band over the control
+  channel**: on restore the host generates a fresh per-run CA and proxy token and pushes
+  them into the running guest (the CA via the additive env/PEM path the clients honor,
+  the token into the proxy-auth slot) before the first credentialed egress; the proxy
+  then accepts the new token and stops honoring the snapshot's old one. If a restore
+  cannot re-install (control channel unavailable), credentialed egress fails closed
+  rather than reusing stale material.
+- **Keeping CA material out of the snapshot.** The CA **private key** and the credential
+  store live only in the host proxy process — never in guest RAM, the cmdline, or
+  `src/vmm/snapshot.rs` state — so they are structurally absent from any snapshot. Only
+  the CA **public cert** is ever in the guest, and it is replaced on restore. The
+  snapshot is still confidential regardless (it contains whatever short-lived token the
+  guest held at capture time, bounded by that token's lifetime — R13).
 
 ## Performance
 
@@ -226,20 +316,18 @@ void-box gates cold boot at p50 ≤ 252 ms (≤ 400 ms threshold) and values VM 
 this design must not regress either. Required cheap defaults:
 
 - **No host crypto on the inference stream.** Proxy injection terminates TLS and so
-  pays per-byte crypto on the whole stream, both legs — the busiest flow in the
-  system; token injection keeps inference end-to-end at zero host crypto. Prefer token
-  injection for high-volume inference; when the proxy is used it re-originates without
-  parsing the body (no content/DLP inspection by default).
-- **Shared proxy, not per-sandbox.** One low-privilege host proxy multiplexed across
-  sandboxes (per-run token + name-constrained CA isolate runs); a process + `mlock`ed
-  store per sandbox fights density (KSM/balloon) and scales linearly with VM count.
-- **Cheap startup.** ECDSA P-256 per-run CA (not RSA — keygen is on the cold budget),
+  pays per-byte crypto on both legs of the busiest flow in the system; token injection
+  keeps inference end-to-end at zero host crypto. This is a consideration in the
+  proxy-vs-injection trade-off for high-volume inference, not a standing recommendation
+  (the ToS/detection analysis dominates the choice). When the proxy is used it
+  re-originates without parsing the body (no content/DLP inspection by default).
+- **Shared proxy (see Mechanism).** Because the proxy is shared rather than per-sandbox,
+  its memory cost is fixed, not linear in VM count; a per-sandbox process with its own
+  `mlock`ed store would fight density (KSM/balloon) as instances grow.
+- **Cheap startup.** ECDSA P-256 per-run CA — keygen is on the cold-start budget;
   installed via the additive env-var/single-PEM path (no `ca-certificates`/initramfs
   rebuild); OAuth refresh lazy on first use, overlapped with boot, never a serial
   pre-boot RTT. Add this feature to the startup-bench gate.
-- **Selective routing + CONNECT-tunnel.** Only credentialed endpoints traverse the
-  proxy; non-credentialed egress and plain allow-listing use a CONNECT-tunnel (no
-  decryption). Routing defaults are owned by `docs/design/egress-policy.md`.
 
 ## Risk register
 
@@ -335,7 +423,7 @@ gates.
   (loopback on KVM; a VZ-specific address on macOS, not `UNSPECIFIED`).
 - **Per-run proxy token** — generation, injection into the guest, the proxy-side
   check, and stripping it before forwarding upstream.
-- **Per-run CA** — **ECDSA P-256** (not RSA — keygen is on the cold-start budget),
+- **Per-run CA** — **ECDSA P-256** (keygen is on the cold-start budget),
   name-constrained, installed via the additive env-var/single-PEM path
   (`NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`) — never a `ca-certificates` bundle or
   initramfs rebuild; teardown on exit; the private key stays in the host proxy process
