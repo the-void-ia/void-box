@@ -68,9 +68,9 @@ exfiltrate it for access that outlives the run. The secrets at risk span (1) **L
 provider credentials** — OAuth refresh tokens for `claude-personal`/`codex`, and API
 keys for `Claude`/`codex`/`Custom` — and (2) **other downstream secrets** the workflow
 or its skills consume — a GitHub token, a Slack token, registry credentials — whichever
-the end user configures. Which risks are live depends on that configuration; the
-subsections below cover the provider credentials first (always present), then
-downstream secrets.
+the end user configures. Which risks are live depends on that configuration. The
+provider credentials (always present) are detailed below; downstream secrets are
+covered where their injection is described ("Downstream credential injection").
 
 The `claude-personal` and `codex` providers stage the OAuth credential —
 **including the refresh token** — into the guest: an RW bind-mount of the credential
