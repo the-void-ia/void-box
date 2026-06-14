@@ -287,12 +287,14 @@ policy is operator-declared.
 
 ## Snapshot / restore
 
-A snapshot persists guest RAM and auth state, and restore reuses them verbatim:
-`from_snapshot()` reconstructs the vsock device with the snapshot's stored session
-secret rather than minting a fresh one (`src/vmm/mod.rs:646-665` — only the socket-path
-`runtime_id` is regenerated). So any per-run material the guest holds is carried into
-every restored instance unless re-installed, which would defeat "per-run ephemeral" for
-the proxy token and CA (R11). Two parts to the solution:
+Restore brings the guest back from a full memory image, so it returns holding whatever
+it had at capture — that part is by design. The concern is **per-run auth material**:
+the restore path reuses the snapshot's stored vsock session secret verbatim rather than
+minting a fresh one (`src/vmm/mod.rs:646-665` — only the socket-path `runtime_id` is
+regenerated; that reuse is a separate, tracked discrepancy, not behavior this design
+relies on). The same path would carry a snapshot-delivered proxy token or CA into every
+restored instance, defeating "per-run ephemeral" for them (R11). Two parts to the
+solution:
 
 - **Reconnecting a restored VM to the proxy.** The resumed guest keeps the original
   token and CA in restored RAM and does not re-read the kernel cmdline, so a host-side
