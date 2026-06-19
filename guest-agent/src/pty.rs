@@ -376,20 +376,33 @@ fn pty_writer_loop(
         }
         if let Some(deadline) = hangup_deadline {
             if !hangup_sent && Instant::now() >= deadline {
-                unsafe { libc::kill(child_pid, libc::SIGHUP) };
+                signal_child_group(child_pid, libc::SIGHUP);
                 hangup_sent = true;
                 kill_deadline = Some(Instant::now() + HANGUP_KILL_GRACE);
             }
         }
         if let Some(deadline) = kill_deadline {
             if Instant::now() >= deadline {
-                unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                signal_child_group(child_pid, libc::SIGKILL);
                 kill_deadline = None;
             }
         }
     }
 
     reap_child(child_pid)
+}
+
+/// Sends `signal` to the child's entire process group.
+///
+/// `run_pty_child` makes the child a session and group leader (forkpty's
+/// `setsid` plus `setpgid(0, 0)`), so its process-group id equals its pid.
+/// Signalling the group (`-pid`) reaches any grandchildren that inherited
+/// the PTY slave, so teardown stays bounded even when those outlive the
+/// direct child.
+fn signal_child_group(child_pid: libc::pid_t, signal: libc::c_int) {
+    unsafe {
+        libc::kill(-child_pid, signal);
+    }
 }
 
 /// Reads framed messages from the vsock fd and dispatches PtyData writes
