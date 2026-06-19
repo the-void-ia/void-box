@@ -11,16 +11,16 @@ set -euo pipefail
 #
 # Usage:
 #   scripts/download_kernel.sh
-#   KERNEL_VER=6.8.0-51 KERNEL_UPLOAD=52 scripts/download_kernel.sh
+#   KERNEL_VER=6.8.0-53 KERNEL_UPLOAD=55 scripts/download_kernel.sh
 #   ARCH=x86_64 scripts/download_kernel.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 # Pinned kernel version — override with KERNEL_VER / KERNEL_UPLOAD env vars.
-# Ubuntu package versions look like: 6.8.0-51.52  (base.upload)
-KERNEL_VER="${KERNEL_VER:-6.8.0-51}"
-KERNEL_UPLOAD="${KERNEL_UPLOAD:-52}"
+# Ubuntu package versions look like: 6.8.0-53.55  (base.upload)
+KERNEL_VER="${KERNEL_VER:-6.8.0-53}"
+KERNEL_UPLOAD="${KERNEL_UPLOAD:-55}"
 KERNEL_FULL_VER="${KERNEL_VER}.${KERNEL_UPLOAD}"
 
 # Detect or override architecture
@@ -33,18 +33,22 @@ fi
 
 # Expected SHA256 checksums for the pinned version.
 # Update these when bumping the kernel version.
-SHA256_ARM64="939693785d4a09c49e4e2edeef9b97b8cf7cd04af2ed40245acd7ba4962ee143"
-SHA256_AMD64="6b5ba8fd5bfb3ab4d5430db830a1600f09416fa8e4ace6b99d1bd8b7b79de43a"
+SHA256_ARM64="87a2c3347ee75d3f0ceb90db2a81725ee3cd3bcc5e3ca0d9216aa1c73087fb03"
+SHA256_AMD64="50e2e15cbd86d9837b0971f1246ce70ce0f24484cc02d25370325b27286b0b20"
+
+# Launchpad's +files archive retains every historical upload. The
+# distribution pool mirrors (ports/archive.ubuntu.com) prune superseded
+# point releases, so a pinned .deb 404s there once a newer upload lands —
+# launchpad keeps it reachable for the lifetime of the pin.
+KERNEL_URL_BASE="https://launchpad.net/ubuntu/+archive/primary/+files"
 
 case "$ARCH" in
   aarch64)
     DEB_ARCH="arm64"
-    KERNEL_URL_BASE="https://ports.ubuntu.com/pool/main/l/linux"
     EXPECTED_SHA256="$SHA256_ARM64"
     ;;
   x86_64)
     DEB_ARCH="amd64"
-    KERNEL_URL_BASE="https://archive.ubuntu.com/ubuntu/pool/main/l/linux"
     EXPECTED_SHA256="$SHA256_AMD64"
     ;;
   *)

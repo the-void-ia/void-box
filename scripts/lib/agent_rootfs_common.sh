@@ -365,8 +365,8 @@ setup_pinned_kernel_modules() {
     local dl_kernel_ver dl_kernel_upload
     dl_kernel_ver=$(sed -n 's/^KERNEL_VER="\${KERNEL_VER:-\([^}]*\)}"/\1/p' "$dl_script" 2>/dev/null | head -n 1)
     dl_kernel_upload=$(sed -n 's/^KERNEL_UPLOAD="\${KERNEL_UPLOAD:-\([^}]*\)}"/\1/p' "$dl_script" 2>/dev/null | head -n 1)
-    export VOID_BOX_KMOD_VERSION="${dl_kernel_ver:-6.8.0-51}"
-    export VOID_BOX_KMOD_UPLOAD="${dl_kernel_upload:-52}"
+    export VOID_BOX_KMOD_VERSION="${dl_kernel_ver:-6.8.0-53}"
+    export VOID_BOX_KMOD_UPLOAD="${dl_kernel_upload:-55}"
     echo "[$log_prefix] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
   else
     echo "[$log_prefix] Using host kernel modules for local build (uname -r=$(uname -r))"

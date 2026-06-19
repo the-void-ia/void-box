@@ -76,8 +76,8 @@ jobs:
           # scripts/agents/manifest.toml (R-B5c.1).
           ARCH=${{ matrix.arch }} \
           BUSYBOX=/tmp/usr/bin/busybox \
-          VOID_BOX_KMOD_VERSION=6.8.0-51 \
-          VOID_BOX_KMOD_UPLOAD=52 \
+          VOID_BOX_KMOD_VERSION=6.8.0-53 \
+          VOID_BOX_KMOD_UPLOAD=55 \
           OUT_CPIO=/tmp/rootfs.cpio.gz \
           OUT_DIR=/tmp/void-box-rootfs \
             scripts/build_claude_rootfs.sh

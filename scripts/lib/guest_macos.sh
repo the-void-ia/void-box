@@ -132,8 +132,8 @@ install_kernel_modules_macos() {
   [[ "$ARCH" == "aarch64" ]] || return 0
 
   # Must match download_kernel.sh (KERNEL_VER) so modules are compatible with the VM kernel
-  local kmod_version="${VOID_BOX_KMOD_VERSION:-6.8.0-51}"
-  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-52}"
+  local kmod_version="${VOID_BOX_KMOD_VERSION:-6.8.0-53}"
+  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-55}"
   local kmod_deb_version="${kmod_version}.${kmod_upload}"
   local kmod_url="https://launchpad.net/ubuntu/+archive/primary/+files/linux-modules-${kmod_version}-generic_${kmod_deb_version}_arm64.deb"
   local tmp
