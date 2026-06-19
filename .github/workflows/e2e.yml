@@ -169,9 +169,8 @@ jobs:
           # Skill-install + MCP exec path (exercises unified ControlChannel)
           cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
-          # PTY exit-code propagation.
-          cargo test --test e2e_pty pty_nonzero_exit_code \
-            -- --ignored --test-threads=1
+          # PTY exit-code propagation and teardown.
+          cargo test --test e2e_pty -- --ignored --test-threads=1
 
       - name: Run snapshot integration tests
         # `KERNEL_VERSION` is not defined in this workflow, so a literal

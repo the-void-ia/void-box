@@ -361,10 +361,18 @@ fn pty_writer_loop(
         if ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             let n =
                 unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
+            if n == 0 {
                 break;
             }
-            if send_pty_data(vsock_fd, request_id, &buf[..n as usize]).is_err() {
+            if n < 0 {
+                // A signal can interrupt the blocking read; retrying keeps the
+                // drain loop (and the teardown escalation below) alive instead
+                // of mistaking the interruption for EOF. Any other error means
+                // the master is gone, so end the session.
+                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            } else if send_pty_data(vsock_fd, request_id, &buf[..n as usize]).is_err() {
                 break;
             }
         }
