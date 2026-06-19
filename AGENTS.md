@@ -13,6 +13,16 @@ LSP provides compiler-aware results that understand types, scopes, and cross-fil
 relationships. Fall back to Grep/Glob only for pattern-based searches LSP doesn't
 cover (comments, config files, non-Rust files).
 
+## Commit and PR messages
+
+Write commit message bodies and pull-request descriptions as Markdown, with
+each paragraph on a **single line** — do not hard-wrap prose to a fixed column.
+The renderer (GitHub, `git log` viewers) wraps it for display; manual line
+breaks mid-paragraph render as ragged text and produce noisy diffs on edits.
+Keep the commit subject line short (~72 chars), and use blank lines to separate
+paragraphs and normal Markdown for lists. Reserve hard line breaks for content
+that is genuinely line-oriented (lists, tables, code blocks).
+
 ## Rust coding conventions
 
 ### Imports and constants
