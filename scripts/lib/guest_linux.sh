@@ -3,6 +3,9 @@
 # Sourced by build_guest_image.sh — not meant to be run directly.
 # Expects: guest_common.sh already sourced, OUT_DIR / ARCH / ROOT_DIR set.
 
+# shellcheck source=./kernel_pin.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel_pin.sh"
+
 # ── Shared libraries for claude-code (via ldd) ───────────────────────────
 
 install_claude_code_libs_linux() {
@@ -80,12 +83,12 @@ install_host_binaries() {
 # Used in CI or when host kernel doesn't match the VM kernel.
 #
 # Env vars:
-#   VOID_BOX_KMOD_VERSION  — Target kernel version (e.g. "6.8.0-51")
-#   VOID_BOX_KMOD_UPLOAD   — Upload number (e.g. "52"), defaults to KERNEL_UPLOAD
+#   VOID_BOX_KMOD_VERSION  — Target kernel version (e.g. "6.8.0-53")
+#   VOID_BOX_KMOD_UPLOAD   — Upload number (e.g. "55"), defaults to KERNEL_UPLOAD
 install_kernel_modules_from_deb() {
   local dest="$1"
-  local kmod_version="${VOID_BOX_KMOD_VERSION:-${KERNEL_VER:-}}"
-  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-${KERNEL_UPLOAD:-}}"
+  local kmod_version="${VOID_BOX_KMOD_VERSION:-${KERNEL_VER:-$VOIDBOX_KERNEL_VER}}"
+  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-${KERNEL_UPLOAD:-$VOIDBOX_KERNEL_UPLOAD}}"
 
   if [[ -z "$kmod_version" || -z "$kmod_upload" ]]; then
     echo "[void-box] WARNING: VOID_BOX_KMOD_VERSION not set — cannot download modules"
@@ -93,10 +96,14 @@ install_kernel_modules_from_deb() {
   fi
 
   local kmod_deb_version="${kmod_version}.${kmod_upload}"
-  local deb_arch url_base
+  # Launchpad's +files archive retains superseded uploads that the pool
+  # mirrors (ports/archive.ubuntu.com) prune, keeping a pinned version
+  # reachable regardless of arch.
+  local url_base="https://launchpad.net/ubuntu/+archive/primary/+files"
+  local deb_arch
   case "$ARCH" in
-    x86_64)  deb_arch="amd64"; url_base="https://archive.ubuntu.com/ubuntu/pool/main/l/linux" ;;
-    aarch64) deb_arch="arm64";  url_base="https://ports.ubuntu.com/pool/main/l/linux" ;;
+    x86_64)  deb_arch="amd64" ;;
+    aarch64) deb_arch="arm64" ;;
     *)       echo "[void-box] ERROR: unsupported arch for module download: $ARCH"; return 1 ;;
   esac
 
