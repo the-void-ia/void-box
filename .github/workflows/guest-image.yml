@@ -70,14 +70,15 @@ jobs:
 
       - name: Build initramfs (with claude-code)
         run: |
-          # Must match the kernel version in scripts/download_kernel.sh
-          # so that the packaged modules are compatible with the VM kernel.
-          # The claude-code version + SHA-256 come from
-          # scripts/agents/manifest.toml (R-B5c.1).
+          # Modules must match the kernel from scripts/download_kernel.sh; both
+          # default to the shared pin in scripts/lib/kernel_pin.sh. The
+          # claude-code version + SHA-256 come from scripts/agents/manifest.toml
+          # (R-B5c.1).
+          source scripts/lib/kernel_pin.sh
           ARCH=${{ matrix.arch }} \
           BUSYBOX=/tmp/usr/bin/busybox \
-          VOID_BOX_KMOD_VERSION=6.8.0-51 \
-          VOID_BOX_KMOD_UPLOAD=52 \
+          VOID_BOX_KMOD_VERSION="$VOIDBOX_KERNEL_VER" \
+          VOID_BOX_KMOD_UPLOAD="$VOIDBOX_KERNEL_UPLOAD" \
           OUT_CPIO=/tmp/rootfs.cpio.gz \
           OUT_DIR=/tmp/void-box-rootfs \
             scripts/build_claude_rootfs.sh
