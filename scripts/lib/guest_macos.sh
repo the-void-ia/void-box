@@ -3,6 +3,9 @@
 # Sourced by build_guest_image.sh — not meant to be run directly.
 # Expects: guest_common.sh already sourced, OUT_DIR / ARCH / GUEST_TARGET / ROOT_DIR set.
 
+# shellcheck source=./kernel_pin.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel_pin.sh"
+
 # ── Static busybox for ARM64 guest (macOS has no native busybox) ──────────────
 
 ensure_busybox_macos() {
@@ -131,9 +134,9 @@ install_kernel_modules_macos() {
 
   [[ "$ARCH" == "aarch64" ]] || return 0
 
-  # Must match download_kernel.sh (KERNEL_VER) so modules are compatible with the VM kernel
-  local kmod_version="${VOID_BOX_KMOD_VERSION:-6.8.0-51}"
-  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-52}"
+  # Pinned in kernel_pin.sh so modules match the VM kernel from download_kernel.sh
+  local kmod_version="${VOID_BOX_KMOD_VERSION:-$VOIDBOX_KERNEL_VER}"
+  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-$VOIDBOX_KERNEL_UPLOAD}"
   local kmod_deb_version="${kmod_version}.${kmod_upload}"
   local kmod_url="https://launchpad.net/ubuntu/+archive/primary/+files/linux-modules-${kmod_version}-generic_${kmod_deb_version}_arm64.deb"
   local tmp
