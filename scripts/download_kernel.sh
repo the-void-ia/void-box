@@ -19,8 +19,10 @@ cd "$ROOT_DIR"
 
 # Pinned kernel version — override with KERNEL_VER / KERNEL_UPLOAD env vars.
 # Ubuntu package versions look like: 6.8.0-53.55  (base.upload)
-KERNEL_VER="${KERNEL_VER:-6.8.0-53}"
-KERNEL_UPLOAD="${KERNEL_UPLOAD:-55}"
+# shellcheck source=lib/kernel_pin.sh
+source "$ROOT_DIR/scripts/lib/kernel_pin.sh"
+KERNEL_VER="${KERNEL_VER:-$VOIDBOX_KERNEL_VER}"
+KERNEL_UPLOAD="${KERNEL_UPLOAD:-$VOIDBOX_KERNEL_UPLOAD}"
 KERNEL_FULL_VER="${KERNEL_VER}.${KERNEL_UPLOAD}"
 
 # Detect or override architecture

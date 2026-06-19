@@ -73,8 +73,9 @@ jobs:
       - name: Build all artifacts
         run: |
           export BUSYBOX=/tmp/usr/bin/busybox
-          export VOID_BOX_KMOD_VERSION=6.8.0-53
-          export VOID_BOX_KMOD_UPLOAD=55
+          source scripts/lib/kernel_pin.sh
+          export VOID_BOX_KMOD_VERSION="$VOIDBOX_KERNEL_VER"
+          export VOID_BOX_KMOD_UPLOAD="$VOIDBOX_KERNEL_UPLOAD"
           ./scripts/build_release_artifacts.sh ${{ github.ref_name }} ${{ matrix.arch }}
 
       - name: Install nfpm
@@ -158,8 +159,9 @@ jobs:
 
       - name: Build guest artifacts
         run: |
-          export VOID_BOX_KMOD_VERSION=6.8.0-53
-          export VOID_BOX_KMOD_UPLOAD=55
+          source scripts/lib/kernel_pin.sh
+          export VOID_BOX_KMOD_VERSION="$VOIDBOX_KERNEL_VER"
+          export VOID_BOX_KMOD_UPLOAD="$VOIDBOX_KERNEL_UPLOAD"
           OUT_CPIO=/tmp/rootfs.cpio.gz ARCH=aarch64 scripts/build_claude_rootfs.sh
 
       - name: Download kernel

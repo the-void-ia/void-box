@@ -3,6 +3,9 @@
 # Sourced by build_guest_image.sh — not meant to be run directly.
 # Expects: guest_common.sh already sourced, OUT_DIR / ARCH / ROOT_DIR set.
 
+# shellcheck source=./kernel_pin.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel_pin.sh"
+
 # ── Shared libraries for claude-code (via ldd) ───────────────────────────
 
 install_claude_code_libs_linux() {
@@ -84,8 +87,8 @@ install_host_binaries() {
 #   VOID_BOX_KMOD_UPLOAD   — Upload number (e.g. "55"), defaults to KERNEL_UPLOAD
 install_kernel_modules_from_deb() {
   local dest="$1"
-  local kmod_version="${VOID_BOX_KMOD_VERSION:-${KERNEL_VER:-}}"
-  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-${KERNEL_UPLOAD:-}}"
+  local kmod_version="${VOID_BOX_KMOD_VERSION:-${KERNEL_VER:-$VOIDBOX_KERNEL_VER}}"
+  local kmod_upload="${VOID_BOX_KMOD_UPLOAD:-${KERNEL_UPLOAD:-$VOIDBOX_KERNEL_UPLOAD}}"
 
   if [[ -z "$kmod_version" || -z "$kmod_upload" ]]; then
     echo "[void-box] WARNING: VOID_BOX_KMOD_VERSION not set — cannot download modules"

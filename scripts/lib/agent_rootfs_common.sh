@@ -351,9 +351,9 @@ setup_busybox() {
 }
 
 # ── Kernel module pinning ──────────────────────────────────────────────────
-# In CI or when VOID_BOX_PINNED_KMODS=1, extract the pinned kernel version
-# from download_kernel.sh and export VOID_BOX_KMOD_VERSION / _UPLOAD.
-# Otherwise fall back to host kernel modules.
+# In CI or when VOID_BOX_PINNED_KMODS=1, pin VOID_BOX_KMOD_VERSION / _UPLOAD to
+# the shared kernel pin so the modules match the VM kernel from
+# download_kernel.sh. Otherwise fall back to host kernel modules.
 
 setup_pinned_kernel_modules() {
   local log_prefix="${1:-agent-rootfs}"
@@ -361,12 +361,10 @@ setup_pinned_kernel_modules() {
     return
   fi
   if [[ "${VOID_BOX_PINNED_KMODS:-0}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    local dl_script="$ROOT_DIR/scripts/download_kernel.sh"
-    local dl_kernel_ver dl_kernel_upload
-    dl_kernel_ver=$(sed -n 's/^KERNEL_VER="\${KERNEL_VER:-\([^}]*\)}"/\1/p' "$dl_script" 2>/dev/null | head -n 1)
-    dl_kernel_upload=$(sed -n 's/^KERNEL_UPLOAD="\${KERNEL_UPLOAD:-\([^}]*\)}"/\1/p' "$dl_script" 2>/dev/null | head -n 1)
-    export VOID_BOX_KMOD_VERSION="${dl_kernel_ver:-6.8.0-53}"
-    export VOID_BOX_KMOD_UPLOAD="${dl_kernel_upload:-55}"
+    # shellcheck source=./kernel_pin.sh
+    source "$_agent_rootfs_common_dir/kernel_pin.sh"
+    export VOID_BOX_KMOD_VERSION="$VOIDBOX_KERNEL_VER"
+    export VOID_BOX_KMOD_UPLOAD="$VOIDBOX_KERNEL_UPLOAD"
     echo "[$log_prefix] Using pinned kernel modules: ${VOID_BOX_KMOD_VERSION} (upload ${VOID_BOX_KMOD_UPLOAD})"
   else
     echo "[$log_prefix] Using host kernel modules for local build (uname -r=$(uname -r))"
