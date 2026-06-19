@@ -12,21 +12,21 @@
 # `.github/workflows/bump-agents.yml` job opens one PR per bumped tuple.
 
 [claude-code.linux.x86_64]
-version = "2.1.143"
+version = "2.1.177"
 url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-x64/claude"
-sha256 = "f75fdc3ff9d9cd494b86192f9e349b5c5c6d3970ed4d5cd5c7b330c5a2b1dcc4"
+sha256 = "ff41753634b20c869ef6a32a20863521b33d4186ac0d6a49379ab48a48395ee7"
 
 [claude-code.linux.aarch64]
-version = "2.1.143"
+version = "2.1.177"
 url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-arm64/claude"
-sha256 = "32e8edc4a5c3c41d18607c75d1b8e7bec643330c03e266be46ac3b41a446c4eb"
+sha256 = "baf3926dc166215772f959e367da9784ff4c75157aaafe4524fdc79ebff984b1"
 
 [codex.linux.x86_64]
-version = "0.137.0"
+version = "0.139.0"
 url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-x86_64-unknown-linux-musl.tar.gz"
-sha256 = "d96e88313b95597e9cbb8704f6db16dbb81c07142b08cfb628479ab433696931"
+sha256 = "12ebf70df41dc831061862912ab5e7eacdd112bb17e8ce9b2098cb3d92180081"
 
 [codex.linux.aarch64]
-version = "0.137.0"
+version = "0.139.0"
 url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-aarch64-unknown-linux-musl.tar.gz"
-sha256 = "1b9cae96e27f5da2752054a5bba9204d486939ea60c65df4ba4a638458734bda"
+sha256 = "2b7407643e0e74c525d84347c9eecec4b3d275af0382142ac42216508bb0b2a2"

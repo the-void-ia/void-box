@@ -129,4 +129,40 @@ mod pty_tests {
         assert_eq!(exit_code, 42);
         let _ = sandbox.stop().await;
     }
+
+    /// A child that exits shortly after the host closes the session must
+    /// still report its own exit code, not the teardown signal. In a
+    /// non-interactive run the host's stdin reaches EOF immediately, closing
+    /// the session while the child is still sleeping; the guest must let the
+    /// child finish rather than hanging it up first (which would surface as
+    /// `128 + SIGHUP = 129`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn pty_exit_code_survives_session_close() {
+        if let Some(reason) = skip_reason() {
+            eprintln!("SKIP: {}", reason);
+            return;
+        }
+
+        let sandbox = test_sandbox().unwrap();
+
+        let request = PtyOpenRequest {
+            cols: 80,
+            rows: 24,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 1; exit 42".to_string()],
+            env: vec![],
+            working_dir: None,
+            interactive: false,
+        };
+
+        let session = sandbox.attach_pty(request).await.unwrap();
+        let exit_code = tokio::task::spawn_blocking(move || session.run())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(exit_code, 42);
+        let _ = sandbox.stop().await;
+    }
 }
