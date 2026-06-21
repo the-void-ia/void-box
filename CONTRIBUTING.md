@@ -173,6 +173,14 @@ cargo doc --workspace --no-deps --all-features --exclude guest-agent
 - Ensure tests are deterministic and don't require external resources
 - Use mock sandboxes for tests that don't require KVM
 
+## Design Proposals: RFCs and ADRs
+
+For changes that are **large, complex, cross-cutting, or need review from other peers** before you commit to them — new subsystems, protocol/wire changes, security-sensitive designs, anything with non-obvious trade-offs — open an **RFC** first. The RFC is where the design, the alternatives, and the trade-offs get discussed before code lands. Once accepted, the concrete load-bearing decisions are recorded as immutable **ADRs**.
+
+Small, local, obvious changes skip the RFC and go straight to a PR.
+
+The full process, numbering rules, statuses, and templates live in [`docs/rfc/README.md`](docs/rfc/README.md), with the decision records indexed in [`docs/adr/README.md`](docs/adr/README.md).
+
 ## Pull Request Process
 
 1. **Update documentation** if you're changing user-facing features
