@@ -101,7 +101,7 @@ Provider behaviors in this RFC are confirmed against Claude Code 2.1.170 and ope
 
 ### B. Credential containment
 
-**Mechanism: the host injection proxy.** A host-side, TLS-terminating, header-injecting proxy, backed by the credential store, is the single committed mechanism for all credential delivery — API keys and OAuth alike. The proxy a client is pointed at is this run's own per-run listener, subject to the same per-run rule as all egress (§A). Only the clients that need a host-held credential are pointed at it (selective routing); the client trusts a per-run CA installed in the guest (name-constrained to the injected upstreams, so it can't impersonate arbitrary sites), the proxy rewrites the credential header(s) with the host-held secret, and forwards to the real upstream. The guest holds only placeholders (non-secret dummy values the proxy replaces).
+**Mechanism: the host injection proxy.** A host-side, TLS-terminating, header-injecting proxy, backed by the credential store, is the single committed mechanism for all credential delivery — API keys and OAuth alike. The proxy a client is pointed at is this run's own per-run listener, subject to the same per-run rule as all egress (§A). Only the clients that need a host-held credential are pointed at it (selective routing — the default; restrictive egress profiles route all traffic through the same proxy, §C); the client trusts a per-run CA installed in the guest (name-constrained to the injected upstreams, so it can't impersonate arbitrary sites), the proxy rewrites the credential header(s) with the host-held secret, and forwards to the real upstream. The guest holds only placeholders (non-secret dummy values the proxy replaces).
 
 ```mermaid
 flowchart LR
