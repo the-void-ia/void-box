@@ -38,3 +38,4 @@ Current behavior is described by code + `docs/architecture.md`; the RFC/ADR set 
 | #    | Title                          | Status   | Date       | Link                                            |
 |------|--------------------------------|----------|------------|-------------------------------------------------|
 | 0001 | RFC + ADR process              | Accepted | 2026-06-20 | [0001-rfc-adr-process.md](0001-rfc-adr-process.md) |
+| 0002 | Guest network egress and credential containment | Accepted | 2026-06-21 | [0002-guest-network-egress-and-credential-containment.md](0002-guest-network-egress-and-credential-containment.md) |
