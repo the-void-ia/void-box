@@ -1,4 +1,4 @@
-# ADR-0005: Model egress as a per-run profile with two-layer, name-based enforcement
+# ADR-0005: Model egress as a per-sandbox profile with two-layer, name-based enforcement
 
 - **Status:** Accepted
 - **Date:** 2026-06-27
@@ -10,7 +10,7 @@ Today's network layer is a SLIRP userspace stack with stateless NAT and a defaul
 
 ## Decision
 
-We will model egress as a per-run profile (a closed enum: `open` default, `monitored`, `allowlist`, `proxy-only`, `none`), enforced at two layers. The **network layer** (`EgressReach`) enforces coarse reach: `open` allows the internet minus a baseline metadata/RFC-1918 deny; the restrictive profiles default-deny and pin the guest to its own proxy listener — independently of proxy liveness, so a proxy crash fails closed, never open. The **proxy layer** enforces a fine-grained FQDN allow-list by hostname (CONNECT host / SNI), using Cilium `toFQDNs` vocabulary (`matchName` exact + `matchPattern` wildcard that does not cross `.`), and produces the audit log, rate-limits, and kill-switch. Names are resolved per connection at the proxy with a resolve-once SSRF pin (reject internal ranges, no connect-time re-resolve), so the guest never deals in IPs. `monitored` is destinations-only — a CONNECT-tunnel that sees the destination but never decrypts content and introduces no guest-trusted egress CA.
+We will model egress as a per-sandbox profile (a closed enum: `open` default, `monitored`, `allowlist`, `proxy-only`, `none`), enforced at two layers. The **network layer** (`EgressReach`) enforces coarse reach: `open` allows the internet minus a baseline metadata/RFC-1918 deny; the restrictive profiles default-deny and pin the guest to its own proxy listener — independently of proxy liveness, so a proxy crash fails closed, never open. The **proxy layer** enforces a fine-grained FQDN allow-list by hostname (CONNECT host / SNI), using Cilium `toFQDNs` vocabulary (`matchName` exact + `matchPattern` wildcard that does not cross `.`), and produces the audit log, rate-limits, and kill-switch. Names are resolved per connection at the proxy with a resolve-once SSRF pin (reject internal ranges, no connect-time re-resolve), so the guest never deals in IPs. `monitored` is destinations-only — a CONNECT-tunnel that sees the destination but never decrypts content and introduces no guest-trusted egress CA.
 
 ## Consequences
 
