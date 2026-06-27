@@ -1,10 +1,10 @@
 # RFC-0002: Guest network egress and credential containment
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Authors:** Cristian Spinetta
 - **Created:** 2026-06-21
 - **Discussion:** [PR #100](https://github.com/the-void-ia/void-box/pull/100)
-- **Related ADRs:** *(to be filed on acceptance)*
+- **Related ADRs:** ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006
 
 ## Summary
 
