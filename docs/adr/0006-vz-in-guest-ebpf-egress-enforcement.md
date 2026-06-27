@@ -6,7 +6,7 @@
 
 ## Context
 
-The network-layer reach floor (ADR-0005) must be enforced somewhere the untrusted guest cannot bypass. On KVM, void-box runs its own userspace SLIRP/NAT, so enforcement is host-side and bypass-resistant. VZ (Apple Virtualization.framework) has no such point: it attaches Apple's NAT directly, which exposes no host-side filter hook. That NAT also puts every VM on one shared segment, with a single gateway and no per-sandbox host address. So per-sandbox isolation cannot be done host-side by binding, and source IP is unsafe to authorize on (ARP-spoofable). The existing in-guest primitive, a blackhole-route deny-list, matches on destination prefix only and therefore cannot express the port-aware, default-deny allow-list that pin-to-proxy requires (a sandbox's own listener and a neighbour's differ by port on the shared gateway).
+The network-layer reach enforcement (ADR-0005) must sit somewhere the untrusted guest cannot bypass. On KVM, void-box runs its own userspace SLIRP/NAT, so enforcement is host-side and bypass-resistant. VZ (Apple Virtualization.framework) has no such point: it attaches Apple's NAT directly, which exposes no host-side filter hook. That NAT also puts every VM on one shared segment, with a single gateway and no per-sandbox host address. So per-sandbox isolation cannot be done host-side by binding, and source IP is unsafe to authorize on (ARP-spoofable). The existing in-guest primitive, a blackhole-route deny-list, matches on destination prefix only and therefore cannot express the port-aware, default-deny allow-list that pin-to-proxy requires (a sandbox's own listener and a neighbour's differ by port on the shared gateway).
 
 ## Decision
 
@@ -14,6 +14,6 @@ We will enforce VZ egress in-guest with a root-attached eBPF cgroup `connect4`/`
 
 ## Consequences
 
-- **Positive:** a real port-aware, default-deny egress floor on VZ; against the modeled uid-1000 adversary — which holds no `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_NET_RAW` — it is a boundary, not merely defense-in-depth; no kernel rebuild on either platform; the `connect4` destination rewrite supplies the transparent pin-to-proxy that VZ otherwise lacks.
+- **Positive:** a real port-aware, default-deny egress enforcement point on VZ; against the modeled uid-1000 adversary — which holds no `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_NET_RAW` — it is a boundary, not merely defense-in-depth; no kernel rebuild on either platform; the `connect4` destination rewrite supplies the transparent pin-to-proxy that VZ otherwise lacks.
 - **Negative / cost:** in-guest enforcement is subvertible by a uid-1000→root escalation (a kernel LPE or a guest-agent exploit) — beyond the primary threat model — which on VZ only leaves a transparent-egress audit-attribution residual (KVM is host-side and unaffected); eBPF coverage is connect/`sendmsg`-only and per-cgroup, and the program is offset-coupled to the pinned kernels.
 - **Follow-ups:** a host userspace TCP/IP stack (gvproxy-style) would move VZ enforcement host-side and close the residual, matching KVM — deferred to its own RFC. Validated by a VZ uid-1000 bypass test (raw socket, `sendmsg`, cgroup escape).
