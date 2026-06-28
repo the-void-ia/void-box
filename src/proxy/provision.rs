@@ -26,6 +26,28 @@ use crate::proxy::PROXY_TOKEN_HEADER;
 /// by the additive-trust env vars; no `ca-certificates` rebuild.
 pub const GUEST_CA_PATH: &str = "/home/sandbox/.voidbox-proxy-ca.pem";
 
+/// Guest path the rendered `/etc/hosts` content is staged to. Under
+/// `/etc/voidbox` (an allowed write root), because the guest-agent's `fs_guard`
+/// forbids host writes to `/etc/hosts` directly. The guest-agent mirrors this
+/// file into `/etc/hosts` on receipt (kept in sync with the guest-agent's
+/// `PROXY_HOSTS_CONFIG_PATH`).
+pub const GUEST_HOSTS_PATH: &str = "/etc/voidbox/hosts";
+
+/// Render the guest `/etc/hosts`: loopback plus the proxied-upstream → gateway
+/// aliases that redirect the client's TLS (SNI = upstream host) onto the
+/// per-sandbox proxy listener. Shared by host provisioning and the e2e test so
+/// both exercise the same bytes.
+pub fn render_guest_hosts(aliases: &[(String, String)]) -> String {
+    let mut hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
+    for (ip, host) in aliases {
+        hosts.push_str(ip);
+        hosts.push(' ');
+        hosts.push_str(host);
+        hosts.push('\n');
+    }
+    hosts
+}
+
 /// Non-secret placeholder the guest carries in the credential env var. The proxy
 /// overwrites it with the real key; some clients require a non-empty value.
 pub const ANTHROPIC_KEY_PLACEHOLDER: &str = "voidbox-proxy-placeholder";

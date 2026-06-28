@@ -41,8 +41,8 @@ use void_box::backend::{
 };
 use void_box::proxy::injector::{ApiKeyScheme, StaticApiKeyInjector};
 use void_box::proxy::{
-    assert_no_real_credential, build_guest_provisioning, ProxiedUpstream, ProxyCa, ProxyHandle,
-    ProxyToken, SandboxContext,
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedUpstream,
+    ProxyCa, ProxyHandle, ProxyToken, SandboxContext, GUEST_HOSTS_PATH,
 };
 use void_box_protocol::SessionSecret;
 
@@ -235,10 +235,30 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
         .await
         .expect("write CA into guest");
-    for (ip, host) in &provisioning.host_aliases {
-        let line = format!("{ip} {host}");
-        let script = format!("echo '{line}' >> /etc/hosts");
-        guest_sh(&*backend, &script).await;
+
+    // Exercise the real host-side hosts provisioning (not a shell `echo`): stage
+    // the rendered hosts file under /etc/voidbox, which the guest-agent mirrors
+    // into /etc/hosts with its own privileged write.
+    backend
+        .mkdir_p("/etc/voidbox")
+        .await
+        .expect("mkdir /etc/voidbox");
+    backend
+        .write_file(
+            GUEST_HOSTS_PATH,
+            render_guest_hosts(&provisioning.host_aliases).as_bytes(),
+        )
+        .await
+        .expect("stage proxy hosts");
+    if let Some(out) = guest_sh(&*backend, "cat /etc/hosts").await {
+        for (ip, host) in &provisioning.host_aliases {
+            assert!(
+                out.stdout_str().contains(&format!("{ip} {host}")),
+                "guest-agent did not mirror proxy alias '{ip} {host}' into /etc/hosts; \
+                 got: {}",
+                out.stdout_str()
+            );
+        }
     }
 
     // Exercise a credentialed call from inside the guest through the proxy.
