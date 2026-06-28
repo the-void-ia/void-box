@@ -17,10 +17,10 @@
 use crate::error::{Error, Result};
 use crate::llm::LlmProvider;
 use crate::proxy::injector::ApiKeyScheme;
-use crate::proxy::server::RunBinding;
+use crate::proxy::server::SandboxBinding;
 use crate::proxy::PROXY_TOKEN_HEADER;
 
-/// Guest path the per-run CA PEM is written to. Referenced by the additive-trust
+/// Guest path the per-sandbox CA PEM is written to. Referenced by the additive-trust
 /// env vars; no `ca-certificates` rebuild.
 pub const GUEST_CA_PATH: &str = "/tmp/voidbox-proxy-ca.pem";
 
@@ -41,14 +41,13 @@ pub struct ProxiedUpstream {
     /// Client env var for the additive CA-trust PEM path.
     pub ca_env: &'static str,
     /// Client env var that carries arbitrary request headers (used to deliver
-    /// the per-run proxy token), if the client supports one.
+    /// the per-sandbox proxy token), if the client supports one.
     pub custom_headers_env: Option<&'static str>,
 }
 
 impl ProxiedUpstream {
-    /// Map an [`LlmProvider`] to its Phase-0 proxied descriptor, or `None` if the
-    /// provider is not an API-key provider the proxy serves yet (local providers
-    /// inject no secret; OAuth providers are Phase 1).
+    /// Map an [`LlmProvider`] to its M0 proxied descriptor, or `None` if the
+    /// proxy does not serve the provider yet. M0 serves only Claude.
     pub fn for_provider(provider: &LlmProvider) -> Option<Self> {
         match provider {
             LlmProvider::Claude => Some(Self {
@@ -58,17 +57,15 @@ impl ProxiedUpstream {
                 ca_env: "NODE_EXTRA_CA_CERTS",
                 custom_headers_env: Some("ANTHROPIC_CUSTOM_HEADERS"),
             }),
-            LlmProvider::Custom { base_url, .. } => Some(Self {
-                host: host_from_base_url(base_url)?,
-                scheme: ApiKeyScheme::AnthropicXApiKey,
-                base_url_env: "ANTHROPIC_BASE_URL",
-                ca_env: "NODE_EXTRA_CA_CERTS",
-                custom_headers_env: Some("ANTHROPIC_CUSTOM_HEADERS"),
-            }),
-            // Codex API-key mode (Bearer to api.openai.com) needs config-file
-            // redirection in addition to env, handled with the OAuth path in
-            // Phase 1; local + OAuth providers are out of Phase-0 scope.
-            LlmProvider::Codex
+            // Custom is deferred to M1: its `env_vars()` already emits a real
+            // `ANTHROPIC_BASE_URL`, so redirecting it through the proxy depends on
+            // env precedence, and its base URL can carry a path that the proxy's
+            // `https://host:port` redirect would drop — both need handling and a
+            // VM test before it ships. Codex API-key mode needs `config.toml`
+            // redirection, so it lands in M1b with the rest of codex. Local + OAuth
+            // providers inject no host-held key here.
+            LlmProvider::Custom { .. }
+            | LlmProvider::Codex
             | LlmProvider::ClaudePersonal
             | LlmProvider::Ollama { .. }
             | LlmProvider::LmStudio { .. } => None,
@@ -81,7 +78,7 @@ impl ProxiedUpstream {
 pub struct GuestProvisioning {
     /// Env vars to inject into the guest exec environment.
     pub env: Vec<(String, String)>,
-    /// `(path, contents)` of the per-run CA PEM to write into the guest.
+    /// `(path, contents)` of the per-sandbox CA PEM to write into the guest.
     pub ca_file: (String, String),
     /// `(ip, host)` aliases to add to the guest's `/etc/hosts` so the upstream
     /// name resolves to the SLIRP/NAT gateway (and thus the proxy listener).
@@ -89,10 +86,10 @@ pub struct GuestProvisioning {
 }
 
 /// Build the guest provisioning for `upstream`, given the proxy `binding`, the
-/// per-run `ca_pem`, and the guest-visible `gateway_ip`.
+/// per-sandbox `ca_pem`, and the guest-visible `gateway_ip`.
 pub fn build_guest_provisioning(
     upstream: &ProxiedUpstream,
-    binding: &RunBinding,
+    binding: &SandboxBinding,
     ca_pem: &str,
     gateway_ip: &str,
 ) -> GuestProvisioning {
@@ -125,7 +122,7 @@ pub fn build_guest_provisioning(
 
 /// R14 gate: assert no real credential reaches the guest. `secret` is the
 /// host-held durable credential; it must not appear in any env value or file
-/// contents the run stages into the guest.
+/// contents the sandbox stages into the guest.
 pub fn assert_no_real_credential(
     env: &[(String, String)],
     files: &[(String, String)],
@@ -147,37 +144,13 @@ pub fn assert_no_real_credential(
     Ok(())
 }
 
-/// Extract the host from a base URL like `https://host:port/path`, without
-/// pulling in a URL parser. Returns `None` if no host can be found.
-fn host_from_base_url(base_url: &str) -> Option<String> {
-    let after_scheme = base_url.split_once("://").map(|(_, rest)| rest)?;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // Strip userinfo.
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    // An IPv6 literal is bracketed (`[::1]:443`); take the bracketed part as the
-    // host so the inner colons are not mistaken for a port separator.
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::{ApiKey, LlmProvider};
 
-    fn binding() -> RunBinding {
-        RunBinding {
+    fn binding() -> SandboxBinding {
+        SandboxBinding {
             port: 54321,
             token_hex: "deadbeef".to_string(),
         }
@@ -191,18 +164,15 @@ mod tests {
     }
 
     #[test]
-    fn maps_custom_host_from_base_url() {
-        let provider = LlmProvider::Custom {
+    fn only_claude_is_proxied_in_m0() {
+        // Custom is deferred to M1 (base-URL precedence + path handling); codex,
+        // OAuth, and local providers are out of M0 scope.
+        let custom = LlmProvider::Custom {
             base_url: "https://openrouter.ai/api/v1".to_string(),
             api_key: Some(ApiKey::new("sk-secret")),
             model: None,
         };
-        let upstream = ProxiedUpstream::for_provider(&provider).expect("custom maps");
-        assert_eq!(upstream.host, "openrouter.ai");
-    }
-
-    #[test]
-    fn local_and_oauth_providers_are_not_proxied_in_phase0() {
+        assert!(ProxiedUpstream::for_provider(&custom).is_none());
         assert!(ProxiedUpstream::for_provider(&LlmProvider::Codex).is_none());
         assert!(ProxiedUpstream::for_provider(&LlmProvider::ClaudePersonal).is_none());
         assert!(ProxiedUpstream::for_provider(&LlmProvider::ollama("m")).is_none());
@@ -256,22 +226,5 @@ mod tests {
 
         let files = vec![("/x".to_string(), "junk sk-ant-REAL junk".to_string())];
         assert!(assert_no_real_credential(&[], &files, "sk-ant-REAL").is_err());
-    }
-
-    #[test]
-    fn host_parsing_handles_ports_and_paths() {
-        assert_eq!(
-            host_from_base_url("https://api.anthropic.com").as_deref(),
-            Some("api.anthropic.com")
-        );
-        assert_eq!(
-            host_from_base_url("https://host:8443/v1").as_deref(),
-            Some("host")
-        );
-        assert_eq!(
-            host_from_base_url("http://user@h.example/x").as_deref(),
-            Some("h.example")
-        );
-        assert_eq!(host_from_base_url("not a url"), None);
     }
 }
