@@ -39,12 +39,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 
+use crate::backend::guest_host_gateway;
 use crate::llm::LlmProvider;
 use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
+use crate::proxy::{
+    assert_no_real_credential, build_guest_provisioning, start_proxy, ProxiedUpstream, ProxyCa,
+    ProxyHandle, ProxyToken, RunContext, StaticApiKeyInjector,
+};
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::spec::AgentMode;
@@ -58,6 +64,57 @@ const CLAUDE_HOME: &str = "/workspace/.claude";
 /// .mcp.json at the project root.
 const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
 const CLAUDE_ONBOARDING_PATH: &str = "/home/sandbox/.claude.json";
+
+/// Whether `key` carries a real provider API key that must be withheld from the
+/// guest when the credential proxy is active (the proxy injects it host-side).
+fn is_withheld_secret_env(key: &str) -> bool {
+    matches!(key, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY")
+}
+
+/// Resolve the host-held API key for a provider the Phase-0 proxy can serve.
+/// Returns `None` when no key is available (caller turns that into an error).
+fn resolve_provider_secret(provider: &LlmProvider) -> Option<SecretString> {
+    match provider {
+        LlmProvider::Claude => std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .map(SecretString::from),
+        LlmProvider::Custom {
+            api_key: Some(key), ..
+        } => Some(SecretString::from(key.expose_secret().to_string())),
+        _ => None,
+    }
+}
+
+/// A credential proxy registered for the current run: the handle keeps the
+/// per-run listener alive, and `exec_env` is the guest env (proxy base-URL, CA
+/// path, placeholder, token header) injected at exec time.
+struct ActiveCredentialProxy {
+    handle: ProxyHandle,
+    token_hex: String,
+    exec_env: Vec<(String, String)>,
+}
+
+impl ActiveCredentialProxy {
+    /// Stop the run's listener. Call after the agent exec completes.
+    async fn teardown(self) {
+        self.handle.unregister_run(&self.token_hex).await;
+    }
+}
+
+/// Redirect the proxied upstream hostnames to the guest→host gateway by writing
+/// `/etc/hosts`, so the client's TLS connection (SNI = upstream host) lands on
+/// the per-run proxy listener while the cert/name-constraint stay scoped to the
+/// real upstream name. Writes a minimal hosts file (loopback + aliases).
+async fn provision_proxy_hosts(sandbox: &Sandbox, aliases: &[(String, String)]) -> Result<()> {
+    let mut hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
+    for (ip, host) in aliases {
+        hosts.push_str(ip);
+        hosts.push(' ');
+        hosts.push_str(host);
+        hosts.push('\n');
+    }
+    sandbox.write_file("/etc/hosts", hosts.as_bytes()).await
+}
 
 /// Published output from a service agent.
 /// Contains only what agent_box knows: guest execution output.
@@ -135,6 +192,10 @@ struct BoxConfig {
     mock: bool,
     /// LLM provider (default: Claude)
     llm: LlmProvider,
+    /// Route the LLM provider's API key through the host credential-injection
+    /// proxy instead of forwarding it into the guest. Opt-in; default `false`
+    /// keeps the legacy env-forwarding behaviour unchanged.
+    credential_proxy: bool,
     /// Per-stage timeout in seconds (overrides the default vsock read timeout).
     /// `None` means use the system default (1200s / 20 minutes).
     timeout_secs: Option<u64>,
@@ -161,6 +222,7 @@ impl Default for BoxConfig {
             output_file: "/workspace/output.json".to_string(),
             mock: false,
             llm: LlmProvider::default(),
+            credential_proxy: false,
             timeout_secs: None,
             mode: AgentMode::default(),
             claude_credentials_host_path: None,
@@ -266,6 +328,19 @@ impl VoidBox {
         self
     }
 
+    /// Route the LLM provider's API key through the host credential-injection
+    /// proxy instead of forwarding it into the guest.
+    ///
+    /// Opt-in: with the default `false`, behaviour is unchanged. When enabled
+    /// for an API-key provider the proxy serves (Claude, Anthropic-compatible
+    /// Custom), the real key is withheld from the guest env and injected
+    /// host-side at egress; the guest carries only a placeholder + the per-run
+    /// CA + proxy token.
+    pub fn credential_proxy(mut self, enable: bool) -> Self {
+        self.config.credential_proxy = enable;
+        self
+    }
+
     /// Set a per-stage timeout in seconds.
     ///
     /// Overrides the system default (1200s / 20 min).  Useful when running
@@ -355,8 +430,16 @@ impl VoidBox {
             builder = builder.initramfs(i);
         }
 
-        // Inject LLM provider env vars first, then user overrides
+        // Inject LLM provider env vars first, then user overrides. When the
+        // credential proxy is enabled for a provider it serves, the real API
+        // key is withheld here (R14) — the proxy injects it host-side, and the
+        // guest receives only a placeholder via the run-time proxy env.
+        let withhold_secret = self.config.credential_proxy
+            && crate::proxy::ProxiedUpstream::for_provider(&self.config.llm).is_some();
         for (k, v) in self.config.llm.env_vars() {
+            if withhold_secret && is_withheld_secret_env(&k) {
+                continue;
+            }
             builder = builder.env(&k, &v);
         }
         for (k, v) in &self.config.env {
@@ -385,6 +468,82 @@ impl VoidBox {
         }
 
         builder.build()
+    }
+
+    /// Start the credential proxy for this run when opted in, deliver the
+    /// per-run CA + `/etc/hosts` redirect into the guest, and return the guest
+    /// env to inject at exec time. Returns `None` when the proxy is disabled.
+    ///
+    /// Errors (rather than silently falling back) when the proxy is enabled but
+    /// the provider is unsupported or no host key is available — a silent
+    /// fallback would forward the real key into the guest, defeating the point.
+    async fn maybe_setup_credential_proxy(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<ActiveCredentialProxy>> {
+        if !self.config.credential_proxy {
+            return Ok(None);
+        }
+        let provider = &self.config.llm;
+        let Some(upstream) = ProxiedUpstream::for_provider(provider) else {
+            return Err(crate::Error::Config(format!(
+                "credential_proxy is enabled but provider '{}' is not served by the Phase-0 proxy",
+                provider.description()
+            )));
+        };
+        let secret = resolve_provider_secret(provider).ok_or_else(|| {
+            crate::Error::Config(
+                "credential_proxy is enabled but no host API key was found for the provider".into(),
+            )
+        })?;
+        let secret_plain = secret.expose_secret().to_string();
+
+        // CA keygen + self-sign is CPU-bound; keep it off the async runtime.
+        let upstream_host = upstream.host.clone();
+        let ca = tokio::task::spawn_blocking(move || ProxyCa::generate(vec![upstream_host]))
+            .await
+            .map_err(|e| crate::Error::Network(format!("proxy CA task join failed: {e}")))??;
+        let ca = Arc::new(ca);
+        let ca_pem = ca.ca_cert_pem().to_string();
+        let injector = Arc::new(StaticApiKeyInjector::new(
+            upstream.host.clone(),
+            upstream.scheme,
+            secret,
+        ));
+        let ctx = RunContext::new(
+            ProxyToken::generate(),
+            ca,
+            injector,
+            vec![upstream.host.clone()],
+        );
+
+        let handle = start_proxy().await?;
+        let binding = handle.register_run(ctx).await?;
+        let provisioning =
+            build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
+
+        // R14: nothing staged into the guest may contain the real key.
+        assert_no_real_credential(
+            &provisioning.env,
+            std::slice::from_ref(&provisioning.ca_file),
+            &secret_plain,
+        )?;
+
+        sandbox
+            .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
+            .await?;
+        provision_proxy_hosts(sandbox, &provisioning.host_aliases).await?;
+
+        info!(
+            "[vm:{}] credential proxy active on port {} for {} (real key withheld from guest)",
+            self.name, binding.port, upstream.host
+        );
+
+        Ok(Some(ActiveCredentialProxy {
+            handle,
+            token_hex: binding.token_hex,
+            exec_env: provisioning.env,
+        }))
     }
 
     /// Provision security configuration into the guest.
@@ -768,6 +927,10 @@ impl VoidBox {
 
         self.provision_claude_bootstrap(sandbox).await?;
 
+        // Start the credential proxy (opt-in) and capture the guest env to
+        // inject at exec time.
+        let active_proxy = self.maybe_setup_credential_proxy(sandbox).await?;
+
         let tag = &self.name;
 
         // Write input data if provided
@@ -810,8 +973,13 @@ impl VoidBox {
             }
         }
 
+        let proxy_env = active_proxy
+            .as_ref()
+            .map(|p| p.exec_env.clone())
+            .unwrap_or_default();
+
         let tag_clone = tag.to_string();
-        let mut agent_result = sandbox
+        let exec_outcome = sandbox
             .exec_agent_streaming(
                 &self.config.llm,
                 &full_prompt,
@@ -819,7 +987,7 @@ impl VoidBox {
                     dangerously_skip_permissions: true,
                     extra_args,
                     timeout_secs: self.config.timeout_secs,
-                    ..Default::default()
+                    env: proxy_env,
                 },
                 |event| match event {
                     crate::observe::claude::AgentStreamEvent::ToolUse(ref tc) => {
@@ -832,7 +1000,13 @@ impl VoidBox {
                     }
                 },
             )
-            .await?;
+            .await;
+
+        // Tear down the per-run proxy listener regardless of exec outcome.
+        if let Some(proxy) = active_proxy {
+            proxy.teardown().await;
+        }
+        let mut agent_result = exec_outcome?;
 
         // Local providers (Ollama) have no real API cost; claude-code
         // still reports a dollar amount using Anthropic pricing, so zero it.
@@ -1208,6 +1382,46 @@ impl VoidBox {
 mod tests {
     use super::*;
     use crate::skill::Skill;
+
+    #[test]
+    fn withheld_secret_env_covers_provider_keys() {
+        assert!(is_withheld_secret_env("ANTHROPIC_API_KEY"));
+        assert!(is_withheld_secret_env("OPENAI_API_KEY"));
+        assert!(!is_withheld_secret_env("ANTHROPIC_BASE_URL"));
+        assert!(!is_withheld_secret_env("HOME"));
+    }
+
+    #[test]
+    fn resolve_secret_for_custom_provider_uses_configured_key() {
+        let provider = LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: Some(crate::llm::ApiKey::new("sk-custom-secret")),
+            model: None,
+        };
+        let secret = resolve_provider_secret(&provider).expect("custom key resolves");
+        assert_eq!(secret.expose_secret(), "sk-custom-secret");
+    }
+
+    #[test]
+    fn resolve_secret_none_for_local_and_oauth_providers() {
+        assert!(resolve_provider_secret(&LlmProvider::ClaudePersonal).is_none());
+        assert!(resolve_provider_secret(&LlmProvider::ollama("m")).is_none());
+        // Custom without a key yields nothing to inject.
+        assert!(resolve_provider_secret(&LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: None,
+            model: None,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn credential_proxy_builder_flag_defaults_off_and_sets() {
+        let off = VoidBox::new("b");
+        assert!(!off.config.credential_proxy);
+        let on = VoidBox::new("b").credential_proxy(true);
+        assert!(on.config.credential_proxy);
+    }
 
     #[test]
     fn test_agent_box_builder() {

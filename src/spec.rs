@@ -91,6 +91,11 @@ pub struct LlmSpec {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Route the provider's API key through the host credential-injection proxy
+    /// instead of forwarding it into the guest. Opt-in; default (absent/false)
+    /// preserves the legacy env-forwarding behaviour.
+    #[serde(default)]
+    pub credential_proxy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

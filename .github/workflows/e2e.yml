@@ -177,6 +177,10 @@ jobs:
           cargo test --test e2e_pty -- --ignored --test-threads=1 \
             --skip pty_command_not_allowed
 
+          # Credential-injection proxy: TLS-terminate, inject the host-held key,
+          # and assert no real credential reaches the guest.
+          cargo test --test e2e_credential_proxy -- --ignored --test-threads=1
+
       - name: Run snapshot integration tests
         # `KERNEL_VERSION` is not defined in this workflow, so a literal
         # `env: VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}`
