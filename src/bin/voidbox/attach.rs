@@ -483,6 +483,7 @@ mod tests {
             model: None,
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         };
         let provider = resolve_provider("claude", None, true, Some(&llm_spec)).unwrap();
         assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));
