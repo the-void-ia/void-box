@@ -20,9 +20,11 @@ use crate::proxy::injector::ApiKeyScheme;
 use crate::proxy::server::SandboxBinding;
 use crate::proxy::PROXY_TOKEN_HEADER;
 
-/// Guest path the per-sandbox CA PEM is written to. Referenced by the additive-trust
-/// env vars; no `ca-certificates` rebuild.
-pub const GUEST_CA_PATH: &str = "/tmp/voidbox-proxy-ca.pem";
+/// Guest path the per-sandbox CA PEM is written to. Lives under `/home` so it
+/// lands in an allowed guest write root — the guest-agent's `fs_guard` permits
+/// only `/workspace`, `/home`, and `/etc/voidbox`, and rejects `/tmp`. Referenced
+/// by the additive-trust env vars; no `ca-certificates` rebuild.
+pub const GUEST_CA_PATH: &str = "/home/sandbox/.voidbox-proxy-ca.pem";
 
 /// Non-secret placeholder the guest carries in the credential env var. The proxy
 /// overwrites it with the real key; some clients require a non-empty value.
