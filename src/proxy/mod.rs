@@ -76,7 +76,10 @@ pub mod token;
 
 pub use ca::ProxyCa;
 pub use injector::{ApiKeyScheme, StaticApiKeyInjector};
-pub use provision::{assert_no_real_credential, build_guest_provisioning, ProxiedUpstream};
+pub use provision::{
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedUpstream,
+    GUEST_HOSTS_PATH,
+};
 pub use server::{start_proxy, ProxyHandle, SandboxBinding};
 pub use token::{ProxyToken, PROXY_TOKEN_HEADER};
 

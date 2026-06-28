@@ -48,8 +48,9 @@ use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::proxy::{
-    assert_no_real_credential, build_guest_provisioning, start_proxy, ProxiedUpstream, ProxyCa,
-    ProxyHandle, ProxyToken, SandboxContext, StaticApiKeyInjector,
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, start_proxy,
+    ProxiedUpstream, ProxyCa, ProxyHandle, ProxyToken, SandboxContext, StaticApiKeyInjector,
+    GUEST_HOSTS_PATH,
 };
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
@@ -108,13 +109,17 @@ impl ActiveCredentialProxy {
     }
 }
 
-/// Redirect the proxied upstream hostnames to the guest→host gateway by writing
-/// `/etc/hosts`, so the client's TLS connection (SNI = upstream host) lands on
-/// the per-sandbox proxy listener while the cert/name-constraint stay scoped to the
-/// real upstream name. Writes a minimal hosts file (loopback + aliases).
+/// Redirect the proxied upstream hostnames to the guest→host gateway so the
+/// client's TLS connection (SNI = upstream host) lands on the per-sandbox proxy
+/// listener while the cert/name-constraint stay scoped to the real upstream name.
+///
+/// `fs_guard` forbids host writes to `/etc/hosts` directly, so the rendered hosts
+/// file is staged under `/etc/voidbox` (an allowed root); the guest-agent mirrors
+/// it into `/etc/hosts` with its own privileged write on receipt.
 async fn provision_proxy_hosts(sandbox: &Sandbox, aliases: &[(String, String)]) -> Result<()> {
-    let hosts = render_hosts_file(aliases);
-    sandbox.write_file("/etc/hosts", hosts.as_bytes()).await
+    let hosts = render_guest_hosts(aliases);
+    sandbox.mkdir_p("/etc/voidbox").await?;
+    sandbox.write_file(GUEST_HOSTS_PATH, hosts.as_bytes()).await
 }
 
 /// Refuse the credential proxy on platforms where its listener cannot be bound
@@ -134,20 +139,6 @@ fn ensure_credential_proxy_platform_supported() -> Result<()> {
          expose the credential-injecting parser to the host LAN (tracked for M1b)"
             .into(),
     ))
-}
-
-/// Render the minimal `/etc/hosts` (loopback + the proxied-upstream → gateway
-/// aliases) the proxy stages into the guest. Pure so the R14 audit can inspect
-/// the exact bytes that get written.
-fn render_hosts_file(aliases: &[(String, String)]) -> String {
-    let mut hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
-    for (ip, host) in aliases {
-        hosts.push_str(ip);
-        hosts.push(' ');
-        hosts.push_str(host);
-        hosts.push('\n');
-    }
-    hosts
 }
 
 /// Published output from a service agent.
@@ -603,8 +594,8 @@ impl VoidBox {
         let staged_files = [
             provisioning.ca_file.clone(),
             (
-                "/etc/hosts".to_string(),
-                render_hosts_file(&provisioning.host_aliases),
+                GUEST_HOSTS_PATH.to_string(),
+                render_guest_hosts(&provisioning.host_aliases),
             ),
         ];
         assert_no_real_credential(&staged_env, &staged_files, &secret_plain)?;
