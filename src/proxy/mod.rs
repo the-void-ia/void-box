@@ -9,35 +9,58 @@
 //! than linear in VM count, and lets a single per-connection handler pipeline
 //! serve both. The credential [`CredentialInjector`] and the egress
 //! `EgressPolicy`/tunnel/audit handlers are *stages in that pipeline*, selected
-//! per run via [`RunContext`].
+//! per sandbox via [`SandboxContext`].
 //!
 //! # The frozen pipeline contract
 //!
 //! Every guest connection is processed by a fixed sequence of stages. Later
 //! phases extend the proxy by swapping the trait objects carried on
-//! [`RunContext`] — **not** by editing the accept/relay loop in [`server`].
+//! [`SandboxContext`] — **not** by editing the accept/relay loop in [`server`].
 //! That separation is the whole point of freezing this interface now: the OAuth
 //! store (Phase 1) replaces the [`CredentialInjector`], and real egress
 //! policy/tunnelling/audit (Phase 2) replace [`AllowAllPolicy`] and
 //! [`DebugAuditSink`], without re-architecting the core.
 //!
 //! ```text
-//! guest conn ─▶ [auth]        per-run token → resolve RunContext (else reject+close)
+//! guest conn ─▶ [auth]        per-sandbox token → resolve SandboxContext (else reject+close)
 //!            ─▶ [destination] CONNECT host / TLS SNI / base-URL host
 //!            ─▶ [policy]      EgressPolicy::decision        (Phase 0: AllowAll)
 //!            ─▶ [injector]    CredentialInjector::inject    (Phase 0: static API key)
 //!               (Phase 2 alt: Tunnel — CONNECT pass-through, no TLS-term)
 //!            ─▶ [audit]       AuditSink::record             (Phase 0: debug log)
-//!            ─▶ upstream      re-resolve per connection, SSRF-pin
+//!            ─▶ upstream      resolve per connection, reject internal IPs (SSRF guard)
 //! ```
 //!
-//! # Process model
+//! # Process model — known deviation from the design
 //!
-//! Phase 0 runs the pipeline as an in-process tokio task (mirroring
-//! [`crate::sidecar`]). The pipeline and its untrusted HTTP/TLS parsing are
-//! kept behind the [`server`] boundary so a follow-up can move them into a
-//! separate low-privilege process without touching callers — the parser surface
-//! that motivates that split is contained here.
+//! The design (ADR-0003, R10) places the proxy in a **separate low-privilege
+//! process** from the host runtime: it parses attacker-controlled
+//! HTTP/TLS/CONNECT bytes on the host, in the hot path before any auth gate, so a
+//! parser compromise must not also be a host-runtime compromise. Phase 0 does
+//! **not** do that yet — the pipeline runs as in-process tokio tasks inside the
+//! host runtime, so a parser-RCE here is a host-runtime RCE. That is an accepted
+//! Phase-0 shortcut, not the designed end state, and it is required hardening
+//! before production. The untrusted parsing is kept behind the [`server`]
+//! boundary so moving it out-of-process is a deployment change rather than a
+//! caller-visible one. The containment invariant — no durable secret in the
+//! guest — does not depend on the split; the split bounds blast radius if the
+//! parser is exploited.
+//!
+//! # Snapshot / restore (R11)
+//!
+//! The design re-mints the per-sandbox CA and token on snapshot restore, because
+//! a snapshot that captured guest-held proxy material and reused it verbatim
+//! would defeat "per-sandbox ephemeral". A snapshot taken while the proxy is
+//! active *does* capture the guest's copy of the token and the CA public cert in
+//! guest RAM. What makes that harmless in Phase 0 is the host side: the CA
+//! private key and the credential store never enter guest RAM, the cmdline, or
+//! `vmm::snapshot` state, and the host listener + token are minted at agent-run
+//! time and torn down when the run ends — so a restored guest's captured token
+//! has no live listener to present to. The one residual is snapshot-then-clone
+//! while the original is still running: the clone's captured token could reach
+//! the original's live listener over the shared host-loopback mapping and get a
+//! real key injected. That window closes with re-mint-on-restore, which becomes
+//! load-bearing once provisioning moves to cold boot (kernel cmdline), in M1.
 
 use std::sync::Arc;
 
@@ -48,12 +71,13 @@ pub mod ca;
 pub mod injector;
 pub mod provision;
 pub mod server;
+pub mod ssrf;
 pub mod token;
 
 pub use ca::ProxyCa;
 pub use injector::{ApiKeyScheme, StaticApiKeyInjector};
 pub use provision::{assert_no_real_credential, build_guest_provisioning, ProxiedUpstream};
-pub use server::{start_proxy, ProxyHandle, RunBinding};
+pub use server::{start_proxy, ProxyHandle, SandboxBinding};
 pub use token::{ProxyToken, PROXY_TOKEN_HEADER};
 
 /// Outcome of the egress-policy stage for a destination host.
@@ -95,7 +119,7 @@ pub trait CredentialInjector: Send + Sync {
     ///
     /// Returns whether a credential was actually injected, so the audit log
     /// records ground truth rather than re-deriving it from the allow-set (the
-    /// two can diverge once a run permits more upstreams than the injector owns).
+    /// two can diverge once a sandbox permits more upstreams than the injector owns).
     fn inject(&self, host: &str, headers: &mut HeaderMap) -> bool;
 }
 
@@ -140,15 +164,15 @@ impl AuditSink for DebugAuditSink {
     }
 }
 
-/// Per-run state the proxy resolves from a presented [`ProxyToken`]. Holds the
-/// pipeline's swappable handler stages plus the run's CA and the set of
-/// upstream hostnames the run is permitted to reach (also the CA's name
+/// Per-sandbox state the proxy resolves from a presented [`ProxyToken`]. Holds the
+/// pipeline's swappable handler stages plus the sandbox's CA and the set of
+/// upstream hostnames the sandbox is permitted to reach (also the CA's name
 /// constraints).
 #[derive(Clone)]
-pub struct RunContext {
-    /// Per-run auth token the guest presents on each connection.
+pub struct SandboxContext {
+    /// Per-sandbox auth token the guest presents on each connection.
     pub token: ProxyToken,
-    /// Per-run name-constrained CA used to terminate the guest's TLS.
+    /// Per-sandbox name-constrained CA used to terminate the guest's TLS.
     pub ca: Arc<ProxyCa>,
     /// Credential-rewrite stage.
     pub injector: Arc<dyn CredentialInjector>,
@@ -156,7 +180,7 @@ pub struct RunContext {
     pub policy: Arc<dyn EgressPolicy>,
     /// Audit stage.
     pub audit: Arc<dyn AuditSink>,
-    /// Upstream hosts this run may reach (CA name-constraint + SSRF allow-set).
+    /// Upstream hosts this sandbox may reach (CA name-constraint + SSRF allow-set).
     pub allowed_upstreams: Vec<String>,
     /// Port to re-originate to on the upstream host. Always 443 in production
     /// (HTTPS providers); overridable so tests can target a local mock.
@@ -166,8 +190,8 @@ pub struct RunContext {
 /// Default upstream port: HTTPS.
 pub const DEFAULT_UPSTREAM_PORT: u16 = 443;
 
-impl RunContext {
-    /// Build a run context with the Phase-0 default policy (allow-all) and audit
+impl SandboxContext {
+    /// Build a sandbox context with the Phase-0 default policy (allow-all) and audit
     /// sink (debug log). The CA is name-constrained to `allowed_upstreams`.
     pub fn new(
         token: ProxyToken,
@@ -193,7 +217,7 @@ impl RunContext {
         self
     }
 
-    /// Whether `host` is in this run's permitted upstream set. Used both as the
+    /// Whether `host` is in this sandbox's permitted upstream set. Used both as the
     /// SSRF allow-set and to mirror the CA's name constraints at request time.
     pub fn permits_upstream(&self, host: &str) -> bool {
         self.allowed_upstreams

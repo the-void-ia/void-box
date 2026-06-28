@@ -1,10 +1,10 @@
-//! Per-run proxy authentication token.
+//! Per-sandbox proxy authentication token.
 //!
 //! The token is a neighbour guard, not an in-guest-adversary control: it is
 //! readable by the guest (it has to be, so the configured client can present
 //! it), so its job is to stop one sandbox from using another sandbox's proxy
-//! run-slot, and to give the proxy a stable key to resolve the per-run
-//! [`RunContext`](crate::proxy::RunContext). It is checked on every guest
+//! sandbox-slot, and to give the proxy a stable key to resolve the per-sandbox
+//! [`SandboxContext`](crate::proxy::SandboxContext). It is checked on every guest
 //! connection and **stripped** before the request is forwarded upstream so it
 //! never leaks to the provider.
 //!
@@ -17,16 +17,16 @@ use std::fmt;
 use subtle::ConstantTimeEq;
 
 /// Number of random bytes behind a token. 256 bits of entropy makes the token
-/// space large enough that guessing another run's slot is infeasible.
+/// space large enough that guessing another sandbox's slot is infeasible.
 const TOKEN_BYTES: usize = 32;
 
-/// HTTP header the guest client uses to present its per-run proxy token.
+/// HTTP header the guest client uses to present its per-sandbox proxy token.
 ///
 /// Carried on the guest→proxy hop only; the proxy strips it before
 /// re-originating to the upstream.
 pub const PROXY_TOKEN_HEADER: &str = "x-voidbox-proxy-token";
 
-/// A per-run proxy token. Compares in constant time and redacts itself in
+/// A per-sandbox proxy token. Compares in constant time and redacts itself in
 /// `Debug` so it never lands in logs verbatim.
 #[derive(Clone)]
 pub struct ProxyToken {

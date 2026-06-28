@@ -1,16 +1,16 @@
-//! Per-run, name-constrained certificate authority for the injection proxy.
+//! Per-sandbox, name-constrained certificate authority for the injection proxy.
 //!
 //! The proxy terminates the guest's TLS so it can rewrite the credential
 //! header. To make that trustable without turning the guest into a universal
-//! MITM target, each run gets its own short-lived CA whose authority is
-//! **name-constrained** to exactly the upstream hosts the run injects into. A
+//! MITM target, each sandbox gets its own short-lived CA whose authority is
+//! **name-constrained** to exactly the upstream hosts the sandbox injects into. A
 //! leaked or guest-readable CA cert can therefore impersonate only those
 //! upstreams, not arbitrary sites — and only the public cert is ever installed
 //! in the guest; the private key never leaves this host process (so it is
 //! structurally absent from any snapshot).
 //!
-//! Leaf certificates are minted lazily, per TLS ClientHello SNI, by
-//! [`LeafResolver`] and cached for the run's lifetime, so a single per-run
+//! Leaf certificates are minted lazily, per TLS ClientHello SNI, by an internal
+//! `LeafResolver` and cached for the sandbox's lifetime, so a single per-sandbox
 //! listener can serve several credentialed upstreams (Phase 0 uses one).
 //!
 //! ECDSA P-256 is chosen because keygen is on the cold-start budget and P-256
@@ -31,7 +31,7 @@ use rustls::ServerConfig;
 
 use crate::error::{Error, Result};
 
-/// A per-run CA that mints leaf certificates name-constrained to the run's
+/// A per-sandbox CA that mints leaf certificates name-constrained to the sandbox's
 /// injected upstream hosts.
 pub struct ProxyCa {
     /// PEM of the CA's public certificate — the only CA material that enters
@@ -47,7 +47,7 @@ pub struct ProxyCa {
 }
 
 impl ProxyCa {
-    /// Generate a fresh per-run CA name-constrained to `allowed_upstreams`.
+    /// Generate a fresh per-sandbox CA name-constrained to `allowed_upstreams`.
     pub fn generate(allowed_upstreams: Vec<String>) -> Result<Self> {
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|e| Error::Network(format!("proxy CA keygen failed: {e}")))?;
@@ -57,7 +57,7 @@ impl ProxyCa {
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params
             .distinguished_name
-            .push(DnType::CommonName, "void-box per-run proxy CA");
+            .push(DnType::CommonName, "void-box per-sandbox proxy CA");
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::DigitalSignature,

@@ -1,7 +1,7 @@
 //! End-to-end credential-proxy integration test.
 //!
 //! Boots a real VM, stands up the host-side injection proxy plus a mock TLS
-//! upstream, provisions the guest (per-run CA + `/etc/hosts` redirect of the
+//! upstream, provisions the guest (per-sandbox CA + `/etc/hosts` redirect of the
 //! upstream name to the gateway), and exercises a credentialed call from inside
 //! the guest. Asserts that:
 //! - the host-held key is injected and reaches the upstream,
@@ -42,7 +42,7 @@ use void_box::backend::{
 use void_box::proxy::injector::{ApiKeyScheme, StaticApiKeyInjector};
 use void_box::proxy::{
     assert_no_real_credential, build_guest_provisioning, ProxiedUpstream, ProxyCa, ProxyHandle,
-    ProxyToken, RunContext,
+    ProxyToken, SandboxContext,
 };
 use void_box_protocol::SessionSecret;
 
@@ -216,9 +216,9 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         ApiKeyScheme::AnthropicXApiKey,
         SecretString::from(REAL_KEY),
     ));
-    let ctx = RunContext::new(token, ca, injector, vec![UPSTREAM_HOST.to_string()])
+    let ctx = SandboxContext::new(token, ca, injector, vec![UPSTREAM_HOST.to_string()])
         .with_upstream_port(mock_addr.port());
-    let binding = proxy.register_run(ctx).await.expect("register run");
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
 
     // Provision the guest: write the CA, redirect the upstream name to the
     // gateway, and assert R14 (no real key in the staged env/files).
@@ -276,5 +276,5 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         }
     }
 
-    proxy.unregister_run(&binding.token_hex).await;
+    proxy.unregister_sandbox(&binding.token_hex).await;
 }
