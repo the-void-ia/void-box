@@ -426,6 +426,130 @@ async fn client_enforces_ca_name_constraints() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rejects_cross_sandbox_token() {
+    // On the shared proxy, sandbox A's token presented to sandbox B's listener
+    // must be rejected — this is the load-bearing cross-sandbox control on KVM in
+    // M0 (the per-sandbox network rule is not implemented yet, so a neighbour can
+    // reach B's listener over the shared loopback). B's token authenticates B's
+    // guest; A's does not.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+
+    let (ctx_a, _token_a, token_a_hex) = sandbox_context(mock_addr.port());
+    let (ctx_b, _token_b, token_b_hex) = sandbox_context(mock_addr.port());
+    let ca_b_pem = ctx_b.ca.ca_cert_pem().to_string();
+
+    let _binding_a = proxy.register_sandbox(ctx_a).await.expect("register A");
+    let binding_b = proxy.register_sandbox(ctx_b).await.expect("register B");
+
+    // A neighbour reaching B's listener trusts B's CA (that is what completes the
+    // TLS handshake); it then presents the only token it holds — its own, A's.
+    let connector = guest_connector(&ca_b_pem);
+    let (status, _) = guest_request(
+        &connector,
+        binding_b.port,
+        Some(&token_a_hex),
+        UPSTREAM_HOST,
+        b"",
+    )
+    .await
+    .expect("guest request");
+    assert_eq!(status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "upstream must not be called for a cross-sandbox token"
+    );
+
+    proxy.unregister_sandbox(&token_a_hex).await;
+    proxy.unregister_sandbox(&token_b_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssrf_guard_rejects_internal_name_through_production_client() {
+    use void_box::proxy::ssrf::SsrfGuardResolver;
+
+    // Build the upstream client with the exact wiring `start_proxy` uses:
+    // redirects disabled, host proxy env ignored, and every upstream name
+    // resolved through the SSRF guard. This exercises the guard as it ships, not
+    // the `is_internal_ip` unit alone.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(SsrfGuardResolver))
+        .build()
+        .expect("upstream client");
+
+    // `localhost` resolves to a loopback address, which is in the baseline-deny
+    // set, so the guard must refuse the resolution before any connection.
+    let err = client
+        .get("https://localhost/")
+        .send()
+        .await
+        .expect_err("guard must refuse an internal upstream");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("SSRF guard"),
+        "error must originate from the SSRF guard, got: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_oversize_header_block() {
+    // The proxy caps its per-connection read buffer at 64 KiB (R10: strict size
+    // limits on the guest-controlled parser surface). A header block larger than
+    // that cannot be parsed, so the request does not complete and the upstream is
+    // never reached.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, _token, token_hex) = sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let tcp = TcpStream::connect(("127.0.0.1", binding.port))
+        .await
+        .expect("connect proxy");
+    let server_name = ServerName::try_from(UPSTREAM_HOST.to_string()).expect("server name");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("handshake");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("http1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let oversize = "a".repeat(80 * 1024);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("host", UPSTREAM_HOST)
+        .header("x-api-key", PLACEHOLDER_KEY)
+        .header(PROXY_TOKEN_HEADER, &token_hex)
+        .header("x-voidbox-oversize", oversize)
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let result = sender.send_request(req).await;
+
+    match result {
+        Err(_) => {}
+        Ok(resp) => assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "an oversize header block must not be proxied through"
+        ),
+    }
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "upstream must not be called for an oversize header block"
+    );
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn proxy_does_not_negotiate_h2_and_serves_http1() {
     // V1: the proxy is HTTP/1.1-only on the client hop. A client that prefers
     // HTTP/2 (offers `h2` first in ALPN) must not end up believing it negotiated

@@ -434,6 +434,16 @@ impl VoidBox {
 
     /// Create the sandbox from the current configuration.
     fn create_sandbox(&self) -> Result<Arc<Sandbox>> {
+        // Reject an unusable credential-proxy configuration before staging any
+        // env or booting the guest. `withhold_provider_secret` is false for a
+        // provider the proxy does not serve, so without this gate an unsupported
+        // provider would boot with the real key in its exec env and only fail
+        // once `maybe_setup_credential_proxy` runs — after the pre-run
+        // provisioning execs have already seen it (R14).
+        if self.config.credential_proxy {
+            self.validate_credential_proxy_preconditions()?;
+        }
+
         let mut builder = if self.config.mock {
             Sandbox::mock()
         } else {
@@ -488,6 +498,22 @@ impl VoidBox {
         }
 
         builder.build()
+    }
+
+    /// Fail closed on a credential-proxy configuration the M0 proxy cannot serve,
+    /// before any guest env is staged. Provider support is platform-independent,
+    /// so it is checked first — an unsupported provider reports the provider error
+    /// on every host — and the Linux/KVM-only platform gate second.
+    fn validate_credential_proxy_preconditions(&self) -> Result<()> {
+        if ProxiedUpstream::for_provider(&self.config.llm).is_none() {
+            return Err(crate::Error::Config(format!(
+                "credential_proxy is enabled but provider '{}' is not served by the \
+                 Phase-0 proxy (M0 serves Claude only)",
+                self.config.llm.description()
+            )));
+        }
+        ensure_credential_proxy_platform_supported()?;
+        Ok(())
     }
 
     /// Whether the real provider key must be withheld from the guest because the
@@ -1522,6 +1548,28 @@ mod tests {
         assert!(kept
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-REAL"));
+    }
+
+    #[test]
+    fn credential_proxy_rejects_unsupported_provider_before_provisioning() {
+        // An unsupported provider with `credential_proxy` must fail at build time
+        // — before any env is staged or the guest boots — rather than staging the
+        // real key and only aborting once `maybe_setup_credential_proxy` runs.
+        // Provider support is platform-independent, so this asserts the provider
+        // error on both Linux and macOS.
+        let err = match VoidBox::new("b")
+            .llm(LlmProvider::Codex)
+            .credential_proxy(true)
+            .build()
+        {
+            Ok(_) => panic!("unsupported provider under credential_proxy must fail to build"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not served by the Phase-0 proxy"),
+            "expected a provider-unsupported error, got: {msg}"
+        );
     }
 
     #[test]

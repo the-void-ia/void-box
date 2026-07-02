@@ -2907,11 +2907,19 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
     // it into `/etc/hosts` with the guest-agent's own (root) write, so the host
     // never needs `fs_guard` access to `/etc`. The staged content is already the
     // full hosts file (loopback + proxy aliases), so this is a plain overwrite.
+    // The mirror is the point of staging this path, so a mirror failure fails the
+    // RPC — otherwise the host reports success while the upstream name never
+    // resolves to the proxy and the credentialed call fails later, opaquely.
     if request.path == PROXY_HOSTS_CONFIG_PATH {
-        match std::fs::write("/etc/hosts", &request.content) {
-            Ok(()) => kmsg("Applied proxy hosts to /etc/hosts"),
-            Err(e) => kmsg(&format!("Failed to apply proxy hosts to /etc/hosts: {}", e)),
+        if let Err(e) = std::fs::write("/etc/hosts", &request.content) {
+            let msg = format!("Failed to apply proxy hosts to /etc/hosts: {}", e);
+            kmsg(&msg);
+            return WriteFileResponse {
+                success: false,
+                error: Some(msg),
+            };
         }
+        kmsg("Applied proxy hosts to /etc/hosts");
     }
 
     WriteFileResponse {

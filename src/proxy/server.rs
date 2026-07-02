@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 use crate::backend::guest_accessible_bind_addr;
 use crate::error::{Error, Result};
 use crate::proxy::ssrf::SsrfGuardResolver;
-use crate::proxy::{EgressEvent, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER};
+use crate::proxy::{EgressEvent, InjectOutcome, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER};
 
 /// Cap on hyper's per-connection read buffer (headers + request-line). Bounds
 /// the host memory a single guest connection can pin in the parser before any
@@ -58,13 +58,24 @@ type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
 /// What [`ProxyHandle::register_sandbox`] returns: how the guest reaches this sandbox's
 /// proxy listener and the token it must present.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SandboxBinding {
     /// Host-side port the sandbox's listener bound to (reachable from the guest via
     /// the SLIRP/NAT gateway).
     pub port: u16,
     /// Per-sandbox token, hex-encoded, for the guest to present on each connection.
     pub token_hex: String,
+}
+
+impl std::fmt::Debug for SandboxBinding {
+    /// Redacts `token_hex` so a `{:?}` of a binding never lands the per-sandbox
+    /// token in a log, mirroring [`ProxyToken`]'s redacting `Debug` (R15).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxBinding")
+            .field("port", &self.port)
+            .field("token_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One registered run: its listener task and a shutdown signal.
@@ -74,8 +85,11 @@ struct SandboxSlot {
     port: u16,
 }
 
-/// Handle to the shared proxy process. Created once and kept warm; sandboxes are
-/// registered and unregistered as they start and stop.
+/// Handle to the proxy: it owns the per-sandbox listener tasks and the shared
+/// upstream client. The interface supports registering and unregistering several
+/// sandboxes on one handle, but M0 stands up a handle per agent run in
+/// [`crate::agent_box`] and registers that run's single sandbox — the
+/// "one shared proxy process" of ADR-0003 is a later milestone.
 pub struct ProxyHandle {
     sandboxes: Arc<Mutex<HashMap<String, SandboxSlot>>>,
     upstream: reqwest::Client,
@@ -291,7 +305,24 @@ async fn proxy_request(
     headers.remove(CONTENT_LENGTH);
 
     // --- inject: rewrite the credential header for this exact host ---
-    let injected = ctx.injector.inject(&host, &mut headers);
+    // A failed injection for a host the injector owns (e.g. a malformed
+    // host-held key) must fail closed: forwarding the request without the
+    // credential would send an unauthenticated call upstream and mis-record it as
+    // credentialed. Return 502 and audit `injected: false` instead.
+    let injected = match ctx.injector.inject(&host, &mut headers) {
+        InjectOutcome::Injected => true,
+        InjectOutcome::NotOwned => false,
+        InjectOutcome::Failed => {
+            ctx.audit.record(EgressEvent {
+                host: host.to_string(),
+                port: ctx.upstream_port,
+                allowed: true,
+                injected: false,
+            });
+            warn!(host = %host, "proxy: credential injection failed; refusing to forward uncredentialed");
+            return text_response(StatusCode::BAD_GATEWAY, "credential injection failed");
+        }
+    };
 
     let path_and_query = parts
         .uri
