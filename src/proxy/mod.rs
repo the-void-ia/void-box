@@ -113,17 +113,34 @@ pub struct EgressEvent {
     pub injected: bool,
 }
 
+/// Outcome of the credential-injection stage for one request. Three states,
+/// because the caller must fail closed on a failed injection but forward an
+/// unowned host — a single boolean cannot tell those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// A credential header was written for this host.
+    Injected,
+    /// This injector does not own `host`; no credential applies, and the request
+    /// proceeds unchanged.
+    NotOwned,
+    /// This injector owns `host` but could not produce a valid credential header
+    /// (e.g. a malformed key). The caller must reject the request rather than
+    /// forward it uncredentialed.
+    Failed,
+}
+
 /// Rewrites the credential header(s) on a request bound for `host` with the
 /// host-held secret. Phase 0 ships [`StaticApiKeyInjector`]; Phase 1 swaps in an
 /// OAuth-backed implementation that mints a short-lived Bearer per call.
 pub trait CredentialInjector: Send + Sync {
     /// Inject the credential for `host` into `headers`, replacing any
-    /// guest-supplied placeholder. A no-op for hosts this injector does not own.
+    /// guest-supplied placeholder.
     ///
-    /// Returns whether a credential was actually injected, so the audit log
-    /// records ground truth rather than re-deriving it from the allow-set (the
-    /// two can diverge once a sandbox permits more upstreams than the injector owns).
-    fn inject(&self, host: &str, headers: &mut HeaderMap) -> bool;
+    /// Returns an [`InjectOutcome`] so the caller can fail closed on a failed
+    /// injection and the audit log records ground truth rather than re-deriving
+    /// it from the allow-set (the two can diverge once a sandbox permits more
+    /// upstreams than the injector owns).
+    fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome;
 }
 
 /// Decides whether a destination host may be reached. Phase 2 replaces the

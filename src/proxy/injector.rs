@@ -16,7 +16,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::warn;
 
-use crate::proxy::CredentialInjector;
+use crate::proxy::{CredentialInjector, InjectOutcome};
 
 /// Anthropic credential header.
 const ANTHROPIC_API_KEY_HEADER: &str = "x-api-key";
@@ -56,14 +56,17 @@ impl StaticApiKeyInjector {
 }
 
 /// Set `name: value`, replacing any existing (guest-supplied placeholder) value,
-/// and mark the value sensitive so it is excluded from header debug output. A
-/// malformed value (non-visible-ASCII secret) is dropped with a warning rather
-/// than forwarded, so a bad key can never leak as a literal header.
-fn set_secret_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+/// and mark the value sensitive so it is excluded from header debug output.
+/// Returns `false` for a malformed value (non-visible-ASCII secret): the header
+/// is removed rather than forwarded, so a bad key can never leak as a literal
+/// header, and the caller fails the request closed rather than sending it
+/// uncredentialed.
+fn set_secret_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> bool {
     match HeaderValue::from_str(value) {
         Ok(mut header_value) => {
             header_value.set_sensitive(true);
             headers.insert(HeaderName::from_static(name), header_value);
+            true
         }
         Err(_) => {
             warn!(
@@ -71,27 +74,32 @@ fn set_secret_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
                 "dropping credential header: value not valid ASCII"
             );
             headers.remove(name);
+            false
         }
     }
 }
 
 impl CredentialInjector for StaticApiKeyInjector {
-    fn inject(&self, host: &str, headers: &mut HeaderMap) -> bool {
+    fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome {
         if !self.host.eq_ignore_ascii_case(host) {
-            return false;
+            return InjectOutcome::NotOwned;
         }
         let secret = self.api_key.expose_secret();
-        match self.scheme {
+        let ok = match self.scheme {
             ApiKeyScheme::AnthropicXApiKey => {
                 headers.remove(AUTHORIZATION_HEADER);
-                set_secret_header(headers, ANTHROPIC_API_KEY_HEADER, secret);
+                set_secret_header(headers, ANTHROPIC_API_KEY_HEADER, secret)
             }
             ApiKeyScheme::Bearer => {
                 headers.remove(ANTHROPIC_API_KEY_HEADER);
-                set_secret_header(headers, AUTHORIZATION_HEADER, &format!("Bearer {secret}"));
+                set_secret_header(headers, AUTHORIZATION_HEADER, &format!("Bearer {secret}"))
             }
+        };
+        if ok {
+            InjectOutcome::Injected
+        } else {
+            InjectOutcome::Failed
         }
-        true
     }
 }
 
@@ -120,7 +128,10 @@ mod tests {
             SecretString::from("sk-real-secret"),
         );
         let mut headers = placeholder_headers();
-        assert!(injector.inject("api.anthropic.com", &mut headers));
+        assert_eq!(
+            injector.inject("api.anthropic.com", &mut headers),
+            InjectOutcome::Injected
+        );
 
         assert_eq!(headers.get("x-api-key").unwrap(), "sk-real-secret");
         assert!(headers.get("authorization").is_none());
@@ -134,7 +145,10 @@ mod tests {
             SecretString::from("sk-openai-secret"),
         );
         let mut headers = placeholder_headers();
-        injector.inject("api.openai.com", &mut headers);
+        assert_eq!(
+            injector.inject("api.openai.com", &mut headers),
+            InjectOutcome::Injected
+        );
 
         assert_eq!(
             headers.get("authorization").unwrap(),
@@ -151,7 +165,10 @@ mod tests {
             SecretString::from("sk-real-secret"),
         );
         let mut headers = HeaderMap::new();
-        assert!(!injector.inject("evil.example.com", &mut headers));
+        assert_eq!(
+            injector.inject("evil.example.com", &mut headers),
+            InjectOutcome::NotOwned
+        );
         assert!(headers.get("x-api-key").is_none());
     }
 
@@ -165,5 +182,26 @@ mod tests {
         let mut headers = HeaderMap::new();
         injector.inject("api.anthropic.com", &mut headers);
         assert!(headers.get("x-api-key").unwrap().is_sensitive());
+    }
+
+    #[test]
+    fn malformed_key_for_owned_host_fails_and_drops_header() {
+        // A key with a non-visible-ASCII byte cannot become a header value. The
+        // injector must report `Failed` (so the caller fails closed) and leave no
+        // credential header behind — never forward the placeholder or a partial.
+        let injector = StaticApiKeyInjector::new(
+            "api.anthropic.com",
+            ApiKeyScheme::AnthropicXApiKey,
+            SecretString::from("sk-bad\nkey"),
+        );
+        let mut headers = placeholder_headers();
+        assert_eq!(
+            injector.inject("api.anthropic.com", &mut headers),
+            InjectOutcome::Failed
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "a malformed key must not be forwarded as a header"
+        );
     }
 }
