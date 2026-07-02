@@ -39,12 +39,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 
+use crate::backend::guest_host_gateway;
 use crate::llm::LlmProvider;
 use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
+use crate::proxy::{
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, start_proxy,
+    ProxiedUpstream, ProxyCa, ProxyHandle, ProxyToken, SandboxContext, StaticApiKeyInjector,
+    GUEST_HOSTS_PATH,
+};
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
 use crate::spec::AgentMode;
@@ -58,6 +65,81 @@ const CLAUDE_HOME: &str = "/workspace/.claude";
 /// .mcp.json at the project root.
 const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
 const CLAUDE_ONBOARDING_PATH: &str = "/home/sandbox/.claude.json";
+
+/// Whether `key` carries a real provider API key that must be withheld from the
+/// guest when the credential proxy is active (the proxy injects it host-side).
+fn is_withheld_secret_env(key: &str) -> bool {
+    matches!(key, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY")
+}
+
+/// Drop the provider's credential env when the credential proxy will supply it
+/// host-side (R14). Pure (no host-env dependence) so the withholding can be
+/// tested directly rather than only through a provider whose `env_vars()` reads
+/// the ambient environment.
+fn filter_withheld_env(env: Vec<(String, String)>, withhold: bool) -> Vec<(String, String)> {
+    env.into_iter()
+        .filter(|(k, _)| !withhold || !is_withheld_secret_env(k))
+        .collect()
+}
+
+/// Resolve the host-held API key for a provider the M0 proxy serves (Claude).
+/// Returns `None` when no key is available (caller turns that into an error).
+fn resolve_provider_secret(provider: &LlmProvider) -> Option<SecretString> {
+    match provider {
+        LlmProvider::Claude => std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .map(SecretString::from),
+        _ => None,
+    }
+}
+
+/// A credential proxy registered for the current sandbox: the handle keeps the
+/// per-sandbox listener alive, and `exec_env` is the guest env (proxy base-URL, CA
+/// path, placeholder, token header) injected at exec time.
+struct ActiveCredentialProxy {
+    handle: ProxyHandle,
+    token_hex: String,
+    exec_env: Vec<(String, String)>,
+}
+
+impl ActiveCredentialProxy {
+    /// Stop the sandbox's listener. Call after the agent exec completes.
+    async fn teardown(self) {
+        self.handle.unregister_sandbox(&self.token_hex).await;
+    }
+}
+
+/// Redirect the proxied upstream hostnames to the guest→host gateway so the
+/// client's TLS connection (SNI = upstream host) lands on the per-sandbox proxy
+/// listener while the cert/name-constraint stay scoped to the real upstream name.
+///
+/// `fs_guard` forbids host writes to `/etc/hosts` directly, so the rendered hosts
+/// file is staged under `/etc/voidbox` (an allowed root); the guest-agent mirrors
+/// it into `/etc/hosts` with its own privileged write on receipt.
+async fn provision_proxy_hosts(sandbox: &Sandbox, aliases: &[(String, String)]) -> Result<()> {
+    let hosts = render_guest_hosts(aliases);
+    sandbox.mkdir_p("/etc/voidbox").await?;
+    sandbox.write_file(GUEST_HOSTS_PATH, hosts.as_bytes()).await
+}
+
+/// Refuse the credential proxy on platforms where its listener cannot be bound
+/// guest-only. On Linux/KVM the listener is loopback-bound (SLIRP-forwarded to
+/// the guest); on macOS/VZ it would bind a host-LAN-reachable address, exposing
+/// the credential-injecting parser. M0 fails closed off Linux (tracked for M1b).
+#[cfg(target_os = "linux")]
+fn ensure_credential_proxy_platform_supported() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_credential_proxy_platform_supported() -> Result<()> {
+    Err(crate::Error::Config(
+        "credential_proxy is only supported on Linux/KVM in M0; on macOS/VZ the \
+         proxy listener cannot yet be bound guest-only, so enabling it would \
+         expose the credential-injecting parser to the host LAN (tracked for M1b)"
+            .into(),
+    ))
+}
 
 /// Published output from a service agent.
 /// Contains only what agent_box knows: guest execution output.
@@ -135,6 +217,10 @@ struct BoxConfig {
     mock: bool,
     /// LLM provider (default: Claude)
     llm: LlmProvider,
+    /// Route the LLM provider's API key through the host credential-injection
+    /// proxy instead of forwarding it into the guest. Opt-in; default `false`
+    /// keeps the legacy env-forwarding behaviour unchanged.
+    credential_proxy: bool,
     /// Per-stage timeout in seconds (overrides the default vsock read timeout).
     /// `None` means use the system default (1200s / 20 minutes).
     timeout_secs: Option<u64>,
@@ -161,6 +247,7 @@ impl Default for BoxConfig {
             output_file: "/workspace/output.json".to_string(),
             mock: false,
             llm: LlmProvider::default(),
+            credential_proxy: false,
             timeout_secs: None,
             mode: AgentMode::default(),
             claude_credentials_host_path: None,
@@ -266,6 +353,19 @@ impl VoidBox {
         self
     }
 
+    /// Route the LLM provider's API key through the host credential-injection
+    /// proxy instead of forwarding it into the guest.
+    ///
+    /// Opt-in: with the default `false`, behaviour is unchanged. When enabled
+    /// for an API-key provider the proxy serves (Claude, Anthropic-compatible
+    /// Custom), the real key is withheld from the guest env and injected
+    /// host-side at egress; the guest carries only a placeholder + the per-sandbox
+    /// CA + proxy token.
+    pub fn credential_proxy(mut self, enable: bool) -> Self {
+        self.config.credential_proxy = enable;
+        self
+    }
+
     /// Set a per-stage timeout in seconds.
     ///
     /// Overrides the system default (1200s / 20 min).  Useful when running
@@ -334,6 +434,16 @@ impl VoidBox {
 
     /// Create the sandbox from the current configuration.
     fn create_sandbox(&self) -> Result<Arc<Sandbox>> {
+        // Reject an unusable credential-proxy configuration before staging any
+        // env or booting the guest. `withhold_provider_secret` is false for a
+        // provider the proxy does not serve, so without this gate an unsupported
+        // provider would boot with the real key in its exec env and only fail
+        // once `maybe_setup_credential_proxy` runs — after the pre-run
+        // provisioning execs have already seen it (R14).
+        if self.config.credential_proxy {
+            self.validate_credential_proxy_preconditions()?;
+        }
+
         let mut builder = if self.config.mock {
             Sandbox::mock()
         } else {
@@ -355,8 +465,11 @@ impl VoidBox {
             builder = builder.initramfs(i);
         }
 
-        // Inject LLM provider env vars first, then user overrides
-        for (k, v) in self.config.llm.env_vars() {
+        // Inject LLM provider env vars first, then user overrides. When the
+        // credential proxy is enabled for a provider it serves, the real API key
+        // is withheld here (R14) — the proxy injects it host-side, and the guest
+        // receives only a placeholder via the runtime proxy env.
+        for (k, v) in self.staged_llm_env() {
             builder = builder.env(&k, &v);
         }
         for (k, v) in &self.config.env {
@@ -385,6 +498,149 @@ impl VoidBox {
         }
 
         builder.build()
+    }
+
+    /// Fail closed on a credential-proxy configuration the M0 proxy cannot serve,
+    /// before any guest env is staged. Provider support is platform-independent,
+    /// so it is checked first — an unsupported provider reports the provider error
+    /// on every host — and the Linux/KVM-only platform gate second.
+    fn validate_credential_proxy_preconditions(&self) -> Result<()> {
+        if ProxiedUpstream::for_provider(&self.config.llm).is_none() {
+            return Err(crate::Error::Config(format!(
+                "credential_proxy is enabled but provider '{}' is not served by the \
+                 Phase-0 proxy (M0 serves Claude only)",
+                self.config.llm.description()
+            )));
+        }
+        ensure_credential_proxy_platform_supported()?;
+        Ok(())
+    }
+
+    /// Whether the real provider key must be withheld from the guest because the
+    /// credential proxy will inject it host-side for a provider it serves.
+    fn withhold_provider_secret(&self) -> bool {
+        self.config.credential_proxy
+            && crate::proxy::ProxiedUpstream::for_provider(&self.config.llm).is_some()
+    }
+
+    /// The provider/LLM env staged into the guest, with the real provider key
+    /// removed when [`Self::withhold_provider_secret`] holds (R14): the guest
+    /// then carries only the proxy's placeholder, never the durable key.
+    fn staged_llm_env(&self) -> Vec<(String, String)> {
+        filter_withheld_env(self.config.llm.env_vars(), self.withhold_provider_secret())
+    }
+
+    /// The complete environment staged into the guest for an agent run: the
+    /// provider/LLM env (post-withholding), the user overrides, and the proxy's
+    /// own provisioning env. This is the set the R14 gate audits — auditing only
+    /// the proxy env would miss a real key reaching the guest through the LLM env
+    /// or a user override.
+    fn r14_audit_env(&self, proxy_env: &[(String, String)]) -> Vec<(String, String)> {
+        let mut env = self.staged_llm_env();
+        env.extend(self.config.env.iter().cloned());
+        env.extend(proxy_env.iter().cloned());
+        env
+    }
+
+    /// Start the credential proxy for this sandbox when opted in, deliver the
+    /// per-sandbox CA + `/etc/hosts` redirect into the guest, and return the guest
+    /// env to inject at exec time. Returns `None` when the proxy is disabled.
+    ///
+    /// Errors (rather than silently falling back) when the proxy is enabled but
+    /// the provider is unsupported or no host key is available — a silent
+    /// fallback would forward the real key into the guest, defeating the point.
+    async fn maybe_setup_credential_proxy(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<ActiveCredentialProxy>> {
+        if !self.config.credential_proxy {
+            return Ok(None);
+        }
+        // The credential-injecting listener — and its in-process, pre-auth
+        // TLS/HTTP parser (R10) — must be reachable only by the guest. On
+        // Linux/KVM it binds host loopback, which SLIRP forwards to the guest. On
+        // macOS/VZ the only guest-reachable bind is a non-loopback address
+        // (`guest_accessible_bind_addr` → 0.0.0.0), which would also expose the
+        // listener, and the real key behind it, to the host LAN. There is no
+        // per-sandbox guest-only host address on VZ yet, so M0 refuses to run the
+        // credential proxy off Linux rather than expose it (tracked for M1b).
+        ensure_credential_proxy_platform_supported()?;
+        let provider = &self.config.llm;
+        let Some(upstream) = ProxiedUpstream::for_provider(provider) else {
+            return Err(crate::Error::Config(format!(
+                "credential_proxy is enabled but provider '{}' is not served by the Phase-0 proxy",
+                provider.description()
+            )));
+        };
+        let secret = resolve_provider_secret(provider).ok_or_else(|| {
+            crate::Error::Config(
+                "credential_proxy is enabled but no host API key was found for the provider".into(),
+            )
+        })?;
+        let secret_plain = secret.expose_secret().to_string();
+
+        // CA keygen + self-sign is CPU-bound; keep it off the async runtime.
+        let upstream_host = upstream.host.clone();
+        let ca = tokio::task::spawn_blocking(move || ProxyCa::generate(vec![upstream_host]))
+            .await
+            .map_err(|e| crate::Error::Network(format!("proxy CA task join failed: {e}")))??;
+        let ca = Arc::new(ca);
+        let ca_pem = ca.ca_cert_pem().to_string();
+        let injector = Arc::new(StaticApiKeyInjector::new(
+            upstream.host.clone(),
+            upstream.scheme,
+            secret,
+        ));
+        let ctx = SandboxContext::new(
+            ProxyToken::generate(),
+            ca,
+            injector,
+            vec![upstream.host.clone()],
+        );
+
+        let handle = start_proxy().await?;
+        let binding = handle.register_sandbox(ctx).await?;
+        let provisioning =
+            build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
+
+        // R14: assert no real credential reaches the guest. The audit covers the
+        // full staged env — provider/LLM env (post-withholding) + user overrides +
+        // the proxy's provisioning env — and the files the proxy itself writes (the
+        // CA PEM and `/etc/hosts`). That is complete for M0: the providers the
+        // proxy serves (Claude, Anthropic-compatible Custom) deliver their key only
+        // through `ANTHROPIC_API_KEY`, which is withheld, so env is the only
+        // credential channel. The full R14 scope (every provisioned file and host
+        // mount) is required before migrating a provider that stages a secret into
+        // a file or mount — none do in M0. The primary control is structural: the
+        // key is withheld from the staged env in the first place. This gate is the
+        // backstop that would catch a withholding regression; it runs before the
+        // agent exec and the proxy's writes (a regression could still reach the
+        // earlier pre-run provisioning execs before this aborts).
+        let staged_env = self.r14_audit_env(&provisioning.env);
+        let staged_files = [
+            provisioning.ca_file.clone(),
+            (
+                GUEST_HOSTS_PATH.to_string(),
+                render_guest_hosts(&provisioning.host_aliases),
+            ),
+        ];
+        assert_no_real_credential(&staged_env, &staged_files, &secret_plain)?;
+
+        sandbox
+            .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
+            .await?;
+        provision_proxy_hosts(sandbox, &provisioning.host_aliases).await?;
+
+        info!(
+            "[vm:{}] credential proxy active on port {} for {} (real key withheld from guest)",
+            self.name, binding.port, upstream.host
+        );
+
+        Ok(Some(ActiveCredentialProxy {
+            handle,
+            token_hex: binding.token_hex,
+            exec_env: provisioning.env,
+        }))
     }
 
     /// Provision security configuration into the guest.
@@ -768,6 +1024,10 @@ impl VoidBox {
 
         self.provision_claude_bootstrap(sandbox).await?;
 
+        // Start the credential proxy (opt-in) and capture the guest env to
+        // inject at exec time.
+        let active_proxy = self.maybe_setup_credential_proxy(sandbox).await?;
+
         let tag = &self.name;
 
         // Write input data if provided
@@ -810,8 +1070,13 @@ impl VoidBox {
             }
         }
 
+        let proxy_env = active_proxy
+            .as_ref()
+            .map(|p| p.exec_env.clone())
+            .unwrap_or_default();
+
         let tag_clone = tag.to_string();
-        let mut agent_result = sandbox
+        let exec_outcome = sandbox
             .exec_agent_streaming(
                 &self.config.llm,
                 &full_prompt,
@@ -819,7 +1084,7 @@ impl VoidBox {
                     dangerously_skip_permissions: true,
                     extra_args,
                     timeout_secs: self.config.timeout_secs,
-                    ..Default::default()
+                    env: proxy_env,
                 },
                 |event| match event {
                     crate::observe::claude::AgentStreamEvent::ToolUse(ref tc) => {
@@ -832,7 +1097,13 @@ impl VoidBox {
                     }
                 },
             )
-            .await?;
+            .await;
+
+        // Tear down the per-sandbox proxy listener regardless of exec outcome.
+        if let Some(proxy) = active_proxy {
+            proxy.teardown().await;
+        }
+        let mut agent_result = exec_outcome?;
 
         // Local providers (Ollama) have no real API cost; claude-code
         // still reports a dollar amount using Anthropic pricing, so zero it.
@@ -1208,6 +1479,121 @@ impl VoidBox {
 mod tests {
     use super::*;
     use crate::skill::Skill;
+
+    #[test]
+    fn withheld_secret_env_covers_provider_keys() {
+        assert!(is_withheld_secret_env("ANTHROPIC_API_KEY"));
+        assert!(is_withheld_secret_env("OPENAI_API_KEY"));
+        assert!(!is_withheld_secret_env("ANTHROPIC_BASE_URL"));
+        assert!(!is_withheld_secret_env("HOME"));
+    }
+
+    #[test]
+    fn resolve_secret_none_for_non_claude_providers() {
+        // M0 proxies only Claude, so the resolver yields a key only for Claude.
+        assert!(resolve_provider_secret(&LlmProvider::ClaudePersonal).is_none());
+        assert!(resolve_provider_secret(&LlmProvider::ollama("m")).is_none());
+        assert!(resolve_provider_secret(&LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: Some(crate::llm::ApiKey::new("sk-custom-secret")),
+            model: None,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn credential_proxy_builder_flag_defaults_off_and_sets() {
+        let off = VoidBox::new("b");
+        assert!(!off.config.credential_proxy);
+        let on = VoidBox::new("b").credential_proxy(true);
+        assert!(on.config.credential_proxy);
+    }
+
+    #[test]
+    fn filter_withheld_env_strips_only_provider_key_only_when_withholding() {
+        // Deterministic (no host-env dependence): the key is present in the input,
+        // so the assertion can't pass vacuously.
+        let env = vec![
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-REAL".to_string()),
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://api.anthropic.com".to_string(),
+            ),
+        ];
+
+        // Withholding removes the credential key, keeps everything else.
+        let withheld = filter_withheld_env(env.clone(), true);
+        assert!(!withheld.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        assert!(withheld.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
+
+        // Not withholding keeps the key.
+        let kept = filter_withheld_env(env, false);
+        assert!(kept
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-REAL"));
+    }
+
+    #[test]
+    fn credential_proxy_rejects_unsupported_provider_before_provisioning() {
+        // An unsupported provider with `credential_proxy` must fail at build time
+        // — before any env is staged or the guest boots — rather than staging the
+        // real key and only aborting once `maybe_setup_credential_proxy` runs.
+        // Provider support is platform-independent, so this asserts the provider
+        // error on both Linux and macOS.
+        let err = match VoidBox::new("b")
+            .llm(LlmProvider::Codex)
+            .credential_proxy(true)
+            .build()
+        {
+            Ok(_) => panic!("unsupported provider under credential_proxy must fail to build"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not served by the Phase-0 proxy"),
+            "expected a provider-unsupported error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn claude_under_proxy_withholds_provider_secret() {
+        let vb = VoidBox::new("b")
+            .llm(LlmProvider::Claude)
+            .credential_proxy(true);
+        assert!(vb.withhold_provider_secret());
+        // Proxy off: nothing is withheld.
+        let vb_off = VoidBox::new("b").llm(LlmProvider::Claude);
+        assert!(!vb_off.withhold_provider_secret());
+    }
+
+    #[test]
+    fn r14_audit_catches_real_key_in_user_env() {
+        // A real provider key copied into a user env override under a
+        // non-withheld name reaches the guest — the R14 audit set must include it
+        // so the gate fails. Auditing only the proxy env would miss this.
+        let secret = "sk-ant-REALKEY-must-not-leak";
+        let vb = VoidBox::new("b")
+            .llm(LlmProvider::Claude)
+            .credential_proxy(true)
+            .env("BACKUP_ANTHROPIC_KEY", secret);
+
+        let proxy_env = vec![(
+            "ANTHROPIC_API_KEY".to_string(),
+            crate::proxy::provision::ANTHROPIC_KEY_PLACEHOLDER.to_string(),
+        )];
+        let audit_env = vb.r14_audit_env(&proxy_env);
+
+        assert!(
+            audit_env
+                .iter()
+                .any(|(k, v)| k == "BACKUP_ANTHROPIC_KEY" && v == secret),
+            "audit set must include user env overrides"
+        );
+        assert!(
+            crate::proxy::assert_no_real_credential(&audit_env, &[], secret).is_err(),
+            "R14 gate must reject a real key staged via a user env override"
+        );
+    }
 
     #[test]
     fn test_agent_box_builder() {

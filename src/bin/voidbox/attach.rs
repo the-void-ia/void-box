@@ -75,6 +75,23 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
         None => build_ephemeral_spec(opts.memory_mb, opts.vcpus, opts.network),
     };
 
+    // `voidbox shell` builds the guest PTY env from the provider's `env_vars()`,
+    // which forwards the real API key into the guest. It does not stand up the
+    // credential proxy, so honouring `credential_proxy` here would leak the key
+    // rather than withhold it. Refuse the combination instead of silently
+    // ignoring the flag; the credential proxy is served by `voidbox run`.
+    if run_spec
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.credential_proxy)
+        .unwrap_or(false)
+    {
+        return Err("credential_proxy is not supported in `voidbox shell` \
+                    (the interactive shell forwards the provider key into the guest \
+                    and does not start the credential proxy); use `voidbox run`"
+            .into());
+    }
+
     // Resolve kernel: spec → env var → installed paths → auto-download.
     let flavor = match opts.provider {
         Some(p) => void_box::image::flavor_for_provider(p).unwrap_or("claude"),
@@ -483,6 +500,7 @@ mod tests {
             model: None,
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         };
         let provider = resolve_provider("claude", None, true, Some(&llm_spec)).unwrap();
         assert!(matches!(provider, Some(LlmProvider::ClaudePersonal)));

@@ -1307,7 +1307,11 @@ fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
         _ => LlmProvider::Claude,
     };
 
-    builder.llm(provider)
+    let builder = builder.llm(provider);
+    match llm.credential_proxy {
+        Some(true) => builder.credential_proxy(true),
+        _ => builder,
+    }
 }
 
 pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
@@ -1325,6 +1329,7 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
         model: None,
         base_url: None,
         api_key_env: None,
+        credential_proxy: None,
     });
 
     if let Some(p) = provider {
@@ -1697,6 +1702,7 @@ mod tests {
             model: None,
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         }
     }
 

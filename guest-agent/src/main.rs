@@ -97,6 +97,13 @@ static CONN_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
 
+/// The credential proxy stages the guest `/etc/hosts` content here (an allowed
+/// write root) rather than writing `/etc/hosts` directly, which `fs_guard`
+/// forbids. On receiving a `WriteFile` for this path, the guest-agent mirrors the
+/// content into `/etc/hosts` with its own privileged write, so the host never
+/// needs write access to `/etc`. Kept in sync with `GUEST_HOSTS_PATH` host-side.
+const PROXY_HOSTS_CONFIG_PATH: &str = "/etc/voidbox/hosts";
+
 fn oci_status_str(code: u8) -> &'static str {
     match code {
         OCI_NOT_RUN => "not-run",
@@ -2883,6 +2890,26 @@ fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
         request.content.len(),
         request.path
     ));
+
+    // The proxy stages the guest `/etc/hosts` under an allowed write root; mirror
+    // it into `/etc/hosts` with the guest-agent's own (root) write, so the host
+    // never needs `fs_guard` access to `/etc`. The staged content is already the
+    // full hosts file (loopback + proxy aliases), so this is a plain overwrite.
+    // The mirror is the point of staging this path, so a mirror failure fails the
+    // RPC — otherwise the host reports success while the upstream name never
+    // resolves to the proxy and the credentialed call fails later, opaquely.
+    if request.path == PROXY_HOSTS_CONFIG_PATH {
+        if let Err(e) = std::fs::write("/etc/hosts", &request.content) {
+            let msg = format!("Failed to apply proxy hosts to /etc/hosts: {}", e);
+            kmsg(&msg);
+            return WriteFileResponse {
+                success: false,
+                error: Some(msg),
+            };
+        }
+        kmsg("Applied proxy hosts to /etc/hosts");
+    }
+
     WriteFileResponse {
         success: true,
         error: None,

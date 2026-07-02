@@ -4,6 +4,8 @@
 - **Date:** 2026-06-27
 - **Related:** RFC-0002; ADR-0003
 
+> **Amendment (RFC-0002 §A is the reconciled source).** The decision below records the per-sandbox token as presented on `Proxy-Authorization` on an explicit `CONNECT`. That carrier holds for the egress path, which reaches the proxy through a `CONNECT`. The M0 credential path instead redirects the client by base URL and issues no `CONNECT`, so it carries the token in an `x-voidbox-proxy-token` request header on the redirected request. RFC-0002 §A describes both carriers. This ADR is left unedited per the superseded-not-edited convention; consult RFC-0002 §A for the current wire contract.
+
 ## Context
 
 A single shared proxy (ADR-0003) serving mutually-untrusted sandboxes must attribute each connection to the sandbox that owns it and prevent one sandbox from acting as another. No single mechanism does this. An in-band marker cannot attribute transparently intercepted (DNAT'd) flows, which carry no header the guest could stamp. Terminating TLS to inject a credential (ADR-0002) requires the client to trust a CA, which — if unconstrained — would let a leaked CA key impersonate any site to the guest.

@@ -91,6 +91,11 @@ pub struct LlmSpec {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Route the provider's API key through the host credential-injection proxy
+    /// instead of forwarding it into the guest. Opt-in; default (absent/false)
+    /// preserves the legacy env-forwarding behaviour.
+    #[serde(default)]
+    pub credential_proxy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +379,24 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
                         "agent: mode: service requires output_file".into(),
                     ));
                 }
+                // The credential proxy is only wired into the task-mode agent run
+                // (`agent_box::run`), not the service run (`run_service`), in M0.
+                // A service run with `credential_proxy` enabled would withhold the
+                // real key from the guest but never start the proxy, so the agent
+                // boots with neither credential nor proxy and fails at API-call
+                // time. Reject the combination up front instead.
+                if spec
+                    .llm
+                    .as_ref()
+                    .and_then(|llm| llm.credential_proxy)
+                    .unwrap_or(false)
+                {
+                    return Err(Error::Config(
+                        "agent: mode: service and llm.credential_proxy are mutually exclusive \
+                         (the credential proxy is not wired for service mode in M0)"
+                            .into(),
+                    ));
+                }
             }
             if agent.mode == AgentMode::Interactive && agent.timeout_secs.is_some() {
                 return Err(Error::Config(
@@ -608,6 +631,47 @@ agent:
         let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
         let err = validate_spec(&spec).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn agent_mode_service_rejects_credential_proxy() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: claude
+  credential_proxy: true
+agent:
+  prompt: "run"
+  mode: service
+  output_file: /workspace/output.json
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("credential_proxy"));
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn agent_mode_task_allows_credential_proxy() {
+        // The task-mode agent run wires the proxy, so the combination is valid.
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: claude
+  credential_proxy: true
+agent:
+  prompt: "run"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
     }
 
     #[test]

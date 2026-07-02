@@ -40,14 +40,25 @@ futures-util = "0.3"
 # `hyperlocal::UnixConnector` (AF_UNIX); `reqwest` is not used here because
 # it has no unix-socket connector. `hyper`/`hyper-util`/`http-body-util`
 # are already in the workspace dep tree (transitive via reqwest).
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http = "1"
 http-body-util = "0.1"
 hyperlocal = "0.9"
 bytes = "1"
 
 # Security (cross-platform)
 getrandom = "0.3"
+
+# Host-side credential/egress injection proxy (TLS-terminating).
+# `rustls` 0.23 matches the version reqwest already pulls in; `tokio-rustls`
+# wraps the server side that terminates the guest's TLS; `rcgen` mints the
+# per-run ECDSA P-256 CA plus name-constrained leaf certs at boot. The `ring`
+# crypto provider is selected explicitly across all three so the process has a
+# single, unambiguous provider. Upstream re-origination reuses `reqwest`.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 # IDs and time formatting
 uuid = { version = "1", features = ["v7"] }
@@ -185,6 +196,10 @@ path = "tests/e2e/mount.rs"
 [[test]]
 name = "e2e_sidecar"
 path = "tests/e2e/sidecar.rs"
+
+[[test]]
+name = "e2e_credential_proxy"
+path = "tests/e2e/credential_proxy.rs"
 
 [[test]]
 name = "e2e_agent_mcp"

@@ -2813,6 +2813,7 @@ mod tests {
                 model: None,
                 base_url: None,
                 api_key_env: None,
+                credential_proxy: None,
             }),
             observe: None,
             agent: Some(AgentSpec {
@@ -2864,6 +2865,7 @@ mod tests {
             model: Some("qwen3-coder".into()),
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         });
         spec.agent
             .as_mut()
@@ -2883,6 +2885,7 @@ mod tests {
             model: Some("qwen3-coder".into()),
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         });
         assert!(!should_register_void_mcp(&spec));
     }
@@ -2895,6 +2898,7 @@ mod tests {
             model: Some("qwen3-coder".into()),
             base_url: None,
             api_key_env: None,
+            credential_proxy: None,
         });
         spec.agent
             .as_mut()
