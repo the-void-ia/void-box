@@ -16,10 +16,12 @@
 //! Every guest connection is processed by a fixed sequence of stages. Later
 //! phases extend the proxy by swapping the trait objects carried on
 //! [`SandboxContext`] — **not** by editing the accept/relay loop in [`server`].
-//! That separation is the whole point of freezing this interface now: the OAuth
-//! store (Phase 1) replaces the [`CredentialInjector`], and real egress
-//! policy/tunnelling/audit (Phase 2) replace [`AllowAllPolicy`] and
-//! [`DebugAuditSink`], without re-architecting the core.
+//! That separation is the whole point of freezing this interface now: at the
+//! injector stage Phase 1 swaps in an OAuth-backed [`CredentialInjector`] for
+//! OAuth providers (the static one stays for API-key providers), and at the
+//! policy/audit stages Phase 2 replaces [`AllowAllPolicy`] and [`DebugAuditSink`]
+//! with real egress policy/tunnelling/audit — all without re-architecting the
+//! core.
 //!
 //! ```text
 //! guest conn ─▶ [auth]        per-sandbox token → resolve SandboxContext (else reject+close)
@@ -130,8 +132,10 @@ pub enum InjectOutcome {
 }
 
 /// Rewrites the credential header(s) on a request bound for `host` with the
-/// host-held secret. Phase 0 ships [`StaticApiKeyInjector`]; Phase 1 swaps in an
-/// OAuth-backed implementation that mints a short-lived Bearer per call.
+/// host-held secret. Phase 0 ships [`StaticApiKeyInjector`]; Phase 1 adds an
+/// OAuth-backed implementation that mints a short-lived Bearer per call. Both
+/// coexist behind this trait, selected per provider and auth mode: OAuth
+/// providers use the new one, API-key providers keep the static injector.
 pub trait CredentialInjector: Send + Sync {
     /// Inject the credential for `host` into `headers`, replacing any
     /// guest-supplied placeholder.
