@@ -9,8 +9,12 @@
 //! needed once non-LLM downstream services share this trait) is deferred to M2;
 //! Phase 0 credits every path on its single name-constrained LLM upstream.
 //!
-//! Phase 1 replaces this with an OAuth-backed injector that mints a short-lived
-//! Bearer per call; the trait boundary stays the same.
+//! Phase 1 adds an OAuth-backed [`CredentialInjector`] alongside this one — a
+//! second implementation that mints a short-lived Bearer per call, selected per
+//! provider and auth mode behind the same trait boundary. It does not replace
+//! this injector: the API-key providers (Claude with an API key, the
+//! Anthropic-compatible Custom provider, and codex API-key mode) keep using this
+//! static path, which is the sanctioned path for programmatic use.
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
