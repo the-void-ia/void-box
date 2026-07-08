@@ -43,14 +43,15 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::guest_host_gateway;
+use crate::credentials::ClaudeOAuthStore;
 use crate::llm::LlmProvider;
 use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::proxy::{
     assert_no_real_credential, build_guest_provisioning, render_guest_hosts, start_proxy,
-    ProxiedUpstream, ProxyCa, ProxyHandle, ProxyToken, SandboxContext, StaticApiKeyInjector,
-    GUEST_HOSTS_PATH,
+    CredentialInjector, OAuthBearerInjector, ProxiedAuth, ProxiedUpstream, ProxyCa, ProxyHandle,
+    ProxyToken, SandboxContext, StaticApiKeyInjector, GUEST_HOSTS_PATH,
 };
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
@@ -533,6 +534,20 @@ impl VoidBox {
                     .into(),
             ));
         }
+        // The proxy injects credentials host-side, so a guest-staged credentials
+        // file must never coexist with it. A per-box override can enable the proxy
+        // while a credentials file was staged from the top-level config; reject
+        // that here — before any provisioning exec — rather than let the durable
+        // refresh token ride into the guest in a file the env/CA/hosts audit does
+        // not cover. Checked before the platform gate because the conflict is
+        // platform-independent.
+        if self.config.claude_credentials_host_path.is_some() {
+            return Err(crate::Error::Config(
+                "credential_proxy is active but an OAuth credentials file is also staged \
+                 into the guest — refusing to leak the durable refresh token"
+                    .into(),
+            ));
+        }
         ensure_credential_proxy_platform_supported()?;
         Ok(())
     }
@@ -594,12 +609,42 @@ impl VoidBox {
                 provider.description()
             )));
         };
-        let secret = resolve_provider_secret(provider).ok_or_else(|| {
-            crate::Error::Config(
-                "credential_proxy is enabled but no host API key was found for the provider".into(),
-            )
-        })?;
-        let secret_plain = secret.expose_secret().to_string();
+        // Build the credential injector for the provider's auth mode, and capture
+        // the durable secret so the no-credential-in-guest gate can assert it
+        // never reaches the guest.
+        //  - API key: a static host-held key injected verbatim.
+        //  - OAuth (Claude personal): a host store that refreshes the durable token
+        //    and mints a short-lived Bearer per request; its warm-up is spawned to
+        //    overlap the first refresh with VM boot.
+        let (injector, secret_plain): (Arc<dyn CredentialInjector>, String) = match upstream.auth {
+            ProxiedAuth::ApiKey(scheme) => {
+                let secret = resolve_provider_secret(provider).ok_or_else(|| {
+                    crate::Error::Config(
+                        "credential_proxy is enabled but no host API key was found for the provider"
+                            .into(),
+                    )
+                })?;
+                let secret_plain = secret.expose_secret().to_string();
+                let injector = Arc::new(StaticApiKeyInjector::new(
+                    upstream.host.clone(),
+                    scheme,
+                    secret,
+                ));
+                (injector, secret_plain)
+            }
+            ProxiedAuth::Oauth => {
+                let store = Arc::new(ClaudeOAuthStore::from_host()?);
+                let secret_plain = store
+                    .durable_secret_snapshot()
+                    .await
+                    .expose_secret()
+                    .to_string();
+                let warm = store.clone();
+                tokio::spawn(async move { warm.warm_up().await });
+                let injector = Arc::new(OAuthBearerInjector::new(upstream.host.clone(), store));
+                (injector, secret_plain)
+            }
+        };
 
         // CA keygen + self-sign is CPU-bound; keep it off the async runtime.
         let upstream_host = upstream.host.clone();
@@ -608,11 +653,6 @@ impl VoidBox {
             .map_err(|e| crate::Error::Network(format!("proxy CA task join failed: {e}")))??;
         let ca = Arc::new(ca);
         let ca_pem = ca.ca_cert_pem().to_string();
-        let injector = Arc::new(StaticApiKeyInjector::new(
-            upstream.host.clone(),
-            upstream.scheme,
-            secret,
-        ));
         let ctx = SandboxContext::new(
             ProxyToken::generate(),
             ca,
@@ -1559,6 +1599,37 @@ mod tests {
         assert!(!off.config.credential_proxy);
         let on = VoidBox::new("b").credential_proxy(true);
         assert!(on.config.credential_proxy);
+    }
+
+    #[test]
+    fn credential_proxy_rejects_a_staged_credentials_file() {
+        // Enabling the proxy while also staging an OAuth credentials file is a
+        // config contradiction: the proxy injects host-side, so the file would
+        // carry the durable refresh token into the guest. Rejected before boot,
+        // ahead of the platform gate, so it fires on every host.
+        let vb = VoidBox::new("b")
+            .credential_proxy(true)
+            .claude_credentials_host_path("/tmp/voidbox-creds-conflict-test");
+        let err = vb
+            .validate_credential_proxy_preconditions()
+            .expect_err("proxy + staged credentials file must be rejected");
+        assert!(
+            err.to_string().contains("OAuth credentials file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_proxy_without_a_staged_credentials_file_passes_checks() {
+        // Default provider (Claude) is proxy-served and no credentials file is
+        // staged, so the provider and credentials-file checks pass; only the
+        // platform gate may object off-Linux.
+        let vb = VoidBox::new("b").credential_proxy(true);
+        let result = vb.validate_credential_proxy_preconditions();
+        #[cfg(target_os = "linux")]
+        assert!(result.is_ok(), "got: {result:?}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(result.unwrap_err().to_string().contains("Linux/KVM"));
     }
 
     #[test]

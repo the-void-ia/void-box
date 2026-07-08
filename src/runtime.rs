@@ -828,10 +828,20 @@ fn build_pipeline_box_with_io(
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
     builder = apply_box_sandbox(builder, spec, guest);
     builder = apply_box_overrides(builder, b.sandbox.as_ref(), spec);
-    builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
+    let effective_llm = b.llm.as_ref().or(spec.llm.as_ref());
+    builder = apply_box_llm(builder, effective_llm);
     builder = apply_codex_credential_mount(builder, staged_codex_creds);
+    // Stage the OAuth credential file into the guest only when this box is NOT
+    // using the credential proxy. With the proxy active the durable refresh token
+    // stays in the host store and is injected at egress; staging it here would put
+    // the durable secret where the uid-1000 agent can read it (R14). A per-box
+    // `credential_proxy` can be on while the top-level (which `staged_creds` was
+    // prepared from) is off, so this decision must read the effective per-box llm.
+    let box_uses_proxy = effective_llm.and_then(|l| l.credential_proxy) == Some(true);
     if let Some(staged) = staged_creds {
-        builder = builder.claude_credentials_host_path(&staged.host_path);
+        if !box_uses_proxy {
+            builder = builder.claude_credentials_host_path(&staged.host_path);
+        }
     }
     for s in &b.skills {
         builder = builder.skill(parse_skill_entry(s)?);
@@ -1356,7 +1366,15 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
 /// control channel. The temp directory is cleaned up when the value is dropped.
 fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredentials>> {
     match llm {
-        Some(l) if l.provider.eq_ignore_ascii_case("claude-personal") => {
+        // With the credential proxy active, the durable OAuth refresh token stays
+        // in the host store ([`crate::credentials::ClaudeOAuthStore`]) and is
+        // injected at egress; staging it into the guest would put the durable
+        // secret where the uid-1000 agent can read it (R14). So skip
+        // discovery/staging entirely here.
+        Some(l)
+            if l.provider.eq_ignore_ascii_case("claude-personal")
+                && l.credential_proxy != Some(true) =>
+        {
             let secret_json = crate::credentials::discover_oauth_credentials()?;
             Ok(Some(crate::credentials::stage_credentials(&secret_json)?))
         }
