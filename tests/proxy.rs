@@ -8,7 +8,9 @@
 //! - a TLS SNI outside the sandbox's name constraints cannot complete a handshake.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::header::HeaderMap;
@@ -25,10 +27,14 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use secrecy::SecretString;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use void_box::credentials::ClaudeOAuthStore;
 use void_box::proxy::injector::{ApiKeyScheme, StaticApiKeyInjector};
-use void_box::proxy::{ProxyCa, ProxyHandle, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER};
+use void_box::proxy::{
+    OAuthBearerInjector, ProxyCa, ProxyHandle, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER,
+};
 
 const UPSTREAM_HOST: &str = "api.anthropic.com";
 const REAL_KEY: &str = "sk-ant-real-host-held-secret";
@@ -598,6 +604,126 @@ async fn proxy_does_not_negotiate_h2_and_serves_http1() {
         .expect("build request");
     let resp = sender.send_request(req).await.expect("http1 request");
     assert_eq!(resp.status(), StatusCode::OK);
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+// ---------------------------------------------------------------------------
+// OAuth injection (Claude personal) — the M1a path
+// ---------------------------------------------------------------------------
+
+/// Stand up a mock OAuth token endpoint that returns `access_token` (with a
+/// rotated refresh token) for every refresh. Returns its URL and a hit counter.
+async fn start_mock_token_endpoint(access_token: &str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind token mock");
+    let addr = listener.local_addr().expect("token mock addr");
+    let body = format!(
+        r#"{{"access_token":"{access_token}","refresh_token":"rotated-refresh","expires_in":3600}}"#
+    );
+    let response = Arc::new(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            let response = response.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await; // drain request; contents unused
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/v1/oauth/token"), hits)
+}
+
+/// Build a sandbox context whose injector is OAuth-backed, with a store that
+/// holds an already-expired access token (so the first request triggers a
+/// refresh against `token_url`) and writes back under a temp dir kept alive by
+/// the returned [`tempfile::TempDir`].
+fn oauth_sandbox_context(
+    upstream_port: u16,
+    token_url: String,
+) -> (SandboxContext, String, tempfile::TempDir) {
+    let token = ProxyToken::generate();
+    let token_hex = token.to_hex();
+    let ca = Arc::new(ProxyCa::generate(vec![UPSTREAM_HOST.to_string()]).expect("CA"));
+
+    let expired_ms = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64)
+        - 60_000;
+    let creds = format!(
+        r#"{{"claudeAiOauth":{{"accessToken":"stale","refreshToken":"durable-refresh","expiresAt":{expired_ms}}}}}"#
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        ClaudeOAuthStore::from_json(
+            &SecretString::from(creds),
+            dir.path().join(".credentials.json"),
+        )
+        .expect("store")
+        .with_token_endpoint(token_url)
+        .with_http_client(reqwest::Client::builder().build().expect("client")),
+    );
+    let injector = Arc::new(OAuthBearerInjector::new(UPSTREAM_HOST, store));
+    let ctx = SandboxContext::new(token, ca, injector, vec![UPSTREAM_HOST.to_string()])
+        .with_upstream_port(upstream_port);
+    (ctx, token_hex, dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_injects_minted_bearer_and_hides_placeholder() {
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let (token_url, token_hits) = start_mock_token_endpoint("minted-oat-abc").await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, token_hex, _creds_dir) = oauth_sandbox_context(mock_addr.port(), token_url);
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let (status, body) = guest_request(
+        &connector,
+        binding.port,
+        Some(&token_hex),
+        UPSTREAM_HOST,
+        b"",
+    )
+    .await
+    .expect("guest request");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Bytes::from("upstream-ok"));
+
+    let seen = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    // The proxy refreshed the OAuth token and injected the minted Bearer...
+    assert_eq!(
+        seen.headers.get("authorization").unwrap(),
+        "Bearer minted-oat-abc"
+    );
+    // ...the guest's placeholder x-api-key was dropped...
+    assert!(seen.headers.get("x-api-key").is_none());
+    // ...the placeholder never reached the upstream in any header...
+    for (_, value) in seen.headers.iter() {
+        assert_ne!(value.to_str().unwrap_or(""), PLACEHOLDER_KEY);
+    }
+    // ...the per-sandbox token was stripped before forwarding...
+    assert!(seen.headers.get(PROXY_TOKEN_HEADER).is_none());
+    // ...and exactly one refresh round-trip happened.
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
 
     proxy.unregister_sandbox(&token_hex).await;
 }

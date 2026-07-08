@@ -66,6 +66,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use http::HeaderMap;
 use tracing::debug;
 
@@ -77,10 +78,10 @@ pub mod ssrf;
 pub mod token;
 
 pub use ca::ProxyCa;
-pub use injector::{ApiKeyScheme, StaticApiKeyInjector};
+pub use injector::{ApiKeyScheme, OAuthBearerInjector, StaticApiKeyInjector};
 pub use provision::{
-    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedUpstream,
-    GUEST_HOSTS_PATH,
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedAuth,
+    ProxiedUpstream, GUEST_HOSTS_PATH,
 };
 pub use server::{start_proxy, ProxyHandle, SandboxBinding};
 pub use token::{ProxyToken, PROXY_TOKEN_HEADER};
@@ -132,10 +133,20 @@ pub enum InjectOutcome {
 }
 
 /// Rewrites the credential header(s) on a request bound for `host` with the
-/// host-held secret. Phase 0 ships [`StaticApiKeyInjector`]; Phase 1 adds an
-/// OAuth-backed implementation that mints a short-lived Bearer per call. Both
-/// coexist behind this trait, selected per provider and auth mode: OAuth
-/// providers use the new one, API-key providers keep the static injector.
+/// host-held secret. [`StaticApiKeyInjector`] serves API-key providers with a
+/// value already in memory; the OAuth-backed injector mints a short-lived Bearer
+/// per call. Both coexist behind this trait, selected per provider and auth
+/// mode: OAuth providers use the OAuth injector, API-key providers keep the
+/// static one.
+///
+/// `inject` is **async** because minting a fresh credential can require a
+/// network round-trip (an OAuth access-token refresh). The static injector
+/// completes without awaiting; the OAuth injector awaits the credential store,
+/// which serializes refreshes so concurrent requests share one token mint rather
+/// than each triggering their own. It runs inside the per-connection request
+/// task ([`server::proxy_request`]), so awaiting here never blocks the accept
+/// loop or another sandbox's traffic.
+#[async_trait]
 pub trait CredentialInjector: Send + Sync {
     /// Inject the credential for `host` into `headers`, replacing any
     /// guest-supplied placeholder.
@@ -144,7 +155,7 @@ pub trait CredentialInjector: Send + Sync {
     /// injection and the audit log records ground truth rather than re-deriving
     /// it from the allow-set (the two can diverge once a sandbox permits more
     /// upstreams than the injector owns).
-    fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome;
+    async fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome;
 }
 
 /// Decides whether a destination host may be reached. Phase 2 replaces the
