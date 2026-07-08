@@ -705,6 +705,59 @@ Skill::mcp("void-mcp")
 | `src/agent_box.rs` | `provision_skills()` — MCP server startup, `.mcp.json` generation |
 | `src/backend/mod.rs` | `DEFAULT_COMMAND_ALLOWLIST` (includes `void-mcp`) |
 
+## Credential proxy and containment
+
+VoidBox runs an untrusted agent (uid 1000) inside the guest, so a durable credential — a long-lived API key or an OAuth refresh token — must never be staged where that agent can read and exfiltrate it. The **credential proxy** is a host-side, TLS-terminating, header-injecting proxy: it holds each provider's durable secret on the host and rewrites the credential header at network egress, so the guest carries only a non-secret placeholder. It is opt-in per box via `credential_proxy: true`, and in M0/M1a runs on Linux/KVM only — the listener must be bound guest-only, and VZ/macOS is deferred to M1b.
+
+This subsystem implements [RFC-0002](docs/rfc/0002-guest-network-egress-and-credential-containment.md). The milestone rollout is **M0** (Claude API key), **M1a** (Claude personal OAuth), then M1b (codex + VZ parity), M2 (downstream services), and the egress track.
+
+### Per-connection pipeline
+
+One shared proxy process serves every sandbox. Each sandbox gets its own TLS-terminating listener (a distinct host port), a per-sandbox name-constrained CA, and a per-sandbox token. Every guest connection runs a fixed pipeline defined in `src/proxy/mod.rs`: **auth** (the per-sandbox token, constant-time compared then stripped before forwarding) → **destination** (the TLS SNI, rejected unless it is in the sandbox's allow-set) → **policy** (`EgressPolicy`; M0 is allow-all) → **inject** (`CredentialInjector`) → **audit** (`AuditSink`; M0 is a debug log) → **re-originate** to the upstream over fresh TLS with SSRF-guarded resolution. Later milestones extend the proxy by swapping the trait objects carried on `SandboxContext`, never by editing the accept/relay loop.
+
+### Credential injection
+
+`CredentialInjector::inject` is async so an OAuth injector can await a token refresh in the request path. Two implementations coexist behind the trait, selected per provider by the `ProxiedAuth` enum:
+
+- `StaticApiKeyInjector` — a host-held API key already in memory (Anthropic `x-api-key`, or `Authorization: Bearer`). Serves `ProxiedAuth::ApiKey(scheme)`.
+- `OAuthBearerInjector` — asks `ClaudeOAuthStore` for a currently-valid access token, injects `Authorization: Bearer`, and drops `x-api-key`. Serves `ProxiedAuth::Oauth` (Claude personal).
+
+Any injection failure fails closed: the proxy returns `502` and drops every credential header rather than forward an unauthenticated upstream call.
+
+### Host-side OAuth store (`ClaudeOAuthStore`)
+
+`ClaudeOAuthStore` (`src/credentials.rs`) holds the durable Claude OAuth refresh token in host memory only, refreshes it against Anthropic's token endpoint to mint short-lived access tokens, and is the rotation owner across void-box runs. Refreshes are serialized within the process by a state mutex (coalescing concurrent requests) and across processes by an advisory `flock` held over the whole read-refresh-write cycle, so a peer run that already rotated the token on disk is adopted rather than double-spending the single-use refresh token. The rotated token is written back atomically — temp file + `rename`, `0600`, parent-directory fsync. The lock coordinates void-box runs with each other only; it does not coordinate with the operator's own `claude-code`, which does not take it. The token-endpoint URL and client id are pinned constants that must be re-verified in the RFC's V2 validation and on every claude-code version bump.
+
+### The R14 invariant — no durable secret in the guest
+
+For `claude-personal` routed through the proxy, no `.credentials.json` is staged into the guest. Three checks enforce this: `prepare_claude_personal` (`src/runtime.rs`) skips discovery/staging when the proxy is active; `build_pipeline_box_with_io` gates the credentials-file mount on the effective per-box config (a per-box override can enable the proxy while the top-level staged a file); and `validate_credential_proxy_preconditions` (`src/agent_box.rs`) refuses, before boot, to run the proxy alongside a staged credentials file. `assert_no_real_credential` (`src/proxy/provision.rs`) audits the staged env and files against the durable secret as a backstop.
+
+### Snapshot / restore
+
+The CA private key and the credential store live only in the host proxy process — never in guest RAM, the kernel cmdline, or `src/vmm/snapshot.rs` state — so they are structurally absent from any snapshot. Re-minting the per-sandbox CA and token on restore (R11) becomes load-bearing once provisioning moves to the cold-boot cmdline; M0/M1a mint at run time and tear down at run end, so the re-mint hook is deferred.
+
+### Validation
+
+- `cargo test --test proxy` — in-process pipeline against a mock upstream: API-key and OAuth injection, token auth, name-constraint enforcement, SSRF rejection, cross-sandbox isolation. No VM.
+- `ANTHROPIC_API_KEY=… cargo test --test proxy_real_upstream -- --ignored` — API-key injection against real `api.anthropic.com`.
+- `VOIDBOX_V2_OAUTH=1 VOIDBOX_TEST_CLAUDE_CREDS=… cargo test --test oauth_real_upstream -- --ignored` — the V2 OAuth-acceptance harness (R4/R5). It spends a single-use refresh token, so it requires a throwaway account's credentials file, not your primary login.
+- Example specs: `examples/specs/credential_proxy_claude.yaml` (API key) and `credential_proxy_claude_personal.yaml` (personal OAuth).
+
+### Key files
+
+| File | Role |
+|------|------|
+| `src/proxy/mod.rs` | Pipeline traits (`CredentialInjector`, `EgressPolicy`, `AuditSink`), `SandboxContext`, frozen-pipeline contract |
+| `src/proxy/server.rs` | Per-sandbox TLS listener, `ProxyHandle`, request pipeline, upstream re-origination |
+| `src/proxy/injector.rs` | `StaticApiKeyInjector`, `OAuthBearerInjector` |
+| `src/proxy/ca.rs` | Per-sandbox name-constrained CA (ECDSA P-256), leaf minting |
+| `src/proxy/token.rs` | Per-sandbox proxy token (`ProxyToken`), constant-time compare + redaction |
+| `src/proxy/ssrf.rs` | SSRF-guard resolver, shared by the proxy upstream client and the OAuth store |
+| `src/proxy/provision.rs` | Provider → proxy mapping (`ProxiedUpstream`/`ProxiedAuth`), guest provisioning, `assert_no_real_credential` (R14) |
+| `src/credentials.rs` | `ClaudeOAuthStore` (refresh/mint/rotation + atomic write-back); credential discovery/staging |
+| `src/agent_box.rs` | `maybe_setup_credential_proxy`, injector selection, `validate_credential_proxy_preconditions` (R14) |
+| `src/runtime.rs` | `prepare_claude_personal`, per-box credentials-file staging gate |
+
 ## Auto image resolution
 
 `voidbox run --file spec.yaml` and `voidbox shell` auto-resolve kernel and
