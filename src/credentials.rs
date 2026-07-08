@@ -604,6 +604,11 @@ impl TokenState {
 /// Build the production token-endpoint client: no redirects (a credential must
 /// not chase a redirect), no ambient proxy, and SSRF-guarded resolution so a
 /// rebound token-endpoint name cannot steer the refresh at an internal target.
+///
+/// `SsrfGuardResolver` is a shared network primitive intentionally reused from
+/// `proxy` (it also guards the proxy's upstream client), so this module depends on
+/// `proxy` here while `proxy::injector` depends back on [`ClaudeOAuthStore`]. If
+/// that mutual dependency grows, promote the resolver to a neutral shared module.
 fn build_token_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
