@@ -96,3 +96,12 @@ jobs:
           VOID_BOX_KERNEL: /tmp/void-box-kernel
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
         run: cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
+
+      # VZ leg of the credential-proxy e2e (Linux runs it in e2e.yml): the
+      # listener binds the VZ NAT gateway address (ADR-0007) and a real guest
+      # exercises the injection + /etc/hosts redirect path.
+      - name: Credential proxy E2E
+        env:
+          VOID_BOX_KERNEL: /tmp/void-box-kernel
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: cargo test --test e2e_credential_proxy -- --ignored --test-threads=1

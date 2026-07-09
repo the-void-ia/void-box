@@ -6,10 +6,12 @@
 //! the API-key providers (Claude with an API key, the Anthropic-compatible Custom
 //! provider, and codex API-key mode) — the sanctioned path for programmatic use.
 //!
-//! [`OAuthBearerInjector`] serves personal-subscription OAuth (Claude personal):
-//! it asks the host [`ClaudeOAuthStore`] for a currently-valid access token per
-//! request and writes it as a Bearer, so the durable refresh token stays on the
-//! host and never reaches the guest.
+//! [`OAuthBearerInjector`] serves personal-subscription OAuth (Claude personal
+//! and codex ChatGPT): it asks the host [`OAuthTokenStore`] for a currently-valid
+//! access token per request and writes it as a Bearer, so the durable refresh
+//! token stays on the host and never reaches the guest. codex additionally
+//! carries the host-held account identity (`chatgpt-account-id`) as an extra
+//! static header on the same injector, replacing the guest's placeholder.
 //!
 //! Both match their upstream host **exactly** (R3): an injector never attaches a
 //! secret to a request whose host differs from the one it was configured for, so
@@ -26,13 +28,16 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::warn;
 
-use crate::credentials::ClaudeOAuthStore;
+use crate::credentials::OAuthTokenStore;
 use crate::proxy::{CredentialInjector, InjectOutcome};
 
 /// Anthropic credential header.
 const ANTHROPIC_API_KEY_HEADER: &str = "x-api-key";
 /// Bearer credential header.
 const AUTHORIZATION_HEADER: &str = "authorization";
+/// ChatGPT account-identity header codex sends alongside its Bearer; the proxy
+/// replaces the guest's placeholder with the host-held account id.
+pub const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 /// How a provider expects its API key presented on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +121,7 @@ impl CredentialInjector for StaticApiKeyInjector {
 }
 
 /// Injects an OAuth access token as `Authorization: Bearer`, minted per request
-/// from the host [`ClaudeOAuthStore`], for the single upstream host it owns.
+/// from the host [`OAuthTokenStore`], for the single upstream host it owns.
 ///
 /// The durable refresh token stays in the store (host memory); the guest holds
 /// only a placeholder. Awaiting the store here (rather than caching a token on
@@ -127,16 +132,39 @@ pub struct OAuthBearerInjector {
     /// The exact upstream host this injector owns (case-insensitive match).
     host: String,
     /// Host-side custodian that mints short-lived access tokens.
-    store: Arc<ClaudeOAuthStore>,
+    store: Arc<OAuthTokenStore>,
+    /// Host-held static headers written alongside the Bearer (e.g. the codex
+    /// `chatgpt-account-id`), replacing any guest-supplied placeholder value.
+    /// Removed together with the credential headers on a failed injection.
+    extra_headers: Vec<(&'static str, String)>,
 }
 
 impl OAuthBearerInjector {
     /// Build an injector that credits requests for `host` with a Bearer minted
     /// by `store`.
-    pub fn new(host: impl Into<String>, store: Arc<ClaudeOAuthStore>) -> Self {
+    pub fn new(host: impl Into<String>, store: Arc<OAuthTokenStore>) -> Self {
         Self {
             host: host.into(),
             store,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    /// Also write the host-held static header `name: value` on every injected
+    /// request, replacing the guest's placeholder. Used for identity headers the
+    /// provider requires next to the Bearer (codex's `chatgpt-account-id`).
+    pub fn with_extra_header(mut self, name: &'static str, value: String) -> Self {
+        self.extra_headers.push((name, value));
+        self
+    }
+
+    /// Drop every header this injector owns, so a failed injection can never
+    /// leave a partial credential (or a stale placeholder identity) behind.
+    fn drop_owned_headers(&self, headers: &mut HeaderMap) {
+        headers.remove(ANTHROPIC_API_KEY_HEADER);
+        headers.remove(AUTHORIZATION_HEADER);
+        for (name, _) in &self.extra_headers {
+            headers.remove(*name);
         }
     }
 }
@@ -155,20 +183,23 @@ impl CredentialInjector for OAuthBearerInjector {
             Ok(token) => token,
             Err(e) => {
                 warn!(host = %host, "OAuth injector: no valid access token ({e}); failing closed");
-                headers.remove(ANTHROPIC_API_KEY_HEADER);
-                headers.remove(AUTHORIZATION_HEADER);
+                self.drop_owned_headers(headers);
                 return InjectOutcome::Failed;
             }
         };
         headers.remove(ANTHROPIC_API_KEY_HEADER);
-        let ok = set_secret_header(
+        let mut ok = set_secret_header(
             headers,
             AUTHORIZATION_HEADER,
             &format!("Bearer {}", token.expose_secret()),
         );
+        for (name, value) in &self.extra_headers {
+            ok = ok && set_secret_header(headers, name, value.as_str());
+        }
         if ok {
             InjectOutcome::Injected
         } else {
+            self.drop_owned_headers(headers);
             InjectOutcome::Failed
         }
     }
@@ -180,6 +211,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::credentials::OAuthProviderKind;
 
     fn placeholder_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -296,9 +328,10 @@ mod tests {
     }
 
     /// A store holding a far-future access token — no refresh, no network.
-    fn store_with_valid_token(access: &str) -> Arc<ClaudeOAuthStore> {
+    fn store_with_valid_token(access: &str) -> Arc<OAuthTokenStore> {
         Arc::new(
-            ClaudeOAuthStore::from_json(
+            OAuthTokenStore::from_json(
+                OAuthProviderKind::ClaudeCode,
                 &SecretString::from(creds_json(access, "r", ms_from_now(3600))),
                 PathBuf::from("/nonexistent/voidbox-injector-test/creds.json"),
             )
@@ -345,7 +378,8 @@ mod tests {
         // injector must report `Failed` and leave no credential header behind.
         let loopback = reqwest::Client::builder().build().unwrap();
         let store = Arc::new(
-            ClaudeOAuthStore::from_json(
+            OAuthTokenStore::from_json(
+                OAuthProviderKind::ClaudeCode,
                 &SecretString::from(creds_json("stale", "dead", ms_from_now(-60))),
                 PathBuf::from("/nonexistent/voidbox-injector-test/creds.json"),
             )

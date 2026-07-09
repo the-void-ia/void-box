@@ -69,6 +69,12 @@ clap = { version = "4", features = ["derive", "cargo", "env"] }
 tracing-appender = "0.2"
 
 # Utilities
+# base64: JWT payload decoding for OAuth access-token expiry (`jwt_exp`) and the
+# codex placeholder JWTs; pinned to the version already in the tree via reqwest.
+base64 = "0.22"
+# url: parsing the Custom provider's base URL (host/port/path extraction for
+# proxy redirection); already in the tree via reqwest.
+url = "2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

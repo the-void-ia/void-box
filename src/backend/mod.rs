@@ -302,6 +302,38 @@ pub fn guest_accessible_bind_addr(port: u16) -> SocketAddr {
     }
 }
 
+/// The macOS/VZ NAT gateway as a host-side bind address. Keep in sync with
+/// [`MACOS_GUEST_HOST_GATEWAY`]: both name the same Virtualization.framework
+/// NAT interface (`bridge100`), one as the guest-visible string, one as the
+/// address the host can bind on it.
+#[cfg(target_os = "macos")]
+const MACOS_GUEST_HOST_GATEWAY_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 1);
+
+/// Bind address for the credential proxy's per-sandbox listener — a service
+/// whose exposure must be tighter than [`guest_accessible_bind_addr`]'s: the
+/// listener fronts a pre-auth TLS/HTTP parser with a real credential behind it
+/// (R10), so binding `0.0.0.0` (what the shared helper does on macOS) would
+/// also expose it to the host's LAN.
+///
+/// - Linux/KVM: host loopback; SLIRP forwards the guest's `10.0.2.2:<port>` hop
+///   onto it and nothing off-host can route to it.
+/// - macOS/VZ: the VZ NAT gateway address (`192.168.64.1`, on the host-local
+///   `bridge100` interface). Guests reach it as their gateway; other LAN hosts
+///   cannot route to it. It is shared by every VZ guest on the host, so — as on
+///   KVM's shared loopback — the per-sandbox proxy token is the cross-sandbox
+///   control until the per-sandbox network rule lands (ADR-0007). The interface
+///   exists only while a VZ NAT VM is running, so callers bind after guest boot.
+pub fn credential_proxy_bind_addr(port: u16) -> SocketAddr {
+    #[cfg(target_os = "macos")]
+    {
+        SocketAddr::V4(SocketAddrV4::new(MACOS_GUEST_HOST_GATEWAY_ADDR, port))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+}
+
 /// Security-relevant settings for the backend.
 #[derive(Debug, Clone)]
 pub struct BackendSecurityConfig {

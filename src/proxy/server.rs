@@ -19,13 +19,14 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::header::{
-    HeaderMap, HeaderName, CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER, TRANSFER_ENCODING,
-    UPGRADE,
+    HeaderMap, HeaderName, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER,
+    TRANSFER_ENCODING, UPGRADE,
 };
 use http::{Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -41,16 +42,29 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::backend::guest_accessible_bind_addr;
+use crate::backend::credential_proxy_bind_addr;
 use crate::error::{Error, Result};
 use crate::proxy::ssrf::SsrfGuardResolver;
-use crate::proxy::{EgressEvent, InjectOutcome, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER};
+use crate::proxy::{
+    EgressEvent, InjectOutcome, ProxyToken, SandboxContext, PROXY_TOKEN_BEARER_PREFIX,
+    PROXY_TOKEN_HEADER,
+};
 
 /// Cap on hyper's per-connection read buffer (headers + request-line). Bounds
 /// the host memory a single guest connection can pin in the parser before any
 /// resource accounting (R10: strict size limits on the guest-controlled parser
 /// surface). Bodies stream and are not held in this buffer.
 const MAX_HEADER_BUF_BYTES: usize = 64 * 1024;
+
+/// Audit-event reason recorded when a protocol-upgrade request is refused (R8).
+const REASON_UPGRADE_REFUSED: &str = "websocket-upgrade-refused";
+
+/// Response body for a refused protocol upgrade. Names the downstream symptom
+/// and the remediation so an operator who sees it in a client log can connect it
+/// to the provisioning knob without a debugging session.
+const UPGRADE_REFUSED_MESSAGE: &str = "protocol upgrade (WebSocket) is not supported by the \
+     credential proxy; the provisioned client config forces plain HTTPS \
+     (supports_websockets = false)";
 
 /// Body type the proxy hands back to hyper: a boxed stream of bytes whose error
 /// is normalised to `std::io::Error`.
@@ -93,17 +107,35 @@ struct SandboxSlot {
 pub struct ProxyHandle {
     sandboxes: Arc<Mutex<HashMap<String, SandboxSlot>>>,
     upstream: reqwest::Client,
+    /// IP each per-sandbox listener binds. Production ([`start_proxy`]) uses the
+    /// guest-reachable address ([`credential_proxy_bind_addr`]); an in-process
+    /// test with no VM overrides it to loopback via [`Self::with_loopback_bind`]
+    /// (on macOS the guest-reachable address is the VZ NAT gateway, which does
+    /// not exist without a running VM).
+    bind_ip: IpAddr,
 }
 
 impl ProxyHandle {
-    /// Build a handle that re-originates upstream requests with `upstream`.
-    /// Exposed so tests can supply a client whose DNS/trust is pointed at a
-    /// mock upstream; production uses [`start_proxy`].
+    /// Build a handle that re-originates upstream requests with `upstream`,
+    /// binding listeners on the guest-reachable address. Exposed so tests can
+    /// supply a client whose DNS/trust is pointed at a mock upstream; production
+    /// uses [`start_proxy`].
     pub fn new(upstream: reqwest::Client) -> Self {
         Self {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             upstream,
+            bind_ip: credential_proxy_bind_addr(0).ip(),
         }
+    }
+
+    /// Bind listeners on loopback instead of the guest-reachable address. For
+    /// in-process tests with no VM: their clients connect over `127.0.0.1`, and
+    /// on macOS the guest-reachable address (the VZ NAT gateway) is unbindable
+    /// without a running VM. Never use in production — the guest cannot reach a
+    /// loopback listener on macOS/VZ.
+    pub fn with_loopback_bind(mut self) -> Self {
+        self.bind_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        self
     }
 
     /// Register a sandbox: bind a fresh per-sandbox listener, spawn its accept loop, and
@@ -113,9 +145,18 @@ impl ProxyHandle {
         let server_config = ctx.ca.server_config();
         let acceptor = TlsAcceptor::from(server_config);
 
-        let listener = TcpListener::bind(guest_accessible_bind_addr(0))
-            .await
-            .map_err(|e| Error::Network(format!("proxy listener bind failed: {e}")))?;
+        let bind_addr = SocketAddr::new(self.bind_ip, 0);
+        let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
+            let macos_hint = if cfg!(target_os = "macos") && !self.bind_ip.is_loopback() {
+                " (the VZ NAT gateway address exists only while a VZ NAT VM is \
+                 running — the proxy must be registered after guest boot)"
+            } else {
+                ""
+            };
+            Error::Network(format!(
+                "credential proxy listener bind failed on {bind_addr}: {e}{macos_hint}"
+            ))
+        })?;
         let port = listener
             .local_addr()
             .map_err(|e| Error::Network(format!("proxy listener addr failed: {e}")))?
@@ -270,17 +311,32 @@ async fn proxy_request(
     upstream: reqwest::Client,
 ) -> Response<ProxyBody> {
     // --- auth: per-sandbox token, checked then stripped ---
-    let presented = req
-        .headers()
-        .get(PROXY_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(ProxyToken::from_hex);
+    let presented = presented_proxy_token(req.headers());
     let authed = matches!(&presented, Some(token) if ctx.token.matches(token));
     if !authed {
         return text_response(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             "missing or invalid proxy token",
         );
+    }
+
+    // --- protocol: refuse upgrades explicitly (R8) ---
+    // The proxy speaks plain request/response HTTP; it cannot inject into a
+    // WebSocket upgrade and must not answer one by silently stripping the
+    // Upgrade header — the client would treat the plain response as a failed
+    // handshake with no hint why. Refuse with a distinguishable status before
+    // any credential is touched or upstream connection made. Placed after auth
+    // so only the legitimate guest learns proxy behavior; strangers still get 407.
+    if is_upgrade_request(req.headers()) {
+        ctx.audit.record(EgressEvent {
+            host: host.to_string(),
+            port: ctx.upstream_port,
+            allowed: false,
+            injected: false,
+            reason: Some(REASON_UPGRADE_REFUSED),
+        });
+        warn!(host = %host, "proxy: refusing protocol-upgrade request (WebSocket unsupported, R8)");
+        return text_response(StatusCode::BAD_GATEWAY, UPGRADE_REFUSED_MESSAGE);
     }
 
     // --- policy: reachability ---
@@ -290,6 +346,7 @@ async fn proxy_request(
             port: ctx.upstream_port,
             allowed: false,
             injected: false,
+            reason: Some("policy-denied"),
         });
         return text_response(StatusCode::FORBIDDEN, &format!("egress denied: {reason}"));
     }
@@ -298,6 +355,18 @@ async fn proxy_request(
     let mut headers = parts.headers;
     strip_hop_by_hop(&mut headers);
     headers.remove(HeaderName::from_static(PROXY_TOKEN_HEADER));
+    // A token-bearing `Authorization` (`Bearer voidbox-proxy-…`) is a carrier,
+    // never a credential, so it is dropped here unconditionally: injection
+    // replaces `Authorization` for owned hosts anyway, and this keeps the token
+    // off the wire even for a host no injector owns.
+    let authorization_carries_token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|bearer| bearer.starts_with(PROXY_TOKEN_BEARER_PREFIX));
+    if authorization_carries_token {
+        headers.remove(AUTHORIZATION);
+    }
     headers.remove(HOST);
     // The body is re-originated as an unknown-length stream (chunked), so drop
     // any inbound Content-Length: forwarding it alongside chunked framing is the
@@ -318,6 +387,7 @@ async fn proxy_request(
                 port: ctx.upstream_port,
                 allowed: true,
                 injected: false,
+                reason: Some("credential-injection-failed"),
             });
             warn!(host = %host, "proxy: credential injection failed; refusing to forward uncredentialed");
             return text_response(StatusCode::BAD_GATEWAY, "credential injection failed");
@@ -346,6 +416,7 @@ async fn proxy_request(
         port: ctx.upstream_port,
         allowed: true,
         injected,
+        reason: None,
     });
 
     match response {
@@ -394,8 +465,56 @@ fn text_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
         .expect("static text response is always valid")
 }
 
+/// Extract the per-sandbox token a guest client presented, from either carrier:
+/// the dedicated header (`x-voidbox-proxy-token`, the Claude path via
+/// `ANTHROPIC_CUSTOM_HEADERS`), or embedded in the Bearer placeholder
+/// (`Authorization: Bearer voidbox-proxy-<hex>`, the codex API-key path, whose
+/// client has no custom-header env knob). The dedicated header wins when both
+/// are present. Whatever carried the token never reaches the upstream: the
+/// dedicated header is stripped, and `Authorization` is replaced or dropped by
+/// the injection stage on every owned-host outcome.
+fn presented_proxy_token(headers: &HeaderMap) -> Option<ProxyToken> {
+    if let Some(token) = headers
+        .get(PROXY_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(ProxyToken::from_hex)
+    {
+        return Some(token);
+    }
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|bearer| bearer.strip_prefix(PROXY_TOKEN_BEARER_PREFIX))
+        .and_then(ProxyToken::from_hex)
+}
+
+/// Whether the request asks for a protocol upgrade (RFC 9110 §7.8): an `Upgrade`
+/// header, or a `Connection` header carrying the `upgrade` option. Checking both
+/// matters — the `Connection: upgrade` option is what marks the `Upgrade` header
+/// as hop-by-hop, and a client may send either in any casing or as one item of a
+/// comma-separated list.
+fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key(UPGRADE) {
+        return true;
+    }
+    headers.get_all(CONNECTION).iter().any(|value| {
+        value
+            .to_str()
+            .map(|options| {
+                options
+                    .split(',')
+                    .any(|option| option.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Whether `name` is a hop-by-hop header that must not be forwarded across the
-/// proxy boundary (RFC 7230 §6.1, plus the proxy token).
+/// proxy boundary (RFC 7230 §6.1, plus the proxy token). `Upgrade` appears here
+/// only as defensive stripping on the response path; a *request* that needs the
+/// upgrade is refused explicitly by [`is_upgrade_request`] instead of being
+/// silently downgraded (R8).
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     name == CONNECTION
         || name == TE

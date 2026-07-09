@@ -25,3 +25,4 @@ An ADR is distinct from an RFC. An RFC (in [`../rfc/`](../rfc/README.md)) is a p
 | 0004 | Isolate sandboxes with a per-sandbox listener, token, and name-constrained CA | Accepted | 2026-06-27 | [0004-per-sandbox-proxy-isolation.md](0004-per-sandbox-proxy-isolation.md) |
 | 0005 | Model egress as a per-sandbox profile with two-layer, name-based enforcement | Accepted | 2026-06-27 | [0005-egress-per-sandbox-profile-model.md](0005-egress-per-sandbox-profile-model.md) |
 | 0006 | Enforce VZ egress in-guest with an eBPF cgroup connect-filter | Accepted | 2026-06-27 | [0006-vz-in-guest-ebpf-egress-enforcement.md](0006-vz-in-guest-ebpf-egress-enforcement.md) |
+| 0007 | Bind the VZ credential-proxy listener to the NAT gateway address | Accepted | 2026-07-09 | [0007-vz-credential-proxy-gateway-bind.md](0007-vz-credential-proxy-gateway-bind.md) |

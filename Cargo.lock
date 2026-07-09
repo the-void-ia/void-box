@@ -3020,6 +3020,7 @@ name = "void-box"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64",
  "block2",
  "byteorder",
  "bytes",
@@ -3077,6 +3078,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "virtio-bindings",
  "vm-fdt",

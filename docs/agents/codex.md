@@ -117,8 +117,11 @@ The codex CLI authenticates against the OpenAI Responses API used by
    stages it into a temp directory with 0600 permissions, and mounts the
    directory at `/home/sandbox/.codex` inside the guest (RW so codex can
    refresh tokens). This works for both `auth_mode: "chatgpt"` (the
-   ChatGPT OAuth flow) and `auth_mode: "api_key"`. The temp directory
+   ChatGPT OAuth flow) and API-key mode. The temp directory
    auto-cleans on run completion.
+
+   Note on the `auth_mode` spelling: codex ≥0.141 serializes API-key mode
+   as `"apikey"`; older files carry `"api_key"`. void-box accepts both.
 2. **`OPENAI_API_KEY` env var.** Forwarded into the guest exec env if set
    on the host. As of codex 0.118, the Responses API endpoint typically
    rejects `sk-proj-...` project-scoped keys with "Missing bearer or
@@ -127,6 +130,40 @@ The codex CLI authenticates against the OpenAI Responses API used by
 
 Both can be set together — codex's own auth resolver picks one based on
 what's available in `auth.json`.
+
+### Auth through the credential proxy (`credential_proxy: true`)
+
+With `credential_proxy: true` in the spec, neither the `auth.json` mount
+nor the `OPENAI_API_KEY` env forward into the guest. Instead the durable
+credential stays on the host and the proxy injects it at TLS egress; the
+guest gets only placeholders. This is the containment path — see the
+"Credential proxy and containment" section of `AGENTS.md`. Two modes,
+resolved host-side from `~/.codex/auth.json` (`auth_mode`, or the fields
+present) and the `OPENAI_API_KEY` env:
+
+- **API-key mode** (`api.openai.com/v1`). The proxy injects
+  `Authorization: Bearer <real key>`; the guest's `auth.json` carries a
+  placeholder "key" that is the per-sandbox proxy token, so the token
+  reaches the proxy inside the Bearer.
+- **ChatGPT mode** (`chatgpt.com/backend-api/codex`). The host
+  `OAuthTokenStore` refreshes `~/.codex/auth.json` and mints a
+  short-lived Bearer; the proxy injects it plus the host-held
+  `chatgpt-account-id`. The guest's placeholder `auth.json` holds
+  dummy far-future JWTs so codex never attempts its own refresh.
+
+codex is redirected via a generated `$CODEX_HOME/config.toml` (a dedicated
+`[model_providers.voidbox]` entry with `supports_websockets = false` — the
+proxy cannot inject into a WebSocket upgrade and refuses one) plus a
+`CODEX_CA_CERTIFICATE` env for the per-sandbox CA. The token also rides the
+provider entry's `http_headers` as `x-voidbox-proxy-token`.
+
+**Limitation (SSRF):** a proxied endpoint must resolve to a public IP. The
+proxy's SSRF guard refuses internal ranges, so a host-local or internal
+codex base URL cannot use `credential_proxy` — it does not need it, since a
+local endpoint takes no durable secret.
+
+All of the above is pinned against codex 0.141.0 and re-verified on every
+bump by `scripts/test_credential_proxy_codex_v1.sh` (R9).
 
 ## Validation
 

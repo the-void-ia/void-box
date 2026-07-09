@@ -26,6 +26,16 @@ const TOKEN_BYTES: usize = 32;
 /// re-originating to the upstream.
 pub const PROXY_TOKEN_HEADER: &str = "x-voidbox-proxy-token";
 
+/// Prefix of a token-bearing placeholder credential: a guest whose client has no
+/// custom-header knob (codex) carries `voidbox-proxy-<token_hex>` as its
+/// placeholder API key, so the token arrives inside `Authorization: Bearer`.
+/// The proxy accepts either carrier and replaces or drops `Authorization`
+/// during injection, so the token never reaches the upstream on this path
+/// either. The Claude placeholder (`voidbox-proxy-placeholder`) shares this
+/// prefix harmlessly: its suffix is not valid token hex, so it never
+/// authenticates — it is only ever a filler value.
+pub const PROXY_TOKEN_BEARER_PREFIX: &str = "voidbox-proxy-";
+
 /// A per-sandbox proxy token. Compares in constant time and redacts itself in
 /// `Debug` so it never lands in logs verbatim.
 #[derive(Clone)]

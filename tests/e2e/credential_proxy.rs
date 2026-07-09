@@ -222,19 +222,19 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
 
     // Provision the guest: write the CA, redirect the upstream name to the
     // gateway, and assert R14 (no real key in the staged env/files).
-    let upstream = ProxiedUpstream::for_provider(&void_box::llm::LlmProvider::Claude).unwrap();
+    let upstream = ProxiedUpstream::for_provider(&void_box::llm::LlmProvider::Claude, None)
+        .expect("claude maps")
+        .expect("claude is served");
     let provisioning = build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
-    assert_no_real_credential(
-        &provisioning.env,
-        std::slice::from_ref(&provisioning.ca_file),
-        REAL_KEY,
-    )
-    .expect("R14: no real credential in guest provisioning");
+    assert_no_real_credential(&provisioning.env, &provisioning.files, REAL_KEY)
+        .expect("R14: no real credential in guest provisioning");
 
-    backend
-        .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
-        .await
-        .expect("write CA into guest");
+    for (path, contents) in &provisioning.files {
+        backend
+            .write_file(path, contents.as_bytes())
+            .await
+            .expect("write provisioning file into guest");
+    }
 
     // Exercise the real host-side hosts provisioning (not a shell `echo`): stage
     // the rendered hosts file under /etc/voidbox, which the guest-agent mirrors
@@ -274,9 +274,14 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
         .map(|(_, v)| v.clone())
         .unwrap();
+    let ca_guest_path = provisioning
+        .files
+        .iter()
+        .find(|(path, _)| path.ends_with(".pem"))
+        .map(|(path, _)| path.clone())
+        .expect("CA PEM staged");
     let script = format!(
-        "wget -q -O - --ca-certificate={} --header='{}' {}/v1/messages",
-        provisioning.ca_file.0, token_header, base_url
+        "wget -q -O - --ca-certificate={ca_guest_path} --header='{token_header}' {base_url}/v1/messages"
     );
     let out = guest_sh(&*backend, &script).await;
 
@@ -291,6 +296,31 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
             eprintln!(
                 "note: guest HTTPS call did not succeed (client capability); \
                  stderr: {}",
+                out.stderr_str()
+            );
+        }
+    }
+
+    // Second leg: the Bearer-carried token — how a proxied codex presents itself
+    // (its placeholder credential `voidbox-proxy-<hex>` arrives as the Bearer;
+    // there is no dedicated token header). Proves the carrier works from a real
+    // guest through the real network path on this platform.
+    let bearer_script = format!(
+        "wget -q -O - --ca-certificate={ca_guest_path} \
+         --header='Authorization: Bearer voidbox-proxy-{token_hex}' {base_url}/v1/messages",
+        token_hex = binding.token_hex,
+    );
+    if let Some(out) = guest_sh(&*backend, &bearer_script).await {
+        if out.success() {
+            assert_eq!(out.stdout_str().trim(), "upstream-ok");
+            let seen = captured.lock().unwrap().clone().expect("upstream called");
+            // Injection replaced the token-carrying Authorization wholesale.
+            assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
+            assert!(seen.get("authorization").is_none());
+        } else {
+            eprintln!(
+                "note: guest HTTPS bearer-carrier call did not succeed (client \
+                 capability); stderr: {}",
                 out.stderr_str()
             );
         }
