@@ -707,9 +707,23 @@ Skill::mcp("void-mcp")
 
 ## Credential proxy and containment
 
-VoidBox runs an untrusted agent (uid 1000) inside the guest, so a durable credential — a long-lived API key or an OAuth refresh token — must never be staged where that agent can read and exfiltrate it. The **credential proxy** is a host-side, TLS-terminating, header-injecting proxy: it holds each provider's durable secret on the host and rewrites the credential header at network egress, so the guest carries only a non-secret placeholder. It is opt-in per box via `credential_proxy: true`, and in M0/M1a runs on Linux/KVM only — the listener must be bound guest-only, and VZ/macOS is deferred to M1b.
+VoidBox runs an untrusted agent (uid 1000) inside the guest, so a durable credential — a long-lived API key or an OAuth refresh token — must never be staged where that agent can read and exfiltrate it. The **credential proxy** is a host-side, TLS-terminating, header-injecting proxy: it holds each provider's durable secret on the host and rewrites the credential header at network egress, so the guest carries only a non-secret placeholder. It is opt-in per box via `credential_proxy: true`, and runs on both Linux/KVM and macOS/VZ. The listener must be reachable by the guest without also being LAN-exposed: `credential_proxy_bind_addr` (`src/backend/mod.rs`) binds host loopback on KVM (SLIRP-forwarded) and the host-local VZ NAT gateway address (`192.168.64.1`) on VZ (ADR-0007). On VZ every guest shares the NAT segment, so the per-sandbox token is the sole cross-sandbox control there until the egress-track in-guest rule lands — the same recorded posture as M0 on KVM's shared loopback.
 
-This subsystem implements [RFC-0002](docs/rfc/0002-guest-network-egress-and-credential-containment.md). The milestone rollout is **M0** (Claude API key), **M1a** (Claude personal OAuth), then M1b (codex + VZ parity), M2 (downstream services), and the egress track.
+This subsystem implements [RFC-0002](docs/rfc/0002-guest-network-egress-and-credential-containment.md). The milestone rollout is **M0** (Claude API key), **M1a** (Claude personal OAuth), **M1b** (codex API-key and ChatGPT OAuth, WebSocket fail-closed, long-run rotation, KVM+VZ parity, the Anthropic-compatible Custom provider), then M2 (downstream services), and the egress track.
+
+### Providers served
+
+| Provider | Auth | Guest client / mechanism |
+|---|---|---|
+| `claude` | API key (`x-api-key`), from `ANTHROPIC_API_KEY` | claude-code, env-driven (`ANTHROPIC_BASE_URL`, placeholder key, `ANTHROPIC_CUSTOM_HEADERS` token) |
+| `claude-personal` | OAuth Bearer, host store refreshes `~/.claude/.credentials.json` | claude-code, env-driven + `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` |
+| `custom` (Anthropic-compatible) | API key (`x-api-key`), from `api_key_env` | claude-code, env-driven; base URL parsed to host/port/path, path preserved in the redirect; https-only, public-IP-only (SSRF baseline) |
+| `codex` (API-key mode) | `Authorization: Bearer`, from `~/.codex/auth.json` or `OPENAI_API_KEY` → `api.openai.com/v1` | codex, config-driven |
+| `codex` (ChatGPT mode) | OAuth Bearer + `chatgpt-account-id`, host store refreshes `~/.codex/auth.json` → `chatgpt.com/backend-api/codex` | codex, config-driven |
+
+codex is provisioned differently from claude-code: rather than env vars, it gets a generated `$CODEX_HOME/config.toml` (a dedicated `[model_providers.voidbox]` entry — a config entry cannot override the built-in `openai` provider, whose WebSocket transport is on) plus a placeholder `auth.json`. The config forces `supports_websockets = false`, so codex uses plain HTTPS; the proxy additionally refuses any protocol-upgrade request with a `502` and a `websocket-upgrade-refused` audit event (R8) rather than silently downgrading it. The proxy token reaches codex two ways: the provider entry's `http_headers` map carries `x-voidbox-proxy-token` (the primary carrier, and the only one in ChatGPT mode), and in API-key mode the placeholder "key" is `voidbox-proxy-<token_hex>`, so it also arrives inside `Authorization: Bearer`. The proxy's auth stage accepts either carrier (constant-time compare) and replaces or drops `Authorization` before re-originating, so the token never reaches the upstream.
+
+All codex behaviors are pinned against codex 0.141.0 and must be re-verified on every bump (R9) via the provisioning harness (below).
 
 ### Per-connection pipeline
 
@@ -720,17 +734,19 @@ One shared proxy process serves every sandbox. Each sandbox gets its own TLS-ter
 `CredentialInjector::inject` is async so an OAuth injector can await a token refresh in the request path. Two implementations coexist behind the trait, selected per provider by the `ProxiedAuth` enum:
 
 - `StaticApiKeyInjector` — a host-held API key already in memory (Anthropic `x-api-key`, or `Authorization: Bearer`). Serves `ProxiedAuth::ApiKey(scheme)`.
-- `OAuthBearerInjector` — asks `ClaudeOAuthStore` for a currently-valid access token, injects `Authorization: Bearer`, and drops `x-api-key`. Serves `ProxiedAuth::Oauth` (Claude personal).
+- `OAuthBearerInjector` — asks the host `OAuthTokenStore` for a currently-valid access token, injects `Authorization: Bearer`, and drops `x-api-key`. Serves `ProxiedAuth::Oauth(kind)`. Its `with_extra_header` variant also writes host-held static headers alongside the Bearer (codex's `chatgpt-account-id`, replacing the guest's placeholder), and drops them together with the credential on a failed injection.
 
 Any injection failure fails closed: the proxy returns `502` and drops every credential header rather than forward an unauthenticated upstream call.
 
-### Host-side OAuth store (`ClaudeOAuthStore`)
+### Host-side OAuth store (`OAuthTokenStore`)
 
-`ClaudeOAuthStore` (`src/credentials.rs`) holds the durable Claude OAuth refresh token in host memory only, refreshes it against Anthropic's token endpoint to mint short-lived access tokens, and is the rotation owner across void-box runs. Refreshes are serialized within the process by a state mutex (coalescing concurrent requests) and across processes by an advisory `flock` held over the whole read-refresh-write cycle, so a peer run that already rotated the token on disk is adopted rather than double-spending the single-use refresh token. The rotated token is written back atomically — temp file + `rename`, `0600`, parent-directory fsync. The lock coordinates void-box runs with each other only; it does not coordinate with the operator's own `claude-code`, which does not take it. The token-endpoint URL and client id are pinned constants that must be re-verified in the RFC's V2 validation and on every claude-code version bump.
+`OAuthTokenStore` (`src/credentials.rs`) holds a durable OAuth refresh token in host memory only, refreshes it against the provider's token endpoint to mint short-lived access tokens, and is the rotation owner across void-box runs. One implementation serves both providers, parameterized by `OAuthProviderKind` (`ClaudeCode` | `CodexChatGpt`): the kind owns the on-disk schema (Claude's `.credentials.json` `claudeAiOauth` object vs codex's `auth.json` `tokens` object + `last_refresh`), the token endpoint + client id, the lock-file name, and how a minted access token's expiry is derived (Claude states `expires_in`; codex has none, so expiry is read from the minted access-token JWT's `exp` with a short fallback). Everything else is shared: refreshes are serialized within the process by a state mutex (coalescing concurrent requests) and across processes by an advisory `flock` held over the whole read-refresh-write cycle, so a peer run that already rotated the token on disk is adopted rather than double-spending the single-use refresh token; the rotated token is written back atomically — temp file + `rename`, `0600`, parent-directory fsync. The lock coordinates void-box runs with each other only; it does not coordinate with the operator's own `claude-code`/`codex`, which do not take it. The token-endpoint URLs and client ids are pinned constants (Anthropic + OpenAI) that must be re-verified in the RFC's V2 validation and on every claude-code / codex version bump. On macOS, `claude-personal` requires a file-based credential (`~/.claude/.credentials.json`): the store is the rotation owner and must write the rotated token back, and Keychain write-back is unimplemented, so a Keychain-only login fails closed with the limitation named (ADR-0007 follow-up).
+
+Long-run rotation stays lazy per-request: injection happens at the start of each request, and a stream never re-authenticates mid-flight, so an access token refreshed just before a long response covers the whole response. Multi-rotation behavior — N sequential single-use-refresh-token rotations, adopt-peer across simulated concurrent runs, atomic write-back verified each step, and the rate-cap over many cycles — is covered by unit tests in `src/credentials.rs` for both provider kinds.
 
 ### The R14 invariant — no durable secret in the guest
 
-For `claude-personal` routed through the proxy, no `.credentials.json` is staged into the guest. Three checks enforce this: `prepare_claude_personal` (`src/runtime.rs`) skips discovery/staging when the proxy is active; `build_pipeline_box_with_io` gates the credentials-file mount on the effective per-box config (a per-box override can enable the proxy while the top-level staged a file); and `validate_credential_proxy_preconditions` (`src/agent_box.rs`) refuses, before boot, to run the proxy alongside a staged credentials file. `assert_no_real_credential` (`src/proxy/provision.rs`) audits the staged env and files against the durable secret as a backstop.
+For any proxied provider, no durable credential is staged into the guest. The controls, in order: the real key is structurally withheld from the staged env (`is_proxy_owned_env` / `provider_is_proxy_servable` — keyed on a pure provider check, so a servable provider's key is withheld whenever the proxy is on, even if setup later errors); `prepare_claude_personal` and `prepare_codex` (`src/runtime.rs`) skip credential discovery/staging when the proxy is active; `build_pipeline_box_with_io` gates the Claude credentials-file mount and the codex `auth.json` mount on the effective per-box config (a per-box override can enable the proxy while the top-level staged one); and `validate_credential_proxy_preconditions` (`src/agent_box.rs`) refuses, before boot, to run the proxy alongside a staged Claude credentials file or a mount over `/home/sandbox/.codex` / `/home/sandbox/.claude`. `assert_no_real_credential` (`src/proxy/provision.rs`) audits every staged env value and file — the CA PEM, codex `auth.json` and `config.toml`, and `/etc/hosts` — against the durable secret as a backstop.
 
 ### Snapshot / restore
 
@@ -738,25 +754,28 @@ The CA private key and the credential store live only in the host proxy process 
 
 ### Validation
 
-- `cargo test --test proxy` — in-process pipeline against a mock upstream: API-key and OAuth injection, token auth, name-constraint enforcement, SSRF rejection, cross-sandbox isolation. No VM.
-- `ANTHROPIC_API_KEY=… cargo test --test proxy_real_upstream -- --ignored` — API-key injection against real `api.anthropic.com`.
-- `VOIDBOX_V2_OAUTH=1 VOIDBOX_TEST_CLAUDE_CREDS=… cargo test --test oauth_real_upstream -- --ignored` — the V2 OAuth-acceptance harness (R4/R5). It spends a single-use refresh token, so it requires a throwaway account's credentials file, not your primary login.
-- Example specs: `examples/specs/credential_proxy_claude.yaml` (API key) and `credential_proxy_claude_personal.yaml` (personal OAuth).
+- `cargo test --test proxy` — in-process pipeline against a mock upstream: API-key and OAuth injection for Claude and codex (Bearer-carried token, OAuth Bearer + `chatgpt-account-id`), token auth, name-constraint enforcement, SSRF rejection, cross-sandbox isolation, WebSocket-upgrade fail-closed. No VM.
+- `ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo test --test proxy_real_upstream -- --ignored` — API-key injection against real `api.anthropic.com` (Claude) and `api.openai.com` (codex, via the Bearer-carried token).
+- `scripts/test_credential_proxy_codex_v1.sh` — the R9 codex provisioning harness: fetches the pinned codex binary and runs `tests/codex_provisioning_harness.rs` against it, asserting on the wire that the generated `config.toml`/`auth.json` are honored (redirect path, token carriers, `supports_websockets=false`, no self-refresh). Run this on every codex bump. Modes: `harness` (default, no VM/key), `mechanics` (adds a funded `OPENAI_API_KEY`), `full` (Linux/KVM VM run), `all`.
+- `VOIDBOX_V2_OAUTH=1 VOIDBOX_TEST_CLAUDE_CREDS=… cargo test --test oauth_real_upstream -- --ignored` and `VOIDBOX_V2_CODEX_OAUTH=1 VOIDBOX_TEST_CODEX_AUTH=… cargo test --test codex_oauth_real_upstream -- --ignored` — the V2 OAuth-acceptance harnesses (R4/R5) for Claude and codex ChatGPT. Each spends a single-use refresh token, so each requires a throwaway account's credential file, not your primary login.
+- `cargo test --test e2e_credential_proxy -- --ignored --test-threads=1` — the VM e2e (real guest), run on both Linux/KVM and macOS/VZ (wired into `e2e.yml` and `e2e-macos.yml`).
+- Example specs: `credential_proxy_claude.yaml` (API key), `credential_proxy_claude_personal.yaml` (personal OAuth), `credential_proxy_codex.yaml` (codex API key), `credential_proxy_codex_chatgpt.yaml` (codex ChatGPT OAuth), `credential_proxy_custom.yaml` (Anthropic-compatible Custom) under `examples/specs/`.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `src/proxy/mod.rs` | Pipeline traits (`CredentialInjector`, `EgressPolicy`, `AuditSink`), `SandboxContext`, frozen-pipeline contract |
-| `src/proxy/server.rs` | Per-sandbox TLS listener, `ProxyHandle`, request pipeline, upstream re-origination |
-| `src/proxy/injector.rs` | `StaticApiKeyInjector`, `OAuthBearerInjector` |
+| `src/proxy/mod.rs` | Pipeline traits (`CredentialInjector`, `EgressPolicy`, `AuditSink`), `SandboxContext`, `EgressEvent` (with `reason`), frozen-pipeline contract |
+| `src/proxy/server.rs` | Per-sandbox TLS listener (`credential_proxy_bind_addr`), `ProxyHandle`, request pipeline, token carriers (`presented_proxy_token`), Upgrade fail-closed (`is_upgrade_request`), upstream re-origination |
+| `src/proxy/injector.rs` | `StaticApiKeyInjector`, `OAuthBearerInjector` (+ `with_extra_header`) |
 | `src/proxy/ca.rs` | Per-sandbox name-constrained CA (ECDSA P-256), leaf minting |
-| `src/proxy/token.rs` | Per-sandbox proxy token (`ProxyToken`), constant-time compare + redaction |
+| `src/proxy/token.rs` | Per-sandbox proxy token (`ProxyToken`), `PROXY_TOKEN_BEARER_PREFIX`, constant-time compare + redaction |
 | `src/proxy/ssrf.rs` | SSRF-guard resolver, shared by the proxy upstream client and the OAuth store |
-| `src/proxy/provision.rs` | Provider → proxy mapping (`ProxiedUpstream`/`ProxiedAuth`), guest provisioning, `assert_no_real_credential` (R14) |
-| `src/credentials.rs` | `ClaudeOAuthStore` (refresh/mint/rotation + atomic write-back); credential discovery/staging |
-| `src/agent_box.rs` | `maybe_setup_credential_proxy`, injector selection, `validate_credential_proxy_preconditions` (R14) |
-| `src/runtime.rs` | `prepare_claude_personal`, per-box credentials-file staging gate |
+| `src/proxy/provision.rs` | Provider → proxy mapping (`ProxiedUpstream`/`ProxiedAuth`/`GuestClient`, incl. Custom URL parsing), guest provisioning, codex `config.toml`/`auth.json` renderers, `assert_no_real_credential` (R14) |
+| `src/credentials.rs` | `OAuthTokenStore` (Claude + codex, refresh/mint/rotation + atomic write-back), `CodexAuthMode`/`resolve_codex_auth_mode`/`discover_codex_api_key`, credential discovery/staging |
+| `src/agent_box.rs` | `maybe_setup_credential_proxy`, injector selection, withholding (`is_proxy_owned_env`/`provider_is_proxy_servable`), codex config.toml composition, `validate_credential_proxy_preconditions` (R14) |
+| `src/backend/mod.rs` | `credential_proxy_bind_addr` (loopback on KVM, VZ NAT gateway on macOS) |
+| `src/runtime.rs` | `prepare_claude_personal`, `prepare_codex`, per-box credential-mount staging gates |
 
 ## Auto image resolution
 
