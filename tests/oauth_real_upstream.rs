@@ -39,7 +39,7 @@ use rustls::{ClientConfig, RootCertStore};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use void_box::credentials::ClaudeOAuthStore;
+use void_box::credentials::{OAuthProviderKind, OAuthTokenStore};
 use void_box::proxy::{
     start_proxy, OAuthBearerInjector, ProxyCa, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER,
 };
@@ -74,8 +74,12 @@ async fn host_refreshed_bearer_is_accepted_by_real_anthropic() {
     // The store uses the production token endpoint + SSRF-guarded client — the
     // exact wiring the running system uses. Write-back targets the supplied file.
     let store = Arc::new(
-        ClaudeOAuthStore::from_json(&SecretString::from(creds_json), creds_path.clone())
-            .expect("build store from throwaway credentials"),
+        OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
+            &SecretString::from(creds_json),
+            creds_path.clone(),
+        )
+        .expect("build store from throwaway credentials"),
     );
 
     // --- R4: a host-replayed refresh is accepted and the rotated token persisted.
@@ -94,7 +98,10 @@ async fn host_refreshed_bearer_is_accepted_by_real_anthropic() {
     eprintln!("-------------------");
 
     // --- R5: the minted Bearer authenticates a real inference request.
-    let proxy = start_proxy().await.expect("start proxy");
+    let proxy = start_proxy()
+        .await
+        .expect("start proxy")
+        .with_loopback_bind();
     let token = ProxyToken::generate();
     let token_hex = token.to_hex();
     let ca = Arc::new(ProxyCa::generate(vec![UPSTREAM_HOST.to_string()]).expect("per-sandbox CA"));

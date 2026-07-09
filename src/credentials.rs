@@ -11,17 +11,23 @@
 //! - **Codex**: `~/.codex/auth.json` (both Linux and macOS — codex stores
 //!   plain JSON, no Keychain integration). Mounted into the guest at
 //!   `/home/sandbox/.codex`. Supports both `auth_mode: "chatgpt"` (cached
-//!   OAuth bearer from `codex login`) and `auth_mode: "api_key"`.
+//!   OAuth bearer from `codex login`) and API-key mode (codex ≥0.141 spells it
+//!   `"apikey"`; older files spell it `"api_key"` — both are accepted).
 //!
 //! Cleanup is automatic: [`StagedCredentials`] wraps a [`tempfile::TempDir`]
 //! whose `Drop` impl removes the directory when the value goes out of scope.
 //!
-//! **Host-side custody without staging** ([`ClaudeOAuthStore`]). When the
-//! credential proxy is active, the durable Claude OAuth refresh token must stay
-//! on the host and never reach the guest. The store holds it in host memory,
-//! refreshes it against Anthropic's token endpoint to mint short-lived access
-//! tokens the proxy injects, and writes the rotated refresh token back to the
-//! host credential file. The guest gets a placeholder, not the secret.
+//! **Host-side custody without staging** ([`OAuthTokenStore`]). When the
+//! credential proxy is active, the durable OAuth refresh token must stay on the
+//! host and never reach the guest. The store holds it in host memory, refreshes
+//! it against the provider's token endpoint to mint short-lived access tokens
+//! the proxy injects, and writes the rotated refresh token back to the host
+//! credential file. The guest gets a placeholder, not the secret. One store
+//! implementation serves both providers, parameterized by
+//! [`OAuthProviderKind`]: the kind owns the on-disk schema (Claude's
+//! `.credentials.json` vs codex's `auth.json`), the token endpoint, and how a
+//! minted token's expiry is derived; the refresh coalescing, rate-cap,
+//! cross-process locking, and atomic write-back are shared.
 
 use std::fs;
 use std::io::Write;
@@ -30,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use reqwest::header::CONTENT_TYPE;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -237,8 +244,134 @@ pub fn stage_codex_credentials(creds_json: &SecretString) -> Result<StagedCreden
     })
 }
 
+/// How the host authenticates codex upstream, resolved from the host's own
+/// codex credential state before any guest provisioning.
+///
+/// A closed two-mode enum rather than a pair of options: the injector the run
+/// builds (static Bearer vs OAuth store), the upstream host it targets, and the
+/// placeholder `auth.json` the guest gets all derive from this one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexAuthMode {
+    /// A static OpenAI API key (from `~/.codex/auth.json` or `OPENAI_API_KEY`),
+    /// injected as `Authorization: Bearer` against `api.openai.com`.
+    ApiKey,
+    /// ChatGPT-subscription OAuth from `codex login`: the host store refreshes
+    /// the durable token and mints short-lived Bearers against the ChatGPT
+    /// backend.
+    ChatGpt,
+}
+
+/// Resolve the codex auth mode from the host's `~/.codex/auth.json` and the
+/// `OPENAI_API_KEY` env var. Fails (rather than guessing) when neither source
+/// can authenticate — a wrong guess would provision a placeholder for an auth
+/// path the host cannot serve.
+pub fn resolve_codex_auth_mode() -> Result<CodexAuthMode> {
+    let auth_json = read_host_codex_auth_json();
+    let env_key_present = std::env::var("OPENAI_API_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    codex_auth_mode_from_parts(auth_json.as_deref(), env_key_present)
+}
+
+/// Pure core of [`resolve_codex_auth_mode`], separated so tests can exercise the
+/// decision table without touching the host filesystem or process env.
+///
+/// Precedence mirrors codex's own resolution: an explicit `auth_mode` in
+/// `auth.json` wins; an ambiguous file is inferred from which credential fields
+/// it holds; with no file at all, a host `OPENAI_API_KEY` selects API-key mode.
+pub fn codex_auth_mode_from_parts(
+    auth_json: Option<&str>,
+    env_api_key_present: bool,
+) -> Result<CodexAuthMode> {
+    if let Some(json) = auth_json {
+        let document: Value = serde_json::from_str(json)
+            .map_err(|_| Error::Config("codex auth.json is not valid JSON".into()))?;
+        if let Some(mode) = document.get("auth_mode").and_then(Value::as_str) {
+            // codex ≥0.141 serializes AuthMode lowercase ("apikey"); older files
+            // carry "api_key". Accept both spellings for the same mode.
+            return match mode.to_ascii_lowercase().as_str() {
+                "chatgpt" => Ok(CodexAuthMode::ChatGpt),
+                "apikey" | "api_key" => Ok(CodexAuthMode::ApiKey),
+                other => Err(Error::Config(format!(
+                    "codex auth.json has unsupported auth_mode '{other}' — \
+                     the credential proxy serves 'chatgpt' and 'apikey' logins only"
+                ))),
+            };
+        }
+        // No explicit mode: infer from which credential the file actually holds.
+        let has_refresh_token = document
+            .get("tokens")
+            .and_then(|tokens| tokens.get("refresh_token"))
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty());
+        if has_refresh_token {
+            return Ok(CodexAuthMode::ChatGpt);
+        }
+        let has_stored_key = document
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.is_empty());
+        if has_stored_key {
+            return Ok(CodexAuthMode::ApiKey);
+        }
+    }
+    if env_api_key_present {
+        return Ok(CodexAuthMode::ApiKey);
+    }
+    Err(Error::Config(
+        "cannot resolve a codex auth mode: no usable ~/.codex/auth.json \
+         (run 'codex login') and no OPENAI_API_KEY in the host environment"
+            .into(),
+    ))
+}
+
+/// Discover the static OpenAI API key for codex API-key mode: the key stored in
+/// `~/.codex/auth.json` (what `codex login --api-key` wrote) first, else the
+/// host `OPENAI_API_KEY` env var. Errors name both remediations.
+pub fn discover_codex_api_key() -> Result<SecretString> {
+    codex_api_key_from_parts(
+        read_host_codex_auth_json().as_deref(),
+        std::env::var("OPENAI_API_KEY").ok(),
+    )
+}
+
+/// Pure core of [`discover_codex_api_key`]; see [`codex_auth_mode_from_parts`]
+/// for why the host IO is separated out.
+pub fn codex_api_key_from_parts(
+    auth_json: Option<&str>,
+    env_api_key: Option<String>,
+) -> Result<SecretString> {
+    if let Some(json) = auth_json {
+        if let Ok(document) = serde_json::from_str::<Value>(json) {
+            if let Some(key) = document
+                .get("OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+            {
+                return Ok(SecretString::from(key.to_string()));
+            }
+        }
+    }
+    if let Some(key) = env_api_key.filter(|key| !key.trim().is_empty()) {
+        return Ok(SecretString::from(key));
+    }
+    Err(Error::Config(
+        "no OpenAI API key found for codex API-key mode: neither \
+         ~/.codex/auth.json holds one (run 'codex login --api-key') nor is \
+         OPENAI_API_KEY set in the host environment"
+            .into(),
+    ))
+}
+
+/// Read `~/.codex/auth.json` if present; `None` when missing or unreadable so
+/// the caller can fall through to env-based resolution.
+fn read_host_codex_auth_json() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    fs::read_to_string(Path::new(&home).join(".codex/auth.json")).ok()
+}
+
 // ---------------------------------------------------------------------------
-// Claude OAuth credential store (host-side refresh / mint / rotation)
+// OAuth credential store (host-side refresh / mint / rotation)
 // ---------------------------------------------------------------------------
 
 /// Anthropic OAuth token endpoint and the claude-code public OAuth client id.
@@ -249,6 +382,23 @@ pub fn stage_codex_credentials(creds_json: &SecretString) -> Result<StagedCreden
 /// version bump (R9) before this path is relied on against a real subscription.
 const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// OpenAI OAuth token endpoint and the codex public OAuth client id.
+///
+/// The values the bundled codex CLI uses for its own refresh flow
+/// (`REFRESH_TOKEN_URL` / `CLIENT_ID` in codex's `login` crate, verified against
+/// codex 0.141.0). Provider-controlled and load-bearing: re-verify in the
+/// codex V2 OAuth-acceptance validation and on every codex version bump (R9)
+/// before this path is relied on against a real subscription.
+const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Lifetime assumed for a codex-minted access token whose JWT carries no
+/// readable `exp` claim. The OpenAI refresh response has no `expires_in` field —
+/// expiry is normally read from the minted access token itself — so this floor
+/// only matters when that parse fails, and it errs short: an early re-refresh is
+/// a wasted round-trip, a late one is an authentication failure mid-run.
+const CODEX_FALLBACK_ACCESS_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// Mint a fresh access token this far before the stored expiry, so a request in
 /// flight never races the expiry boundary.
@@ -278,39 +428,94 @@ const MAX_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 /// write cycle across concurrent void-box runs sharing one credential file.
 ///
 /// It coordinates void-box runs with each other only. It cannot coordinate with
-/// the operator's own `claude-code`, which does not take this lock — a concurrent
-/// refresh by that client remains an inherent, unguarded race on the shared
-/// single-use refresh token.
-const CREDENTIALS_LOCK_NAME: &str = ".voidbox-claude-credentials.lock";
+/// the operator's own `claude-code`/`codex`, which do not take this lock — a
+/// concurrent refresh by those clients remains an inherent, unguarded race on
+/// the shared single-use refresh token.
+const CLAUDE_CREDENTIALS_LOCK_NAME: &str = ".voidbox-claude-credentials.lock";
 
-/// Host-side custodian of a Claude personal-subscription OAuth credential.
+/// Codex counterpart of [`CLAUDE_CREDENTIALS_LOCK_NAME`], sibling to
+/// `~/.codex/auth.json`.
+const CODEX_CREDENTIALS_LOCK_NAME: &str = ".voidbox-codex-auth.lock";
+
+/// Which provider's OAuth credential an [`OAuthTokenStore`] custodies.
+///
+/// The kind owns everything schema- and endpoint-specific — on-disk layout,
+/// token endpoint + client id, lock-file name, and how a minted access token's
+/// expiry is derived — as enum dispatch on one closed set, so the shared refresh
+/// machinery (coalescing, rate-cap, cross-process lock, atomic write-back)
+/// cannot diverge between providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthProviderKind {
+    /// Claude personal subscription: `~/.claude/.credentials.json`, tokens under
+    /// the `claudeAiOauth` object, expiry from the response's `expires_in`.
+    ClaudeCode,
+    /// codex ChatGPT subscription: `~/.codex/auth.json`, tokens under the
+    /// `tokens` object, expiry read from the minted access-token JWT's `exp`
+    /// (the OpenAI refresh response carries no `expires_in`).
+    CodexChatGpt,
+}
+
+impl OAuthProviderKind {
+    /// Pinned production token endpoint for this provider.
+    fn token_url(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => ANTHROPIC_TOKEN_URL,
+            Self::CodexChatGpt => OPENAI_TOKEN_URL,
+        }
+    }
+
+    /// Pinned public OAuth client id the refresh grant presents.
+    fn client_id(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => ANTHROPIC_OAUTH_CLIENT_ID,
+            Self::CodexChatGpt => CODEX_OAUTH_CLIENT_ID,
+        }
+    }
+
+    /// Basename of the sibling advisory-lock file for this provider's
+    /// credential file.
+    fn lock_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => CLAUDE_CREDENTIALS_LOCK_NAME,
+            Self::CodexChatGpt => CODEX_CREDENTIALS_LOCK_NAME,
+        }
+    }
+}
+
+/// Host-side custodian of a personal-subscription OAuth credential (Claude
+/// personal or codex ChatGPT, selected by [`OAuthProviderKind`]).
 ///
 /// Holds the durable refresh token in host memory only — never the guest —
-/// refreshes it against Anthropic's token endpoint to mint short-lived access
+/// refreshes it against the provider's token endpoint to mint short-lived access
 /// tokens, and is the rotation owner across void-box runs: refreshes are
 /// serialized within the process (the state mutex, coalescing concurrent
 /// requests) and across processes (an advisory `flock` held over the whole
 /// read-refresh-write cycle, so two runs sharing one credential file never
 /// double-spend the single-use refresh token), and the rotated token is written
 /// back atomically so subsequent runs stay valid. This does not extend to the
-/// operator's own `claude-code`, which does not take the lock (see
-/// [`CREDENTIALS_LOCK_NAME`]).
+/// operator's own `claude-code`/`codex`, which do not take the lock (see
+/// [`CLAUDE_CREDENTIALS_LOCK_NAME`]).
 ///
 /// The injection proxy asks it for a currently-valid access token per request via
-/// [`access_token`](ClaudeOAuthStore::access_token); the durable refresh token
+/// [`access_token`](OAuthTokenStore::access_token); the durable refresh token
 /// never leaves this process. Secrets are held in [`SecretString`] (zeroized on
 /// drop). `mlock` + `PR_SET_DUMPABLE=0` land with the out-of-process proxy
 /// hardening, alongside the R10 process split the M0 proxy also defers.
-pub struct ClaudeOAuthStore {
+pub struct OAuthTokenStore {
+    /// Which provider's schema/endpoint this store speaks.
+    kind: OAuthProviderKind,
     /// Host path of the durable credential file; the write-back target.
     creds_path: PathBuf,
-    /// Token endpoint (the pinned Anthropic URL in production; overridable in
-    /// tests via [`with_token_endpoint`](ClaudeOAuthStore::with_token_endpoint)).
+    /// Token endpoint (the pinned provider URL in production; overridable in
+    /// tests via [`with_token_endpoint`](OAuthTokenStore::with_token_endpoint)).
     token_url: String,
     /// HTTP client for the token endpoint. In production it resolves through the
     /// SSRF guard and ignores any ambient `HTTPS_PROXY`, mirroring the proxy's
     /// upstream client; tests swap in a client pointed at a loopback mock.
     http: reqwest::Client,
+    /// Floor on refresh-attempt spacing ([`MIN_REFRESH_INTERVAL`] in production;
+    /// overridable in tests so multi-rotation sequences run at test speed).
+    min_refresh_interval: Duration,
     /// Serialized token state. A `tokio` mutex so a refresh (which awaits a
     /// network round-trip) holds the lock across the await, forcing concurrent
     /// callers to wait for and reuse the one refresh rather than each spending the
@@ -318,7 +523,7 @@ pub struct ClaudeOAuthStore {
     state: Mutex<TokenState>,
 }
 
-/// The mutable half of a [`ClaudeOAuthStore`].
+/// The mutable half of an [`OAuthTokenStore`].
 struct TokenState {
     /// Short-lived minted access token presented upstream as a Bearer.
     access_token: SecretString,
@@ -338,49 +543,104 @@ struct RefreshedTokens {
     access_token: SecretString,
     /// Present only when the endpoint rotated the refresh token.
     refresh_token: Option<SecretString>,
-    expires_in: Duration,
+    /// Present only when the endpoint minted a fresh identity token (codex).
+    id_token: Option<SecretString>,
+    /// Absolute expiry of `access_token`, derived per provider kind.
+    expires_at: SystemTime,
 }
 
 /// The subset of the OAuth token-endpoint response this path consumes.
+/// Anthropic returns `expires_in`; OpenAI returns none (expiry is read from the
+/// minted access-token JWT) but may rotate `id_token` alongside the pair.
 #[derive(Deserialize)]
 struct RefreshResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
-    expires_in: u64,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
-impl ClaudeOAuthStore {
-    /// Build a store from the host's discovered Claude OAuth credential.
+impl OAuthTokenStore {
+    /// Build a Claude-personal store from the host's credential file.
     ///
-    /// Reads via [`discover_oauth_credentials`] (macOS Keychain or the Linux
-    /// credential file) and targets the Linux credential file for write-back. The
-    /// credential proxy runs only on Linux/KVM today (macOS/VZ is deferred to
-    /// M1b), so a Keychain-sourced credential is never refreshed in practice.
-    pub fn from_host() -> Result<Self> {
-        let json = discover_oauth_credentials()?;
+    /// Requires `~/.claude/.credentials.json` on both platforms, because the
+    /// store is the rotation owner: it must write the rotated single-use refresh
+    /// token back where the credential lives, and it can only do that for a
+    /// file. On macOS `claude auth login` may store the credential only in the
+    /// Keychain — Keychain write-back is not implemented, and treating the
+    /// Keychain entry as read-only would strand the operator's login on the
+    /// spent pre-rotation token. So a missing file fails closed with the
+    /// limitation named instead of discovering the Keychain copy.
+    pub fn claude_from_host() -> Result<Self> {
         let home = std::env::var("HOME").map_err(|_| {
             Error::Config("HOME not set; cannot locate ~/.claude/.credentials.json".into())
         })?;
         let creds_path = Path::new(&home).join(".claude/.credentials.json");
-        Self::from_json(&json, creds_path)
+        let json = fs::read_to_string(&creds_path).map_err(|_| {
+            let macos_note = if cfg!(target_os = "macos") {
+                " On macOS the Keychain copy cannot be used: the credential proxy's \
+                 host store writes rotated refresh tokens back to this file, and \
+                 Keychain write-back is not implemented."
+            } else {
+                ""
+            };
+            Error::Config(format!(
+                "Claude personal credentials not found at {} — run 'claude auth login' \
+                 first, then retry.{macos_note}",
+                creds_path.display()
+            ))
+        })?;
+        validate_credentials_json(&json)?;
+        Self::from_json(
+            OAuthProviderKind::ClaudeCode,
+            &SecretString::from(json),
+            creds_path,
+        )
+    }
+
+    /// Build a codex ChatGPT store from the host's `~/.codex/auth.json`.
+    pub fn codex_from_host() -> Result<Self> {
+        let home = std::env::var("HOME")
+            .map_err(|_| Error::Config("HOME not set; cannot locate ~/.codex/auth.json".into()))?;
+        let creds_path = Path::new(&home).join(".codex/auth.json");
+        let json = fs::read_to_string(&creds_path).map_err(|_| {
+            Error::Config(format!(
+                "codex ChatGPT credentials not found at {} — run 'codex login' first, \
+                 then retry.",
+                creds_path.display()
+            ))
+        })?;
+        Self::from_json(
+            OAuthProviderKind::CodexChatGpt,
+            &SecretString::from(json),
+            creds_path,
+        )
     }
 
     /// Build a store from an explicit credential JSON and write-back path.
     /// Exposed so tests avoid touching the host's real credential file.
-    pub fn from_json(creds_json: &SecretString, creds_path: PathBuf) -> Result<Self> {
-        let state = TokenState::parse(creds_json.expose_secret())?;
+    pub fn from_json(
+        kind: OAuthProviderKind,
+        creds_json: &SecretString,
+        creds_path: PathBuf,
+    ) -> Result<Self> {
+        let state = TokenState::parse(kind, creds_json.expose_secret())?;
         Ok(Self {
+            kind,
             creds_path,
-            token_url: ANTHROPIC_TOKEN_URL.to_string(),
+            token_url: kind.token_url().to_string(),
             http: build_token_client()?,
+            min_refresh_interval: MIN_REFRESH_INTERVAL,
             state: Mutex::new(state),
         })
     }
 
     /// Point the store at a different token endpoint. A test/override seam
     /// (mirroring [`ProxyHandle::new`](crate::proxy::ProxyHandle::new)): production
-    /// uses the pinned Anthropic URL, tests target a loopback mock.
+    /// uses the pinned provider URL, tests target a loopback mock.
     pub fn with_token_endpoint(mut self, url: impl Into<String>) -> Self {
         self.token_url = url.into();
         self
@@ -392,6 +652,28 @@ impl ClaudeOAuthStore {
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
         self
+    }
+
+    /// Override the refresh rate-cap. A test seam so multi-rotation sequences
+    /// (hours of run time in production) execute at test speed; production keeps
+    /// [`MIN_REFRESH_INTERVAL`].
+    pub fn with_refresh_rate_cap(mut self, cap: Duration) -> Self {
+        self.min_refresh_interval = cap;
+        self
+    }
+
+    /// The account id stored alongside the codex tokens (`tokens.account_id`),
+    /// which the proxy injects as `chatgpt-account-id`. `None` for a credential
+    /// that carries none — callers requiring it must fail closed.
+    pub async fn codex_account_id(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .document
+            .get("tokens")
+            .and_then(|tokens| tokens.get("account_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
     }
 
     /// Return a currently-valid access token, refreshing if the cached one has
@@ -408,7 +690,7 @@ impl ClaudeOAuthStore {
         }
         // A refresh is due. Apply the rate-cap before spending the refresh token.
         if let Some(last) = state.last_refresh_attempt {
-            if last.elapsed() < MIN_REFRESH_INTERVAL {
+            if last.elapsed() < self.min_refresh_interval {
                 // Within the skew window the current token is still usable, so keep
                 // it rather than refresh again; if it is already expired, fail
                 // closed instead of looping on the single-use refresh token.
@@ -416,7 +698,7 @@ impl ClaudeOAuthStore {
                     return Ok(state.access_token.clone());
                 }
                 return Err(Error::Network(
-                    "Claude OAuth access token expired; refresh rate-capped, failing closed".into(),
+                    "OAuth access token expired; refresh rate-capped, failing closed".into(),
                 ));
             }
         }
@@ -437,7 +719,7 @@ impl ClaudeOAuthStore {
     /// surfaces again (fail-closed) on the request itself.
     pub async fn warm_up(&self) {
         if let Err(e) = self.access_token().await {
-            tracing::debug!("Claude OAuth warm-up did not mint a token: {e}");
+            tracing::debug!("OAuth warm-up did not mint a token: {e}");
         }
     }
 
@@ -452,9 +734,10 @@ impl ClaudeOAuthStore {
         // runtime; the guard owns the lock file, so it travels with us across the
         // await below and the lock stays held until the write completes.
         let path = self.creds_path.clone();
+        let kind = self.kind;
         let (guard, on_disk) = tokio::task::spawn_blocking(move || {
-            let guard = FlockGuard::acquire(&path)?;
-            Ok::<_, Error>((guard, read_on_disk(&path)))
+            let guard = FlockGuard::acquire(&path, kind.lock_name())?;
+            Ok::<_, Error>((guard, read_on_disk(kind, &path)))
         })
         .await
         .map_err(|e| Error::Config(format!("credential lock task join failed: {e}")))??;
@@ -476,7 +759,7 @@ impl ClaudeOAuthStore {
 
         let refresh_token = state.refresh_token.expose_secret().to_string();
         let refreshed = self.request_refresh(&refresh_token).await?;
-        state.apply(refreshed);
+        state.apply(self.kind, refreshed);
 
         // Write back and release the lock, both on the blocking pool.
         let path = self.creds_path.clone();
@@ -493,7 +776,7 @@ impl ClaudeOAuthStore {
         let request = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "client_id": self.kind.client_id(),
         });
         let body = serde_json::to_vec(&request)
             .map_err(|e| Error::Config(format!("serialize OAuth refresh request: {e}")))?;
@@ -521,17 +804,77 @@ impl ClaudeOAuthStore {
         let parsed: RefreshResponse = serde_json::from_slice(&bytes).map_err(|_| {
             Error::Network("OAuth refresh response was not the expected JSON".into())
         })?;
+        let expires_at = self.derive_expiry(&parsed)?;
         Ok(RefreshedTokens {
             access_token: SecretString::from(parsed.access_token),
             refresh_token: parsed.refresh_token.map(SecretString::from),
-            expires_in: Duration::from_secs(parsed.expires_in),
+            id_token: parsed.id_token.map(SecretString::from),
+            expires_at,
         })
+    }
+
+    /// Derive the minted access token's absolute expiry per provider kind.
+    ///
+    /// Anthropic states it in the response (`expires_in`, required — its absence
+    /// is a malformed response, not a default). OpenAI's response has no such
+    /// field, so expiry is read from the minted access-token JWT's `exp`, with
+    /// [`CODEX_FALLBACK_ACCESS_LIFETIME`] when the JWT is unreadable. Both paths
+    /// cap the lifetime so a bogus value cannot overflow the `SystemTime` math.
+    fn derive_expiry(&self, parsed: &RefreshResponse) -> Result<SystemTime> {
+        let now = SystemTime::now();
+        let capped = |lifetime: Duration| {
+            now.checked_add(lifetime.min(MAX_ACCESS_TOKEN_LIFETIME))
+                .unwrap_or(now)
+        };
+        match self.kind {
+            OAuthProviderKind::ClaudeCode => {
+                let expires_in = parsed.expires_in.ok_or_else(|| {
+                    Error::Network("OAuth refresh response missing expires_in".into())
+                })?;
+                Ok(capped(Duration::from_secs(expires_in)))
+            }
+            OAuthProviderKind::CodexChatGpt => Ok(jwt_exp(&parsed.access_token)
+                .map(|exp| exp.min(capped(MAX_ACCESS_TOKEN_LIFETIME)))
+                .unwrap_or_else(|| capped(CODEX_FALLBACK_ACCESS_LIFETIME))),
+        }
     }
 }
 
+/// Read the `exp` claim (absolute expiry) out of a JWT's payload, without
+/// verifying the signature — the value only schedules our own refresh, so a
+/// forged claim gains nothing beyond a mistimed refresh. `None` when the string
+/// is not a readable three-segment JWT or carries no `exp`.
+fn jwt_exp(jwt: &str) -> Option<SystemTime> {
+    let mut segments = jwt.split('.');
+    let payload_b64 = match (segments.next(), segments.next(), segments.next()) {
+        (Some(header), Some(payload), Some(signature))
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+        {
+            payload
+        }
+        _ => return None,
+    };
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let exp = claims.get("exp")?.as_i64().filter(|exp| *exp >= 0)?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(exp as u64))
+}
+
 impl TokenState {
-    /// Parse the `claudeAiOauth` block, keeping the whole document for write-back.
-    fn parse(json: &str) -> Result<Self> {
+    /// Parse the provider's on-disk credential document, keeping the whole
+    /// document for write-back.
+    fn parse(kind: OAuthProviderKind, json: &str) -> Result<Self> {
+        match kind {
+            OAuthProviderKind::ClaudeCode => Self::parse_claude(json),
+            OAuthProviderKind::CodexChatGpt => Self::parse_codex(json),
+        }
+    }
+
+    /// Parse Claude's `.credentials.json`: tokens under the `claudeAiOauth`
+    /// object, expiry stated as epoch-milliseconds in `expiresAt`.
+    fn parse_claude(json: &str) -> Result<Self> {
         let document: Value = serde_json::from_str(json)
             .map_err(|_| Error::Config("credentials file is not valid JSON".into()))?;
         let oauth = document
@@ -562,41 +905,107 @@ impl TokenState {
         })
     }
 
+    /// Parse codex's `auth.json`: tokens under the `tokens` object, expiry read
+    /// from the stored access-token JWT's `exp` claim. An unreadable `exp` is
+    /// treated as already-expired so the first use refreshes rather than
+    /// trusting a token of unknown lifetime.
+    fn parse_codex(json: &str) -> Result<Self> {
+        let document: Value = serde_json::from_str(json)
+            .map_err(|_| Error::Config("codex auth.json is not valid JSON".into()))?;
+        let tokens = document
+            .get("tokens")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::Config(
+                    "codex auth.json has no 'tokens' object — it holds no ChatGPT \
+                     login; re-run 'codex login'"
+                        .into(),
+                )
+            })?;
+        let field = |name: &str| -> Result<&str> {
+            tokens
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::Config(format!("codex auth.json missing 'tokens.{name}'")))
+        };
+        let access_token = field("access_token")?.to_string();
+        let refresh_token = field("refresh_token")?.to_string();
+        let expires_at = jwt_exp(&access_token).unwrap_or(UNIX_EPOCH);
+        Ok(Self {
+            access_token: SecretString::from(access_token),
+            refresh_token: SecretString::from(refresh_token),
+            expires_at,
+            document,
+            last_refresh_attempt: None,
+        })
+    }
+
     /// Whether the access token is still valid at `instant`.
     fn valid_at(&self, instant: SystemTime) -> bool {
         self.expires_at > instant
     }
 
-    /// Fold a refresh result into the in-memory state and the preserved document.
-    fn apply(&mut self, refreshed: RefreshedTokens) {
+    /// Fold a refresh result into the in-memory state and the preserved document,
+    /// touching only the fields this store owns for `kind`.
+    fn apply(&mut self, kind: OAuthProviderKind, refreshed: RefreshedTokens) {
+        self.expires_at = refreshed.expires_at;
         self.access_token = refreshed.access_token;
         if let Some(rotated) = refreshed.refresh_token {
             self.refresh_token = rotated;
         }
-        // Cap the lifetime so a bogus/hostile `expires_in` cannot overflow the
-        // `SystemTime` addition (which panics); clamp to "now" if it somehow still
-        // overflows, treating that as already-expired.
-        let lifetime = refreshed.expires_in.min(MAX_ACCESS_TOKEN_LIFETIME);
-        self.expires_at = SystemTime::now()
-            .checked_add(lifetime)
-            .unwrap_or_else(SystemTime::now);
-        if let Some(oauth) = self
-            .document
-            .get_mut("claudeAiOauth")
-            .and_then(Value::as_object_mut)
-        {
-            oauth.insert(
-                "accessToken".into(),
-                Value::String(self.access_token.expose_secret().to_string()),
-            );
-            oauth.insert(
-                "refreshToken".into(),
-                Value::String(self.refresh_token.expose_secret().to_string()),
-            );
-            oauth.insert(
-                "expiresAt".into(),
-                Value::Number(system_time_to_unix_ms(self.expires_at).into()),
-            );
+        match kind {
+            OAuthProviderKind::ClaudeCode => {
+                if let Some(oauth) = self
+                    .document
+                    .get_mut("claudeAiOauth")
+                    .and_then(Value::as_object_mut)
+                {
+                    oauth.insert(
+                        "accessToken".into(),
+                        Value::String(self.access_token.expose_secret().to_string()),
+                    );
+                    oauth.insert(
+                        "refreshToken".into(),
+                        Value::String(self.refresh_token.expose_secret().to_string()),
+                    );
+                    oauth.insert(
+                        "expiresAt".into(),
+                        Value::Number(system_time_to_unix_ms(self.expires_at).into()),
+                    );
+                }
+            }
+            OAuthProviderKind::CodexChatGpt => {
+                if let Some(tokens) = self
+                    .document
+                    .get_mut("tokens")
+                    .and_then(Value::as_object_mut)
+                {
+                    tokens.insert(
+                        "access_token".into(),
+                        Value::String(self.access_token.expose_secret().to_string()),
+                    );
+                    tokens.insert(
+                        "refresh_token".into(),
+                        Value::String(self.refresh_token.expose_secret().to_string()),
+                    );
+                    if let Some(id_token) = &refreshed.id_token {
+                        tokens.insert(
+                            "id_token".into(),
+                            Value::String(id_token.expose_secret().to_string()),
+                        );
+                    }
+                }
+                // codex reads `last_refresh` (RFC3339) as its own proactive-refresh
+                // fallback signal; stamp it the way `codex login` does so a later
+                // codex run against this file behaves as after a native refresh.
+                if let Some(root) = self.document.as_object_mut() {
+                    root.insert(
+                        "last_refresh".into(),
+                        Value::String(humantime::format_rfc3339(SystemTime::now()).to_string()),
+                    );
+                }
+            }
         }
     }
 }
@@ -607,7 +1016,7 @@ impl TokenState {
 ///
 /// `SsrfGuardResolver` is a shared network primitive intentionally reused from
 /// `proxy` (it also guards the proxy's upstream client), so this module depends on
-/// `proxy` here while `proxy::injector` depends back on [`ClaudeOAuthStore`]. If
+/// `proxy` here while `proxy::injector` depends back on [`OAuthTokenStore`]. If
 /// that mutual dependency grows, promote the resolver to a neutral shared module.
 fn build_token_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -640,9 +1049,9 @@ fn system_time_to_unix_ms(time: SystemTime) -> i64 {
 /// Read and parse the current on-disk credential, tolerating a missing or
 /// malformed file (returns `None`) so a fresh mint proceeds from the in-memory
 /// token rather than erroring.
-fn read_on_disk(path: &Path) -> Option<TokenState> {
+fn read_on_disk(kind: OAuthProviderKind, path: &Path) -> Option<TokenState> {
     let text = fs::read_to_string(path).ok()?;
-    TokenState::parse(&text).ok()
+    TokenState::parse(kind, &text).ok()
 }
 
 /// Atomically write `document` to `path` (temp file + `rename`), then release the
@@ -690,7 +1099,7 @@ fn write_document(path: &Path, document: &Value, guard: FlockGuard) -> Result<()
 /// calls [`write_document`] directly, so this convenience is only used by tests.
 #[cfg(test)]
 fn persist_credentials(path: &Path, document: &Value) -> Result<()> {
-    let guard = FlockGuard::acquire(path)?;
+    let guard = FlockGuard::acquire(path, CLAUDE_CREDENTIALS_LOCK_NAME)?;
     write_document(path, document, guard)
 }
 
@@ -704,9 +1113,9 @@ struct FlockGuard {
 
 impl FlockGuard {
     /// Acquire the exclusive advisory lock for the credential file at `creds_path`
-    /// (blocking until available). The lock lives in a sibling file so the
-    /// credential `rename` never swaps out the inode the lock is held on.
-    fn acquire(creds_path: &Path) -> Result<Self> {
+    /// (blocking until available). The lock lives in a sibling file (`lock_name`)
+    /// so the credential `rename` never swaps out the inode the lock is held on.
+    fn acquire(creds_path: &Path, lock_name: &str) -> Result<Self> {
         let dir = creds_path
             .parent()
             .ok_or_else(|| Error::Config("credential path has no parent directory".into()))?;
@@ -715,7 +1124,7 @@ impl FlockGuard {
             .create(true)
             .write(true)
             .truncate(false)
-            .open(dir.join(CREDENTIALS_LOCK_NAME))?;
+            .open(dir.join(lock_name))?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(Error::Io(std::io::Error::last_os_error()));
@@ -921,7 +1330,11 @@ mod store_tests {
 
     #[test]
     fn parse_extracts_fields() {
-        let state = TokenState::parse(&creds_json("acc", "ref", ms_from_now(3600))).unwrap();
+        let state = TokenState::parse(
+            OAuthProviderKind::ClaudeCode,
+            &creds_json("acc", "ref", ms_from_now(3600)),
+        )
+        .unwrap();
         assert_eq!(state.access_token.expose_secret(), "acc");
         assert_eq!(state.refresh_token.expose_secret(), "ref");
         assert!(state.valid_at(SystemTime::now()));
@@ -931,7 +1344,7 @@ mod store_tests {
     /// tokens), so it deliberately has no `Debug`; extract the error by match
     /// rather than `unwrap_err`, which would require `Ok: Debug`.
     fn parse_err(json: &str) -> Error {
-        match TokenState::parse(json) {
+        match TokenState::parse(OAuthProviderKind::ClaudeCode, json) {
             Err(e) => e,
             Ok(_) => panic!("expected a parse error"),
         }
@@ -954,7 +1367,8 @@ mod store_tests {
     async fn valid_token_is_returned_without_refresh() {
         // Far-future expiry → no refresh; a bogus endpoint proves it isn't hit.
         let dir = tempfile::tempdir().unwrap();
-        let store = ClaudeOAuthStore::from_json(
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds_json("live-access", "ref", ms_from_now(3600))),
             dir.path().join(".credentials.json"),
         )
@@ -997,7 +1411,8 @@ mod store_tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".credentials.json");
-        let store = ClaudeOAuthStore::from_json(
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds_json("stale-access", "old-refresh", ms_from_now(-60))),
             path.clone(),
         )
@@ -1033,7 +1448,8 @@ mod store_tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".credentials.json");
-        let store = ClaudeOAuthStore::from_json(
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds_json("stale", "keep-refresh", ms_from_now(-60))),
             path.clone(),
         )
@@ -1053,7 +1469,8 @@ mod store_tests {
         let (url, hits) =
             spawn_mock_token_endpoint("HTTP/1.1 400 Bad Request", r#"{"error":"invalid_grant"}"#);
         let dir = tempfile::tempdir().unwrap();
-        let store = ClaudeOAuthStore::from_json(
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds_json("stale", "dead-refresh", ms_from_now(-60))),
             dir.path().join(".credentials.json"),
         )
@@ -1084,7 +1501,8 @@ mod store_tests {
         )
         .unwrap();
 
-        let store = ClaudeOAuthStore::from_json(
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds_json(
                 "our-stale-access",
                 "our-refresh",
@@ -1098,5 +1516,472 @@ mod store_tests {
 
         let tok = store.access_token().await.unwrap();
         assert_eq!(tok.expose_secret(), "peer-fresh-access");
+    }
+
+    // ---- long-run rotation, single-use refresh-token chains (M1b) ----
+
+    /// Build a syntactically valid unsigned JWT whose payload carries `exp`
+    /// seconds-since-epoch `delta_secs` from now.
+    fn test_jwt(delta_secs: i64) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let exp = (system_time_to_unix_ms(SystemTime::now()) / 1000) + delta_secs;
+        let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = b64.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.voidbox-test-signature")
+    }
+
+    /// A JWT with `exp` `delta_secs` from now plus a `step` marker claim, so a
+    /// test can tell rotation N's minted token from rotation N+1's.
+    fn test_jwt_with_marker(delta_secs: i64, step: usize) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let exp = (system_time_to_unix_ms(SystemTime::now()) / 1000) + delta_secs;
+        let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = b64.encode(format!(r#"{{"exp":{exp},"step":{step}}}"#));
+        format!("{header}.{payload}.voidbox-test-signature")
+    }
+
+    /// Read an integer claim out of an unsigned test JWT.
+    fn jwt_payload_field(jwt: &str, field: &str) -> Option<i64> {
+        use base64::Engine;
+        let payload = jwt.split('.').nth(1)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()?
+            .get(field)?
+            .as_i64()
+    }
+
+    /// Build a codex `auth.json` document with the given tokens, an account id,
+    /// and unowned fields that write-back must preserve.
+    fn codex_auth_json(access_jwt: &str, refresh: &str) -> String {
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": test_jwt(3600),
+                "access_token": access_jwt,
+                "refresh_token": refresh,
+                "account_id": "acct-under-test",
+            },
+            "last_refresh": "2026-01-01T00:00:00Z",
+            "unowned_top_level": {"keep": true},
+        })
+        .to_string()
+    }
+
+    /// Read one HTTP request off `stream` and return its body (respecting
+    /// Content-Length, so a body split across reads is reassembled).
+    fn read_request_body(stream: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return String::new();
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if buf.len() >= body_start + content_length {
+                return String::from_utf8_lossy(&buf[body_start..body_start + content_length])
+                    .to_string();
+            }
+        }
+    }
+
+    /// Spawn a token endpoint enforcing a **single-use refresh-token chain**:
+    /// request N must present `chain[N].0` and receives `chain[N].1`; any other
+    /// presented token — including a replay of an already-spent one — gets a 401,
+    /// the way a real provider treats a double-spent single-use refresh token.
+    fn spawn_single_use_token_endpoint(chain: Vec<(String, String)>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind chain mock");
+        let addr = listener.local_addr().expect("chain mock addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_thread = hits.clone();
+        let state = Arc::new(std::sync::Mutex::new((0usize, chain)));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                hits_thread.fetch_add(1, Ordering::SeqCst);
+                let body = read_request_body(&mut stream);
+                let presented = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["refresh_token"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let mut guard = state.lock().unwrap();
+                let (next, chain) = &mut *guard;
+                let response = if *next < chain.len() && chain[*next].0 == presented {
+                    let json = chain[*next].1.clone();
+                    *next += 1;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    )
+                } else {
+                    let json = r#"{"error":"invalid_grant"}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    )
+                };
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        (format!("http://{addr}/oauth/token"), hits)
+    }
+
+    #[cfg(unix)]
+    fn assert_mode_0600(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn claude_sequential_rotations_persist_each_step() {
+        // A long run refreshes many times, each refresh rotating the single-use
+        // token. Every step must spend exactly the current token (the chain mock
+        // 401s a replay) and durably persist the rotation before the next step.
+        const ROTATIONS: usize = 5;
+        let chain: Vec<(String, String)> = (0..ROTATIONS)
+            .map(|step| {
+                (
+                    format!("refresh-{step}"),
+                    // expires_in: 0 → immediately stale, so the next call refreshes.
+                    format!(
+                        r#"{{"access_token":"access-{next}","refresh_token":"refresh-{next}","expires_in":0}}"#,
+                        next = step + 1
+                    ),
+                )
+            })
+            .collect();
+        let (url, hits) = spawn_single_use_token_endpoint(chain);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
+            &SecretString::from(creds_json("access-0", "refresh-0", ms_from_now(-60))),
+            path.clone(),
+        )
+        .unwrap()
+        .with_token_endpoint(url)
+        .with_http_client(loopback_client())
+        .with_refresh_rate_cap(Duration::ZERO);
+
+        for step in 1..=ROTATIONS {
+            let token = store.access_token().await.unwrap();
+            assert_eq!(token.expose_secret(), format!("access-{step}"));
+            assert_eq!(
+                read_oauth_field(&path, "refreshToken"),
+                format!("refresh-{step}"),
+                "rotation {step} must be persisted before the next refresh"
+            );
+            #[cfg(unix)]
+            assert_mode_0600(&path);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), ROTATIONS);
+
+        // Unowned fields survive every rotation.
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["someOtherTopLevelKey"]["keep"],
+            serde_json::json!(true)
+        );
+        assert_eq!(written["claudeAiOauth"]["subscriptionType"], "max");
+    }
+
+    #[tokio::test]
+    async fn codex_sequential_rotations_persist_tokens_and_last_refresh() {
+        const ROTATIONS: usize = 5;
+        let chain: Vec<(String, String)> = (0..ROTATIONS)
+            .map(|step| {
+                let next = step + 1;
+                // Minted access tokens are JWTs already at expiry (exp = now), so
+                // each subsequent call refreshes again; no expires_in field, as on
+                // the real OpenAI endpoint.
+                let response = serde_json::json!({
+                    "id_token": test_jwt(3600),
+                    "access_token": test_jwt_with_marker(0, next),
+                    "refresh_token": format!("refresh-{next}"),
+                })
+                .to_string();
+                (format!("refresh-{step}"), response)
+            })
+            .collect();
+        let (url, hits) = spawn_single_use_token_endpoint(chain);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::CodexChatGpt,
+            &SecretString::from(codex_auth_json(&test_jwt(-60), "refresh-0")),
+            path.clone(),
+        )
+        .unwrap()
+        .with_token_endpoint(url)
+        .with_http_client(loopback_client())
+        .with_refresh_rate_cap(Duration::ZERO);
+
+        for step in 1..=ROTATIONS {
+            let token = store.access_token().await.unwrap();
+            assert_eq!(
+                jwt_payload_field(token.expose_secret(), "step"),
+                Some(step as i64),
+                "rotation {step} must return the freshly minted access token"
+            );
+            let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                written["tokens"]["refresh_token"],
+                format!("refresh-{step}"),
+                "rotation {step} must be persisted before the next refresh"
+            );
+            #[cfg(unix)]
+            assert_mode_0600(&path);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), ROTATIONS);
+
+        // Write-back updates only the owned fields: the account id, auth_mode, and
+        // unowned extras survive; `last_refresh` moved off its initial stamp.
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["account_id"], "acct-under-test");
+        assert_eq!(written["auth_mode"], "chatgpt");
+        assert_eq!(
+            written["unowned_top_level"]["keep"],
+            serde_json::json!(true)
+        );
+        let last_refresh = written["last_refresh"].as_str().unwrap();
+        assert_ne!(last_refresh, "2026-01-01T00:00:00Z");
+        assert!(humantime::parse_rfc3339(last_refresh).is_ok());
+    }
+
+    #[tokio::test]
+    async fn adopt_peer_with_expired_on_disk_state_uses_disk_refresh_token() {
+        // A peer run rotated the refresh token on disk and exited; its access
+        // token has since expired. Our in-memory copy holds the pre-rotation
+        // token. The refresh must spend the *disk* token — the chain mock 401s
+        // anything else, including our stale in-memory token.
+        let (url, hits) = spawn_single_use_token_endpoint(vec![(
+            "disk-refresh".to_string(),
+            r#"{"access_token":"fresh","refresh_token":"rotated","expires_in":3600}"#.to_string(),
+        )]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        fs::write(
+            &path,
+            creds_json("peer-stale-access", "disk-refresh", ms_from_now(-60)),
+        )
+        .unwrap();
+
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
+            &SecretString::from(creds_json("our-stale", "memory-refresh", ms_from_now(-60))),
+            path.clone(),
+        )
+        .unwrap()
+        .with_token_endpoint(url)
+        .with_http_client(loopback_client());
+
+        let token = store.access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "fresh");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(read_oauth_field(&path, "refreshToken"), "rotated");
+    }
+
+    #[tokio::test]
+    async fn rate_cap_holds_over_many_cycles() {
+        // Over a long run the rate-cap must keep holding: within the cap window
+        // an expired token fails closed with no endpoint hit; once the window
+        // elapses the next refresh is permitted. Three full cycles at test speed.
+        const CYCLES: usize = 3;
+        let cap = Duration::from_millis(150);
+        let chain: Vec<(String, String)> = (0..CYCLES)
+            .map(|step| {
+                (
+                    format!("refresh-{step}"),
+                    format!(
+                        r#"{{"access_token":"access-{next}","refresh_token":"refresh-{next}","expires_in":0}}"#,
+                        next = step + 1
+                    ),
+                )
+            })
+            .collect();
+        let (url, hits) = spawn_single_use_token_endpoint(chain);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
+            &SecretString::from(creds_json("access-0", "refresh-0", ms_from_now(-60))),
+            dir.path().join(".credentials.json"),
+        )
+        .unwrap()
+        .with_token_endpoint(url)
+        .with_http_client(loopback_client())
+        .with_refresh_rate_cap(cap);
+
+        for cycle in 0..CYCLES {
+            let token = store.access_token().await.unwrap();
+            assert_eq!(token.expose_secret(), format!("access-{}", cycle + 1));
+            assert_eq!(hits.load(Ordering::SeqCst), cycle + 1);
+
+            // Immediately inside the cap window: expired token, fail closed, no
+            // endpoint hit.
+            assert!(store.access_token().await.is_err());
+            assert_eq!(hits.load(Ordering::SeqCst), cycle + 1);
+
+            tokio::time::sleep(cap + Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), CYCLES);
+    }
+
+    // ---- codex schema specifics ----
+
+    #[test]
+    fn codex_parse_derives_expiry_from_jwt_exp() {
+        let live = TokenState::parse(
+            OAuthProviderKind::CodexChatGpt,
+            &codex_auth_json(&test_jwt(3600), "r"),
+        )
+        .unwrap();
+        assert!(live.valid_at(SystemTime::now()));
+
+        let stale = TokenState::parse(
+            OAuthProviderKind::CodexChatGpt,
+            &codex_auth_json(&test_jwt(-3600), "r"),
+        )
+        .unwrap();
+        assert!(!stale.valid_at(SystemTime::now()));
+
+        // An access token with no readable exp is treated as already expired, so
+        // the first use refreshes rather than trusting an unknown lifetime.
+        let opaque = TokenState::parse(
+            OAuthProviderKind::CodexChatGpt,
+            &codex_auth_json("not-a-jwt", "r"),
+        )
+        .unwrap();
+        assert!(!opaque.valid_at(SystemTime::now()));
+    }
+
+    #[test]
+    fn codex_parse_rejects_missing_tokens_object() {
+        let json = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}"#;
+        match TokenState::parse(OAuthProviderKind::CodexChatGpt, json) {
+            Err(e) => assert!(e.to_string().contains("tokens")),
+            Ok(_) => panic!("expected a parse error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_account_id_read_from_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::CodexChatGpt,
+            &SecretString::from(codex_auth_json(&test_jwt(3600), "r")),
+            dir.path().join("auth.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.codex_account_id().await.as_deref(),
+            Some("acct-under-test")
+        );
+
+        let without = serde_json::json!({
+            "tokens": {"id_token": test_jwt(60), "access_token": test_jwt(60), "refresh_token": "r"},
+        })
+        .to_string();
+        let store = OAuthTokenStore::from_json(
+            OAuthProviderKind::CodexChatGpt,
+            &SecretString::from(without),
+            dir.path().join("auth2.json"),
+        )
+        .unwrap();
+        assert_eq!(store.codex_account_id().await, None);
+    }
+
+    #[test]
+    fn jwt_exp_reads_and_rejects() {
+        assert!(jwt_exp(&test_jwt(3600)).is_some());
+        assert!(jwt_exp("garbage").is_none());
+        assert!(jwt_exp("a.b").is_none());
+        assert!(jwt_exp("..").is_none());
+    }
+
+    // ---- codex auth-mode resolution ----
+
+    #[test]
+    fn codex_auth_mode_explicit_and_legacy_spellings() {
+        let chatgpt = r#"{"auth_mode":"chatgpt"}"#;
+        assert_eq!(
+            codex_auth_mode_from_parts(Some(chatgpt), false).unwrap(),
+            CodexAuthMode::ChatGpt
+        );
+        // codex ≥0.141 spelling.
+        let apikey = r#"{"auth_mode":"apikey"}"#;
+        assert_eq!(
+            codex_auth_mode_from_parts(Some(apikey), false).unwrap(),
+            CodexAuthMode::ApiKey
+        );
+        // Older files.
+        let legacy = r#"{"auth_mode":"api_key"}"#;
+        assert_eq!(
+            codex_auth_mode_from_parts(Some(legacy), false).unwrap(),
+            CodexAuthMode::ApiKey
+        );
+        let unsupported = r#"{"auth_mode":"agentIdentity"}"#;
+        assert!(codex_auth_mode_from_parts(Some(unsupported), false).is_err());
+    }
+
+    #[test]
+    fn codex_auth_mode_inferred_from_fields() {
+        let tokens_only = r#"{"tokens":{"refresh_token":"r"}}"#;
+        assert_eq!(
+            codex_auth_mode_from_parts(Some(tokens_only), false).unwrap(),
+            CodexAuthMode::ChatGpt
+        );
+        let key_only = r#"{"OPENAI_API_KEY":"sk-x"}"#;
+        assert_eq!(
+            codex_auth_mode_from_parts(Some(key_only), false).unwrap(),
+            CodexAuthMode::ApiKey
+        );
+    }
+
+    #[test]
+    fn codex_auth_mode_env_fallback_and_unresolvable() {
+        assert_eq!(
+            codex_auth_mode_from_parts(None, true).unwrap(),
+            CodexAuthMode::ApiKey
+        );
+        assert!(codex_auth_mode_from_parts(None, false).is_err());
+        // An empty file with an env key still resolves to ApiKey.
+        assert_eq!(
+            codex_auth_mode_from_parts(Some("{}"), true).unwrap(),
+            CodexAuthMode::ApiKey
+        );
+    }
+
+    #[test]
+    fn codex_api_key_prefers_stored_key_over_env() {
+        let stored = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-stored"}"#;
+        let key = codex_api_key_from_parts(Some(stored), Some("sk-env".into())).unwrap();
+        assert_eq!(key.expose_secret(), "sk-stored");
+
+        let key = codex_api_key_from_parts(None, Some("sk-env".into())).unwrap();
+        assert_eq!(key.expose_secret(), "sk-env");
+
+        assert!(codex_api_key_from_parts(None, None).is_err());
+        assert!(codex_api_key_from_parts(Some("{}"), Some("  ".into())).is_err());
     }
 }

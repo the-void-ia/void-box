@@ -43,15 +43,17 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::guest_host_gateway;
-use crate::credentials::ClaudeOAuthStore;
+use crate::credentials::{resolve_codex_auth_mode, OAuthProviderKind, OAuthTokenStore};
 use crate::llm::LlmProvider;
 use crate::observe::claude::AgentExecOpts;
 use crate::observe::telemetry::TelemetryBuffer;
 use crate::pipeline::StageResult;
 use crate::proxy::{
-    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, start_proxy,
-    CredentialInjector, OAuthBearerInjector, ProxiedAuth, ProxiedUpstream, ProxyCa, ProxyHandle,
-    ProxyToken, SandboxContext, StaticApiKeyInjector, GUEST_HOSTS_PATH,
+    assert_no_real_credential, build_guest_provisioning, render_codex_config_toml,
+    render_codex_mcp_servers_toml, render_guest_hosts, start_proxy, CredentialInjector,
+    GuestClient, OAuthBearerInjector, ProxiedAuth, ProxiedUpstream, ProxyCa, ProxyHandle,
+    ProxyToken, SandboxContext, StaticApiKeyInjector, CHATGPT_ACCOUNT_ID_HEADER,
+    GUEST_CODEX_CONFIG_PATH, GUEST_HOSTS_PATH,
 };
 use crate::sandbox::Sandbox;
 use crate::skill::{Skill, SkillKind};
@@ -67,30 +69,74 @@ const CLAUDE_HOME: &str = "/workspace/.claude";
 const MCP_CONFIG_PATH: &str = "/workspace/.mcp.json";
 const CLAUDE_ONBOARDING_PATH: &str = "/home/sandbox/.claude.json";
 
-/// Whether `key` carries a real provider API key that must be withheld from the
-/// guest when the credential proxy is active (the proxy injects it host-side).
-fn is_withheld_secret_env(key: &str) -> bool {
-    matches!(key, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY")
+/// Whether `key` is an env var the proxy owns when active: a real provider API
+/// key that must be withheld from the guest (the proxy injects it host-side),
+/// or the provider base URL that the proxy's own redirect must be the single
+/// source of (the Custom provider's `env_vars()` emits a real
+/// `ANTHROPIC_BASE_URL`; letting it coexist with the proxy's redirect would
+/// leave the effective endpoint to env-ordering precedence).
+fn is_proxy_owned_env(key: &str) -> bool {
+    matches!(
+        key,
+        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "ANTHROPIC_BASE_URL"
+    )
 }
 
-/// Drop the provider's credential env when the credential proxy will supply it
+/// Drop the proxy-owned provider env when the credential proxy will supply it
 /// host-side (R14). Pure (no host-env dependence) so the withholding can be
 /// tested directly rather than only through a provider whose `env_vars()` reads
 /// the ambient environment.
 fn filter_withheld_env(env: Vec<(String, String)>, withhold: bool) -> Vec<(String, String)> {
     env.into_iter()
-        .filter(|(k, _)| !withhold || !is_withheld_secret_env(k))
+        .filter(|(k, _)| !withhold || !is_proxy_owned_env(k))
         .collect()
 }
 
-/// Resolve the host-held API key for a provider the M0 proxy serves (Claude).
-/// Returns `None` when no key is available (caller turns that into an error).
-fn resolve_provider_secret(provider: &LlmProvider) -> Option<SecretString> {
+/// Whether the proxy serves `provider` at all. Pure (no host IO), so the R14
+/// withholding decision never depends on host filesystem or env state: whenever
+/// the proxy is enabled for a servable provider the real key is withheld, even
+/// if proxy setup later fails for a host-side reason — the unrepresentable
+/// alternative would be a guest holding both the placeholder routing and the
+/// real credential.
+fn provider_is_proxy_servable(provider: &LlmProvider) -> bool {
+    match provider {
+        LlmProvider::Claude
+        | LlmProvider::ClaudePersonal
+        | LlmProvider::Codex
+        | LlmProvider::Custom { .. } => true,
+        LlmProvider::Ollama { .. } | LlmProvider::LmStudio { .. } => false,
+    }
+}
+
+/// Resolve the host-held API key for an API-key-mode provider the proxy serves.
+/// Errors name the provider-specific remediation.
+fn resolve_provider_secret(provider: &LlmProvider) -> Result<SecretString> {
     match provider {
         LlmProvider::Claude => std::env::var("ANTHROPIC_API_KEY")
             .ok()
-            .map(SecretString::from),
-        _ => None,
+            .filter(|key| !key.trim().is_empty())
+            .map(SecretString::from)
+            .ok_or_else(|| {
+                crate::Error::Config(
+                    "credential_proxy is enabled but ANTHROPIC_API_KEY is not set on the host"
+                        .into(),
+                )
+            }),
+        LlmProvider::Codex => crate::credentials::discover_codex_api_key(),
+        LlmProvider::Custom { api_key, .. } => api_key
+            .as_ref()
+            .map(|key| SecretString::from(key.expose_secret().to_string()))
+            .ok_or_else(|| {
+                crate::Error::Config(
+                    "credential_proxy is enabled for a custom provider but no API key was \
+                     resolved — set the spec's api_key_env to a host env var holding the key"
+                        .into(),
+                )
+            }),
+        _ => Err(crate::Error::Config(format!(
+            "no host-held API key applies to provider '{}'",
+            provider.description()
+        ))),
     }
 }
 
@@ -123,21 +169,22 @@ async fn provision_proxy_hosts(sandbox: &Sandbox, aliases: &[(String, String)]) 
     sandbox.write_file(GUEST_HOSTS_PATH, hosts.as_bytes()).await
 }
 
-/// Refuse the credential proxy on platforms where its listener cannot be bound
-/// guest-only. On Linux/KVM the listener is loopback-bound (SLIRP-forwarded to
-/// the guest); on macOS/VZ it would bind a host-LAN-reachable address, exposing
-/// the credential-injecting parser. M0 fails closed off Linux (tracked for M1b).
-#[cfg(target_os = "linux")]
+/// Refuse the credential proxy on platforms with no guest-reachable bind that is
+/// not also LAN-exposed. Linux/KVM binds host loopback (SLIRP-forwarded to the
+/// guest); macOS/VZ binds the host-local VZ NAT gateway address
+/// ([`crate::backend::credential_proxy_bind_addr`], ADR-0007). Any other
+/// platform has neither, so it fails closed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_credential_proxy_platform_supported() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn ensure_credential_proxy_platform_supported() -> Result<()> {
     Err(crate::Error::Config(
-        "credential_proxy is only supported on Linux/KVM in M0; on macOS/VZ the \
-         proxy listener cannot yet be bound guest-only, so enabling it would \
-         expose the credential-injecting parser to the host LAN (tracked for M1b)"
+        "credential_proxy is supported on Linux/KVM and macOS/VZ only: this platform \
+         has no bind address for the proxy listener that the guest can reach without \
+         also exposing the credential-injecting parser to the host's network"
             .into(),
     ))
 }
@@ -501,18 +548,22 @@ impl VoidBox {
         builder.build()
     }
 
-    /// Fail closed on a credential-proxy configuration the M0 proxy cannot serve,
+    /// Fail closed on a credential-proxy configuration the proxy cannot serve,
     /// before any guest env is staged. Provider support is platform-independent,
     /// so it is checked first — an unsupported provider reports the provider error
-    /// on every host — and the Linux/KVM-only platform gate second.
+    /// on every host — and the platform gate second.
     fn validate_credential_proxy_preconditions(&self) -> Result<()> {
-        if ProxiedUpstream::for_provider(&self.config.llm).is_none() {
+        if !provider_is_proxy_servable(&self.config.llm) {
             return Err(crate::Error::Config(format!(
-                "credential_proxy is enabled but provider '{}' is not served by the \
-                 Phase-0 proxy (M0 serves Claude only)",
+                "credential_proxy is enabled but provider '{}' holds no host-side \
+                 credential for the proxy to contain (local providers are not proxied)",
                 self.config.llm.description()
             )));
         }
+        // Surface provider-shape config errors (a non-HTTPS or internal Custom
+        // base URL, an unresolvable codex auth mode) now, before boot, rather
+        // than after the guest is already running.
+        self.resolve_proxied_upstream()?;
         // R14: the proxy injects credentials host-side, so a guest-staged
         // credentials file must never coexist with it. A per-box override can
         // enable the proxy while a credentials file was staged from the top-level
@@ -527,15 +578,45 @@ impl VoidBox {
                     .into(),
             ));
         }
+        // Same R14 shape for credential-directory mounts: the codex auth.json
+        // mount (or any user mount over an agent config home) would carry a
+        // durable secret into the guest beside the proxy's placeholders.
+        for mount in &self.config.mounts {
+            if matches!(
+                mount.guest_path.as_str(),
+                "/home/sandbox/.codex" | "/home/sandbox/.claude"
+            ) {
+                return Err(crate::Error::Config(format!(
+                    "credential_proxy is active but a mount stages {} into the guest — \
+                     refusing to leak a durable credential beside the proxy placeholders (R14)",
+                    mount.guest_path
+                )));
+            }
+        }
         ensure_credential_proxy_platform_supported()?;
         Ok(())
     }
 
-    /// Whether the real provider key must be withheld from the guest because the
-    /// credential proxy will inject it host-side for a provider it serves.
+    /// Resolve the proxied-upstream descriptor for this run's provider, including
+    /// the host-side codex auth-mode resolution when the provider is codex.
+    fn resolve_proxied_upstream(&self) -> Result<ProxiedUpstream> {
+        let codex_mode = if matches!(self.config.llm, LlmProvider::Codex) {
+            Some(resolve_codex_auth_mode()?)
+        } else {
+            None
+        };
+        ProxiedUpstream::for_provider(&self.config.llm, codex_mode)?.ok_or_else(|| {
+            crate::Error::Config(format!(
+                "credential_proxy is enabled but provider '{}' is not served by the proxy",
+                self.config.llm.description()
+            ))
+        })
+    }
+
+    /// Whether the proxy-owned provider env must be withheld from the guest
+    /// because the credential proxy will inject the credential host-side.
     fn withhold_provider_secret(&self) -> bool {
-        self.config.credential_proxy
-            && crate::proxy::ProxiedUpstream::for_provider(&self.config.llm).is_some()
+        self.config.credential_proxy && provider_is_proxy_servable(&self.config.llm)
     }
 
     /// The provider/LLM env staged into the guest, with the real provider key
@@ -567,40 +648,30 @@ impl VoidBox {
     async fn maybe_setup_credential_proxy(
         &self,
         sandbox: &Sandbox,
+        codex_mcp_toml: &str,
     ) -> Result<Option<ActiveCredentialProxy>> {
         if !self.config.credential_proxy {
             return Ok(None);
         }
         // The credential-injecting listener — and its in-process, pre-auth
-        // TLS/HTTP parser (R10) — must be reachable only by the guest. On
-        // Linux/KVM it binds host loopback, which SLIRP forwards to the guest. On
-        // macOS/VZ the only guest-reachable bind is a non-loopback address
-        // (`guest_accessible_bind_addr` → 0.0.0.0), which would also expose the
-        // listener, and the real key behind it, to the host LAN. There is no
-        // per-sandbox guest-only host address on VZ yet, so M0 refuses to run the
-        // credential proxy off Linux rather than expose it (tracked for M1b).
+        // TLS/HTTP parser (R10) — must be reachable by the guest without being
+        // LAN-exposed. `credential_proxy_bind_addr` provides that on Linux/KVM
+        // (loopback, SLIRP-forwarded) and macOS/VZ (the host-local NAT gateway
+        // address, ADR-0007); any other platform fails closed here.
         ensure_credential_proxy_platform_supported()?;
         let provider = &self.config.llm;
-        let Some(upstream) = ProxiedUpstream::for_provider(provider) else {
-            return Err(crate::Error::Config(format!(
-                "credential_proxy is enabled but provider '{}' is not served by the Phase-0 proxy",
-                provider.description()
-            )));
-        };
+        let upstream = self.resolve_proxied_upstream()?;
         // Build the credential injector for the provider's auth mode, and capture
         // the durable secret so the R14 gate can assert it never reaches the guest.
-        //  - API key: a static host-held key injected verbatim.
-        //  - OAuth (Claude personal): a host store that refreshes the durable token
-        //    and mints a short-lived Bearer per request; its warm-up is spawned to
-        //    overlap the first refresh with VM boot.
+        //  - API key: a static host-held key injected verbatim (Anthropic
+        //    `x-api-key`, or `Authorization: Bearer` for codex/OpenAI).
+        //  - OAuth: a host store that refreshes the durable token and mints a
+        //    short-lived Bearer per request; its warm-up is spawned to overlap the
+        //    first refresh with VM boot. codex ChatGPT additionally injects the
+        //    host-held account identity next to the Bearer.
         let (injector, secret_plain): (Arc<dyn CredentialInjector>, String) = match upstream.auth {
             ProxiedAuth::ApiKey(scheme) => {
-                let secret = resolve_provider_secret(provider).ok_or_else(|| {
-                    crate::Error::Config(
-                        "credential_proxy is enabled but no host API key was found for the provider"
-                            .into(),
-                    )
-                })?;
+                let secret = resolve_provider_secret(provider)?;
                 let secret_plain = secret.expose_secret().to_string();
                 let injector = Arc::new(StaticApiKeyInjector::new(
                     upstream.host.clone(),
@@ -609,8 +680,8 @@ impl VoidBox {
                 ));
                 (injector, secret_plain)
             }
-            ProxiedAuth::Oauth => {
-                let store = Arc::new(ClaudeOAuthStore::from_host()?);
+            ProxiedAuth::Oauth(OAuthProviderKind::ClaudeCode) => {
+                let store = Arc::new(OAuthTokenStore::claude_from_host()?);
                 let secret_plain = store
                     .durable_secret_snapshot()
                     .await
@@ -619,6 +690,31 @@ impl VoidBox {
                 let warm = store.clone();
                 tokio::spawn(async move { warm.warm_up().await });
                 let injector = Arc::new(OAuthBearerInjector::new(upstream.host.clone(), store));
+                (injector, secret_plain)
+            }
+            ProxiedAuth::Oauth(OAuthProviderKind::CodexChatGpt) => {
+                let store = Arc::new(OAuthTokenStore::codex_from_host()?);
+                // The ChatGPT backend authorizes the (Bearer, account) pair, so a
+                // credential without its account id cannot be injected usefully —
+                // fail closed now with the remediation named.
+                let account_id = store.codex_account_id().await.ok_or_else(|| {
+                    crate::Error::Config(
+                        "codex auth.json holds no tokens.account_id — re-run 'codex login' \
+                         to refresh the stored ChatGPT identity"
+                            .into(),
+                    )
+                })?;
+                let secret_plain = store
+                    .durable_secret_snapshot()
+                    .await
+                    .expose_secret()
+                    .to_string();
+                let warm = store.clone();
+                tokio::spawn(async move { warm.warm_up().await });
+                let injector = Arc::new(
+                    OAuthBearerInjector::new(upstream.host.clone(), store)
+                        .with_extra_header(CHATGPT_ACCOUNT_ID_HEADER, account_id),
+                );
                 (injector, secret_plain)
             }
         };
@@ -635,39 +731,50 @@ impl VoidBox {
             ca,
             injector,
             vec![upstream.host.clone()],
-        );
+        )
+        .with_upstream_port(upstream.port);
 
         let handle = start_proxy().await?;
         let binding = handle.register_sandbox(ctx).await?;
         let provisioning =
             build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
 
+        // Everything the proxy writes into the guest: the CA PEM (and, for codex,
+        // the placeholder auth.json) from the provisioning, plus the generated
+        // codex config.toml — composed here because MCP server entries share that
+        // file (`provision_skills` hands them over instead of writing the file
+        // itself when the proxy owns it).
+        let mut staged_files = provisioning.files.clone();
+        if upstream.client == GuestClient::CodexCli {
+            staged_files.push((
+                GUEST_CODEX_CONFIG_PATH.to_string(),
+                render_codex_config_toml(&upstream, &binding, codex_mcp_toml),
+            ));
+        }
+
         // R14: assert no real credential reaches the guest. The audit covers the
         // full staged env — provider/LLM env (post-withholding) + user overrides +
-        // the proxy's provisioning env — and the files the proxy itself writes (the
-        // CA PEM and `/etc/hosts`). That is complete for M0: the providers the
-        // proxy serves (Claude, Anthropic-compatible Custom) deliver their key only
-        // through `ANTHROPIC_API_KEY`, which is withheld, so env is the only
-        // credential channel. The full R14 scope (every provisioned file and host
-        // mount) is required before migrating a provider that stages a secret into
-        // a file or mount — none do in M0. The primary control is structural: the
-        // key is withheld from the staged env in the first place. This gate is the
-        // backstop that would catch a withholding regression; it runs before the
-        // agent exec and the proxy's writes (a regression could still reach the
-        // earlier pre-run provisioning execs before this aborts).
+        // the proxy's provisioning env — and every file the proxy stages (CA PEM,
+        // codex auth.json/config.toml, `/etc/hosts`). The primary control is
+        // structural: the key is withheld from the staged env, and the staged
+        // files are rendered from placeholders in the first place. This gate is
+        // the backstop that would catch a withholding or rendering regression; it
+        // runs before the agent exec and the proxy's writes (a regression could
+        // still reach the earlier pre-run provisioning execs before this aborts).
         let staged_env = self.r14_audit_env(&provisioning.env);
-        let staged_files = [
-            provisioning.ca_file.clone(),
-            (
-                GUEST_HOSTS_PATH.to_string(),
-                render_guest_hosts(&provisioning.host_aliases),
-            ),
-        ];
-        assert_no_real_credential(&staged_env, &staged_files, &secret_plain)?;
+        let mut audit_files = staged_files.clone();
+        audit_files.push((
+            GUEST_HOSTS_PATH.to_string(),
+            render_guest_hosts(&provisioning.host_aliases),
+        ));
+        assert_no_real_credential(&staged_env, &audit_files, &secret_plain)?;
 
-        sandbox
-            .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
-            .await?;
+        if upstream.client == GuestClient::CodexCli {
+            sandbox.mkdir_p("/home/sandbox/.codex").await?;
+        }
+        for (path, contents) in &staged_files {
+            sandbox.write_file(path, contents.as_bytes()).await?;
+        }
         provision_proxy_hosts(sandbox, &provisioning.host_aliases).await?;
 
         info!(
@@ -798,7 +905,13 @@ impl VoidBox {
     }
 
     /// Provision skills into the sandbox: write SKILL.md files and MCP config.
-    async fn provision_skills(&self, sandbox: &Sandbox) -> Result<()> {
+    ///
+    /// Returns the rendered codex MCP-server TOML instead of writing
+    /// `~/.codex/config.toml` when the credential proxy owns that file (a proxied
+    /// codex run generates the whole config, and a second writer here would
+    /// clobber it); the caller threads the returned TOML into the proxy's
+    /// composer. `None` in every other case.
+    async fn provision_skills(&self, sandbox: &Sandbox) -> Result<Option<String>> {
         let tag = &self.name;
 
         // Collect MCP servers for mcp.json
@@ -977,33 +1090,38 @@ impl VoidBox {
             );
 
             if !self.config.llm.supports_claude_settings() {
-                let mut toml_buf = String::new();
-                for (name, entry) in &mcp_servers {
-                    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
-                        let escaped_url = url.replace('\\', "\\\\").replace('"', "\\\"");
-                        toml_buf.push_str(&format!(
-                            "[mcp_servers.\"{}\"]\nurl = \"{}\"\n\n",
-                            escaped_name, escaped_url
-                        ));
-                    }
+                let servers: Vec<(String, String)> = mcp_servers
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        entry
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .map(|url| (name.clone(), url.to_string()))
+                    })
+                    .collect();
+                let toml_buf = render_codex_mcp_servers_toml(&servers);
+                // A proxied codex run's config.toml is generated wholesale by the
+                // credential proxy (provider redirect + these MCP entries in one
+                // file); hand the section to that composer instead of writing a
+                // file it would clobber.
+                if self.config.credential_proxy && matches!(self.config.llm, LlmProvider::Codex) {
+                    return Ok(Some(toml_buf));
                 }
                 if !toml_buf.is_empty() {
-                    let codex_config_path = "/home/sandbox/.codex/config.toml";
                     sandbox
-                        .write_file(codex_config_path, toml_buf.as_bytes())
+                        .write_file(GUEST_CODEX_CONFIG_PATH, toml_buf.as_bytes())
                         .await?;
                     eprintln!(
                         "[vm:{}] Wrote codex MCP config ({} servers) to {}",
                         tag,
                         mcp_servers.len(),
-                        codex_config_path,
+                        GUEST_CODEX_CONFIG_PATH,
                     );
                 }
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn build_full_prompt(&self, input: Option<&[u8]>) -> String {
@@ -1058,14 +1176,17 @@ impl VoidBox {
             }
         }
 
-        // Provision skills into the guest
-        self.provision_skills(sandbox).await?;
+        // Provision skills into the guest. A proxied codex run hands its MCP
+        // config-section back here for the proxy's config.toml composer.
+        let codex_mcp_toml = self.provision_skills(sandbox).await?;
 
         self.provision_claude_bootstrap(sandbox).await?;
 
         // Start the credential proxy (opt-in) and capture the guest env to
         // inject at exec time.
-        let active_proxy = self.maybe_setup_credential_proxy(sandbox).await?;
+        let active_proxy = self
+            .maybe_setup_credential_proxy(sandbox, codex_mcp_toml.as_deref().unwrap_or(""))
+            .await?;
 
         let tag = &self.name;
 
@@ -1213,6 +1334,8 @@ impl VoidBox {
             }
         }
 
+        // Service mode and the credential proxy are mutually exclusive (spec
+        // validation), so a deferred codex MCP section can never be produced here.
         self.provision_skills(sandbox).await?;
 
         self.provision_claude_bootstrap(sandbox).await?;
@@ -1520,24 +1643,48 @@ mod tests {
     use crate::skill::Skill;
 
     #[test]
-    fn withheld_secret_env_covers_provider_keys() {
-        assert!(is_withheld_secret_env("ANTHROPIC_API_KEY"));
-        assert!(is_withheld_secret_env("OPENAI_API_KEY"));
-        assert!(!is_withheld_secret_env("ANTHROPIC_BASE_URL"));
-        assert!(!is_withheld_secret_env("HOME"));
+    fn proxy_owned_env_covers_provider_keys_and_base_url() {
+        assert!(is_proxy_owned_env("ANTHROPIC_API_KEY"));
+        assert!(is_proxy_owned_env("OPENAI_API_KEY"));
+        // The proxy's redirect must be the single source of the base URL (the
+        // Custom provider's env_vars() emits a real one).
+        assert!(is_proxy_owned_env("ANTHROPIC_BASE_URL"));
+        assert!(!is_proxy_owned_env("HOME"));
     }
 
     #[test]
-    fn resolve_secret_none_for_non_claude_providers() {
-        // M0 proxies only Claude, so the resolver yields a key only for Claude.
-        assert!(resolve_provider_secret(&LlmProvider::ClaudePersonal).is_none());
-        assert!(resolve_provider_secret(&LlmProvider::ollama("m")).is_none());
-        assert!(resolve_provider_secret(&LlmProvider::Custom {
+    fn resolve_secret_per_provider() {
+        // OAuth providers and local providers have no static key to resolve.
+        assert!(resolve_provider_secret(&LlmProvider::ClaudePersonal).is_err());
+        assert!(resolve_provider_secret(&LlmProvider::ollama("m")).is_err());
+        // A Custom provider resolves the key its spec carried (from api_key_env).
+        let custom_key = resolve_provider_secret(&LlmProvider::Custom {
             base_url: "https://example.test/v1".into(),
             api_key: Some(crate::llm::ApiKey::new("sk-custom-secret")),
             model: None,
         })
-        .is_none());
+        .expect("custom key resolves");
+        assert_eq!(custom_key.expose_secret(), "sk-custom-secret");
+        // ...and fails closed when the spec resolved none.
+        assert!(resolve_provider_secret(&LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: None,
+            model: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn provider_servability_is_pure_and_covers_m1b_set() {
+        assert!(provider_is_proxy_servable(&LlmProvider::Claude));
+        assert!(provider_is_proxy_servable(&LlmProvider::ClaudePersonal));
+        assert!(provider_is_proxy_servable(&LlmProvider::Codex));
+        assert!(provider_is_proxy_servable(&LlmProvider::Custom {
+            base_url: "https://example.test/v1".into(),
+            api_key: None,
+            model: None,
+        }));
+        assert!(!provider_is_proxy_servable(&LlmProvider::ollama("m")));
     }
 
     #[test]
@@ -1566,60 +1713,100 @@ mod tests {
     #[test]
     fn credential_proxy_without_a_staged_credentials_file_passes_r14_check() {
         // Default provider (Claude) is proxy-served and no credentials file is
-        // staged, so the provider and R14 checks pass; only the platform gate may
-        // object off-Linux.
+        // staged, so the provider and R14 checks pass on both supported
+        // platforms (Linux/KVM and macOS/VZ).
         let vb = VoidBox::new("b").credential_proxy(true);
         let result = vb.validate_credential_proxy_preconditions();
-        #[cfg(target_os = "linux")]
         assert!(result.is_ok(), "got: {result:?}");
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.unwrap_err().to_string().contains("Linux/KVM"));
     }
 
     #[test]
-    fn filter_withheld_env_strips_only_provider_key_only_when_withholding() {
-        // Deterministic (no host-env dependence): the key is present in the input,
-        // so the assertion can't pass vacuously.
+    fn filter_withheld_env_strips_proxy_owned_vars_only_when_withholding() {
+        // Deterministic (no host-env dependence): the keys are present in the
+        // input, so the assertions can't pass vacuously.
         let env = vec![
             ("ANTHROPIC_API_KEY".to_string(), "sk-ant-REAL".to_string()),
             (
                 "ANTHROPIC_BASE_URL".to_string(),
-                "https://api.anthropic.com".to_string(),
+                "https://gateway.example.com/v1".to_string(),
             ),
+            ("HOME".to_string(), "/home/sandbox".to_string()),
         ];
 
-        // Withholding removes the credential key, keeps everything else.
+        // Withholding removes the credential key AND the provider base URL (the
+        // proxy's redirect must be the single source of it); everything else stays.
         let withheld = filter_withheld_env(env.clone(), true);
         assert!(!withheld.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
-        assert!(withheld.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
+        assert!(!withheld.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
+        assert!(withheld.iter().any(|(k, _)| k == "HOME"));
 
-        // Not withholding keeps the key.
+        // Not withholding keeps everything.
         let kept = filter_withheld_env(env, false);
         assert!(kept
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-REAL"));
+        assert!(kept.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
     }
 
     #[test]
     fn credential_proxy_rejects_unsupported_provider_before_provisioning() {
-        // An unsupported provider with `credential_proxy` must fail at build time
-        // — before any env is staged or the guest boots — rather than staging the
-        // real key and only aborting once `maybe_setup_credential_proxy` runs.
-        // Provider support is platform-independent, so this asserts the provider
-        // error on both Linux and macOS.
+        // A provider without a host-side credential (local) under
+        // `credential_proxy` must fail at build time — before any env is staged
+        // or the guest boots — rather than staging env and only aborting once
+        // `maybe_setup_credential_proxy` runs. Provider support is
+        // platform-independent, so this asserts the provider error on both Linux
+        // and macOS.
         let err = match VoidBox::new("b")
-            .llm(LlmProvider::Codex)
+            .llm(LlmProvider::ollama("m"))
             .credential_proxy(true)
             .build()
         {
-            Ok(_) => panic!("unsupported provider under credential_proxy must fail to build"),
+            Ok(_) => panic!("local provider under credential_proxy must fail to build"),
             Err(e) => e,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("not served by the Phase-0 proxy"),
+            msg.contains("holds no host-side credential"),
             "expected a provider-unsupported error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn credential_proxy_rejects_plaintext_custom_base_url_before_boot() {
+        // A Custom provider with an http:// base URL cannot be proxied — the
+        // proxy injects the key at TLS egress. Rejected at build time with the
+        // scheme named, on every host (no platform or host-state dependence).
+        let err = match VoidBox::new("b")
+            .llm(LlmProvider::Custom {
+                base_url: "http://gateway.example.com/v1".into(),
+                api_key: Some(crate::llm::ApiKey::new("sk-x")),
+                model: None,
+            })
+            .credential_proxy(true)
+            .build()
+        {
+            Ok(_) => panic!("plaintext custom base_url under credential_proxy must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("https"), "got: {err}");
+    }
+
+    #[test]
+    fn credential_proxy_rejects_credential_home_mounts_r14() {
+        // A mount over an agent credential home would carry a durable secret in
+        // beside the proxy placeholders; rejected before boot (R14). Uses Claude
+        // as the provider so the check is deterministic (no codex host state).
+        let err = VoidBox::new("b")
+            .llm(LlmProvider::Claude)
+            .credential_proxy(true)
+            .mount(crate::backend::MountConfig {
+                host_path: "/tmp/voidbox-r14-codex-creds".into(),
+                guest_path: "/home/sandbox/.codex".into(),
+                read_only: false,
+            })
+            .validate_credential_proxy_preconditions()
+            .expect_err("credential-home mount under the proxy must be rejected");
+        assert!(err.to_string().contains("R14"), "got: {err}");
     }
 
     #[test]

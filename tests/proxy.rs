@@ -30,7 +30,7 @@ use secrecy::SecretString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use void_box::credentials::ClaudeOAuthStore;
+use void_box::credentials::{OAuthProviderKind, OAuthTokenStore};
 use void_box::proxy::injector::{ApiKeyScheme, StaticApiKeyInjector};
 use void_box::proxy::{
     OAuthBearerInjector, ProxyCa, ProxyHandle, ProxyToken, SandboxContext, PROXY_TOKEN_HEADER,
@@ -51,7 +51,12 @@ type CaptureSlot = Arc<Mutex<Option<Captured>>>;
 /// Stand up a mock TLS upstream that records the request headers + body and
 /// returns 200. Returns its address and the capture slot.
 async fn start_mock_upstream() -> (SocketAddr, CaptureSlot) {
-    let cert = rcgen::generate_simple_self_signed(vec![UPSTREAM_HOST.to_string()])
+    start_mock_upstream_for(UPSTREAM_HOST).await
+}
+
+/// [`start_mock_upstream`] with an explicit certificate host.
+async fn start_mock_upstream_for(host: &str) -> (SocketAddr, CaptureSlot) {
+    let cert = rcgen::generate_simple_self_signed(vec![host.to_string()])
         .expect("self-signed upstream cert");
     let cert_der = cert.cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
@@ -112,13 +117,21 @@ async fn start_mock_upstream() -> (SocketAddr, CaptureSlot) {
 /// Build a proxy whose upstream client trusts the (self-signed) mock and routes
 /// the upstream host to loopback.
 fn proxy_for(mock_addr: SocketAddr) -> ProxyHandle {
+    proxy_for_host(mock_addr, UPSTREAM_HOST)
+}
+
+/// [`proxy_for`] with an explicit upstream host to route to the mock.
+fn proxy_for_host(mock_addr: SocketAddr, host: &str) -> ProxyHandle {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .resolve(UPSTREAM_HOST, mock_addr)
+        .resolve(host, mock_addr)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("upstream client");
-    ProxyHandle::new(client)
+    // In-process tests connect over 127.0.0.1 and run with no VM, so the
+    // listener binds loopback (the production/guest-reachable default would be
+    // the unbindable VZ NAT gateway on macOS).
+    ProxyHandle::new(client).with_loopback_bind()
 }
 
 /// Build a guest-side TLS connector that trusts `ca_pem`, advertising `alpn`
@@ -608,6 +621,440 @@ async fn proxy_does_not_negotiate_h2_and_serves_http1() {
     proxy.unregister_sandbox(&token_hex).await;
 }
 
+/// Send one request through the proxy with arbitrary extra headers. Returns the
+/// HTTP status and the response body bytes.
+async fn guest_request_with_headers(
+    connector: &TlsConnector,
+    proxy_port: u16,
+    token_header: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<(StatusCode, Bytes)> {
+    let tcp = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let server_name = ServerName::try_from(UPSTREAM_HOST.to_string()).expect("server name");
+    let tls = connector.connect(server_name, tcp).await?;
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .map_err(std::io::Error::other)?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/v1/responses")
+        .header("host", UPSTREAM_HOST)
+        .header("x-api-key", PLACEHOLDER_KEY);
+    if let Some(token) = token_header {
+        builder = builder.header(PROXY_TOKEN_HEADER, token);
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(Full::new(Bytes::new()))
+        .expect("build guest request");
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(std::io::Error::other)?;
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(std::io::Error::other)?
+        .to_bytes();
+    Ok((status, body))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_request_fails_closed_with_502_and_no_upstream_call() {
+    // R8: the proxy cannot inject into a WebSocket upgrade, so an authenticated
+    // upgrade request must be refused with a distinguishable status — never
+    // silently downgraded to plain HTTP or forwarded upstream.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, _token, token_hex) = sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let (status, body) = guest_request_with_headers(
+        &connector,
+        binding.port,
+        Some(&token_hex),
+        &[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await
+    .expect("guest request");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(
+        body_text.contains("upgrade"),
+        "refusal must name the symptom, got: {body_text}"
+    );
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "upstream must not be called for an upgrade request"
+    );
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_upgrade_option_alone_fails_closed() {
+    // The `Connection` options list can request the upgrade without the client
+    // having sent an `Upgrade` header yet (or in mixed case / alongside other
+    // options); the refusal must key on the option, not the exact header shape.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, _token, token_hex) = sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let (status, _) = guest_request_with_headers(
+        &connector,
+        binding.port,
+        Some(&token_hex),
+        &[("connection", "keep-alive, UPGRADE")],
+    )
+    .await
+    .expect("guest request");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "upstream must not be called when the Connection options request an upgrade"
+    );
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_upgrade_request_still_gets_407() {
+    // The upgrade refusal sits after token auth: a stranger probing the listener
+    // with an upgrade request learns nothing beyond the generic 407.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, _token, token_hex) = sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let (status, _) = guest_request_with_headers(
+        &connector,
+        binding.port,
+        None,
+        &[("connection", "Upgrade"), ("upgrade", "websocket")],
+    )
+    .await
+    .expect("guest request");
+
+    assert_eq!(status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert!(captured.lock().unwrap().is_none());
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+// ---------------------------------------------------------------------------
+// codex paths (M1b): Bearer-carried token + OAuth with account identity
+// ---------------------------------------------------------------------------
+
+const CODEX_UPSTREAM_HOST: &str = "api.openai.com";
+const REAL_OPENAI_KEY: &str = "sk-openai-real-host-held-secret";
+
+/// Build a sandbox context shaped like a codex API-key run: Bearer injection for
+/// api.openai.com.
+fn codex_api_key_sandbox_context(upstream_port: u16) -> (SandboxContext, String) {
+    let token = ProxyToken::generate();
+    let token_hex = token.to_hex();
+    let ca = Arc::new(ProxyCa::generate(vec![CODEX_UPSTREAM_HOST.to_string()]).expect("CA"));
+    let injector = Arc::new(StaticApiKeyInjector::new(
+        CODEX_UPSTREAM_HOST,
+        ApiKeyScheme::Bearer,
+        SecretString::from(REAL_OPENAI_KEY),
+    ));
+    let ctx = SandboxContext::new(token, ca, injector, vec![CODEX_UPSTREAM_HOST.to_string()])
+        .with_upstream_port(upstream_port);
+    (ctx, token_hex)
+}
+
+/// Send one request the way a proxied codex does: the per-sandbox token embedded
+/// in the Bearer placeholder (`Authorization: Bearer voidbox-proxy-<hex>`), no
+/// dedicated token header, plus codex's identity headers.
+async fn codex_style_request(
+    connector: &TlsConnector,
+    proxy_port: u16,
+    bearer: &str,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<(StatusCode, Bytes)> {
+    let tcp = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let server_name = ServerName::try_from(CODEX_UPSTREAM_HOST.to_string()).expect("server name");
+    let tls = connector.connect(server_name, tcp).await?;
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .map_err(std::io::Error::other)?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("host", CODEX_UPSTREAM_HOST)
+        .header("authorization", format!("Bearer {bearer}"));
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(Full::new(Bytes::new()))
+        .expect("build codex request");
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(std::io::Error::other)?;
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(std::io::Error::other)?
+        .to_bytes();
+    Ok((status, body))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_api_key_bearer_carried_token_authenticates_and_real_key_injected() {
+    // codex has no custom-header env knob, so its placeholder OPENAI_API_KEY
+    // carries the per-sandbox token (`voidbox-proxy-<hex>`) and arrives as
+    // `Authorization: Bearer`. The proxy must accept that carrier, then inject
+    // the real key — the placeholder (and thus the token) never goes upstream.
+    let (mock_addr, captured) = start_mock_upstream_for(CODEX_UPSTREAM_HOST).await;
+    let proxy = proxy_for_host(mock_addr, CODEX_UPSTREAM_HOST);
+    let (ctx, token_hex) = codex_api_key_sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let bearer = format!("voidbox-proxy-{token_hex}");
+    let (status, body) = codex_style_request(
+        &connector,
+        binding.port,
+        &bearer,
+        &[("originator", "codex_cli_rs")],
+    )
+    .await
+    .expect("codex request");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Bytes::from("upstream-ok"));
+
+    let seen = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    // The real host-held key reached the upstream as a Bearer...
+    assert_eq!(
+        seen.headers.get("authorization").unwrap(),
+        &format!("Bearer {REAL_OPENAI_KEY}")
+    );
+    // ...codex's originator header passed through untouched...
+    assert_eq!(seen.headers.get("originator").unwrap(), "codex_cli_rs");
+    // ...and the token-bearing placeholder appears in no upstream header.
+    for (_, value) in seen.headers.iter() {
+        assert!(!value.to_str().unwrap_or("").contains(&token_hex));
+    }
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_bearer_embedded_token_is_rejected_407() {
+    let (mock_addr, captured) = start_mock_upstream_for(CODEX_UPSTREAM_HOST).await;
+    let proxy = proxy_for_host(mock_addr, CODEX_UPSTREAM_HOST);
+    let (ctx, token_hex) = codex_api_key_sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    // A well-formed but wrong embedded token.
+    let wrong = format!("voidbox-proxy-{}", ProxyToken::generate().to_hex());
+    let (status, _) = codex_style_request(&connector, binding.port, &wrong, &[])
+        .await
+        .expect("codex request");
+    assert_eq!(status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+
+    // A bearer that is not a token carrier at all is also rejected (no token).
+    let (status, _) = codex_style_request(&connector, binding.port, "sk-not-a-carrier", &[])
+        .await
+        .expect("codex request");
+    assert_eq!(status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "upstream must not be called without a valid token"
+    );
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_oauth_injects_minted_bearer_and_account_id() {
+    // ChatGPT-mode codex: the proxy mints a Bearer from the codex OAuth store
+    // (whose refresh response has no expires_in) and replaces the guest's
+    // placeholder chatgpt-account-id with the host-held identity.
+    let (mock_addr, captured) = start_mock_upstream_for(CODEX_UPSTREAM_HOST).await;
+    let (token_url, token_hits) = start_mock_token_endpoint_codex("minted-codex-oat").await;
+    let proxy = proxy_for_host(mock_addr, CODEX_UPSTREAM_HOST);
+
+    let token = ProxyToken::generate();
+    let token_hex = token.to_hex();
+    let ca = Arc::new(ProxyCa::generate(vec![CODEX_UPSTREAM_HOST.to_string()]).expect("CA"));
+
+    // codex auth.json with an expired (past-exp JWT) access token so the first
+    // request forces a refresh.
+    let auth_json = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": expired_test_jwt(),
+            "access_token": expired_test_jwt(),
+            "refresh_token": "durable-codex-refresh",
+            "account_id": "acct-real-identity",
+        },
+    })
+    .to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        OAuthTokenStore::from_json(
+            OAuthProviderKind::CodexChatGpt,
+            &SecretString::from(auth_json),
+            dir.path().join("auth.json"),
+        )
+        .expect("store")
+        .with_token_endpoint(token_url)
+        .with_http_client(reqwest::Client::builder().build().expect("client")),
+    );
+    let injector = Arc::new(
+        OAuthBearerInjector::new(CODEX_UPSTREAM_HOST, store)
+            .with_extra_header("chatgpt-account-id", "acct-real-identity".to_string()),
+    );
+    let ctx = SandboxContext::new(token, ca, injector, vec![CODEX_UPSTREAM_HOST.to_string()])
+        .with_upstream_port(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    // The guest codex presents placeholder JWTs as its Bearer; the proxy token
+    // travels in the dedicated header (the config.toml http_headers carrier).
+    let tcp = TcpStream::connect(("127.0.0.1", binding.port))
+        .await
+        .expect("connect");
+    let server_name = ServerName::try_from(CODEX_UPSTREAM_HOST.to_string()).expect("server name");
+    let tls = connector.connect(server_name, tcp).await.expect("tls");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/backend-api/codex/responses")
+        .header("host", CODEX_UPSTREAM_HOST)
+        .header("authorization", "Bearer placeholder-jwt-from-auth-json")
+        .header("chatgpt-account-id", "voidbox-proxy-placeholder")
+        .header("originator", "codex_cli_rs")
+        .header(PROXY_TOKEN_HEADER, &token_hex)
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let resp = sender.send_request(req).await.expect("send");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let seen = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    // Minted Bearer injected; placeholder never reached the upstream.
+    assert_eq!(
+        seen.headers.get("authorization").unwrap(),
+        "Bearer minted-codex-oat"
+    );
+    // The host-held account identity replaced the guest placeholder.
+    assert_eq!(
+        seen.headers.get("chatgpt-account-id").unwrap(),
+        "acct-real-identity"
+    );
+    // originator passes through; the proxy token does not.
+    assert_eq!(seen.headers.get("originator").unwrap(), "codex_cli_rs");
+    assert!(seen.headers.get(PROXY_TOKEN_HEADER).is_none());
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+/// A syntactically valid unsigned JWT whose `exp` is one hour in the past.
+fn expired_test_jwt() -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 3600;
+    let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = b64.encode(format!(r#"{{"exp":{exp}}}"#));
+    format!("{header}.{payload}.test-signature")
+}
+
+/// Mock OpenAI-style token endpoint: rotating refresh token, an `id_token`, and
+/// **no `expires_in`** (expiry comes from the minted access token; here it is
+/// opaque, so the store falls back to its short default lifetime).
+async fn start_mock_token_endpoint_codex(access_token: &str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind token mock");
+    let addr = listener.local_addr().expect("token mock addr");
+    let body = format!(
+        r#"{{"access_token":"{access_token}","refresh_token":"rotated-codex-refresh","id_token":"rotated-id"}}"#
+    );
+    let response = Arc::new(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            let response = response.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await; // drain request; contents unused
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/oauth/token"), hits)
+}
+
 // ---------------------------------------------------------------------------
 // OAuth injection (Claude personal) — the M1a path
 // ---------------------------------------------------------------------------
@@ -668,7 +1115,8 @@ fn oauth_sandbox_context(
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(
-        ClaudeOAuthStore::from_json(
+        OAuthTokenStore::from_json(
+            OAuthProviderKind::ClaudeCode,
             &SecretString::from(creds),
             dir.path().join(".credentials.json"),
         )

@@ -78,13 +78,16 @@ pub mod ssrf;
 pub mod token;
 
 pub use ca::ProxyCa;
-pub use injector::{ApiKeyScheme, OAuthBearerInjector, StaticApiKeyInjector};
+pub use injector::{
+    ApiKeyScheme, OAuthBearerInjector, StaticApiKeyInjector, CHATGPT_ACCOUNT_ID_HEADER,
+};
 pub use provision::{
-    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedAuth,
-    ProxiedUpstream, GUEST_HOSTS_PATH,
+    assert_no_real_credential, build_guest_provisioning, render_codex_config_toml,
+    render_codex_mcp_servers_toml, render_guest_hosts, GuestClient, ProxiedAuth, ProxiedUpstream,
+    GUEST_CODEX_AUTH_PATH, GUEST_CODEX_CONFIG_PATH, GUEST_HOSTS_PATH,
 };
 pub use server::{start_proxy, ProxyHandle, SandboxBinding};
-pub use token::{ProxyToken, PROXY_TOKEN_HEADER};
+pub use token::{ProxyToken, PROXY_TOKEN_BEARER_PREFIX, PROXY_TOKEN_HEADER};
 
 /// Outcome of the egress-policy stage for a destination host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,10 @@ pub struct EgressEvent {
     pub allowed: bool,
     /// Whether a credential header was injected on this connection.
     pub injected: bool,
+    /// Why the proxy refused the request, when it did — a stable machine-readable
+    /// slug (e.g. `"websocket-upgrade-refused"`), so an operator can tell a policy
+    /// deny from a protocol refusal without parsing free-form log text.
+    pub reason: Option<&'static str>,
 }
 
 /// Outcome of the credential-injection stage for one request. Three states,
@@ -194,6 +201,7 @@ impl AuditSink for DebugAuditSink {
             port = event.port,
             allowed = event.allowed,
             injected = event.injected,
+            reason = event.reason,
             "proxy egress"
         );
     }
@@ -245,7 +253,8 @@ impl SandboxContext {
         }
     }
 
-    /// Override the upstream port (default 443). Intended for tests targeting a
+    /// Override the upstream port (default 443). Production uses it for a Custom
+    /// provider whose base URL names a non-443 port; tests use it to target a
     /// local mock upstream.
     pub fn with_upstream_port(mut self, port: u16) -> Self {
         self.upstream_port = port;

@@ -830,14 +830,17 @@ fn build_pipeline_box_with_io(
     builder = apply_box_overrides(builder, b.sandbox.as_ref(), spec);
     let effective_llm = b.llm.as_ref().or(spec.llm.as_ref());
     builder = apply_box_llm(builder, effective_llm);
-    builder = apply_codex_credential_mount(builder, staged_codex_creds);
-    // Stage the OAuth credential file into the guest only when this box is NOT
-    // using the credential proxy. With the proxy active the durable refresh token
-    // stays in the host store and is injected at egress; staging it here would put
-    // the durable secret where the uid-1000 agent can read it (R14). A per-box
-    // `credential_proxy` can be on while the top-level (which `staged_creds` was
-    // prepared from) is off, so this decision must read the effective per-box llm.
+    // Stage host credentials into the guest only when this box is NOT using the
+    // credential proxy. With the proxy active the durable secret (the Claude or
+    // codex refresh token / stored key) stays in the host store and is injected
+    // at egress; staging it here would put the durable secret where the uid-1000
+    // agent can read it (R14). A per-box `credential_proxy` can be on while the
+    // top-level (which the staged credentials were prepared from) is off, so
+    // this decision must read the effective per-box llm.
     let box_uses_proxy = effective_llm.and_then(|l| l.credential_proxy) == Some(true);
+    if !box_uses_proxy {
+        builder = apply_codex_credential_mount(builder, staged_codex_creds);
+    }
     if let Some(staged) = staged_creds {
         if !box_uses_proxy {
             builder = builder.claude_credentials_host_path(&staged.host_path);
@@ -1367,7 +1370,7 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
 fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredentials>> {
     match llm {
         // With the credential proxy active, the durable OAuth refresh token stays
-        // in the host store ([`crate::credentials::ClaudeOAuthStore`]) and is
+        // in the host store ([`crate::credentials::OAuthTokenStore`]) and is
         // injected at egress; staging it into the guest would put the durable
         // secret where the uid-1000 agent can read it (R14). So skip
         // discovery/staging entirely here.
@@ -1393,6 +1396,15 @@ fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredent
 fn prepare_codex(llm: Option<&LlmSpec>) -> Option<StagedCredentials> {
     let llm = llm?;
     if !llm.provider.eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    // With the credential proxy active, the durable codex credential (the
+    // ChatGPT refresh token, or the stored API key) stays in the host store and
+    // is injected at egress; mounting auth.json into the guest would put the
+    // durable secret where the uid-1000 agent can read it (R14). So skip
+    // discovery/staging entirely here — the guest gets a placeholder auth.json
+    // from the proxy provisioning instead.
+    if llm.credential_proxy == Some(true) {
         return None;
     }
     match crate::credentials::discover_codex_credentials() {

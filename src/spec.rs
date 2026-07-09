@@ -360,6 +360,10 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
         )));
     }
 
+    if let Some(llm) = &spec.llm {
+        validate_llm_credential_proxy(llm)?;
+    }
+
     match spec.kind {
         RunKind::Agent => {
             let Some(agent) = &spec.agent else {
@@ -413,6 +417,11 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
             if pipeline.boxes.is_empty() {
                 return Err(Error::Config("pipeline.boxes cannot be empty".into()));
             }
+            for pipeline_box in &pipeline.boxes {
+                if let Some(llm) = &pipeline_box.llm {
+                    validate_llm_credential_proxy(llm)?;
+                }
+            }
         }
         RunKind::Workflow => {
             let Some(workflow) = &spec.workflow else {
@@ -451,6 +460,53 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Reject a `custom` provider + `credential_proxy` combination the proxy cannot
+/// serve, at parse time rather than after the guest boots. The proxy injects
+/// the key at TLS egress, so it needs an `https` base URL (absent defaults to
+/// the plaintext local-gateway URL at runtime) and a host key source
+/// (`api_key_env`) to inject — without one there is nothing to contain and the
+/// run would fail only at proxy setup.
+fn validate_llm_credential_proxy(llm: &LlmSpec) -> Result<()> {
+    if llm.credential_proxy != Some(true) || !llm.provider.eq_ignore_ascii_case("custom") {
+        return Ok(());
+    }
+    match &llm.base_url {
+        Some(url)
+            if url
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("https://") => {}
+        Some(url) => {
+            return Err(Error::Config(format!(
+                "llm: provider 'custom' with credential_proxy requires an https base_url \
+                 (got '{url}') — the proxy injects the real key at TLS egress and will \
+                 not put it on plaintext HTTP"
+            )));
+        }
+        None => {
+            return Err(Error::Config(
+                "llm: provider 'custom' with credential_proxy requires an explicit https \
+                 base_url (the default is a plaintext local-gateway URL)"
+                    .into(),
+            ));
+        }
+    }
+    if llm
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .is_none()
+    {
+        return Err(Error::Config(
+            "llm: provider 'custom' with credential_proxy requires api_key_env — the \
+             proxy has no host-held key to inject without one"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -672,6 +728,111 @@ agent:
 "#;
         let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
         validate_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn custom_credential_proxy_requires_https_base_url() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: custom
+  base_url: "http://gateway.example.com/v1"
+  api_key_env: MY_KEY
+  credential_proxy: true
+agent:
+  prompt: "run"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("https"), "got: {err}");
+
+        // Absent base_url defaults to a plaintext local-gateway URL at runtime,
+        // so it is rejected the same way.
+        let yaml_no_url = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: custom
+  api_key_env: MY_KEY
+  credential_proxy: true
+agent:
+  prompt: "run"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml_no_url).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("https"), "got: {err}");
+    }
+
+    #[test]
+    fn custom_credential_proxy_requires_api_key_env() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: custom
+  base_url: "https://openrouter.ai/api/v1"
+  credential_proxy: true
+agent:
+  prompt: "run"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("api_key_env"), "got: {err}");
+    }
+
+    #[test]
+    fn custom_credential_proxy_accepts_https_with_key_env() {
+        let yaml = r#"
+api_version: v1
+kind: agent
+name: test
+sandbox:
+  mode: auto
+llm:
+  provider: custom
+  base_url: "https://openrouter.ai/api/v1"
+  api_key_env: MY_KEY
+  credential_proxy: true
+agent:
+  prompt: "run"
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        validate_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn pipeline_box_llm_credential_proxy_is_validated() {
+        // The per-box llm override goes through the same custom+proxy validation
+        // as the top-level llm.
+        let yaml = r#"
+api_version: v1
+kind: pipeline
+name: test
+sandbox:
+  mode: auto
+pipeline:
+  boxes:
+    - name: analyst
+      prompt: "run"
+      llm:
+        provider: custom
+        base_url: "http://gateway.example.com/v1"
+        api_key_env: MY_KEY
+        credential_proxy: true
+"#;
+        let spec: RunSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("https"), "got: {err}");
     }
 
     #[test]
