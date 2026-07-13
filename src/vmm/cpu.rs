@@ -75,36 +75,37 @@ pub struct MmioDevices {
     pub virtio_blk: Option<Arc<Mutex<VirtioBlkDevice>>>,
 }
 
-/// Create and start a vCPU with fresh register state (cold boot).
-#[allow(clippy::too_many_arguments)]
-pub fn create_vcpu(
-    vm: Arc<Vm>,
-    vcpu_id: u64,
-    entry_point: u64,
-    running: Arc<AtomicBool>,
-    serial: SerialDevice,
-    mmio_devices: MmioDevices,
-) -> Result<VcpuHandle> {
+/// A vCPU that has been created and configured but not started.
+///
+/// Creating a vCPU and spawning its run thread are separate steps so that
+/// arch-specific VM setup which must happen after every vCPU exists but
+/// before any of them runs — the vGIC on aarch64, see
+/// [`Arch::setup_vm_post_vcpus`] — can slot in between.
+pub struct PreparedVcpu {
+    vcpu_fd: kvm_ioctls::VcpuFd,
+    id: u64,
+}
+
+/// Create and configure a vCPU with fresh register state (cold boot).
+pub fn prepare_vcpu(vm: &Vm, vcpu_id: u64, entry_point: u64) -> Result<PreparedVcpu> {
     let vcpu_fd = vm.create_vcpu(vcpu_id)?;
     debug!("Created vCPU {}", vcpu_id);
 
     // Delegate arch-specific configuration (CPUID + regs on x86, vcpu_init on aarch64)
-    CurrentArch::configure_vcpu(&vcpu_fd, vcpu_id, entry_point, &vm)?;
+    CurrentArch::configure_vcpu(&vcpu_fd, vcpu_id, entry_point, vm)?;
 
-    // Start vCPU thread with state capture on exit
-    spawn_vcpu_thread(vm, vcpu_fd, vcpu_id, running, serial, mmio_devices)
+    Ok(PreparedVcpu {
+        vcpu_fd,
+        id: vcpu_id,
+    })
 }
 
-/// Create and start a vCPU with state restored from a snapshot.
-#[allow(clippy::too_many_arguments)]
-pub fn create_vcpu_restored(
-    vm: Arc<Vm>,
+/// Create a vCPU and restore its register state from a snapshot.
+pub fn prepare_vcpu_restored(
+    vm: &Vm,
     vcpu_id: u64,
     state: &arch::VcpuState,
-    running: Arc<AtomicBool>,
-    serial: SerialDevice,
-    mmio_devices: MmioDevices,
-) -> Result<VcpuHandle> {
+) -> Result<PreparedVcpu> {
     let vcpu_fd = vm.create_vcpu(vcpu_id)?;
     debug!("Created vCPU {} for restore", vcpu_id);
 
@@ -115,14 +116,34 @@ pub fn create_vcpu_restored(
     #[cfg(target_arch = "x86_64")]
     {
         // x86 needs CPUID set before any register restore
-        crate::vmm::arch::x86_64::cpu::configure_vcpu(&vcpu_fd, vcpu_id, 0, &vm)?;
+        crate::vmm::arch::x86_64::cpu::configure_vcpu(&vcpu_fd, vcpu_id, 0, vm)?;
     }
 
     // Restore full register state from snapshot
     CurrentArch::restore_vcpu_state(&vcpu_fd, state, vcpu_id)?;
 
-    // Start vCPU thread with state capture on exit
-    spawn_vcpu_thread(vm, vcpu_fd, vcpu_id, running, serial, mmio_devices)
+    Ok(PreparedVcpu {
+        vcpu_fd,
+        id: vcpu_id,
+    })
+}
+
+/// Spawn the run thread for a prepared vCPU.
+pub fn start_vcpu(
+    prepared: PreparedVcpu,
+    vm: Arc<Vm>,
+    running: Arc<AtomicBool>,
+    serial: SerialDevice,
+    mmio_devices: MmioDevices,
+) -> Result<VcpuHandle> {
+    spawn_vcpu_thread(
+        vm,
+        prepared.vcpu_fd,
+        prepared.id,
+        running,
+        serial,
+        mmio_devices,
+    )
 }
 
 /// Install a no-op signal handler for SIGRTMIN so that `pthread_kill(SIGRTMIN)`

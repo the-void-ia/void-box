@@ -23,8 +23,12 @@ impl Arch for Aarch64 {
     type IrqchipState = IrqchipState;
     type ArchVmState = ArchVmState;
 
-    fn setup_vm(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
-        kvm::setup_vm(vm_fd, vcpu_count)
+    fn setup_vm(vm_fd: &VmFd) -> Result<()> {
+        kvm::setup_vm(vm_fd)
+    }
+
+    fn setup_vm_post_vcpus(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
+        kvm::setup_vm_post_vcpus(vm_fd, vcpu_count)
     }
 
     fn load_kernel(vm: &Vm, kernel: &Path, initramfs: Option<&Path>, cmdline: &str) -> Result<u64> {

@@ -42,8 +42,24 @@ pub trait Arch {
 
     // -- Boot --
 
-    /// Arch-specific VM setup (irqchip + PIT on x86; GIC on aarch64).
-    fn setup_vm(vm_fd: &VmFd, vcpu_count: usize) -> Result<()>;
+    /// Arch-specific VM setup that must run **before** any vCPU is created.
+    ///
+    /// x86_64 creates the in-kernel irqchip + PIT here: KVM rejects
+    /// `KVM_CREATE_IRQCHIP` once vCPUs exist, and each vCPU's in-kernel
+    /// LAPIC is wired according to the irqchip mode at `KVM_CREATE_VCPU`
+    /// time. No-op on aarch64, whose GIC has the opposite ordering
+    /// constraint — see [`Arch::setup_vm_post_vcpus`].
+    fn setup_vm(vm_fd: &VmFd) -> Result<()>;
+
+    /// Arch-specific VM setup that must run **after** all vCPUs are created
+    /// and **before** any of them runs.
+    ///
+    /// aarch64 creates and initializes the vGIC here:
+    /// `KVM_DEV_ARM_VGIC_CTRL_INIT` sizes per-vCPU redistributor state and
+    /// freezes the vGIC configuration, so the kernel rejects any later
+    /// `KVM_CREATE_VCPU` with `EBUSY` — and refuses to create a vGIC at all
+    /// once a vCPU has run. No-op on x86_64.
+    fn setup_vm_post_vcpus(vm_fd: &VmFd, vcpu_count: usize) -> Result<()>;
 
     /// Load kernel (and optionally initramfs) into guest memory.
     fn load_kernel(vm: &Vm, kernel: &Path, initramfs: Option<&Path>, cmdline: &str) -> Result<u64>;

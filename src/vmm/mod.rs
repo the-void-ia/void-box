@@ -39,6 +39,7 @@ use crate::guest::protocol::{
 use crate::network::slirp::SlirpBackend;
 use crate::observe::telemetry::TelemetryAggregator;
 use crate::observe::Observer;
+use crate::vmm::arch::{Arch, CurrentArch};
 use crate::vmm::cpu::MmioDevices;
 use crate::{Error, ExecOutput, Result};
 
@@ -402,14 +403,22 @@ impl MicroVm {
         // from KVM_RUN instead of terminating the process.
         cpu::install_vcpu_signal_handler();
 
-        // Create vCPUs (with MMIO dispatch to virtio-net and virtio-vsock)
+        // Create and configure all vCPUs before starting any of them: the
+        // aarch64 vGIC must be initialized after every vCPU exists and
+        // before any vCPU runs (see `Arch::setup_vm_post_vcpus`).
+        let mut prepared_vcpus = Vec::with_capacity(config.vcpus);
+        for vcpu_id in 0..config.vcpus {
+            prepared_vcpus.push(cpu::prepare_vcpu(&vm, vcpu_id as u64, entry_point)?);
+        }
+        CurrentArch::setup_vm_post_vcpus(vm.vm_fd(), config.vcpus)?;
+
+        // Start vCPU threads (with MMIO dispatch to virtio-net and virtio-vsock)
         let running = Arc::new(AtomicBool::new(true));
         let mut vcpu_handles = Vec::with_capacity(config.vcpus);
-        for vcpu_id in 0..config.vcpus {
-            let handle = cpu::create_vcpu(
+        for prepared in prepared_vcpus {
+            let handle = cpu::start_vcpu(
+                prepared,
                 vm.clone(),
-                vcpu_id as u64,
-                entry_point,
                 running.clone(),
                 serial.clone(),
                 MmioDevices {
@@ -627,7 +636,6 @@ impl MicroVm {
 
         // 3. Restore in-kernel interrupt controller + arch state.
         let t1 = std::time::Instant::now();
-        use crate::vmm::arch::{Arch, CurrentArch};
         CurrentArch::restore_irqchip(&vm, &snap.irqchip)?;
         CurrentArch::restore_arch_vm_state(&vm, &snap.arch_state)?;
         let t_irq = t1.elapsed();
@@ -712,16 +720,23 @@ impl MicroVm {
             virtio_blk: None,
         };
 
-        // 8. Restore vCPUs from snapshot state
+        // 8. Restore vCPUs from snapshot state. As on the cold-boot path,
+        // every vCPU is created before any is started so the aarch64 vGIC
+        // can be initialized in between (see `Arch::setup_vm_post_vcpus`).
         let t_vcpu_start = std::time::Instant::now();
         cpu::install_vcpu_signal_handler();
-        let running = Arc::new(AtomicBool::new(true));
-        let mut vcpu_handles = Vec::with_capacity(snap.vcpu_states.len());
+        let mut prepared_vcpus = Vec::with_capacity(snap.vcpu_states.len());
         for (i, vcpu_state) in snap.vcpu_states.iter().enumerate() {
-            let handle = cpu::create_vcpu_restored(
+            prepared_vcpus.push(cpu::prepare_vcpu_restored(&vm, i as u64, vcpu_state)?);
+        }
+        CurrentArch::setup_vm_post_vcpus(vm.vm_fd(), prepared_vcpus.len())?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut vcpu_handles = Vec::with_capacity(prepared_vcpus.len());
+        for prepared in prepared_vcpus {
+            let handle = cpu::start_vcpu(
+                prepared,
                 vm.clone(),
-                i as u64,
-                vcpu_state,
                 running.clone(),
                 serial.clone(),
                 cpu::MmioDevices {
@@ -953,7 +968,6 @@ impl MicroVm {
         debug!("Captured {} vCPU states", vcpu_states.len());
 
         // 4. Capture VM-level state (vm_fd is still valid)
-        use crate::vmm::arch::{Arch, CurrentArch};
         let irqchip = CurrentArch::capture_irqchip(&self.vm)?;
         let arch_state = CurrentArch::capture_arch_vm_state(&self.vm)?;
 

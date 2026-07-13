@@ -26,14 +26,11 @@ pub struct Vm {
 impl Vm {
     /// Create a new KVM VM with the specified memory size.
     ///
-    /// Also performs arch-specific setup (irqchip + PIT on x86, GIC on aarch64)
-    /// via [`CurrentArch::setup_vm`].
+    /// Also performs the pre-vCPU arch-specific setup (irqchip + PIT on x86)
+    /// via [`CurrentArch::setup_vm`]. Arch setup that must wait until all
+    /// vCPUs exist (the vGIC on aarch64) runs later, via
+    /// [`CurrentArch::setup_vm_post_vcpus`].
     pub fn new(memory_mb: usize) -> Result<Self> {
-        Self::with_vcpu_count(memory_mb, 1)
-    }
-
-    /// Create a new KVM VM, passing the vCPU count for arch-specific setup.
-    pub fn with_vcpu_count(memory_mb: usize, vcpu_count: usize) -> Result<Self> {
         let memory_size = (memory_mb as u64) * 1024 * 1024;
 
         // Open /dev/kvm
@@ -61,8 +58,8 @@ impl Vm {
         // Register memory with KVM
         vm.register_memory()?;
 
-        // Arch-specific VM setup (irqchip + PIT on x86, GIC on aarch64)
-        CurrentArch::setup_vm(&vm.vm_fd, vcpu_count)?;
+        // Pre-vCPU arch-specific VM setup (irqchip + PIT on x86)
+        CurrentArch::setup_vm(&vm.vm_fd)?;
 
         Ok(vm)
     }
