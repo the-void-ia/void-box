@@ -862,3 +862,31 @@ fn ensure_response_type(msg: &Message, expected: MessageType, context: &'static 
         msg.msg_type
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env mutation is process-global; this is the only test touching the
+    /// variable, and it restores the unset state before returning.
+    #[test]
+    fn connect_deadline_env_override_extends_only() {
+        const VAR: &str = "VOID_BOX_CONNECT_DEADLINE_SECS";
+
+        std::env::remove_var(VAR);
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        std::env::set_var(VAR, "240");
+        assert_eq!(connect_deadline(), Duration::from_secs(240));
+
+        // The override can only extend the deadline, never shorten it.
+        std::env::set_var(VAR, "5");
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        // Garbage falls back to the default.
+        std::env::set_var(VAR, "not-a-number");
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        std::env::remove_var(VAR);
+    }
+}

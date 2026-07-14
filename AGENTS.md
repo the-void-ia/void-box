@@ -838,6 +838,12 @@ found. If BusyBox is not auto-detected, set the `BUSYBOX` env var explicitly:
 BUSYBOX=/path/to/busybox-static scripts/build_test_image.sh
 ```
 
+Ubuntu caveat (applies to `build_guest_image.sh` too): installing
+`busybox-static` places the static binary at `/bin/busybox`, but the dynamic
+`busybox` package's `/usr/bin/busybox` shadows it in PATH-based
+auto-detection — the build then silently produces an image with no `/bin/sh`.
+Pass `BUSYBOX=/bin/busybox` explicitly on Ubuntu hosts.
+
 BusyBox provides `/bin/sh` and common utilities (`echo`, `cat`, `mkdir`, `rm`,
 `mv`, `chmod`, `stat`, `dd`, `ls`, `wc`, `test`, `grep`, `sed`, `find`, etc.)
 inside the guest. **Without BusyBox**, any test that runs `sh -c "..."` will
@@ -1133,7 +1139,11 @@ host connects via AF_VSOCK but gets `ECONNRESET` on every attempt.
    to decompress, load modules, and complete network setup — especially with only
    256 MB of guest RAM. **Fix:** Use at least **3 GB** of guest memory for
    production initramfs (`memory_mb(3072)`) so the kernel can decompress and
-   boot within the timeout window.
+   boot within the timeout window. On hosts where boot is legitimately slow
+   even with correct sizing — nested virtualization (e.g. a Lima validation
+   VM) makes the production image take ~90 s+ — extend the connect deadline
+   with `VOID_BOX_CONNECT_DEADLINE_SECS` (opt-in; can only lengthen the
+   default, never shorten it).
 
 **Debugging tip:** Boot a `MicroVm` directly with `loglevel=7` in the kernel
 cmdline and read `vm.read_serial_output()` to see guest-agent progress messages.
