@@ -43,10 +43,24 @@ pub static MEMORY_LAYOUT: MemoryLayout = MemoryLayout {
     mmio_gap_end: None,
 };
 
-/// Create the GIC (Generic Interrupt Controller) for the VM.
+/// Pre-vCPU VM setup — nothing to do on aarch64.
+///
+/// The GIC is deliberately not created here: `KVM_DEV_ARM_VGIC_CTRL_INIT`
+/// freezes the vGIC configuration and the kernel then rejects
+/// `KVM_CREATE_VCPU` with `EBUSY`, so all GIC work happens in
+/// [`setup_vm_post_vcpus`] once every vCPU exists.
+pub fn setup_vm(_vm_fd: &VmFd) -> Result<()> {
+    Ok(())
+}
+
+/// Create and initialize the GIC (Generic Interrupt Controller) for the VM.
+///
+/// Must run after every vCPU is created and before any of them runs: the
+/// vGIC init sizes per-vCPU redistributor state from the vCPUs present, and
+/// the kernel refuses to create a vGIC once a vCPU has run.
 ///
 /// Tries GICv3 first, then falls back to GICv2.
-pub fn setup_vm(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
+pub fn setup_vm_post_vcpus(vm_fd: &VmFd, vcpu_count: usize) -> Result<()> {
     // Try GICv3 first
     match create_gicv3(vm_fd, vcpu_count) {
         Ok(()) => {
@@ -199,6 +213,10 @@ pub fn capture_irqchip(_vm: &Vm) -> Result<IrqchipState> {
 }
 
 /// Restore GIC state from a snapshot.
+///
+/// Currently a stub. A real implementation must run after
+/// [`setup_vm_post_vcpus`] — the vGIC only exists from that point — which
+/// is later than the arch-neutral restore path calls this today.
 pub fn restore_irqchip(_vm: &Vm, _state: &IrqchipState) -> Result<()> {
     // TODO: Implement full GIC register restore via KVM_SET_DEVICE_ATTR
     debug!("Restored aarch64 GIC state (stub)");

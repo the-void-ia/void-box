@@ -2,6 +2,12 @@
 //!
 //! Uses `KVM_GET_ONE_REG` / `KVM_SET_ONE_REG` for all register access.
 
+use std::mem::offset_of;
+
+use kvm_bindings::{
+    kvm_regs, user_fpsimd_state, user_pt_regs, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
+    KVM_REG_ARM_CORE, KVM_REG_SIZE_U128, KVM_REG_SIZE_U32, KVM_REG_SIZE_U64,
+};
 use kvm_ioctls::VcpuFd;
 use tracing::debug;
 
@@ -10,26 +16,23 @@ use crate::{Error, Result};
 
 use super::snapshot::VcpuState;
 
-// KVM register ID encoding for ARM64.
-// See: arch/arm64/include/uapi/asm/kvm.h in the Linux kernel.
+// KVM register IDs follow the arm64 ABI (arch/arm64/include/uapi/asm/kvm.h):
+// the coproc class occupies bits 16–27 of the ID, and a core register is
+// addressed by offsetof(struct kvm_regs, <field>) in 32-bit words. IDs built
+// with the class bits or offsets in any other position land in the kernel's
+// system-register lookup, which fails with ENOENT. Offsets are derived from
+// the `kvm_bindings` struct layout so they cannot drift from the ABI.
 
-const KVM_REG_ARM64: u64 = 0x6030_0000_0000_0000;
-const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
-const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
-const KVM_REG_ARM_CORE: u64 = 0x0010_0000_0000_0000;
-const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000_0000_0000;
-const _KVM_REG_ARM64_SVE: u64 = 0x0015_0000_0000_0000;
-
-/// Encode a core register ID by its offset in `kvm_regs` (in u64 units).
-const fn core_reg(offset: u64) -> u64 {
-    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offset & 0xFFFF)
+/// Encode a core register ID from its size class and byte offset in `kvm_regs`.
+const fn core_reg(size: u64, byte_offset: usize) -> u64 {
+    KVM_REG_ARM64 | size | (KVM_REG_ARM_CORE as u64) | (byte_offset / 4) as u64
 }
 
 /// Encode a system register ID from its Op0/Op1/CRn/CRm/Op2 fields.
 const fn sys_reg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
     KVM_REG_ARM64
         | KVM_REG_SIZE_U64
-        | KVM_REG_ARM64_SYSREG
+        | (KVM_REG_ARM64_SYSREG as u64)
         | ((op0 & 3) << 14)
         | ((op1 & 7) << 11)
         | ((crn & 0xf) << 7)
@@ -37,17 +40,33 @@ const fn sys_reg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
         | (op2 & 7)
 }
 
-// Core register offsets (in u64 units within struct kvm_regs).
-// x0 = offset 0, x1 = offset 1, ..., x30 = offset 30.
-// SP = 31, PC = 32, PSTATE = 33.
+/// Byte offset of general-purpose register `x<n>` within `kvm_regs`.
+const fn xreg_offset(n: usize) -> usize {
+    offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, regs) + n * 8
+}
+
+/// Byte offset of FP/SIMD vector register `V<i>` within `kvm_regs`.
+const fn vreg_offset(i: usize) -> usize {
+    offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, vregs) + i * 16
+}
+
+const SP_OFFSET: usize = offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, sp);
+const PC_OFFSET: usize = offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, pc);
+const PSTATE_OFFSET: usize = offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, pstate);
+const FPSR_OFFSET: usize = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpsr);
+const FPCR_OFFSET: usize = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
 
 /// Core registers to capture: x0–x30, SP, PC, PSTATE.
-const CORE_REG_OFFSETS: &[u64] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    26, 27, 28, 29, 30, 31, // SP
-    32, // PC
-    33, // PSTATE
-];
+fn core_reg_ids() -> Vec<u64> {
+    let mut ids = Vec::with_capacity(34);
+    for n in 0..31 {
+        ids.push(core_reg(KVM_REG_SIZE_U64, xreg_offset(n)));
+    }
+    ids.push(core_reg(KVM_REG_SIZE_U64, SP_OFFSET));
+    ids.push(core_reg(KVM_REG_SIZE_U64, PC_OFFSET));
+    ids.push(core_reg(KVM_REG_SIZE_U64, PSTATE_OFFSET));
+    ids
+}
 
 /// System registers essential for snapshot/restore.
 fn system_reg_ids() -> Vec<u64> {
@@ -95,14 +114,14 @@ pub fn configure_vcpu(vcpu_fd: &VcpuFd, _vcpu_id: u64, entry_point: u64, vm: &Vm
     debug!("Initialized aarch64 vCPU");
 
     // Set PC to kernel entry point.
-    let pc_id = core_reg(32); // PC
+    let pc_id = core_reg(KVM_REG_SIZE_U64, PC_OFFSET);
     vcpu_fd
         .set_one_reg(pc_id, &entry_point.to_le_bytes())
         .map_err(Error::Kvm)?;
 
     // Set x0 to DTB address (Linux boot protocol for ARM64).
     let dtb_addr = super::kvm::layout::DTB_ADDR;
-    let x0_id = core_reg(0); // x0
+    let x0_id = core_reg(KVM_REG_SIZE_U64, xreg_offset(0));
     vcpu_fd
         .set_one_reg(x0_id, &dtb_addr.to_le_bytes())
         .map_err(Error::Kvm)?;
@@ -118,13 +137,13 @@ pub fn configure_vcpu(vcpu_fd: &VcpuFd, _vcpu_id: u64, entry_point: u64, vm: &Vm
 /// Capture the full register state of a vCPU for snapshotting.
 pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
     // Core registers
-    let mut core_regs = Vec::with_capacity(CORE_REG_OFFSETS.len());
-    for &offset in CORE_REG_OFFSETS {
-        let reg_id = core_reg(offset);
+    let core_reg_ids = core_reg_ids();
+    let mut core_regs = Vec::with_capacity(core_reg_ids.len());
+    for reg_id in core_reg_ids {
         match get_one_reg_u64(vcpu_fd, reg_id) {
             Ok(val) => core_regs.push((reg_id, val)),
             Err(e) => {
-                debug!("Core reg offset {} not available: {}", offset, e);
+                debug!("Core reg {:#x} not available: {}", reg_id, e);
             }
         }
     }
@@ -142,9 +161,8 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
 
     // FP/SIMD registers (V0-V31 are 128-bit)
     let mut fp_regs = Vec::new();
-    for i in 0u64..32 {
-        // V registers are in the core area at offset 34 + i*2 (128-bit = 2 u64s)
-        let reg_id = KVM_REG_ARM64 | KVM_REG_SIZE_U128 | KVM_REG_ARM_CORE | (34 + i * 2);
+    for i in 0..32 {
+        let reg_id = core_reg(KVM_REG_SIZE_U128, vreg_offset(i));
         let mut buf = [0u8; 16];
         match vcpu_fd.get_one_reg(reg_id, &mut buf) {
             Ok(_) => fp_regs.push((reg_id, buf.to_vec())),
@@ -153,14 +171,15 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
             }
         }
     }
-    // FPSR and FPCR
-    for &offset in &[98u64, 99u64] {
-        // FPSR = offset 98, FPCR = offset 99
-        let reg_id = core_reg(offset);
-        match get_one_reg_u64(vcpu_fd, reg_id) {
-            Ok(val) => fp_regs.push((reg_id, val.to_le_bytes().to_vec())),
+    // FPSR and FPCR are 32-bit registers and must be encoded (and buffered)
+    // as U32 — the kernel rejects a mismatched size class.
+    for (name, offset) in [("FPSR", FPSR_OFFSET), ("FPCR", FPCR_OFFSET)] {
+        let reg_id = core_reg(KVM_REG_SIZE_U32, offset);
+        let mut buf = [0u8; 4];
+        match vcpu_fd.get_one_reg(reg_id, &mut buf) {
+            Ok(_) => fp_regs.push((reg_id, buf.to_vec())),
             Err(e) => {
-                debug!("FP control reg offset {} not available: {}", offset, e);
+                debug!("{} not available: {}", name, e);
             }
         }
     }
@@ -251,4 +270,53 @@ fn get_one_reg_u64(vcpu_fd: &VcpuFd, reg_id: u64) -> Result<u64> {
     let mut buf = [0u8; 8];
     vcpu_fd.get_one_reg(reg_id, &mut buf).map_err(Error::Kvm)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected values are the arm64 KVM ABI register IDs as documented in
+    // arch/arm64/include/uapi/asm/kvm.h (and used verbatim by Firecracker,
+    // crosvm, and QEMU), pinning the offset_of!-derived encoding.
+
+    #[test]
+    fn core_reg_ids_match_abi() {
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U64, xreg_offset(0)),
+            0x6030_0000_0010_0000
+        ); // x0
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U64, xreg_offset(1)),
+            0x6030_0000_0010_0002
+        ); // x1
+        assert_eq!(core_reg(KVM_REG_SIZE_U64, SP_OFFSET), 0x6030_0000_0010_003e);
+        assert_eq!(core_reg(KVM_REG_SIZE_U64, PC_OFFSET), 0x6030_0000_0010_0040);
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U64, PSTATE_OFFSET),
+            0x6030_0000_0010_0042
+        );
+    }
+
+    #[test]
+    fn fp_reg_ids_match_abi() {
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U128, vreg_offset(0)),
+            0x6040_0000_0010_0054
+        ); // V0
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U32, FPSR_OFFSET),
+            0x6020_0000_0010_00d4
+        );
+        assert_eq!(
+            core_reg(KVM_REG_SIZE_U32, FPCR_OFFSET),
+            0x6020_0000_0010_00d5
+        );
+    }
+
+    #[test]
+    fn sys_reg_ids_match_abi() {
+        // MPIDR_EL1 = Op0 3, Op1 0, CRn 0, CRm 0, Op2 5.
+        assert_eq!(sys_reg(3, 0, 0, 0, 5), 0x6030_0000_0013_c005);
+    }
 }

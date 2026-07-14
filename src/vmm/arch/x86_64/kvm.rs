@@ -65,7 +65,7 @@ pub static MEMORY_LAYOUT: MemoryLayout = MemoryLayout {
 /// [`KVM_X86_DISABLE_EXITS_PAUSE`] so the guest's `HLT` and `PAUSE` instructions
 /// do not force a vCPU exit to userspace. Cap-not-supported failures are logged
 /// and ignored — the VM still boots, just without the optimisation.
-pub fn setup_vm(vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
+pub fn setup_vm(vm_fd: &VmFd) -> Result<()> {
     vm_fd.create_irq_chip().map_err(Error::Kvm)?;
     debug!("Created IRQ chip");
 
@@ -86,6 +86,15 @@ pub fn setup_vm(vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
         Err(e) => debug!("KVM_CAP_X86_DISABLE_EXITS unavailable: {e}"),
     }
 
+    Ok(())
+}
+
+/// Post-vCPU VM setup — nothing to do on x86_64.
+///
+/// The in-kernel irqchip and PIT must already exist when vCPUs are created
+/// (KVM rejects `KVM_CREATE_IRQCHIP` once vCPUs exist), so they are set up
+/// in [`setup_vm`]; no x86 setup has to wait for the vCPUs.
+pub fn setup_vm_post_vcpus(_vm_fd: &VmFd, _vcpu_count: usize) -> Result<()> {
     Ok(())
 }
 
