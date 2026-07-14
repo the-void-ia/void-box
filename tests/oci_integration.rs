@@ -219,8 +219,10 @@ fn kernel_cmdline_includes_oci_rootfs_dev() {
     );
 }
 
-/// `VoidBoxConfig` with `oci_rootfs_disk` emits the virtio-mmio declaration for
-/// virtio-blk (IRQ 13, MMIO base 0xd1800000).
+/// `VoidBoxConfig` with `oci_rootfs_disk` declares the virtio-blk device to
+/// the guest kernel: x86_64 via the cmdline virtio-mmio declaration (IRQ 13,
+/// MMIO base 0xd1800000), aarch64 via a DTB node (so the cmdline must NOT
+/// carry one — a cmdline declaration would double-register the window).
 #[cfg(target_os = "linux")]
 #[test]
 fn kernel_cmdline_includes_virtio_blk_mmio_for_oci_disk() {
@@ -229,9 +231,25 @@ fn kernel_cmdline_includes_virtio_blk_mmio_for_oci_disk() {
         ..Default::default()
     };
     let cmdline = config.kernel_cmdline();
+    #[cfg(target_arch = "x86_64")]
     assert!(
         cmdline.contains("virtio_mmio.device=512@0xd1800000:13"),
         "kernel cmdline should contain virtio-blk MMIO declaration: {cmdline}"
+    );
+    #[cfg(target_arch = "aarch64")]
+    assert!(
+        !cmdline.contains("virtio_mmio.device="),
+        "aarch64 cmdline must not declare virtio-mmio windows (DTB owns discovery): {cmdline}"
+    );
+    #[cfg(target_arch = "aarch64")]
+    assert!(
+        void_box::vmm::config::VoidBoxConfig {
+            oci_rootfs_disk: Some(PathBuf::from("/tmp/oci-rootfs.img")),
+            ..Default::default()
+        }
+        .populated_virtio_slots()
+        .contains(&void_box::vmm::arch::VirtioSlot::Blk),
+        "aarch64 must declare the blk slot for the DTB"
     );
 }
 
