@@ -70,6 +70,25 @@ pub const GUEST_AGENT_PORT: u32 = 1234;
 /// 10+ minutes per turn for complex prompts with tool definitions.
 const DEFAULT_EXEC_READ_TIMEOUT: Duration = Duration::from_secs(1200);
 
+/// Deadline for the connect/handshake loop against a booting guest.
+///
+/// The 30 s default covers production-size initramfs boots on bare-metal
+/// hosts (see the AGENTS.md known-issues entry on boot timeouts). Slow
+/// validation environments — nested virtualization in particular — can
+/// extend it with `VOID_BOX_CONNECT_DEADLINE_SECS`; the override is opt-in
+/// and can only lengthen the deadline, never shorten it, so default
+/// behavior is unchanged wherever the variable is unset.
+fn connect_deadline() -> Duration {
+    const DEFAULT_CONNECT_DEADLINE_SECS: u64 = 30;
+    let secs = std::env::var("VOID_BOX_CONNECT_DEADLINE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_CONNECT_DEADLINE_SECS, |value| {
+            value.max(DEFAULT_CONNECT_DEADLINE_SECS)
+        });
+    Duration::from_secs(secs)
+}
+
 /// Resolve the read timeout for an exec request.
 ///
 /// Service mode passes `Some(0)` to mean "wait forever" (no timeout). Any other
@@ -609,7 +628,7 @@ pub(crate) fn connect_with_handshake_sync(
     // over-sleep, not 2s.
     let mut delay = Duration::from_millis(25);
     let max_delay = Duration::from_millis(250);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + connect_deadline();
     let mut attempt: u32 = 0;
     let t_start = Instant::now();
     let mut attempt_timeout = handshake_timeout;

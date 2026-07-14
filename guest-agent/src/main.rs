@@ -746,10 +746,22 @@ fn virtio_mmio_params_from_cmdline() -> String {
         }
     }
     if params.is_empty() {
-        "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12".to_string()
-    } else {
-        params.join(" ")
+        // x86_64: fall back to the host's standard device windows in case
+        // the cmdline params were not forwarded to the module. On aarch64
+        // devices are declared in the DTB and the kernel probes them from
+        // there — module parameters would register bogus windows at
+        // addresses that don't exist on that layout.
+        #[cfg(target_arch = "x86_64")]
+        {
+            return "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12"
+                .to_string();
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return String::new();
+        }
     }
+    params.join(" ")
 }
 
 /// Load a single kernel module using finit_module(2), with optional parameters.

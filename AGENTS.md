@@ -140,8 +140,9 @@ where applicable. Key platform differences:
 
 | Concern | Linux (KVM) | macOS (VZ) |
 |---------|-------------|------------|
-| Kernel | `vmlinuz` (compressed OK) | `vmlinux` (uncompressed); `download_kernel.sh` uses `extract-vmlinux` |
-| Network detection | `virtio_mmio.device=512@0xd0000000:10` in cmdline | `voidbox.network=1` in cmdline (VZ uses PCI) |
+| Kernel | `vmlinuz` (compressed OK; aarch64 gunzips the Image in the loader) | `vmlinux` (uncompressed); `download_kernel.sh` uses `extract-vmlinux` |
+| Device discovery | x86_64: `virtio_mmio.device=512@0xd0000000:10`-style cmdline args; aarch64: virtio-mmio DTB nodes (no `virtio_mmio.device=` args) | PCI |
+| Network detection (guest-agent) | x86_64: exact `virtio_mmio.device=512@0xd0000000:10` token; aarch64: `voidbox.network=1` | `voidbox.network=1` in cmdline |
 | Kernel modules | Host or pinned; `build_test_image.sh` | `guest_macos.sh`; `VOID_BOX_KMOD_VERSION` must match `download_kernel.sh` |
 
 ## Architecture overview

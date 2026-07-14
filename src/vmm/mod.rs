@@ -39,7 +39,7 @@ use crate::guest::protocol::{
 use crate::network::slirp::SlirpBackend;
 use crate::observe::telemetry::TelemetryAggregator;
 use crate::observe::Observer;
-use crate::vmm::arch::{Arch, CurrentArch};
+use crate::vmm::arch::{Arch, CurrentArch, VirtioSlot};
 use crate::vmm::cpu::MmioDevices;
 use crate::{Error, ExecOutput, Result};
 
@@ -232,11 +232,16 @@ impl MicroVm {
         debug!("Created serial device");
 
         // Load kernel and initramfs
+        let boot_platform = arch::BootPlatform {
+            vcpu_count: config.vcpus,
+            virtio_slots: config.populated_virtio_slots(),
+        };
         let entry_point = boot::load_kernel(
             &vm,
             &config.kernel,
             config.initramfs.as_deref(),
             &config.kernel_cmdline(),
+            &boot_platform,
         )?;
         debug!("Loaded kernel at entry point: {:#x}", entry_point);
 
@@ -277,7 +282,7 @@ impl MicroVm {
             match config.vsock_backend {
                 config::VsockBackendType::Userspace => match VirtioVsockUserspace::new(cid) {
                     Ok(mut dev) => {
-                        dev.set_mmio_base(0xd080_0000);
+                        dev.set_mmio_base(VirtioSlot::Vsock.mmio_base());
                         debug!(
                             "virtio-vsock-userspace MMIO at {:#x}, CID {}",
                             dev.mmio_base(),
@@ -295,7 +300,7 @@ impl MicroVm {
                 config::VsockBackendType::Vhost => {
                     match VirtioVsockMmio::new_with_require_vhost(cid, true) {
                         Ok(mut dev) => {
-                            dev.set_mmio_base(0xd080_0000);
+                            dev.set_mmio_base(VirtioSlot::Vsock.mmio_base());
                             debug!("virtio-vsock MMIO at {:#x}, CID {}", dev.mmio_base(), cid);
                             Some(Arc::new(Mutex::new(dev)))
                         }
@@ -326,7 +331,7 @@ impl MicroVm {
                     &[],
                 )?));
             let mut net_device = VirtioNetDevice::new(slirp)?;
-            net_device.set_mmio_base(0xd000_0000);
+            net_device.set_mmio_base(VirtioSlot::Net.mmio_base());
             debug!(
                 "virtio-net enabled at MMIO {:#x}, MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 net_device.mmio_base(),
@@ -350,7 +355,7 @@ impl MicroVm {
             let first_mount = &config.mounts[0];
             let mut dev =
                 Virtio9pDevice::new(&first_mount.host_path, "mount0", first_mount.read_only);
-            dev.set_mmio_base(0xd100_0000);
+            dev.set_mmio_base(VirtioSlot::P9.mmio_base());
             // RW mounts: map metadata uid/gid to the guest sandbox uid (1000)
             // so the sandboxed guest user sees consistent ownership of the
             // mount, regardless of whether the host runtime process runs as
@@ -381,7 +386,7 @@ impl MicroVm {
 
         let virtio_blk = if let Some(ref disk_path) = config.oci_rootfs_disk {
             let mut dev = VirtioBlkDevice::new(disk_path)?;
-            dev.set_mmio_base(0xd180_0000);
+            dev.set_mmio_base(VirtioSlot::Blk.mmio_base());
             debug!(
                 "virtio-blk MMIO at {:#x}, disk={}",
                 dev.mmio_base(),
@@ -635,6 +640,12 @@ impl MicroVm {
         let t_mem = t0.elapsed() - t_vm_new;
 
         // 3. Restore in-kernel interrupt controller + arch state.
+        //
+        // This ordering is x86-specific: the x86 irqchip exists from
+        // Vm::new, but the aarch64 vGIC is only created after all vCPUs
+        // exist (setup_vm_post_vcpus, step 8). A real aarch64 GIC restore
+        // cannot run here — it must move after the post-vCPU hook. Safe
+        // today only because the aarch64 restore_irqchip is a stub.
         let t1 = std::time::Instant::now();
         CurrentArch::restore_irqchip(&vm, &snap.irqchip)?;
         CurrentArch::restore_arch_vm_state(&vm, &snap.arch_state)?;
@@ -701,7 +712,7 @@ impl MicroVm {
                     Arc::new(Mutex::new(SlirpBackend::new()?));
                 let mut net_dev = VirtioNetDevice::new(slirp)?;
                 net_dev.restore_state(net_state);
-                net_dev.set_mmio_base(0xd000_0000);
+                net_dev.set_mmio_base(VirtioSlot::Net.mmio_base());
                 debug!("Restored virtio-net MMIO at {:#x}", net_dev.mmio_base());
                 Some(Arc::new(Mutex::new(net_dev)))
             } else {
@@ -1590,7 +1601,7 @@ fn vsock_irq_thread(
                 }
 
                 // Inject IRQ 11 (vsock) via KVM_IRQ_LINE
-                cpu::inject_irq(vm_fd, 11);
+                cpu::inject_irq(vm_fd, VirtioSlot::Vsock);
             }
         }
     }
@@ -1693,12 +1704,6 @@ fn setup_tx_notify_ioeventfd(
 }
 
 fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: Arc<AtomicBool>) {
-    #[repr(C)]
-    struct KvmIrqLevel {
-        irq: u32,
-        level: u32,
-    }
-    const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
     // Adaptive epoll_wait timeout.  Active periods need a 5 ms cadence so
     // the guest's TCP delayed-ACK timer fires on schedule (the guest spends
     // most idle time in HLT and relies on our IRQ pulses to advance vCPU
@@ -1741,15 +1746,18 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     // still set from an un-acked earlier pulse.
     let mut prev_pending: bool = false;
 
-    // KVM_IRQFD: register an eventfd that asserts IRQ 10 when written.
-    // Writing 8 bytes to the eventfd is one syscall; the kernel signals
-    // the in-kernel irqchip directly.  This replaces the pair of
-    // KVM_IRQ_LINE ioctls (assert level=1 / deassert level=0) with a
-    // single write.  If setup fails (kernel without irqfd, broken irqchip
-    // routing) we fall back to the ioctl path below.
+    // KVM_IRQFD: register an eventfd that asserts the net slot's interrupt
+    // when written. Writing 8 bytes to the eventfd is one syscall; the
+    // kernel signals the in-kernel irqchip directly. This replaces the pair
+    // of KVM_IRQ_LINE ioctls (assert level=1 / deassert level=0) with a
+    // single write. If setup fails (kernel without irqfd, broken irqchip
+    // routing) we fall back to the ioctl path below. On aarch64 the GSI
+    // resolves through the vGIC's default identity routing, which exists
+    // because the vGIC was initialized before this thread spawned (see
+    // VirtioSlot::irqfd_gsi).
     let irq_eventfd: Option<vmm_sys_util::eventfd::EventFd> =
         match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
-            Ok(fd) => match vm.vm_fd().register_irqfd(&fd, 10) {
+            Ok(fd) => match vm.vm_fd().register_irqfd(&fd, VirtioSlot::Net.irqfd_gsi()) {
                 Ok(()) => Some(fd),
                 Err(e) => {
                     debug!(
@@ -1780,13 +1788,14 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     // The net-poll thread sees the eventfd as another epoll source, drains
     // it, and calls process_tx_queue asynchronously.  No vCPU exit.
     //
-    // Address: virtio-net mmio_base (0xd000_0000) + QUEUE_NOTIFY offset
-    // (0x050) = 0xd000_0050.  Datamatch=1 triggers only on TX queue
-    // notifies (value=1 → queue index 1 = transmit queue).  Notifies for
-    // queue 0 (RX) still take the slow path through MMIO; they're rare
-    // (only when guest adds new RX buffers) so the optimisation isn't
-    // needed there.
-    const VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
+    // Address: the net slot's mmio_base + QUEUE_NOTIFY offset (0x050).
+    // Datamatch=1 triggers only on TX queue notifies (value=1 → queue
+    // index 1 = transmit queue).  Notifies for queue 0 (RX) still take the
+    // slow path through MMIO; they're rare (only when guest adds new RX
+    // buffers) so the optimisation isn't needed there.  The doorbell
+    // address derives from the same slot table as the device's mmio_base,
+    // so the two cannot drift apart (a mismatched datamatch would silently
+    // push every TX back to the MMIO-exit path).
     const VIRTIO_NET_QUEUE_NOTIFY_OFFSET: u64 = 0x050;
     const TX_NOTIFY_QUEUE_IDX: u32 = 1;
     // Token used to identify the TX-notify eventfd in epoll readiness
@@ -1797,7 +1806,7 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
     let tx_notify_eventfd = setup_tx_notify_ioeventfd(
         vm.as_ref(),
         epoll_arc.as_ref(),
-        VIRTIO_NET_MMIO_BASE + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
+        VirtioSlot::Net.mmio_base() + VIRTIO_NET_QUEUE_NOTIFY_OFFSET,
         TX_NOTIFY_QUEUE_IDX,
         TX_NOTIFY_TOKEN,
     );
@@ -1953,20 +1962,14 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         if pulse {
             if let Some(ref efd) = irq_eventfd {
                 // Fast path: KVM_IRQFD.  One 8-byte write to the eventfd;
-                // the kernel asserts IRQ 10 directly.  No ioctl pair.
+                // the kernel asserts the net interrupt directly.  No ioctl
+                // pair.
                 let _ = efd.write(1);
             } else {
-                let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
-                // SAFETY: KVM_IRQ_LINE ioctl writes the KvmIrqLevel struct into
-                // the in-kernel APIC; the struct is #[repr(C)] and the fd is valid
-                // for the lifetime of `vm`.
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
-                }
-                let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
-                unsafe {
-                    libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
-                }
+                // Slow path: shares the arch-aware encoding with every
+                // other injection site (raw GSI on x86_64, packed SPI on
+                // aarch64) instead of hand-rolling the ioctl here.
+                cpu::inject_irq(vm_fd, VirtioSlot::Net);
             }
         }
     }

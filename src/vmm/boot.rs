@@ -14,6 +14,7 @@ pub fn load_kernel(
     kernel_path: &Path,
     initramfs_path: Option<&Path>,
     cmdline: &str,
+    platform: &crate::vmm::arch::BootPlatform,
 ) -> Result<u64> {
-    CurrentArch::load_kernel(vm, kernel_path, initramfs_path, cmdline)
+    CurrentArch::load_kernel(vm, kernel_path, initramfs_path, cmdline, platform)
 }

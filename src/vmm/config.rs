@@ -9,6 +9,15 @@ use crate::{Error, Result};
 // Re-export from the cross-platform backend module for backward compatibility.
 pub use crate::backend::{ResourceLimits, DEFAULT_COMMAND_ALLOWLIST};
 
+/// Maximum vCPU count. On aarch64 the ceiling comes from the guest memory
+/// map — the GICv3 redistributor region grows 128 KB per vCPU and must stay
+/// below the UART window (see `arch::aarch64::kvm::layout::MAX_VCPUS`);
+/// x86_64 has no layout-derived limit.
+#[cfg(target_arch = "aarch64")]
+const MAX_VCPUS: usize = crate::vmm::arch::aarch64::kvm::layout::MAX_VCPUS;
+#[cfg(not(target_arch = "aarch64"))]
+const MAX_VCPUS: usize = 256;
+
 /// Backend type for the virtio-vsock device.
 ///
 /// The default `Vhost` backend uses the kernel vhost-vsock module for maximum
@@ -207,8 +216,36 @@ impl VoidBoxConfig {
         self
     }
 
+    /// The virtio-mmio slots this configuration populates, in slot order.
+    ///
+    /// Single source for device construction, the x86_64 cmdline args, and
+    /// the aarch64 DTB nodes — the three must agree on which devices exist.
+    pub fn populated_virtio_slots(&self) -> Vec<crate::vmm::arch::VirtioSlot> {
+        use crate::vmm::arch::VirtioSlot;
+
+        let mut slots = Vec::new();
+        if self.network {
+            slots.push(VirtioSlot::Net);
+        }
+        if self.enable_vsock {
+            slots.push(VirtioSlot::Vsock);
+        }
+        if !self.mounts.is_empty() {
+            slots.push(VirtioSlot::P9);
+        }
+        if self.oci_rootfs_disk.is_some() {
+            slots.push(VirtioSlot::Blk);
+        }
+        slots
+    }
+
     /// Build the kernel command line string
     pub fn kernel_cmdline(&self) -> String {
+        // The x86_64 list is byte-identical to the pre-RFC-0003 cmdline —
+        // the guest-agent matches some of these tokens exactly. The
+        // aarch64 list drops the x86 hardware quirks (i8042, cmos, PCI,
+        // reboot=k), which name devices that do not exist on that layout.
+        #[cfg(target_arch = "x86_64")]
         let mut cmdline = vec![
             "console=ttyS0".to_string(),
             "loglevel=0".to_string(), // Suppress kernel console messages
@@ -224,27 +261,45 @@ impl VoidBoxConfig {
             // symbols are silently ignored.
             "initcall_blacklist=cmos_init,i8042_init".to_string(),
         ];
+        #[cfg(target_arch = "aarch64")]
+        let mut cmdline = vec![
+            "console=ttyS0".to_string(),
+            "loglevel=0".to_string(), // Suppress kernel console messages
+            "panic=1".to_string(),
+            "nokaslr".to_string(),
+        ];
 
         // Only add nomodules if vsock is NOT enabled (vsock needs modprobe)
         if !self.enable_vsock {
             cmdline.push("nomodules".to_string());
         }
 
-        // Virtio MMIO devices so the guest kernel discovers them (no ACPI in minimal boot).
-        // Format: size@baseaddr:irq (see Linux virtio_mmio driver).
+        // Device discovery (RFC-0003): x86_64 declares virtio-mmio windows
+        // via kernel parameters (no ACPI in the minimal boot); aarch64
+        // declares them as DTB nodes — emitting both would register two
+        // platform devices over one window. Format: size@baseaddr:irq (see
+        // the Linux virtio_mmio driver). On aarch64, `voidbox.network=1` is
+        // the platform-neutral marker the guest-agent reads (macOS/VZ
+        // already uses it).
         if self.network {
+            #[cfg(target_arch = "x86_64")]
             cmdline.push("virtio_mmio.device=512@0xd0000000:10".to_string());
+            #[cfg(target_arch = "aarch64")]
+            cmdline.push("voidbox.network=1".to_string());
             // Disable IPv6 - our SLIRP stack only supports IPv4
             cmdline.push("ipv6.disable=1".to_string());
         }
-        if self.enable_vsock {
-            cmdline.push("virtio_mmio.device=512@0xd0800000:11".to_string());
-        }
-        if !self.mounts.is_empty() {
-            cmdline.push("virtio_mmio.device=512@0xd1000000:12".to_string());
-        }
-        if self.oci_rootfs_disk.is_some() {
-            cmdline.push("virtio_mmio.device=512@0xd1800000:13".to_string());
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.enable_vsock {
+                cmdline.push("virtio_mmio.device=512@0xd0800000:11".to_string());
+            }
+            if !self.mounts.is_empty() {
+                cmdline.push("virtio_mmio.device=512@0xd1000000:12".to_string());
+            }
+            if self.oci_rootfs_disk.is_some() {
+                cmdline.push("virtio_mmio.device=512@0xd1800000:13".to_string());
+            }
         }
 
         // Add root device if rootfs is specified
@@ -330,8 +385,11 @@ impl VoidBoxConfig {
         if self.vcpus == 0 {
             return Err(Error::Config("Must have at least 1 vCPU".into()));
         }
-        if self.vcpus > 256 {
-            return Err(Error::Config("Maximum 256 vCPUs supported".into()));
+        if self.vcpus > MAX_VCPUS {
+            return Err(Error::Config(format!(
+                "Maximum {} vCPUs supported",
+                MAX_VCPUS
+            )));
         }
 
         // Validate CID if specified (must be > 2)
@@ -379,6 +437,52 @@ mod tests {
         let cmdline = config.kernel_cmdline();
         assert!(cmdline.contains("console=ttyS0"));
         assert!(cmdline.contains("quiet"));
+    }
+
+    /// The guest-agent matches some of these tokens exactly (see
+    /// `network_enabled_from_cmdline` in guest-agent), so the x86_64
+    /// cmdline must stay byte-identical across refactors.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_kernel_cmdline_x86_is_byte_identical() {
+        let config = VoidBoxConfig::new().network(true);
+        let cmdline = config.kernel_cmdline();
+        assert!(cmdline.starts_with(
+            "console=ttyS0 loglevel=0 reboot=k panic=1 pci=off nokaslr \
+             i8042.noaux i8042.nokbd i8042.nopnp \
+             initcall_blacklist=cmos_init,i8042_init"
+        ));
+        assert!(cmdline.contains("virtio_mmio.device=512@0xd0000000:10 ipv6.disable=1"));
+        assert!(cmdline.contains("virtio_mmio.device=512@0xd0800000:11"));
+    }
+
+    /// aarch64 devices are declared in the DTB; the cmdline must not also
+    /// declare virtio-mmio windows (double registration) and carries the
+    /// platform-neutral network marker instead.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_kernel_cmdline_aarch64_uses_dtb_discovery() {
+        let config = VoidBoxConfig::new().network(true);
+        let cmdline = config.kernel_cmdline();
+        assert!(!cmdline.contains("virtio_mmio.device="));
+        assert!(cmdline.contains("voidbox.network=1"));
+        assert!(cmdline.contains("ipv6.disable=1"));
+        assert!(cmdline.contains("console=ttyS0"));
+        assert!(!cmdline.contains("i8042"));
+        assert!(!cmdline.contains("pci=off"));
+    }
+
+    #[test]
+    fn test_populated_virtio_slots_match_config() {
+        use crate::vmm::arch::VirtioSlot;
+
+        let config = VoidBoxConfig::new().network(true); // vsock on by default
+        assert_eq!(
+            config.populated_virtio_slots(),
+            vec![VirtioSlot::Net, VirtioSlot::Vsock]
+        );
+        let config = VoidBoxConfig::new().enable_vsock(false);
+        assert!(config.populated_virtio_slots().is_empty());
     }
 
     #[test]

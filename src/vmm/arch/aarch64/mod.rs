@@ -31,8 +31,14 @@ impl Arch for Aarch64 {
         kvm::setup_vm_post_vcpus(vm_fd, vcpu_count)
     }
 
-    fn load_kernel(vm: &Vm, kernel: &Path, initramfs: Option<&Path>, cmdline: &str) -> Result<u64> {
-        boot::load_kernel(vm, kernel, initramfs, cmdline)
+    fn load_kernel(
+        vm: &Vm,
+        kernel: &Path,
+        initramfs: Option<&Path>,
+        cmdline: &str,
+        platform: &crate::vmm::arch::BootPlatform,
+    ) -> Result<u64> {
+        boot::load_kernel(vm, kernel, initramfs, cmdline, platform)
     }
 
     fn configure_vcpu(vcpu_fd: &VcpuFd, vcpu_id: u64, entry_point: u64, vm: &Vm) -> Result<()> {

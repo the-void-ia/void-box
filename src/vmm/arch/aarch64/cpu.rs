@@ -102,16 +102,35 @@ fn timer_reg_ids() -> Vec<u64> {
 /// Configure a freshly-created vCPU for cold boot.
 ///
 /// Calls `KVM_ARM_VCPU_INIT` then sets the entry point (PC) and DTB address (x0).
-pub fn configure_vcpu(vcpu_fd: &VcpuFd, _vcpu_id: u64, entry_point: u64, vm: &Vm) -> Result<()> {
+pub fn configure_vcpu(vcpu_fd: &VcpuFd, vcpu_id: u64, entry_point: u64, vm: &Vm) -> Result<()> {
     // Get the preferred target for this VM.
     let mut kvi = kvm_bindings::kvm_vcpu_init::default();
     vm.vm_fd()
         .get_preferred_target(&mut kvi)
         .map_err(Error::Kvm)?;
 
+    // PSCI 0.2 must be requested explicitly: without the feature bit KVM
+    // exposes the legacy PSCI 0.1 interface, and the DTB's "arm,psci-1.0"
+    // node would promise SMCCC function IDs the hypervisor doesn't honor —
+    // secondary-CPU bring-up and guest-initiated shutdown would misfire.
+    kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+
+    // Secondary vCPUs start powered off and wait for the guest's PSCI
+    // CPU_ON (the DTB advertises enable-method = "psci"). Without this,
+    // every vCPU begins executing at the kernel entry point simultaneously
+    // and the guest corrupts itself before reaching the console. x86 gets
+    // the equivalent for free from the INIT/SIPI wait state.
+    if vcpu_id != 0 {
+        kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_POWER_OFF;
+    }
+
     // Initialize the vCPU with the preferred target.
     vcpu_fd.vcpu_init(&kvi).map_err(Error::Kvm)?;
-    debug!("Initialized aarch64 vCPU");
+    debug!(
+        "Initialized aarch64 vCPU {} (PSCI 0.2{})",
+        vcpu_id,
+        if vcpu_id != 0 { ", powered off" } else { "" }
+    );
 
     // Set PC to kernel entry point.
     let pc_id = core_reg(KVM_REG_SIZE_U64, PC_OFFSET);
