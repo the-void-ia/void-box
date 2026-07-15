@@ -76,15 +76,18 @@ const DEFAULT_EXEC_READ_TIMEOUT: Duration = Duration::from_secs(1200);
 /// hosts (see the AGENTS.md known-issues entry on boot timeouts). Slow
 /// validation environments — nested virtualization in particular — can
 /// extend it with `VOID_BOX_CONNECT_DEADLINE_SECS`; the override is opt-in
-/// and can only lengthen the deadline, never shorten it, so default
-/// behavior is unchanged wherever the variable is unset.
+/// and is clamped to [default, 1 h]: it can only lengthen the deadline
+/// (default behavior is unchanged wherever the variable is unset), and the
+/// upper bound keeps the `Instant + Duration` deadline arithmetic
+/// panic-free if the variable holds an absurd value.
 fn connect_deadline() -> Duration {
     const DEFAULT_CONNECT_DEADLINE_SECS: u64 = 30;
+    const MAX_CONNECT_DEADLINE_SECS: u64 = 3600;
     let secs = std::env::var("VOID_BOX_CONNECT_DEADLINE_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_CONNECT_DEADLINE_SECS, |value| {
-            value.max(DEFAULT_CONNECT_DEADLINE_SECS)
+            value.clamp(DEFAULT_CONNECT_DEADLINE_SECS, MAX_CONNECT_DEADLINE_SECS)
         });
     Duration::from_secs(secs)
 }
@@ -886,6 +889,11 @@ mod tests {
         // Garbage falls back to the default.
         std::env::set_var(VAR, "not-a-number");
         assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        // Absurd values are clamped so the Instant + Duration deadline
+        // arithmetic cannot panic on overflow.
+        std::env::set_var(VAR, &u64::MAX.to_string());
+        assert_eq!(connect_deadline(), Duration::from_secs(3600));
 
         std::env::remove_var(VAR);
     }
