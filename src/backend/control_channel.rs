@@ -892,7 +892,7 @@ mod tests {
 
         // Absurd values are clamped so the Instant + Duration deadline
         // arithmetic cannot panic on overflow.
-        std::env::set_var(VAR, &u64::MAX.to_string());
+        std::env::set_var(VAR, u64::MAX.to_string());
         assert_eq!(connect_deadline(), Duration::from_secs(3600));
 
         std::env::remove_var(VAR);
