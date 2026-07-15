@@ -1390,31 +1390,44 @@ impl MicroVm {
             handle.kick();
         }
 
-        // Wait for vCPU + background threads (blocking joins).
-        // Wrapped in block_in_place to avoid stalling the tokio worker thread.
-        tokio::task::block_in_place(|| -> Result<()> {
-            for handle in self.vcpu_handles.drain(..) {
-                handle.join()?;
+        // Wait for vCPU + background threads (blocking joins). On a
+        // multi-thread runtime, block_in_place keeps the joins from
+        // stalling other tasks on this worker. block_in_place panics on a
+        // current-thread runtime (e.g. #[tokio::test]); joining inline is
+        // acceptable there — teardown is the VM's last act, and with
+        // `running` cleared and the vCPUs kicked the joins complete in
+        // milliseconds.
+        match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.join_vm_threads())?;
             }
-            if let Some(handle) = self.event_loop_handle.take() {
-                handle
-                    .join()
-                    .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
-            }
-            if let Some(handle) = self.vsock_irq_handle.take() {
-                handle
-                    .join()
-                    .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
-            }
-            if let Some(handle) = self.net_poll_handle.take() {
-                handle
-                    .join()
-                    .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
-            }
-            Ok(())
-        })?;
+            _ => self.join_vm_threads()?,
+        }
 
         info!("MicroVm stopped");
+        Ok(())
+    }
+
+    /// Join the vCPU and background threads (blocking).
+    fn join_vm_threads(&mut self) -> Result<()> {
+        for handle in self.vcpu_handles.drain(..) {
+            handle.join()?;
+        }
+        if let Some(handle) = self.event_loop_handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
+        }
+        if let Some(handle) = self.vsock_irq_handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
+        }
+        if let Some(handle) = self.net_poll_handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
+        }
         Ok(())
     }
 }
