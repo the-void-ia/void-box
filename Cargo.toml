@@ -99,6 +99,11 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Device Tree Blob generation for aarch64 boot
 vm-fdt = "0.3"
 
+# Gzip decompression for aarch64 kernel loading: distro /boot/vmlinuz on
+# arm64 is a gzip-compressed Image with no self-decompressor, so the
+# loader must inflate it before writing it into guest memory.
+flate2 = "1"
+
 # Security (Linux-specific)
 seccompiler = "0.4"
 ipnet = "2"

@@ -50,6 +50,15 @@ pub mod layout {
 
     /// PCI MMIO space size.
     pub const PCI_MMIO_SIZE: u64 = 0x1000_0000; // 256 MB
+
+    /// Base of the virtio-mmio device slots (inside the MMIO gap).
+    pub const VIRTIO_MMIO_BASE: u64 = 0xD000_0000;
+
+    /// Stride between virtio-mmio slots.
+    pub const VIRTIO_MMIO_STRIDE: u64 = 0x0080_0000;
+
+    /// IOAPIC GSI of virtio slot 0; slot N uses GSI base + N.
+    pub const VIRTIO_GSI_BASE: u32 = 10;
 }
 
 /// x86_64 memory layout for arch-neutral code.

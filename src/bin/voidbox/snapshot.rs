@@ -189,7 +189,7 @@ async fn cmd_snapshot_create_linux(
             memory_mb,
             vcpus,
             cid: vm.cid(),
-            vsock_mmio_base: 0xd080_0000,
+            vsock_mmio_base: void_box::vmm::arch::VirtioSlot::Vsock.mmio_base(),
             network,
         };
 
@@ -268,7 +268,7 @@ async fn cmd_snapshot_create_linux(
             memory_mb,
             vcpus,
             cid: vm.cid(),
-            vsock_mmio_base: 0xd080_0000,
+            vsock_mmio_base: void_box::vmm::arch::VirtioSlot::Vsock.mmio_base(),
             network: config.network,
         };
 

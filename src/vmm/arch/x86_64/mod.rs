@@ -31,7 +31,13 @@ impl Arch for X86_64 {
         kvm::setup_vm_post_vcpus(vm_fd, vcpu_count)
     }
 
-    fn load_kernel(vm: &Vm, kernel: &Path, initramfs: Option<&Path>, cmdline: &str) -> Result<u64> {
+    fn load_kernel(
+        vm: &Vm,
+        kernel: &Path,
+        initramfs: Option<&Path>,
+        cmdline: &str,
+        _platform: &crate::vmm::arch::BootPlatform,
+    ) -> Result<u64> {
         boot::load_kernel(vm, kernel, initramfs, cmdline)
     }
 

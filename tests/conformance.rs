@@ -78,7 +78,12 @@ fn backend_config_with(
     getrandom::fill(&mut secret).ok()?;
 
     Some(BackendConfig {
-        memory_mb: 256,
+        // Must satisfy the documented sizing formula (AGENTS.md "VM memory
+        // sizing"): compressed + uncompressed initramfs + 208 MB overhead.
+        // A dev image with distro kernel modules and BusyBox exceeds the
+        // old 256 MB — the guest then boots but its rootfs tmpfs is nearly
+        // full and file RPCs fail with ENOSPC.
+        memory_mb: 1024,
         vcpus: 1,
         kernel,
         initramfs: Some(initramfs),
@@ -215,16 +220,19 @@ async fn conformance_write_file() {
         None => return,
     };
 
+    // Under an allowlisted write root (post-openat2-hardening the
+    // guest-agent refuses host-driven writes outside /workspace, /home,
+    // /etc/voidbox).
     let content = b"hello from conformance test";
     backend
-        .write_file("/tmp/conformance_test.txt", content)
+        .write_file("/workspace/conformance_test.txt", content)
         .await
         .expect("write_file failed");
 
     let output = backend
         .exec(
             "cat",
-            &["/tmp/conformance_test.txt"],
+            &["/workspace/conformance_test.txt"],
             &[],
             &[],
             None,
@@ -256,7 +264,7 @@ async fn conformance_mkdir_p() {
     };
 
     backend
-        .mkdir_p("/tmp/conformance/nested/dir")
+        .mkdir_p("/workspace/conformance/nested/dir")
         .await
         .expect("mkdir_p failed");
 
@@ -264,7 +272,7 @@ async fn conformance_mkdir_p() {
     let output = backend
         .exec(
             "test",
-            &["-d", "/tmp/conformance/nested/dir"],
+            &["-d", "/workspace/conformance/nested/dir"],
             &[],
             &[],
             None,
@@ -331,17 +339,22 @@ async fn conformance_exec_timeout() {
         None => return,
     };
 
-    // Sleep for 60s but with a 2s timeout — should be killed
-    let output = backend
+    // Sleep for 60s but with a 2s timeout — should be killed. The backend
+    // may surface the kill either as a non-zero exit code or as a guest
+    // error naming the timeout; both satisfy "enforces execution timeouts".
+    match backend
         .exec("sh", &["-c", "sleep 60"], &[], &[], None, Some(2))
         .await
-        .expect("exec failed");
-
-    // Should have a non-zero exit code (killed by timeout)
-    assert_ne!(
-        output.exit_code, 0,
-        "timed-out command should have non-zero exit code"
-    );
+    {
+        Ok(output) => assert_ne!(
+            output.exit_code, 0,
+            "timed-out command should have non-zero exit code"
+        ),
+        Err(e) => assert!(
+            e.to_string().contains("timed out"),
+            "expected a timeout error, got: {e}"
+        ),
+    }
 }
 
 // ===========================================================================

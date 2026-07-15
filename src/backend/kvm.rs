@@ -21,6 +21,7 @@ use crate::guest::protocol::{
 use crate::observe::telemetry::{TelemetryAggregator, TelemetryBuffer};
 use crate::observe::tracer::SpanContext;
 use crate::observe::Observer;
+use crate::vmm::arch::VirtioSlot;
 use crate::vmm::config::{SecurityConfig, VoidBoxConfig, VsockBackendType};
 use crate::vmm::MicroVm;
 use crate::{Error, ExecOutput, Result};
@@ -467,7 +468,7 @@ impl VmmBackend for KvmBackend {
             memory_mb: self.memory_mb,
             vcpus: self.vcpus,
             cid: 0, // overwritten by snapshot_internal
-            vsock_mmio_base: 0xd080_0000,
+            vsock_mmio_base: VirtioSlot::Vsock.mmio_base(),
             network: vm.has_network(),
         };
 

@@ -70,6 +70,28 @@ pub const GUEST_AGENT_PORT: u32 = 1234;
 /// 10+ minutes per turn for complex prompts with tool definitions.
 const DEFAULT_EXEC_READ_TIMEOUT: Duration = Duration::from_secs(1200);
 
+/// Deadline for the connect/handshake loop against a booting guest.
+///
+/// The 30 s default covers production-size initramfs boots on bare-metal
+/// hosts (see the AGENTS.md known-issues entry on boot timeouts). Slow
+/// validation environments — nested virtualization in particular — can
+/// extend it with `VOID_BOX_CONNECT_DEADLINE_SECS`; the override is opt-in
+/// and is clamped to [default, 1 h]: it can only lengthen the deadline
+/// (default behavior is unchanged wherever the variable is unset), and the
+/// upper bound keeps the `Instant + Duration` deadline arithmetic
+/// panic-free if the variable holds an absurd value.
+fn connect_deadline() -> Duration {
+    const DEFAULT_CONNECT_DEADLINE_SECS: u64 = 30;
+    const MAX_CONNECT_DEADLINE_SECS: u64 = 3600;
+    let secs = std::env::var("VOID_BOX_CONNECT_DEADLINE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_CONNECT_DEADLINE_SECS, |value| {
+            value.clamp(DEFAULT_CONNECT_DEADLINE_SECS, MAX_CONNECT_DEADLINE_SECS)
+        });
+    Duration::from_secs(secs)
+}
+
 /// Resolve the read timeout for an exec request.
 ///
 /// Service mode passes `Some(0)` to mean "wait forever" (no timeout). Any other
@@ -609,7 +631,7 @@ pub(crate) fn connect_with_handshake_sync(
     // over-sleep, not 2s.
     let mut delay = Duration::from_millis(25);
     let max_delay = Duration::from_millis(250);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + connect_deadline();
     let mut attempt: u32 = 0;
     let t_start = Instant::now();
     let mut attempt_timeout = handshake_timeout;
@@ -842,4 +864,37 @@ fn ensure_response_type(msg: &Message, expected: MessageType, context: &'static 
         "Unexpected response type for {context}: {:?}",
         msg.msg_type
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env mutation is process-global; this is the only test touching the
+    /// variable, and it restores the unset state before returning.
+    #[test]
+    fn connect_deadline_env_override_extends_only() {
+        const VAR: &str = "VOID_BOX_CONNECT_DEADLINE_SECS";
+
+        std::env::remove_var(VAR);
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        std::env::set_var(VAR, "240");
+        assert_eq!(connect_deadline(), Duration::from_secs(240));
+
+        // The override can only extend the deadline, never shorten it.
+        std::env::set_var(VAR, "5");
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        // Garbage falls back to the default.
+        std::env::set_var(VAR, "not-a-number");
+        assert_eq!(connect_deadline(), Duration::from_secs(30));
+
+        // Absurd values are clamped so the Instant + Duration deadline
+        // arithmetic cannot panic on overflow.
+        std::env::set_var(VAR, u64::MAX.to_string());
+        assert_eq!(connect_deadline(), Duration::from_secs(3600));
+
+        std::env::remove_var(VAR);
+    }
 }

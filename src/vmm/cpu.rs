@@ -237,7 +237,7 @@ fn vcpu_run_loop(
                 let guard = dev.lock().unwrap();
                 let pending = guard.has_pending_interrupt();
                 if pending && !p9_irq_notified {
-                    inject_irq(vm.vm_fd().as_raw_fd(), 12);
+                    inject_irq(vm.vm_fd().as_raw_fd(), arch::VirtioSlot::P9);
                     p9_irq_notified = true;
                 } else if !pending {
                     p9_irq_notified = false;
@@ -248,7 +248,7 @@ fn vcpu_run_loop(
                 let guard = dev.lock().unwrap();
                 let pending = guard.has_pending_interrupt();
                 if pending && !blk_irq_notified {
-                    inject_irq(vm.vm_fd().as_raw_fd(), 13);
+                    inject_irq(vm.vm_fd().as_raw_fd(), arch::VirtioSlot::Blk);
                     blk_irq_notified = true;
                 } else if !pending {
                     blk_irq_notified = false;
@@ -269,6 +269,10 @@ fn vcpu_run_loop(
                         handle_io_in(port, data, &serial);
                     }
                     VcpuExit::MmioRead(addr, data) => {
+                        #[cfg(target_arch = "aarch64")]
+                        if uart_mmio::try_read(&serial, addr, data) {
+                            continue;
+                        }
                         let handled = if let Some(ref dev) = mmio_devices.virtio_net {
                             let mut guard = dev.lock().unwrap();
                             if guard.handles_mmio(addr) {
@@ -329,6 +333,10 @@ fn vcpu_run_loop(
                         }
                     }
                     VcpuExit::MmioWrite(addr, data) => {
+                        #[cfg(target_arch = "aarch64")]
+                        if uart_mmio::try_write(&mut serial, addr, data) {
+                            continue;
+                        }
                         let handled = if let Some(ref dev) = mmio_devices.virtio_net {
                             let mut guard = dev.lock().unwrap();
                             if guard.handles_mmio(addr) {
@@ -368,7 +376,7 @@ fn vcpu_run_loop(
                                     let offset = addr - guard.mmio_base();
                                     guard.mmio_write(offset, data, Some(guest_memory));
                                     if guard.has_pending_interrupt() {
-                                        inject_irq(vm.vm_fd().as_raw_fd(), 13);
+                                        inject_irq(vm.vm_fd().as_raw_fd(), arch::VirtioSlot::Blk);
                                     }
                                     true
                                 } else {
@@ -386,7 +394,7 @@ fn vcpu_run_loop(
                                     guard.mmio_write(offset, data, Some(guest_memory));
 
                                     if guard.has_pending_interrupt() {
-                                        inject_irq(vm.vm_fd().as_raw_fd(), 12);
+                                        inject_irq(vm.vm_fd().as_raw_fd(), arch::VirtioSlot::P9);
                                     }
                                 }
                             }
@@ -399,6 +407,19 @@ fn vcpu_run_loop(
                     }
                     VcpuExit::Shutdown => {
                         debug!("vCPU {} shutdown", vcpu_id);
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    VcpuExit::SystemEvent(event_type, _) => {
+                        // PSCI SYSTEM_OFF / SYSTEM_RESET arrive as system
+                        // events on arm64 (x86 guests reboot via the port
+                        // 0x64 write handled in handle_io_out). Both mean
+                        // the guest is gone; without this arm the loop
+                        // would spin re-reporting the same event forever.
+                        debug!(
+                            "vCPU {} system event {} (guest shutdown/reset)",
+                            vcpu_id, event_type
+                        );
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
@@ -445,13 +466,70 @@ fn vcpu_run_loop(
     debug!("vCPU {} exiting run loop", vcpu_id);
 }
 
-pub(crate) fn inject_irq(vm_fd: i32, irq: u32) {
+/// MMIO-mapped UART dispatch (aarch64 has no port I/O). The 16550 register
+/// model is shared with the x86 port-I/O path; only the transport differs.
+///
+/// The DTB advertises a 4 KB window but the register file is 8 bytes wide:
+/// offsets past it read as zero and ignore writes, rather than truncating
+/// the offset into an aliased register index.
+#[cfg(target_arch = "aarch64")]
+mod uart_mmio {
+    use crate::devices::serial::SerialDevice;
+    use crate::vmm::arch::aarch64::kvm::layout;
+
+    /// Registers implemented by the 16550 model (1-byte wide, reg-shift 0).
+    const UART_REG_COUNT: u64 = 8;
+
+    fn offset_of(addr: u64) -> Option<u64> {
+        if (layout::UART_ADDR..layout::UART_ADDR + layout::UART_SIZE).contains(&addr) {
+            Some(addr - layout::UART_ADDR)
+        } else {
+            None
+        }
+    }
+
+    /// Handle an MMIO read if `addr` falls in the UART window.
+    pub fn try_read(serial: &SerialDevice, addr: u64, data: &mut [u8]) -> bool {
+        let Some(offset) = offset_of(addr) else {
+            return false;
+        };
+        data.iter_mut().for_each(|b| *b = 0);
+        if offset < UART_REG_COUNT {
+            if let Some(first) = data.first_mut() {
+                *first = serial.read(offset as u8);
+            }
+        }
+        true
+    }
+
+    /// Handle an MMIO write if `addr` falls in the UART window.
+    pub fn try_write(serial: &mut SerialDevice, addr: u64, data: &[u8]) -> bool {
+        let Some(offset) = offset_of(addr) else {
+            return false;
+        };
+        if offset < UART_REG_COUNT {
+            if let Some(&byte) = data.first() {
+                serial.write(offset as u8, byte);
+            }
+        }
+        true
+    }
+}
+
+/// Pulse a virtio device's interrupt line via `KVM_IRQ_LINE`.
+///
+/// The `irq` field encoding is arch-specific ([`arch::VirtioSlot::irq_line_value`]):
+/// the raw GSI on x86_64, the packed SPI form on aarch64. Every injection
+/// site — including the vsock-irq thread and the net-poll fallback in
+/// `vmm/mod.rs` — goes through here so no site can carry a stale encoding.
+pub(crate) fn inject_irq(vm_fd: i32, slot: arch::VirtioSlot) {
     #[repr(C)]
     struct KvmIrqLevel {
         irq: u32,
         level: u32,
     }
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
+    let irq = slot.irq_line_value();
     let assert = KvmIrqLevel { irq, level: 1 };
     unsafe {
         libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert);
