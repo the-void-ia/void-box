@@ -739,8 +739,25 @@ impl VoidBox {
     ///
     /// If `input` is provided, it's written to `/workspace/input.json` before
     /// the agent runs, and the prompt is augmented to reference it.
+    ///
+    /// Consuming `self` means the VM cannot outlive the call, so the sandbox
+    /// is stopped gracefully before returning — on success and on error.
+    /// Without that, teardown falls to the VM's `Drop` safety net, which
+    /// logs an error on every one-shot run.
     pub async fn run(
         self,
+        input: Option<&[u8]>,
+        telemetry_buffer: Option<TelemetryBuffer>,
+    ) -> Result<StageResult> {
+        let result = self.run_inner(input, telemetry_buffer).await;
+        if let Some(sandbox) = &self.sandbox {
+            let _ = sandbox.stop().await;
+        }
+        result
+    }
+
+    async fn run_inner(
+        &self,
         input: Option<&[u8]>,
         telemetry_buffer: Option<TelemetryBuffer>,
     ) -> Result<StageResult> {
