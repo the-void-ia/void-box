@@ -83,11 +83,15 @@ fn filter_withheld_env(env: Vec<(String, String)>, withhold: bool) -> Vec<(Strin
 }
 
 /// Resolve the host-held API key for a provider the M0 proxy serves (Claude).
-/// Returns `None` when no key is available (caller turns that into an error).
+/// Returns `None` when no key is available — including an empty or
+/// whitespace-only value, which is as unusable as an absent one; treating it as
+/// present would inject an empty credential header and surface as an opaque
+/// upstream 401 instead of the caller's clear config error.
 fn resolve_provider_secret(provider: &LlmProvider) -> Option<SecretString> {
     match provider {
         LlmProvider::Claude => std::env::var("ANTHROPIC_API_KEY")
             .ok()
+            .filter(|key| !key.trim().is_empty())
             .map(SecretString::from),
         _ => None,
     }
@@ -357,10 +361,10 @@ impl VoidBox {
     /// proxy instead of forwarding it into the guest.
     ///
     /// Opt-in: with the default `false`, behaviour is unchanged. When enabled
-    /// for an API-key provider the proxy serves (Claude, Anthropic-compatible
-    /// Custom), the real key is withheld from the guest env and injected
-    /// host-side at egress; the guest carries only a placeholder + the per-sandbox
-    /// CA + proxy token.
+    /// for a provider the M0 proxy serves (Claude only; the Anthropic-compatible
+    /// Custom provider and codex are deferred to M1/M1b), the real key is
+    /// withheld from the guest env and injected host-side at egress; the guest
+    /// carries only a placeholder + the per-sandbox CA + proxy token.
     pub fn credential_proxy(mut self, enable: bool) -> Self {
         self.config.credential_proxy = enable;
         self
@@ -503,7 +507,7 @@ impl VoidBox {
     /// Fail closed on a credential-proxy configuration the M0 proxy cannot serve,
     /// before any guest env is staged. Provider support is platform-independent,
     /// so it is checked first — an unsupported provider reports the provider error
-    /// on every host — and the Linux/KVM-only platform gate second.
+    /// on every host — then the mode gate, then the Linux/KVM-only platform gate.
     fn validate_credential_proxy_preconditions(&self) -> Result<()> {
         if ProxiedUpstream::for_provider(&self.config.llm).is_none() {
             return Err(crate::Error::Config(format!(
@@ -511,6 +515,19 @@ impl VoidBox {
                  Phase-0 proxy (M0 serves Claude only)",
                 self.config.llm.description()
             )));
+        }
+        // The proxy is wired only into the task-mode `run()` path in M0, while
+        // the key withholding happens here at build time for every mode. A
+        // service run would therefore boot a guest holding neither the real key
+        // nor a proxy route and fail opaquely at API-call time — reject it up
+        // front instead (the YAML path is already rejected in `validate_spec`;
+        // this closes the builder-API path).
+        if self.config.mode == AgentMode::Service {
+            return Err(crate::Error::Config(
+                "credential_proxy and service mode are mutually exclusive in M0: \
+                 the credential proxy is wired only into the task-mode agent run"
+                    .into(),
+            ));
         }
         ensure_credential_proxy_platform_supported()?;
         Ok(())
@@ -606,9 +623,9 @@ impl VoidBox {
         // R14: assert no real credential reaches the guest. The audit covers the
         // full staged env — provider/LLM env (post-withholding) + user overrides +
         // the proxy's provisioning env — and the files the proxy itself writes (the
-        // CA PEM and `/etc/hosts`). That is complete for M0: the providers the
-        // proxy serves (Claude, Anthropic-compatible Custom) deliver their key only
-        // through `ANTHROPIC_API_KEY`, which is withheld, so env is the only
+        // CA PEM and `/etc/hosts`). That is complete for M0: the one provider the
+        // proxy serves (Claude) delivers its key only through
+        // `ANTHROPIC_API_KEY`, which is withheld, so env is the only
         // credential channel. The full R14 scope (every provisioned file and host
         // mount) is required before migrating a provider that stages a secret into
         // a file or mount — none do in M0. The primary control is structural: the
@@ -1172,6 +1189,19 @@ impl VoidBox {
         input: Option<&[u8]>,
         telemetry_buffer: Option<TelemetryBuffer>,
     ) -> Result<ServiceStageHandle> {
+        // Authoritative service-mode gate: this path never starts the credential
+        // proxy, while `create_sandbox` withholds the real key from the staged
+        // env whenever the flag is set — so a service run with the proxy enabled
+        // would hold neither the credential nor a proxy route. The build-time
+        // check catches the common construction order; this covers a mode or
+        // flag set after `build()`.
+        if self.config.credential_proxy {
+            return Err(crate::Error::Config(
+                "credential_proxy is not supported for service mode in M0 \
+                 (run_service does not start the proxy); use task mode"
+                    .into(),
+            ));
+        }
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             crate::Error::Config("VoidBox not built — call .build() first".into())
         })?;
@@ -1569,6 +1599,51 @@ mod tests {
         assert!(
             msg.contains("not served by the Phase-0 proxy"),
             "expected a provider-unsupported error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn credential_proxy_rejects_service_mode_at_build() {
+        // The proxy is wired only into the task-mode run; a service-mode build
+        // with the flag set must fail up front rather than boot a guest holding
+        // neither the real key (withheld) nor a proxy route. The provider check
+        // passes (Claude) and the mode gate precedes the platform gate, so the
+        // service-mode error is asserted on both Linux and macOS.
+        let err = match VoidBox::new("b")
+            .llm(LlmProvider::Claude)
+            .mode(AgentMode::Service)
+            .credential_proxy(true)
+            .build()
+        {
+            Ok(_) => panic!("service mode under credential_proxy must fail to build"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "expected the service-mode error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_service_rejects_credential_proxy_set_after_build() {
+        // Builder methods remain callable after `build()`, so the flag can slip
+        // past the build-time validation; the gate inside `run_service` is the
+        // authoritative one. Enabling the flag post-build keeps this test off
+        // the platform gate, so it runs on macOS too.
+        let vb = VoidBox::new("b")
+            .mock()
+            .llm(LlmProvider::Claude)
+            .build()
+            .expect("task-mode build succeeds");
+        let err = match vb.credential_proxy(true).run_service(None, None).await {
+            Ok(_) => panic!("run_service with credential_proxy must fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("credential_proxy") && msg.contains("service"),
+            "expected the run_service credential_proxy error, got: {msg}"
         );
     }
 

@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -51,6 +52,12 @@ use crate::proxy::{EgressEvent, InjectOutcome, ProxyToken, SandboxContext, PROXY
 /// resource accounting (R10: strict size limits on the guest-controlled parser
 /// surface). Bodies stream and are not held in this buffer.
 const MAX_HEADER_BUF_BYTES: usize = 64 * 1024;
+
+/// Bound on establishing the upstream TCP connection. Without it a black-holing
+/// upstream pins the guest's request (and its listener task) until run teardown.
+/// Deliberately a *connect* timeout only — a total-request timeout would kill
+/// long-lived streaming (SSE) responses mid-flight.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Body type the proxy hands back to hyper: a boxed stream of bytes whose error
 /// is normalised to `std::io::Error`.
@@ -168,6 +175,7 @@ pub async fn start_proxy() -> Result<ProxyHandle> {
     let upstream = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .dns_resolver(Arc::new(SsrfGuardResolver))
         .build()
         .map_err(|e| Error::Network(format!("proxy upstream client build failed: {e}")))?;
@@ -408,13 +416,28 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
         || name.as_str().eq_ignore_ascii_case(PROXY_TOKEN_HEADER)
 }
 
-/// Strip hop-by-hop headers from a request header map in place.
+/// Strip hop-by-hop headers from a request header map in place: the fixed
+/// RFC 7230 §6.1 set, plus any header the inbound `Connection` header nominates
+/// as connection-scoped — those are hop-by-hop by nomination and must not cross
+/// the proxy boundary either.
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    let to_remove: Vec<HeaderName> = headers
+    let mut to_remove: Vec<HeaderName> = headers
         .keys()
         .filter(|name| is_hop_by_hop(name))
         .cloned()
         .collect();
+    // Collect nominated names before any removal — `Connection` itself is in the
+    // fixed set above and would otherwise be gone before it is read.
+    for value in headers.get_all(CONNECTION) {
+        let Ok(list) = value.to_str() else {
+            continue;
+        };
+        for nominated in list.split(',') {
+            if let Ok(name) = HeaderName::from_bytes(nominated.trim().as_bytes()) {
+                to_remove.push(name);
+            }
+        }
+    }
     for name in to_remove {
         headers.remove(name);
     }

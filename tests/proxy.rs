@@ -550,6 +550,61 @@ async fn rejects_oversize_header_block() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn strips_connection_nominated_headers() {
+    // RFC 7230 §6.1: a header nominated by the inbound `Connection` header is
+    // hop-by-hop by nomination; the proxy must drop it (not just the fixed
+    // hop-by-hop set) rather than forward it upstream.
+    let (mock_addr, captured) = start_mock_upstream().await;
+    let proxy = proxy_for(mock_addr);
+    let (ctx, _token, token_hex) = sandbox_context(mock_addr.port());
+    let ca_pem = ctx.ca.ca_cert_pem().to_string();
+    let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
+
+    let connector = guest_connector(&ca_pem);
+    let tcp = TcpStream::connect(("127.0.0.1", binding.port))
+        .await
+        .expect("connect proxy");
+    let server_name = ServerName::try_from(UPSTREAM_HOST.to_string()).expect("server name");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("handshake");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("http1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("host", UPSTREAM_HOST)
+        .header("x-api-key", PLACEHOLDER_KEY)
+        .header(PROXY_TOKEN_HEADER, &token_hex)
+        .header("connection", "x-voidbox-nominated")
+        .header("x-voidbox-nominated", "must-not-cross-the-proxy")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender.send_request(req).await.expect("request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let seen = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert!(
+        seen.headers.get("x-voidbox-nominated").is_none(),
+        "a Connection-nominated header must not be forwarded upstream"
+    );
+    // The credentialed request itself still went through intact.
+    assert_eq!(seen.headers.get("x-api-key").unwrap(), REAL_KEY);
+
+    proxy.unregister_sandbox(&token_hex).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn proxy_does_not_negotiate_h2_and_serves_http1() {
     // V1: the proxy is HTTP/1.1-only on the client hop. A client that prefers
     // HTTP/2 (offers `h2` first in ALPN) must not end up believing it negotiated
