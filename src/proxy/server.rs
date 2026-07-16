@@ -94,7 +94,7 @@ struct SandboxSlot {
 
 /// Handle to the proxy: it owns the per-sandbox listener tasks and the shared
 /// upstream client. The interface supports registering and unregistering several
-/// sandboxes on one handle, but M0 stands up a handle per agent run in
+/// sandboxes on one handle, but M0 (RFC-0002) stands up a handle per agent run in
 /// [`crate::agent_box`] and registers that run's single sandbox — the
 /// "one shared proxy process" of ADR-0003 is a later milestone.
 pub struct ProxyHandle {

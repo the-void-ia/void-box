@@ -14,22 +14,22 @@
 //! # The frozen pipeline contract
 //!
 //! Every guest connection is processed by a fixed sequence of stages. Later
-//! phases extend the proxy by swapping the trait objects carried on
+//! RFC-0002 milestones extend the proxy by swapping the trait objects carried on
 //! [`SandboxContext`] — **not** by editing the accept/relay loop in [`server`].
 //! That separation is the whole point of freezing this interface now: at the
-//! injector stage Phase 1 swaps in an OAuth-backed [`CredentialInjector`] for
-//! OAuth providers (the static one stays for API-key providers), and at the
-//! policy/audit stages Phase 2 replaces [`AllowAllPolicy`] and [`DebugAuditSink`]
-//! with real egress policy/tunnelling/audit — all without re-architecting the
-//! core.
+//! injector stage the OAuth milestone (RFC-0002 M1a) swaps in an OAuth-backed
+//! [`CredentialInjector`] for OAuth providers (the static one stays for API-key
+//! providers), and at the policy/audit stages the egress track (RFC-0002
+//! "Egress profiles") replaces [`AllowAllPolicy`] and [`DebugAuditSink`] with
+//! real egress policy/tunnelling/audit — all without re-architecting the core.
 //!
 //! ```text
 //! guest conn ─▶ [auth]        per-sandbox token → resolve SandboxContext (else reject+close)
 //!            ─▶ [destination] CONNECT host / TLS SNI / base-URL host
-//!            ─▶ [policy]      EgressPolicy::decision        (Phase 0: AllowAll)
-//!            ─▶ [injector]    CredentialInjector::inject    (Phase 0: static API key)
-//!               (Phase 2 alt: Tunnel — CONNECT pass-through, no TLS-term)
-//!            ─▶ [audit]       AuditSink::record             (Phase 0: debug log)
+//!            ─▶ [policy]      EgressPolicy::decision        (M0: AllowAll)
+//!            ─▶ [injector]    CredentialInjector::inject    (M0: static API key)
+//!               (egress-track alt: Tunnel — CONNECT pass-through, no TLS-term)
+//!            ─▶ [audit]       AuditSink::record             (M0: debug log)
 //!            ─▶ upstream      resolve per connection, reject internal IPs (SSRF guard)
 //! ```
 //!
@@ -38,10 +38,10 @@
 //! The design (ADR-0003, R10) places the proxy in a **separate low-privilege
 //! process** from the host runtime: it parses attacker-controlled
 //! HTTP/TLS/CONNECT bytes on the host, in the hot path before any auth gate, so a
-//! parser compromise must not also be a host-runtime compromise. Phase 0 does
+//! parser compromise must not also be a host-runtime compromise. M0 does
 //! **not** do that yet — the pipeline runs as in-process tokio tasks inside the
 //! host runtime, so a parser-RCE here is a host-runtime RCE. That is an accepted
-//! Phase-0 shortcut, not the designed end state, and it is required hardening
+//! M0 shortcut, not the designed end state, and it is required hardening
 //! before production. The untrusted parsing is kept behind the [`server`]
 //! boundary so moving it out-of-process is a deployment change rather than a
 //! caller-visible one. The containment invariant — no durable secret in the
@@ -54,7 +54,7 @@
 //! a snapshot that captured guest-held proxy material and reused it verbatim
 //! would defeat "per-sandbox ephemeral". A snapshot taken while the proxy is
 //! active *does* capture the guest's copy of the token and the CA public cert in
-//! guest RAM. What makes that harmless in Phase 0 is the host side: the CA
+//! guest RAM. What makes that harmless in M0 is the host side: the CA
 //! private key and the credential store never enter guest RAM, the cmdline, or
 //! `vmm::snapshot` state, and the host listener + token are minted at agent-run
 //! time and torn down when the run ends — so a restored guest's captured token
@@ -101,8 +101,9 @@ impl Decision {
     }
 }
 
-/// One audited egress decision. Phase 0 records the destination and whether a
-/// credential was injected; Phase 2 extends this with bytes/timing.
+/// One audited egress decision. M0 records the destination and whether a
+/// credential was injected; the egress track (RFC-0002) extends this with
+/// bytes/timing.
 #[derive(Debug, Clone)]
 pub struct EgressEvent {
     /// Destination hostname (CONNECT host or TLS SNI).
@@ -132,8 +133,9 @@ pub enum InjectOutcome {
 }
 
 /// Rewrites the credential header(s) on a request bound for `host` with the
-/// host-held secret. Phase 0 ships [`StaticApiKeyInjector`]; Phase 1 adds an
-/// OAuth-backed implementation that mints a short-lived Bearer per call. Both
+/// host-held secret. M0 ships [`StaticApiKeyInjector`]; the OAuth milestone
+/// (RFC-0002 M1a) adds an implementation that mints a short-lived Bearer per
+/// call. Both
 /// coexist behind this trait, selected per provider and auth mode: OAuth
 /// providers use the new one, API-key providers keep the static injector.
 pub trait CredentialInjector: Send + Sync {
@@ -147,21 +149,24 @@ pub trait CredentialInjector: Send + Sync {
     fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome;
 }
 
-/// Decides whether a destination host may be reached. Phase 2 replaces the
-/// Phase-0 [`AllowAllPolicy`] with the FQDN allow-list.
+/// Decides whether a destination host may be reached. The egress track
+/// (RFC-0002 "Egress profiles") replaces the M0 [`AllowAllPolicy`] with the
+/// FQDN allow-list.
 pub trait EgressPolicy: Send + Sync {
     /// Decide reachability for `host`.
     fn decision(&self, host: &str) -> Decision;
 }
 
-/// Records egress decisions. Phase 2 routes this into `src/observe/`.
+/// Records egress decisions. The egress track (RFC-0002) routes this into
+/// `src/observe/`.
 pub trait AuditSink: Send + Sync {
     /// Record one egress decision.
     fn record(&self, event: EgressEvent);
 }
 
-/// Phase-0 egress policy: allow every destination. Reach is unrestricted until
-/// the egress track (Phase 2) lands; credential containment holds regardless.
+/// M0 egress policy: allow every destination. Reach is unrestricted until the
+/// egress track (RFC-0002 "Egress profiles") lands; credential containment
+/// holds regardless.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllowAllPolicy;
 
@@ -171,7 +176,7 @@ impl EgressPolicy for AllowAllPolicy {
     }
 }
 
-/// Phase-0 audit sink: emit each decision at `debug`. Never logs payloads or
+/// M0 audit sink: emit each decision at `debug`. Never logs payloads or
 /// credentials — only the destination and the allow/inject flags.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DebugAuditSink;
@@ -215,7 +220,7 @@ pub struct SandboxContext {
 pub const DEFAULT_UPSTREAM_PORT: u16 = 443;
 
 impl SandboxContext {
-    /// Build a sandbox context with the Phase-0 default policy (allow-all) and audit
+    /// Build a sandbox context with the M0 default policy (allow-all) and audit
     /// sink (debug log). The CA is name-constrained to `allowed_upstreams`.
     pub fn new(
         token: ProxyToken,

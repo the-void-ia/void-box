@@ -221,7 +221,7 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
 
     // Provision the guest: write the CA, redirect the upstream name to the
-    // gateway, and assert R14 (no real key in the staged env/files).
+    // gateway, and assert RFC-0002 R14 (no real key in the staged env/files).
     let upstream = ProxiedUpstream::for_provider(&void_box::llm::LlmProvider::Claude).unwrap();
     let provisioning = build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
     assert_no_real_credential(

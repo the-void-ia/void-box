@@ -2,7 +2,7 @@
 //! a client at it without ever staging the real credential.
 //!
 //! This is the host-side, VM-independent core of provider migration: it decides
-//! which providers the Phase-0 proxy can serve, derives the upstream host +
+//! which providers the RFC-0002 M0 proxy can serve, derives the upstream host +
 //! credential scheme, and builds the exact guest env / files / host-aliases that
 //! redirect the client through the proxy. The live wiring (owning the proxy
 //! handle, writing the CA over the control channel, lifecycle) sits in
@@ -52,8 +52,8 @@ pub fn render_guest_hosts(aliases: &[(String, String)]) -> String {
 /// overwrites it with the real key; some clients require a non-empty value.
 pub const ANTHROPIC_KEY_PLACEHOLDER: &str = "voidbox-proxy-placeholder";
 
-/// A provider the Phase-0 proxy can serve, with the knobs needed to redirect its
-/// client through the proxy.
+/// A provider the M0 proxy (RFC-0002) can serve, with the knobs needed to
+/// redirect its client through the proxy.
 #[derive(Debug, Clone)]
 pub struct ProxiedUpstream {
     /// Upstream host the client talks to (TLS SNI + credential injection target).

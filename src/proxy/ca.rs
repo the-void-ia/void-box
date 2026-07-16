@@ -11,7 +11,7 @@
 //!
 //! Leaf certificates are minted lazily, per TLS ClientHello SNI, by an internal
 //! `LeafResolver` and cached for the sandbox's lifetime, so a single per-sandbox
-//! listener can serve several credentialed upstreams (Phase 0 uses one).
+//! listener can serve several credentialed upstreams (RFC-0002 M0 uses one).
 //!
 //! ECDSA P-256 is chosen because keygen is on the cold-start budget and P-256
 //! generation is cheap relative to RSA.

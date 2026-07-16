@@ -380,11 +380,12 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
                     ));
                 }
                 // The credential proxy is only wired into the task-mode agent run
-                // (`agent_box::run`), not the service run (`run_service`), in M0.
-                // A service run with `credential_proxy` enabled would withhold the
-                // real key from the guest but never start the proxy, so the agent
-                // boots with neither credential nor proxy and fails at API-call
-                // time. Reject the combination up front instead.
+                // (`agent_box::run`), not the service run (`run_service`), in
+                // RFC-0002 M0. A service run with `credential_proxy` enabled
+                // would withhold the real key from the guest but never start the
+                // proxy, so the agent boots with neither credential nor proxy
+                // and fails at API-call time. Reject the combination up front
+                // instead.
                 if spec
                     .llm
                     .as_ref()
@@ -393,7 +394,7 @@ pub fn validate_spec(spec: &RunSpec) -> Result<()> {
                 {
                     return Err(Error::Config(
                         "agent: mode: service and llm.credential_proxy are mutually exclusive \
-                         (the credential proxy is not wired for service mode in M0)"
+                         (the credential proxy is not wired for service mode in RFC-0002 M0)"
                             .into(),
                     ));
                 }

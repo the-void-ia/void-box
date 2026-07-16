@@ -1,4 +1,4 @@
-//! Static API-key credential injector — the Phase-0 [`CredentialInjector`].
+//! Static API-key credential injector — the RFC-0002 M0 [`CredentialInjector`].
 //!
 //! Holds one host-held API key and rewrites the credential header for the exact
 //! upstream host it owns. Exact-host matching is deliberate (R3): the injector
@@ -7,11 +7,12 @@
 //! anyway) or a misrouted connection cannot redirect the credential to another
 //! destination. Path-scoped injection (crediting only specific paths on a host,
 //! needed once non-LLM downstream services share this trait) is deferred to M2;
-//! Phase 0 credits every path on its single name-constrained LLM upstream.
+//! M0 credits every path on its single name-constrained LLM upstream.
 //!
-//! Phase 1 adds an OAuth-backed [`CredentialInjector`] alongside this one — a
-//! second implementation that mints a short-lived Bearer per call, selected per
-//! provider and auth mode behind the same trait boundary. It does not replace
+//! The OAuth milestone (M1a) adds an OAuth-backed [`CredentialInjector`]
+//! alongside this one — a second implementation that mints a short-lived Bearer
+//! per call, selected per provider and auth mode behind the same trait
+//! boundary. It does not replace
 //! this injector: the API-key providers (Claude with an API key, the
 //! Anthropic-compatible Custom provider, and codex API-key mode) keep using this
 //! static path, which is the sanctioned path for programmatic use.

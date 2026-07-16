@@ -1,4 +1,4 @@
-//! SSRF guard for the proxy's upstream re-origination (R3).
+//! SSRF guard for the proxy's upstream re-origination (RFC-0002 R3).
 //!
 //! The proxy connects upstream on the guest's behalf, so it must not be steered
 //! into an internal target. A name the guest can influence — or a public name an
@@ -33,7 +33,8 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 /// Whether an IPv4 address is in a baseline-deny (host-internal or otherwise
 /// unsafe-to-egress) range. Covers the RFC-required set plus a few adjacent
 /// special-use ranges, because this guard is the frozen base the egress track
-/// (Phase 2) builds on, so over-denying obscure non-public space costs nothing.
+/// (RFC-0002 "Egress profiles") builds on, so over-denying obscure non-public
+/// space costs nothing.
 fn is_internal_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     ip.is_private()              // 10/8, 172.16/12, 192.168/16

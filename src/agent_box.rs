@@ -82,7 +82,8 @@ fn filter_withheld_env(env: Vec<(String, String)>, withhold: bool) -> Vec<(Strin
         .collect()
 }
 
-/// Resolve the host-held API key for a provider the M0 proxy serves (Claude).
+/// Resolve the host-held API key for a provider the RFC-0002 M0 proxy serves
+/// (Claude).
 /// Returns `None` when no key is available — including an empty or
 /// whitespace-only value, which is as unusable as an absent one; treating it as
 /// present would inject an empty credential header and surface as an opaque
@@ -138,9 +139,10 @@ fn ensure_credential_proxy_platform_supported() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn ensure_credential_proxy_platform_supported() -> Result<()> {
     Err(crate::Error::Config(
-        "credential_proxy is only supported on Linux/KVM in M0; on macOS/VZ the \
-         proxy listener cannot yet be bound guest-only, so enabling it would \
-         expose the credential-injecting parser to the host LAN (tracked for M1b)"
+        "credential_proxy is only supported on Linux/KVM in RFC-0002 M0; on \
+         macOS/VZ the proxy listener cannot yet be bound guest-only, so enabling \
+         it would expose the credential-injecting parser to the host LAN \
+         (tracked for M1b)"
             .into(),
     ))
 }
@@ -361,8 +363,9 @@ impl VoidBox {
     /// proxy instead of forwarding it into the guest.
     ///
     /// Opt-in: with the default `false`, behaviour is unchanged. When enabled
-    /// for a provider the M0 proxy serves (Claude only; the Anthropic-compatible
-    /// Custom provider and codex are deferred to M1/M1b), the real key is
+    /// for a provider the RFC-0002 M0 proxy serves (Claude only; the
+    /// Anthropic-compatible Custom provider and codex are deferred to M1/M1b),
+    /// the real key is
     /// withheld from the guest env and injected host-side at egress; the guest
     /// carries only a placeholder + the per-sandbox CA + proxy token.
     pub fn credential_proxy(mut self, enable: bool) -> Self {
@@ -512,7 +515,7 @@ impl VoidBox {
         if ProxiedUpstream::for_provider(&self.config.llm).is_none() {
             return Err(crate::Error::Config(format!(
                 "credential_proxy is enabled but provider '{}' is not served by the \
-                 Phase-0 proxy (M0 serves Claude only)",
+                 proxy (RFC-0002 M0 serves Claude only)",
                 self.config.llm.description()
             )));
         }
@@ -524,8 +527,9 @@ impl VoidBox {
         // this closes the builder-API path).
         if self.config.mode == AgentMode::Service {
             return Err(crate::Error::Config(
-                "credential_proxy and service mode are mutually exclusive in M0: \
-                 the credential proxy is wired only into the task-mode agent run"
+                "credential_proxy and service mode are mutually exclusive in \
+                 RFC-0002 M0: the credential proxy is wired only into the \
+                 task-mode agent run"
                     .into(),
             ));
         }
@@ -585,7 +589,8 @@ impl VoidBox {
         let provider = &self.config.llm;
         let Some(upstream) = ProxiedUpstream::for_provider(provider) else {
             return Err(crate::Error::Config(format!(
-                "credential_proxy is enabled but provider '{}' is not served by the Phase-0 proxy",
+                "credential_proxy is enabled but provider '{}' is not served by the \
+                 proxy (RFC-0002 M0 serves Claude only)",
                 provider.description()
             )));
         };
@@ -1197,7 +1202,7 @@ impl VoidBox {
         // flag set after `build()`.
         if self.config.credential_proxy {
             return Err(crate::Error::Config(
-                "credential_proxy is not supported for service mode in M0 \
+                "credential_proxy is not supported for service mode in RFC-0002 M0 \
                  (run_service does not start the proxy); use task mode"
                     .into(),
             ));
@@ -1597,7 +1602,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("not served by the Phase-0 proxy"),
+            msg.contains("not served by the proxy"),
             "expected a provider-unsupported error, got: {msg}"
         );
     }

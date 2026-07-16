@@ -363,7 +363,7 @@ async fn try_handshake(ca_pem: &str, addr: SocketAddr, sni: &str) -> std::io::Re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_enforces_ca_name_constraints() {
-    // R2 / V1: a compliant client trusting the per-sandbox CA must reject a leaf
+    // RFC-0002 R2 / V1: a compliant client trusting the per-sandbox CA must reject a leaf
     // for a host OUTSIDE the CA's name constraints, even with a valid signature —
     // otherwise the name-constrained CA is a universal MITM anchor. `ProxyCa`
     // refuses to *mint* such a leaf, so this forges one directly with rcgen to
@@ -429,7 +429,7 @@ async fn client_enforces_ca_name_constraints() {
 async fn rejects_cross_sandbox_token() {
     // On the shared proxy, sandbox A's token presented to sandbox B's listener
     // must be rejected — this is the load-bearing cross-sandbox control on KVM in
-    // M0 (the per-sandbox network rule is not implemented yet, so a neighbour can
+    // RFC-0002 M0 (the per-sandbox network rule is not implemented yet, so a neighbour can
     // reach B's listener over the shared loopback). B's token authenticates B's
     // guest; A's does not.
     let (mock_addr, captured) = start_mock_upstream().await;
