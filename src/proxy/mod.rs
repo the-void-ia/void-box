@@ -120,9 +120,9 @@ pub struct EgressEvent {
     pub injected: bool,
 }
 
-/// Outcome of the credential-injection stage for one request. Three states,
-/// because the caller must fail closed on a failed injection but forward an
-/// unowned host — a single boolean cannot tell those apart.
+/// Outcome of the credential-injection stage for one request. Four states,
+/// because the caller must fail closed on a failed injection but forward the
+/// other cases uninjected — a single boolean cannot tell them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectOutcome {
     /// A credential header was written for this host.
@@ -130,6 +130,12 @@ pub enum InjectOutcome {
     /// This injector does not own `host`; no credential applies, and the request
     /// proceeds unchanged.
     NotOwned,
+    /// This injector owns `host`, but the request carried no credential header
+    /// for its scheme, so it was not a request the client meant to authenticate
+    /// with this credential. The injector adds nothing — introducing the secret
+    /// into a request that never carried it would expose it to an endpoint that
+    /// did not ask for it — and the request proceeds unchanged.
+    NoCredentialHeader,
     /// This injector owns `host` but could not produce a valid credential header
     /// (e.g. a malformed key). The caller must reject the request rather than
     /// forward it uncredentialed.

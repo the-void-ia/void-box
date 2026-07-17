@@ -320,7 +320,10 @@ async fn proxy_request(
     // credentialed. Return 502 and audit `injected: false` instead.
     let injected = match ctx.injector.inject(&host, &mut headers) {
         InjectOutcome::Injected => true,
-        InjectOutcome::NotOwned => false,
+        // Owned host but no credential presented, or a host this injector does
+        // not own: forward as-is, uninjected. Not a failure — the secret is
+        // simply never introduced into a request that did not carry it.
+        InjectOutcome::NoCredentialHeader | InjectOutcome::NotOwned => false,
         InjectOutcome::Failed => {
             ctx.audit.record(EgressEvent {
                 host: host.to_string(),
