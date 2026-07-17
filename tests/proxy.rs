@@ -363,7 +363,7 @@ async fn try_handshake(ca_pem: &str, addr: SocketAddr, sni: &str) -> std::io::Re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_enforces_ca_name_constraints() {
-    // RFC-0002 R2 / V1: a compliant client trusting the per-sandbox CA must reject a leaf
+    // RFC-0002: a compliant client trusting the per-sandbox CA must reject a leaf
     // for a host OUTSIDE the CA's name constraints, even with a valid signature —
     // otherwise the name-constrained CA is a universal MITM anchor. `ProxyCa`
     // refuses to *mint* such a leaf, so this forges one directly with rcgen to
@@ -495,7 +495,7 @@ async fn ssrf_guard_rejects_internal_name_through_production_client() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_oversize_header_block() {
-    // The proxy caps its per-connection read buffer at 64 KiB (R10: strict size
+    // The proxy caps its per-connection read buffer at 64 KiB (strict size
     // limits on the guest-controlled parser surface). A header block larger than
     // that cannot be parsed, so the request does not complete and the upstream is
     // never reached.

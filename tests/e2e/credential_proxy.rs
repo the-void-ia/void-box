@@ -221,7 +221,7 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     let binding = proxy.register_sandbox(ctx).await.expect("register sandbox");
 
     // Provision the guest: write the CA, redirect the upstream name to the
-    // gateway, and assert RFC-0002 R14 (no real key in the staged env/files).
+    // gateway, and assert no real key reaches the staged env/files.
     let upstream = ProxiedUpstream::for_provider(&void_box::llm::LlmProvider::Claude).unwrap();
     let provisioning = build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
     assert_no_real_credential(
@@ -229,7 +229,7 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         std::slice::from_ref(&provisioning.ca_file),
         REAL_KEY,
     )
-    .expect("R14: no real credential in guest provisioning");
+    .expect("no real credential in guest provisioning");
 
     backend
         .write_file(&provisioning.ca_file.0, provisioning.ca_file.1.as_bytes())
@@ -287,7 +287,7 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
             assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
         } else {
             // The deterministic test image's wget may lack HTTPS/custom-CA
-            // support; the host-side proxy + R14 path above is still asserted.
+            // support; the host-side proxy + no-credential-in-guest path above is still asserted.
             eprintln!(
                 "note: guest HTTPS call did not succeed (client capability); \
                  stderr: {}",

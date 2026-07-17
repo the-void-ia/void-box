@@ -9,7 +9,7 @@
 //! `agent_box`/`daemon` and is validated by the VM e2e suite; everything here is
 //! pure and unit-tested.
 //!
-//! The [`assert_no_real_credential`] gate (R14) is the automated check that a
+//! The [`assert_no_real_credential`] gate is the automated check that a
 //! migrated provider leaves no durable secret in the guest's env or files — so a
 //! half-migration that both redirects to the proxy *and* leaks the key cannot
 //! pass review silently.
@@ -144,7 +144,7 @@ pub fn build_guest_provisioning(
     }
 }
 
-/// R14 gate: assert no real credential reaches the guest. `secret` is the
+/// Assert no real credential reaches the guest. `secret` is the
 /// host-held durable credential; it must not appear in any env value or file
 /// contents the sandbox stages into the guest.
 pub fn assert_no_real_credential(
@@ -157,12 +157,12 @@ pub fn assert_no_real_credential(
     }
     if let Some((key, _)) = env.iter().find(|(_, value)| value.contains(secret)) {
         return Err(Error::Network(format!(
-            "R14: real credential leaked into guest env var {key}"
+            "real credential leaked into guest env var {key}"
         )));
     }
     if files.iter().any(|(_, contents)| contents.contains(secret)) {
         return Err(Error::Network(
-            "R14: real credential leaked into a guest file".to_string(),
+            "real credential leaked into a guest file".to_string(),
         ));
     }
     Ok(())
@@ -234,7 +234,7 @@ mod tests {
             vec![("10.0.2.2".to_string(), "api.anthropic.com".to_string())]
         );
 
-        // R14: the real key appears nowhere.
+        // The real key appears nowhere.
         assert!(assert_no_real_credential(
             &prov.env,
             std::slice::from_ref(&prov.ca_file),
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn r14_detects_a_leaked_secret() {
+    fn gate_detects_a_leaked_secret() {
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-REAL".to_string())];
         assert!(assert_no_real_credential(&env, &[], "sk-ant-REAL").is_err());
 

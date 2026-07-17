@@ -49,8 +49,8 @@ use crate::proxy::{EgressEvent, InjectOutcome, ProxyToken, SandboxContext, PROXY
 
 /// Cap on hyper's per-connection read buffer (headers + request-line). Bounds
 /// the host memory a single guest connection can pin in the parser before any
-/// resource accounting (R10: strict size limits on the guest-controlled parser
-/// surface). Bodies stream and are not held in this buffer.
+/// resource accounting — strict size limits on the guest-controlled parser
+/// surface. Bodies stream and are not held in this buffer.
 const MAX_HEADER_BUF_BYTES: usize = 64 * 1024;
 
 /// Bound on establishing the upstream TCP connection. Without it a black-holing
@@ -76,7 +76,7 @@ pub struct SandboxBinding {
 
 impl std::fmt::Debug for SandboxBinding {
     /// Redacts `token_hex` so a `{:?}` of a binding never lands the per-sandbox
-    /// token in a log, mirroring [`ProxyToken`]'s redacting `Debug` (R15).
+    /// token in a log, mirroring [`ProxyToken`]'s redacting `Debug`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SandboxBinding")
             .field("port", &self.port)
@@ -162,9 +162,9 @@ impl ProxyHandle {
 }
 
 /// Start the shared proxy with a production upstream client. The client never
-/// follows redirects (credentials must not chase an agent-controlled redirect,
-/// R3) and resolves upstream names through the [`SsrfGuardResolver`], which
-/// rejects any name resolving to an internal address (R3).
+/// follows redirects (credentials must not chase an agent-controlled redirect)
+/// and resolves upstream names through the [`SsrfGuardResolver`], which
+/// rejects any name resolving to an internal address.
 ///
 /// `no_proxy()` is deliberate: with a host `HTTPS_PROXY`/`ALL_PROXY` set, reqwest
 /// would `CONNECT` through it and skip its own resolver, silently bypassing the

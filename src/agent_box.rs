@@ -73,7 +73,7 @@ fn is_withheld_secret_env(key: &str) -> bool {
 }
 
 /// Drop the provider's credential env when the credential proxy will supply it
-/// host-side (R14). Pure (no host-env dependence) so the withholding can be
+/// host-side, keeping the real credential out of the guest. Pure (no host-env dependence) so the withholding can be
 /// tested directly rather than only through a provider whose `env_vars()` reads
 /// the ambient environment.
 fn filter_withheld_env(env: Vec<(String, String)>, withhold: bool) -> Vec<(String, String)> {
@@ -446,7 +446,7 @@ impl VoidBox {
         // provider the proxy does not serve, so without this gate an unsupported
         // provider would boot with the real key in its exec env and only fail
         // once `maybe_setup_credential_proxy` runs — after the pre-run
-        // provisioning execs have already seen it (R14).
+        // provisioning execs have already seen it.
         if self.config.credential_proxy {
             self.validate_credential_proxy_preconditions()?;
         }
@@ -474,7 +474,7 @@ impl VoidBox {
 
         // Inject LLM provider env vars first, then user overrides. When the
         // credential proxy is enabled for a provider it serves, the real API key
-        // is withheld here (R14) — the proxy injects it host-side, and the guest
+        // is withheld here (no real credential enters the guest) — the proxy injects it host-side, and the guest
         // receives only a placeholder via the runtime proxy env.
         for (k, v) in self.staged_llm_env() {
             builder = builder.env(&k, &v);
@@ -545,7 +545,7 @@ impl VoidBox {
     }
 
     /// The provider/LLM env staged into the guest, with the real provider key
-    /// removed when [`Self::withhold_provider_secret`] holds (R14): the guest
+    /// removed when [`Self::withhold_provider_secret`] holds: the guest
     /// then carries only the proxy's placeholder, never the durable key.
     fn staged_llm_env(&self) -> Vec<(String, String)> {
         filter_withheld_env(self.config.llm.env_vars(), self.withhold_provider_secret())
@@ -553,10 +553,10 @@ impl VoidBox {
 
     /// The complete environment staged into the guest for an agent run: the
     /// provider/LLM env (post-withholding), the user overrides, and the proxy's
-    /// own provisioning env. This is the set the R14 gate audits — auditing only
+    /// own provisioning env. This is the set the no-real-credential-in-guest gate audits — auditing only
     /// the proxy env would miss a real key reaching the guest through the LLM env
     /// or a user override.
-    fn r14_audit_env(&self, proxy_env: &[(String, String)]) -> Vec<(String, String)> {
+    fn credential_audit_env(&self, proxy_env: &[(String, String)]) -> Vec<(String, String)> {
         let mut env = self.staged_llm_env();
         env.extend(self.config.env.iter().cloned());
         env.extend(proxy_env.iter().cloned());
@@ -578,7 +578,7 @@ impl VoidBox {
             return Ok(None);
         }
         // The credential-injecting listener — and its in-process, pre-auth
-        // TLS/HTTP parser (R10) — must be reachable only by the guest. On
+        // TLS/HTTP parser — must be reachable only by the guest. On
         // Linux/KVM it binds host loopback, which SLIRP forwards to the guest. On
         // macOS/VZ the only guest-reachable bind is a non-loopback address
         // (`guest_accessible_bind_addr` → 0.0.0.0), which would also expose the
@@ -625,20 +625,20 @@ impl VoidBox {
         let provisioning =
             build_guest_provisioning(&upstream, &binding, &ca_pem, guest_host_gateway());
 
-        // R14: assert no real credential reaches the guest. The audit covers the
+        // Assert no real credential reaches the guest. The audit covers the
         // full staged env — provider/LLM env (post-withholding) + user overrides +
         // the proxy's provisioning env — and the files the proxy itself writes (the
         // CA PEM and `/etc/hosts`). That is complete for M0: the one provider the
         // proxy serves (Claude) delivers its key only through
         // `ANTHROPIC_API_KEY`, which is withheld, so env is the only
-        // credential channel. The full R14 scope (every provisioned file and host
+        // credential channel. The full no-credential-in-guest scope (every provisioned file and host
         // mount) is required before migrating a provider that stages a secret into
         // a file or mount — none do in M0. The primary control is structural: the
         // key is withheld from the staged env in the first place. This gate is the
         // backstop that would catch a withholding regression; it runs before the
         // agent exec and the proxy's writes (a regression could still reach the
         // earlier pre-run provisioning execs before this aborts).
-        let staged_env = self.r14_audit_env(&provisioning.env);
+        let staged_env = self.credential_audit_env(&provisioning.env);
         let staged_files = [
             provisioning.ca_file.clone(),
             (
@@ -1664,9 +1664,9 @@ mod tests {
     }
 
     #[test]
-    fn r14_audit_catches_real_key_in_user_env() {
+    fn credential_audit_catches_real_key_in_user_env() {
         // A real provider key copied into a user env override under a
-        // non-withheld name reaches the guest — the R14 audit set must include it
+        // non-withheld name reaches the guest — the no-credential-in-guest audit set must include it
         // so the gate fails. Auditing only the proxy env would miss this.
         let secret = "sk-ant-REALKEY-must-not-leak";
         let vb = VoidBox::new("b")
@@ -1678,7 +1678,7 @@ mod tests {
             "ANTHROPIC_API_KEY".to_string(),
             crate::proxy::provision::ANTHROPIC_KEY_PLACEHOLDER.to_string(),
         )];
-        let audit_env = vb.r14_audit_env(&proxy_env);
+        let audit_env = vb.credential_audit_env(&proxy_env);
 
         assert!(
             audit_env
@@ -1688,7 +1688,7 @@ mod tests {
         );
         assert!(
             crate::proxy::assert_no_real_credential(&audit_env, &[], secret).is_err(),
-            "R14 gate must reject a real key staged via a user env override"
+            "the no-credential-in-guest gate must reject a real key staged via a user env override"
         );
     }
 

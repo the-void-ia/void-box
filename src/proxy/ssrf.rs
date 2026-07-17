@@ -1,4 +1,4 @@
-//! SSRF guard for the proxy's upstream re-origination (RFC-0002 R3).
+//! SSRF guard for the proxy's upstream re-origination (RFC-0002).
 //!
 //! The proxy connects upstream on the guest's behalf, so it must not be steered
 //! into an internal target. A name the guest can influence — or a public name an

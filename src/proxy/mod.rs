@@ -35,7 +35,7 @@
 //!
 //! # Process model — known deviation from the design
 //!
-//! The design (ADR-0003, R10) places the proxy in a **separate low-privilege
+//! The design (ADR-0003) places the proxy in a **separate low-privilege
 //! process** from the host runtime: it parses attacker-controlled
 //! HTTP/TLS/CONNECT bytes on the host, in the hot path before any auth gate, so a
 //! parser compromise must not also be a host-runtime compromise. M0 does
@@ -48,7 +48,7 @@
 //! guest — does not depend on the split; the split bounds blast radius if the
 //! parser is exploited.
 //!
-//! # Snapshot / restore (R11)
+//! # Snapshot / restore
 //!
 //! The design re-mints the per-sandbox CA and token on snapshot restore, because
 //! a snapshot that captured guest-held proxy material and reused it verbatim

@@ -1,7 +1,7 @@
 //! Static API-key credential injector — the RFC-0002 M0 [`CredentialInjector`].
 //!
 //! Holds one host-held API key and rewrites the credential header for the exact
-//! upstream host it owns. Exact-host matching is deliberate (R3): the injector
+//! upstream host it owns. Exact-host matching is deliberate: the injector
 //! never attaches the secret to a request whose host differs from the one it was
 //! configured for, so an agent-controlled `Host` header (which the proxy strips
 //! anyway) or a misrouted connection cannot redirect the credential to another
