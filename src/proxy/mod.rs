@@ -110,6 +110,10 @@ pub struct EgressEvent {
     pub host: String,
     /// Destination port.
     pub port: u16,
+    /// Request path, without the query string. The endpoint is the useful
+    /// audit signal; query parameters are excluded because a client can place
+    /// secrets there and the audit log must never record credentials.
+    pub path: String,
     /// Whether the policy stage allowed the connection.
     pub allowed: bool,
     /// Whether a credential header was injected on this connection.
@@ -186,6 +190,7 @@ impl AuditSink for DebugAuditSink {
         debug!(
             host = %event.host,
             port = event.port,
+            path = %event.path,
             allowed = event.allowed,
             injected = event.injected,
             "proxy egress"

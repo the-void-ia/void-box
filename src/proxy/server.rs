@@ -296,6 +296,7 @@ async fn proxy_request(
         ctx.audit.record(EgressEvent {
             host: host.to_string(),
             port: ctx.upstream_port,
+            path: req.uri().path().to_string(),
             allowed: false,
             injected: false,
         });
@@ -324,6 +325,7 @@ async fn proxy_request(
             ctx.audit.record(EgressEvent {
                 host: host.to_string(),
                 port: ctx.upstream_port,
+                path: parts.uri.path().to_string(),
                 allowed: true,
                 injected: false,
             });
@@ -352,6 +354,7 @@ async fn proxy_request(
     ctx.audit.record(EgressEvent {
         host: host.to_string(),
         port: ctx.upstream_port,
+        path: parts.uri.path().to_string(),
         allowed: true,
         injected,
     });
