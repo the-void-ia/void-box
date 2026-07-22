@@ -124,6 +124,14 @@ get wrong:
 Keep concrete attack examples or worked use-cases when they're pedagogically
 useful — those are illustrations, not history.
 
+Likewise, document the design, not the deliberation. State what the code is
+and the structural reason it holds; don't reproduce the internal reasoning
+that reached it — the alternatives weighed, why one won, or emphatic framing
+("the whole point of X", a "X, not Y" heading, a rhetorical "this raises the
+obvious question"). That belongs in the PR or the RFC's "Alternatives
+considered" / "Risks & trade-offs" sections, not in code the reader is trying
+to understand.
+
 Avoid ticket IDs (`R-B*`, `R-arch-*`) and PR/commit references inside doc
 comments and inline comments. They belong in commit messages and PR
 descriptions where they're audit trail; in code they age into noise as the
