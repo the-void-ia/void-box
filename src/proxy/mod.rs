@@ -1,27 +1,27 @@
-//! Host-side shared injection proxy — the single egress chokepoint that both
-//! the credential track and the (future) egress track plug into.
+//! Host-side proxy that mediates a guest's outbound connections at the host
+//! boundary. It provides two capabilities over one per-connection pipeline:
+//! credential injection and egress control.
 //!
-//! # One shared proxy, not two
+//! # Capabilities
 //!
-//! Credential injection and egress policy are the same concern observed at two
-//! granularities: both act on a guest's outbound connection at the host
-//! boundary. Running them in one process keeps the memory cost fixed rather
-//! than linear in VM count, and lets a single per-connection handler pipeline
-//! serve both. The credential [`CredentialInjector`] and the egress
-//! `EgressPolicy`/tunnel/audit handlers are *stages in that pipeline*, selected
-//! per sandbox via [`SandboxContext`].
+//! **Credential injection** rewrites a guest's placeholder credential header
+//! with a host-held secret at egress. **Egress control** decides, audits, and
+//! routes which destinations a guest may reach. Each is a pipeline stage,
+//! carried as a trait object on [`SandboxContext`] and selected per sandbox:
+//! the credential [`CredentialInjector`], and the egress `EgressPolicy` /
+//! tunnel / `AuditSink` handlers. M0 implements the credential injector; the
+//! egress track (RFC-0002 "Egress profiles") supplies the policy, tunnel, and
+//! audit stages.
 //!
-//! # The frozen pipeline contract
+//! # Extending the pipeline
 //!
-//! Every guest connection is processed by a fixed sequence of stages. Later
-//! RFC-0002 milestones extend the proxy by swapping the trait objects carried on
-//! [`SandboxContext`] — **not** by editing the accept/relay loop in [`server`].
-//! That separation is the whole point of freezing this interface now: at the
-//! injector stage the OAuth milestone (RFC-0002 M1a) swaps in an OAuth-backed
-//! [`CredentialInjector`] for OAuth providers (the static one stays for API-key
-//! providers), and at the policy/audit stages the egress track (RFC-0002
-//! "Egress profiles") replaces [`AllowAllPolicy`] and [`DebugAuditSink`] with
-//! real egress policy/tunnelling/audit — all without re-architecting the core.
+//! The accept/relay loop in [`server`] is fixed; a milestone extends the proxy
+//! by swapping the trait objects on [`SandboxContext`], not by editing that
+//! loop. At the injector stage the OAuth milestone (RFC-0002 M1a) adds an
+//! OAuth-backed [`CredentialInjector`] for OAuth providers (the static one
+//! serves API-key providers). At the policy and audit stages the egress track
+//! (RFC-0002 "Egress profiles") replaces [`AllowAllPolicy`] and
+//! [`DebugAuditSink`] with the real policy, tunnel, and audit handlers.
 //!
 //! ```text
 //! guest conn ─▶ [auth]        per-sandbox token → resolve SandboxContext (else reject+close)

@@ -11,7 +11,7 @@
 //! before forwarding. This stays "one shared process" — the listeners are tasks
 //! inside it, so the memory cost is per-sandbox state, not a per-sandbox OS process.
 //!
-//! # Request flow (the frozen pipeline, see [`crate::proxy`])
+//! # Request flow (see [`crate::proxy`])
 //!
 //! TLS-terminate (per-sandbox CA, SNI → upstream host) → auth (per-sandbox token) →
 //! policy (allow/deny) → inject credential header → re-originate to the real

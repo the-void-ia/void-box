@@ -32,7 +32,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 
 /// Whether an IPv4 address is in a baseline-deny (host-internal or otherwise
 /// unsafe-to-egress) range. Covers the RFC-required set plus a few adjacent
-/// special-use ranges, because this guard is the frozen base the egress track
+/// special-use ranges, because this guard is the base the egress track
 /// (RFC-0002 "Egress profiles") builds on, so over-denying obscure non-public
 /// space costs nothing.
 fn is_internal_v4(ip: Ipv4Addr) -> bool {
