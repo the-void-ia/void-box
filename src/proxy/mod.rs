@@ -41,8 +41,8 @@
 //! parser compromise must not also be a host-runtime compromise. M0 does
 //! **not** do that yet — the pipeline runs as in-process tokio tasks inside the
 //! host runtime, so a parser-RCE here is a host-runtime RCE. That is an accepted
-//! M0 shortcut, not the designed end state, and it is required hardening
-//! before production. The untrusted parsing is kept behind the [`server`]
+//! M0 shortcut, not the designed end state, and it is a hardening step the
+//! design still requires. The untrusted parsing is kept behind the [`server`]
 //! boundary so moving it out-of-process is a deployment change rather than a
 //! caller-visible one. The containment invariant — no durable secret in the
 //! guest — does not depend on the split; the split bounds blast radius if the
@@ -222,8 +222,8 @@ pub struct SandboxContext {
     pub audit: Arc<dyn AuditSink>,
     /// Upstream hosts this sandbox may reach (CA name-constraint + SSRF allow-set).
     pub allowed_upstreams: Vec<String>,
-    /// Port to re-originate to on the upstream host. Always 443 in production
-    /// (HTTPS providers); overridable so tests can target a local mock.
+    /// Port to re-originate to on the upstream host. Always 443 for a real HTTPS
+    /// upstream; overridable so tests can target a local mock.
     pub upstream_port: u16,
 }
 

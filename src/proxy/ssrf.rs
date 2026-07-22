@@ -15,9 +15,9 @@
 //! cherry-picking a public address. Redirects are already disabled on the
 //! upstream client, so there is no connect-time re-resolution to reopen the gap.
 //!
-//! The guard lives on the production upstream client only ([`crate::proxy::server::start_proxy`]);
+//! The guard lives on the real upstream client only ([`crate::proxy::server::start_proxy`]);
 //! tests that point the proxy at a loopback mock supply their own client through
-//! `ProxyHandle::new`, so the mock is reachable without weakening the production
+//! `ProxyHandle::new`, so the mock is reachable without weakening the real
 //! path.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

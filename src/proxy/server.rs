@@ -105,7 +105,7 @@ pub struct ProxyHandle {
 impl ProxyHandle {
     /// Build a handle that re-originates upstream requests with `upstream`.
     /// Exposed so tests can supply a client whose DNS/trust is pointed at a
-    /// mock upstream; production uses [`start_proxy`].
+    /// mock upstream; the real client comes from [`start_proxy`].
     pub fn new(upstream: reqwest::Client) -> Self {
         Self {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
@@ -161,7 +161,7 @@ impl ProxyHandle {
     }
 }
 
-/// Start the shared proxy with a production upstream client. The client never
+/// Start the shared proxy with the real upstream client. The client never
 /// follows redirects (credentials must not chase an agent-controlled redirect)
 /// and resolves upstream names through the [`SsrfGuardResolver`], which
 /// rejects any name resolving to an internal address.
