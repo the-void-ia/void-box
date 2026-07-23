@@ -325,7 +325,7 @@ async fn proxy_request(
     // host-held key) must fail closed: forwarding the request without the
     // credential would send an unauthenticated call upstream and mis-record it as
     // credentialed. Return 502 and audit `injected: false` instead.
-    let injected = match ctx.injector.inject(&host, &mut headers) {
+    let injected = match ctx.injector.inject(&host, &mut headers).await {
         InjectOutcome::Injected => true,
         // Owned host but no credential presented, or a host this injector does
         // not own: forward as-is, uninjected. Not a failure — the secret is
