@@ -31,7 +31,7 @@ use http::header::{
 use http::{Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
@@ -117,7 +117,13 @@ impl ProxyHandle {
     /// return the guest-reachable port + the token to present.
     pub async fn register_sandbox(&self, ctx: SandboxContext) -> Result<SandboxBinding> {
         let token_hex = ctx.token.to_hex();
-        let server_config = ctx.ca.server_config();
+        // Building the server config pre-mints a leaf certificate per allowed
+        // upstream (ECDSA keygen + sign) — CPU-bound work kept off the async
+        // runtime, like `ProxyCa::generate`.
+        let ca = ctx.ca.clone();
+        let server_config = tokio::task::spawn_blocking(move || ca.server_config())
+            .await
+            .map_err(|e| Error::Network(format!("proxy server-config task join failed: {e}")))?;
         let acceptor = TlsAcceptor::from(server_config);
 
         let listener = TcpListener::bind(guest_accessible_bind_addr(0))
@@ -305,8 +311,9 @@ async fn proxy_request(
 
     let (parts, body) = req.into_parts();
     let mut headers = parts.headers;
+    // strip_hop_by_hop already removes the proxy token (it is in the hop-by-hop
+    // set) along with the RFC 7230 §6.1 connection-scoped headers.
     strip_hop_by_hop(&mut headers);
-    headers.remove(HeaderName::from_static(PROXY_TOKEN_HEADER));
     headers.remove(HOST);
     // The body is re-originated as an unknown-length stream (chunked), so drop
     // any inbound Content-Length: forwarding it alongside chunked framing is the
@@ -344,15 +351,16 @@ async fn proxy_request(
         .unwrap_or("/");
     let url = format!("https://{host}:{}{path_and_query}", ctx.upstream_port);
 
-    let body_stream = body.into_data_stream();
-    let upstream_body = reqwest::Body::wrap_stream(body_stream);
-
-    let response = upstream
-        .request(parts.method, &url)
-        .headers(headers)
-        .body(upstream_body)
-        .send()
-        .await;
+    // Framing is owned by this hop: the inbound Content-Length was already
+    // stripped, and a body is re-originated as an unknown-length (chunked)
+    // stream. Attach that stream only when the request actually has a body — a
+    // bodyless GET/HEAD must not be re-framed as an empty chunked message, which
+    // some upstreams reject.
+    let mut outgoing = upstream.request(parts.method, &url).headers(headers);
+    if body.size_hint().exact() != Some(0) {
+        outgoing = outgoing.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    }
+    let response = outgoing.send().await;
 
     ctx.audit.record(EgressEvent {
         host: host.to_string(),
@@ -379,7 +387,12 @@ fn relay_upstream_response(upstream_resp: reqwest::Response) -> Response<ProxyBo
     let mut builder = Response::builder().status(status);
     if let Some(out_headers) = builder.headers_mut() {
         for (name, value) in upstream_resp.headers() {
-            if !is_hop_by_hop(name) {
+            // Semantic headers pass through; framing headers are hop-owned.
+            // Transfer-Encoding is already in the hop-by-hop set; drop the
+            // upstream Content-Length too, since the body is re-framed as an
+            // unknown-length stream and a forwarded length could desync from the
+            // bytes actually emitted.
+            if !is_hop_by_hop(name) && name != CONTENT_LENGTH {
                 out_headers.append(name.clone(), value.clone());
             }
         }
