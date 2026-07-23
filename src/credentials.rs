@@ -246,7 +246,7 @@ pub fn stage_codex_credentials(creds_json: &SecretString) -> Result<StagedCreden
 /// These are the values the bundled claude-code uses for its own refresh flow.
 /// They are provider-controlled and load-bearing, so they must be re-verified in
 /// the V2 OAuth-acceptance validation (RFC-0002 rollout) and on every claude-code
-/// version bump (R9) before this path is relied on against a real subscription.
+/// version bump before this path is relied on against a real subscription.
 const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -257,7 +257,7 @@ const ACCESS_TOKEN_SKEW: Duration = Duration::from_secs(300);
 /// Floor on the spacing between refresh attempts. A single-use refresh token must
 /// not be spent in a tight loop, so when a refresh fails or a token is already
 /// expired, callers fail closed until this interval elapses rather than hammering
-/// the token endpoint. The store is the sole rotation owner (R12).
+/// the token endpoint. The store is the sole rotation owner.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Overall deadline for one refresh round-trip. Without it, a token endpoint that
@@ -300,21 +300,21 @@ const CREDENTIALS_LOCK_NAME: &str = ".voidbox-claude-credentials.lock";
 /// [`access_token`](ClaudeOAuthStore::access_token); the durable refresh token
 /// never leaves this process. Secrets are held in [`SecretString`] (zeroized on
 /// drop). `mlock` + `PR_SET_DUMPABLE=0` land with the out-of-process proxy
-/// hardening, alongside the R10 process split the M0 proxy also defers.
+/// hardening, alongside the process split the M0 proxy also defers.
 pub struct ClaudeOAuthStore {
     /// Host path of the durable credential file; the write-back target.
     creds_path: PathBuf,
-    /// Token endpoint (the pinned Anthropic URL in production; overridable in
+    /// Token endpoint (the pinned Anthropic URL on the real path; overridable in
     /// tests via [`with_token_endpoint`](ClaudeOAuthStore::with_token_endpoint)).
     token_url: String,
-    /// HTTP client for the token endpoint. In production it resolves through the
+    /// HTTP client for the token endpoint. On the real path it resolves through the
     /// SSRF guard and ignores any ambient `HTTPS_PROXY`, mirroring the proxy's
     /// upstream client; tests swap in a client pointed at a loopback mock.
     http: reqwest::Client,
     /// Serialized token state. A `tokio` mutex so a refresh (which awaits a
     /// network round-trip) holds the lock across the await, forcing concurrent
     /// callers to wait for and reuse the one refresh rather than each spending the
-    /// single-use refresh token (R12).
+    /// single-use refresh token.
     state: Mutex<TokenState>,
 }
 
@@ -379,15 +379,15 @@ impl ClaudeOAuthStore {
     }
 
     /// Point the store at a different token endpoint. A test/override seam
-    /// (mirroring [`ProxyHandle::new`](crate::proxy::ProxyHandle::new)): production
-    /// uses the pinned Anthropic URL, tests target a loopback mock.
+    /// (mirroring [`ProxyHandle::new`](crate::proxy::ProxyHandle::new)): the real
+    /// path uses the pinned Anthropic URL, tests target a loopback mock.
     pub fn with_token_endpoint(mut self, url: impl Into<String>) -> Self {
         self.token_url = url.into();
         self
     }
 
     /// Replace the HTTP client so a loopback mock is reachable without the SSRF
-    /// guard rejecting it. A test/override seam; production uses the SSRF-guarded
+    /// guard rejecting it. A test/override seam; the real path uses the SSRF-guarded
     /// client from [`build_token_client`].
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
@@ -425,7 +425,7 @@ impl ClaudeOAuthStore {
         Ok(state.access_token.clone())
     }
 
-    /// Snapshot the durable refresh token for the R14 audit — the host-side
+    /// Snapshot the durable refresh token for the no-credential-in-guest audit — the host-side
     /// "no durable secret in the guest" check. The value already lives in host
     /// memory; the audit only searches the staged env/files for it and drops it.
     pub async fn durable_secret_snapshot(&self) -> SecretString {
@@ -601,7 +601,7 @@ impl TokenState {
     }
 }
 
-/// Build the production token-endpoint client: no redirects (a credential must
+/// Build the token-endpoint client: no redirects (a credential must
 /// not chase a redirect), no ambient proxy, and SSRF-guarded resolution so a
 /// rebound token-endpoint name cannot steer the refresh at an internal target.
 ///
@@ -649,7 +649,7 @@ fn read_on_disk(path: &Path) -> Option<TokenState> {
 /// held lock. `guard` must be the lock acquired for `path`; it is dropped here,
 /// after the durable rename, so the lock spans the whole read-refresh-write cycle.
 ///
-/// R12: a non-atomic or raced write to a single-use refresh token risks account
+/// A non-atomic or raced write to a single-use refresh token risks account
 /// lockout. The temp-file swap means a concurrent reader never observes a
 /// half-written credential.
 fn write_document(path: &Path, document: &Value, guard: FlockGuard) -> Result<()> {
