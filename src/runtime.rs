@@ -834,7 +834,7 @@ fn build_pipeline_box_with_io(
     // Stage the OAuth credential file into the guest only when this box is NOT
     // using the credential proxy. With the proxy active the durable refresh token
     // stays in the host store and is injected at egress; staging it here would put
-    // the durable secret where the uid-1000 agent can read it (R14). A per-box
+    // the durable secret where the uid-1000 agent can read it. A per-box
     // `credential_proxy` can be on while the top-level (which `staged_creds` was
     // prepared from) is off, so this decision must read the effective per-box llm.
     let box_uses_proxy = effective_llm.and_then(|l| l.credential_proxy) == Some(true);
@@ -1369,7 +1369,7 @@ fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredent
         // With the credential proxy active, the durable OAuth refresh token stays
         // in the host store ([`crate::credentials::ClaudeOAuthStore`]) and is
         // injected at egress; staging it into the guest would put the durable
-        // secret where the uid-1000 agent can read it (R14). So skip
+        // secret where the uid-1000 agent can read it. So skip
         // discovery/staging entirely here.
         Some(l)
             if l.provider.eq_ignore_ascii_case("claude-personal")
