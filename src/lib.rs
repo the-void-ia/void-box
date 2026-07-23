@@ -95,6 +95,7 @@ pub mod image;
 pub mod llm;
 pub mod persistence;
 pub mod pipeline;
+pub mod proxy;
 pub mod runtime;
 pub mod sidecar;
 pub mod skill;

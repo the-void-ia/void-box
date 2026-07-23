@@ -1,0 +1,267 @@
+//! Host-side proxy that mediates a guest's outbound connections at the host
+//! boundary. It provides two capabilities over one per-connection pipeline:
+//! credential injection and egress control.
+//!
+//! # Capabilities
+//!
+//! **Credential injection** rewrites a guest's placeholder credential header
+//! with a host-held secret at egress. **Egress control** decides, audits, and
+//! routes which destinations a guest may reach. Each is a pipeline stage,
+//! carried as a trait object on [`SandboxContext`] and selected per sandbox:
+//! the credential [`CredentialInjector`], and the egress `EgressPolicy` /
+//! tunnel / `AuditSink` handlers. M0 implements the credential injector; the
+//! egress track (RFC-0002 "Egress profiles") supplies the policy, tunnel, and
+//! audit stages.
+//!
+//! # Extending the pipeline
+//!
+//! The accept/relay loop in [`server`] is fixed; a milestone extends the proxy
+//! by swapping the trait objects on [`SandboxContext`], not by editing that
+//! loop. At the injector stage the OAuth milestone (RFC-0002 M1a) adds an
+//! OAuth-backed [`CredentialInjector`] for OAuth providers (the static one
+//! serves API-key providers). At the policy and audit stages the egress track
+//! (RFC-0002 "Egress profiles") replaces [`AllowAllPolicy`] and
+//! [`DebugAuditSink`] with the real policy, tunnel, and audit handlers.
+//!
+//! ```text
+//! guest conn ─▶ [auth]        per-sandbox token → resolve SandboxContext (else reject+close)
+//!            ─▶ [destination] CONNECT host / TLS SNI / base-URL host
+//!            ─▶ [policy]      EgressPolicy::decision        (M0: AllowAll)
+//!            ─▶ [injector]    CredentialInjector::inject    (M0: static API key)
+//!               (egress-track alt: Tunnel — CONNECT pass-through, no TLS-term)
+//!            ─▶ [audit]       AuditSink::record             (M0: debug log)
+//!            ─▶ upstream      resolve per connection, reject internal IPs (SSRF guard)
+//! ```
+//!
+//! # Process model — known deviation from the design
+//!
+//! The design (ADR-0003) places the proxy in a **separate low-privilege
+//! process** from the host runtime: it parses attacker-controlled
+//! HTTP/TLS/CONNECT bytes on the host, in the hot path before any auth gate, so a
+//! parser compromise must not also be a host-runtime compromise. M0 does
+//! **not** do that yet — the pipeline runs as in-process tokio tasks inside the
+//! host runtime, so a parser-RCE here is a host-runtime RCE. That is an accepted
+//! M0 shortcut, not the designed end state, and it is a hardening step the
+//! design still requires. The untrusted parsing is kept behind the [`server`]
+//! boundary so moving it out-of-process is a deployment change rather than a
+//! caller-visible one. The containment invariant — no durable secret in the
+//! guest — does not depend on the split; the split bounds blast radius if the
+//! parser is exploited.
+//!
+//! # Snapshot / restore
+//!
+//! The design re-mints the per-sandbox CA and token on snapshot restore, because
+//! a snapshot that captured guest-held proxy material and reused it verbatim
+//! would defeat "per-sandbox ephemeral". A snapshot taken while the proxy is
+//! active *does* capture the guest's copy of the token and the CA public cert in
+//! guest RAM. What makes that harmless in M0 is the host side: the CA
+//! private key and the credential store never enter guest RAM, the cmdline, or
+//! `vmm::snapshot` state, and the host listener + token are minted at agent-run
+//! time and torn down when the run ends — so a restored guest's captured token
+//! has no live listener to present to. The one residual is snapshot-then-clone
+//! while the original is still running: the clone's captured token could reach
+//! the original's live listener over the shared host-loopback mapping and get a
+//! real key injected. That window closes with re-mint-on-restore, which becomes
+//! load-bearing once provisioning moves to cold boot (kernel cmdline), in M1.
+
+use std::sync::Arc;
+
+use http::HeaderMap;
+use tracing::debug;
+
+pub mod ca;
+pub mod injector;
+pub mod provision;
+pub mod server;
+pub mod ssrf;
+pub mod token;
+
+pub use ca::ProxyCa;
+pub use injector::{ApiKeyScheme, StaticApiKeyInjector};
+pub use provision::{
+    assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedUpstream,
+    GUEST_HOSTS_PATH,
+};
+pub use server::{start_proxy, ProxyHandle, SandboxBinding};
+pub use token::{ProxyToken, PROXY_TOKEN_HEADER};
+
+/// Outcome of the egress-policy stage for a destination host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// The destination may be reached.
+    Allow,
+    /// The destination is blocked; `reason` is for the audit log.
+    Deny { reason: String },
+}
+
+impl Decision {
+    /// Whether the decision permits the connection.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Decision::Allow)
+    }
+}
+
+/// One audited egress decision. M0 records the destination and whether a
+/// credential was injected; the egress track (RFC-0002) extends this with
+/// bytes/timing.
+#[derive(Debug, Clone)]
+pub struct EgressEvent {
+    /// Destination hostname (CONNECT host or TLS SNI).
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// Request path, without the query string. The endpoint is the useful
+    /// audit signal; query parameters are excluded because a client can place
+    /// secrets there and the audit log must never record credentials.
+    pub path: String,
+    /// Whether the policy stage allowed the connection.
+    pub allowed: bool,
+    /// Whether a credential header was injected on this connection.
+    pub injected: bool,
+}
+
+/// Outcome of the credential-injection stage for one request. Four states,
+/// because the caller must fail closed on a failed injection but forward the
+/// other cases uninjected — a single boolean cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// A credential header was written for this host.
+    Injected,
+    /// This injector does not own `host`; no credential applies, and the request
+    /// proceeds unchanged.
+    NotOwned,
+    /// This injector owns `host`, but the request carried no credential header
+    /// for its scheme, so it was not a request the client meant to authenticate
+    /// with this credential. The injector adds nothing — introducing the secret
+    /// into a request that never carried it would expose it to an endpoint that
+    /// did not ask for it — and the request proceeds unchanged.
+    NoCredentialHeader,
+    /// This injector owns `host` but could not produce a valid credential header
+    /// (e.g. a malformed key). The caller must reject the request rather than
+    /// forward it uncredentialed.
+    Failed,
+}
+
+/// Rewrites the credential header(s) on a request bound for `host` with the
+/// host-held secret. M0 ships [`StaticApiKeyInjector`]; the OAuth milestone
+/// (RFC-0002 M1a) adds an implementation that mints a short-lived Bearer per
+/// call. Both
+/// coexist behind this trait, selected per provider and auth mode: OAuth
+/// providers use the new one, API-key providers keep the static injector.
+pub trait CredentialInjector: Send + Sync {
+    /// Inject the credential for `host` into `headers`, replacing any
+    /// guest-supplied placeholder.
+    ///
+    /// Returns an [`InjectOutcome`] so the caller can fail closed on a failed
+    /// injection and the audit log records ground truth rather than re-deriving
+    /// it from the allow-set (the two can diverge once a sandbox permits more
+    /// upstreams than the injector owns).
+    fn inject(&self, host: &str, headers: &mut HeaderMap) -> InjectOutcome;
+}
+
+/// Decides whether a destination host may be reached. The egress track
+/// (RFC-0002 "Egress profiles") replaces the M0 [`AllowAllPolicy`] with the
+/// FQDN allow-list.
+pub trait EgressPolicy: Send + Sync {
+    /// Decide reachability for `host`.
+    fn decision(&self, host: &str) -> Decision;
+}
+
+/// Records egress decisions. The egress track (RFC-0002) routes this into
+/// `src/observe/`.
+pub trait AuditSink: Send + Sync {
+    /// Record one egress decision.
+    fn record(&self, event: EgressEvent);
+}
+
+/// M0 egress policy: allow every destination. Reach is unrestricted until the
+/// egress track (RFC-0002 "Egress profiles") lands; credential containment
+/// holds regardless.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AllowAllPolicy;
+
+impl EgressPolicy for AllowAllPolicy {
+    fn decision(&self, _host: &str) -> Decision {
+        Decision::Allow
+    }
+}
+
+/// M0 audit sink: emit each decision at `debug`. Never logs payloads or
+/// credentials — only the destination and the allow/inject flags.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DebugAuditSink;
+
+impl AuditSink for DebugAuditSink {
+    fn record(&self, event: EgressEvent) {
+        debug!(
+            host = %event.host,
+            port = event.port,
+            path = %event.path,
+            allowed = event.allowed,
+            injected = event.injected,
+            "proxy egress"
+        );
+    }
+}
+
+/// Per-sandbox state the proxy resolves from a presented [`ProxyToken`]. Holds the
+/// pipeline's swappable handler stages plus the sandbox's CA and the set of
+/// upstream hostnames the sandbox is permitted to reach (also the CA's name
+/// constraints).
+#[derive(Clone)]
+pub struct SandboxContext {
+    /// Per-sandbox auth token the guest presents on each connection.
+    pub token: ProxyToken,
+    /// Per-sandbox name-constrained CA used to terminate the guest's TLS.
+    pub ca: Arc<ProxyCa>,
+    /// Credential-rewrite stage.
+    pub injector: Arc<dyn CredentialInjector>,
+    /// Reachability stage.
+    pub policy: Arc<dyn EgressPolicy>,
+    /// Audit stage.
+    pub audit: Arc<dyn AuditSink>,
+    /// Upstream hosts this sandbox may reach (CA name-constraint + SSRF allow-set).
+    pub allowed_upstreams: Vec<String>,
+    /// Port to re-originate to on the upstream host. Always 443 for a real HTTPS
+    /// upstream; overridable so tests can target a local mock.
+    pub upstream_port: u16,
+}
+
+/// Default upstream port: HTTPS.
+pub const DEFAULT_UPSTREAM_PORT: u16 = 443;
+
+impl SandboxContext {
+    /// Build a sandbox context with the M0 default policy (allow-all) and audit
+    /// sink (debug log). The CA is name-constrained to `allowed_upstreams`.
+    pub fn new(
+        token: ProxyToken,
+        ca: Arc<ProxyCa>,
+        injector: Arc<dyn CredentialInjector>,
+        allowed_upstreams: Vec<String>,
+    ) -> Self {
+        Self {
+            token,
+            ca,
+            injector,
+            policy: Arc::new(AllowAllPolicy),
+            audit: Arc::new(DebugAuditSink),
+            allowed_upstreams,
+            upstream_port: DEFAULT_UPSTREAM_PORT,
+        }
+    }
+
+    /// Override the upstream port (default 443). Intended for tests targeting a
+    /// local mock upstream.
+    pub fn with_upstream_port(mut self, port: u16) -> Self {
+        self.upstream_port = port;
+        self
+    }
+
+    /// Whether `host` is in this sandbox's permitted upstream set. Used both as the
+    /// SSRF allow-set and to mirror the CA's name constraints at request time.
+    pub fn permits_upstream(&self, host: &str) -> bool {
+        self.allowed_upstreams
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    }
+}

@@ -16,6 +16,12 @@ Cut sentences whose subject is the document itself rather than its subject matte
 
 For example, prefer "This design adds the following components:" (followed by the list) over "This design adds the following components. The rest of the RFC refers to them by name, so they are defined here first; later sections describe each in full."
 
+## Document the design, not the deliberation
+
+Describe what is being built and how it works — not the reasoning that produced it. Cut the internal deliberation: the alternatives weighed, why one option won, and emphatic framing that betrays a settled argument ("the whole point of X", "the same concern at two granularities", a "X, not Y" heading, a rhetorical "this raises the obvious question…"). A reader wants the mechanism and the structural constraint, not the debate that reached them. Design rationale — the alternatives and trade-offs — has a home: the RFC's "Alternatives considered" and "Risks & trade-offs" sections. State it there once; don't re-argue it in the design narrative, in an ADR, or in code comments.
+
+For example, prefer "The proxy provides two capabilities over one pipeline: credential injection and egress control." over "Credential injection and egress are the same concern at two granularities, so one process keeps memory cost fixed rather than linear in VM count."
+
 ## Prefer standard terms; don't coin jargon
 
 Use the field's established vocabulary rather than invented shorthand — a reader should never have to decode a term the doc made up. Avoid three habits: **coined compounds** ("daemon-vs-proxy", "name-at-the-proxy") — write what they mean ("the process boundary between the daemon and the proxy"); **load-bearing metaphors** ("the floor", "north star") — name the mechanism ("default-deny, non-bypassable network-layer enforcement"); **unexpanded abbreviations** ("per-ns") — spell them out on first use ("per-network-namespace"). When a precise term of art exists (default-deny, fail-closed, complete mediation, chokepoint), use it; otherwise describe the mechanism in plain words rather than minting a noun. If a coined term is unavoidable, define it once at first use and reuse that exact spelling — don't let it sprout variants ("network floor" / "reach floor" / "per-VM floor" for one idea).
