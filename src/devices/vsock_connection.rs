@@ -637,15 +637,21 @@ impl VsockConnectionMap {
         self.connections.remove(&(guest_port, host_port));
     }
 
-    /// Poll every established connection's host stream once: forward data
-    /// to the guest and reap connections whose host application closed.
+    /// Poll every connection's host stream once — regardless of state:
+    /// forward data on established connections to the guest, buffer data
+    /// read during `Connecting` in `tx_buf` (forwarded by `flush_tx_buf`
+    /// when the guest's OP_RESPONSE lands), and reap connections whose
+    /// host application closed.
     ///
-    /// Reaping here is load-bearing, not hygiene. A closed-but-unreaped
-    /// stream stays in the worker's level-triggered epoll set where EOF
-    /// reads as perpetually ready, so each leaked connection turns the
-    /// worker's poll loop into a busy spin that starves the vCPU threads —
-    /// and abandoned control-channel handshake attempts create such
-    /// connections on every boot.
+    /// Reaping here is load-bearing, not hygiene, and it must cover every
+    /// state. A closed-but-unreaped stream stays in the worker's
+    /// level-triggered epoll set where EOF reads as perpetually ready, so
+    /// each leaked connection turns the worker's poll loop into a busy
+    /// spin that starves the vCPU threads. Abandoned control-channel
+    /// handshake attempts create such connections on every boot, and an
+    /// abandoned attempt whose OP_RESPONSE never completes leaves its
+    /// connection parked in `Connecting` — a sweep restricted to
+    /// established connections can never reap it.
     ///
     /// Returns `true` if anything was queued for the guest (data or RSTs),
     /// i.e. the guest should be signaled.
@@ -653,13 +659,12 @@ impl VsockConnectionMap {
         let mut forwards: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         let mut closed: Vec<(u32, u32)> = Vec::new();
         for ((guest_port, host_port), conn) in self.connections.iter_mut() {
-            if conn.state != ConnState::Connected {
-                continue;
-            }
             match conn.read_from_host() {
                 HostReadOutcome::Data(_) => {
-                    let data = conn.tx_buf.drain(..).collect::<Vec<_>>();
-                    forwards.push((*guest_port, *host_port, data));
+                    if conn.state == ConnState::Connected {
+                        let data = conn.tx_buf.drain(..).collect::<Vec<_>>();
+                        forwards.push((*guest_port, *host_port, data));
+                    }
                 }
                 HostReadOutcome::NoData => {}
                 HostReadOutcome::Closed => closed.push((*guest_port, *host_port)),
@@ -802,6 +807,24 @@ mod tests {
         assert_eq!(hdr.dst_port, 1234);
         assert_eq!(hdr.src_port, 50000);
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn drain_host_streams_reaps_closed_connecting_connections() {
+        let mut map = VsockConnectionMap::new_without_listener(42);
+        let (host_side, peer) = UnixStream::pair().unwrap();
+        let conn = VsockConnection::new(1234, 50002, host_side);
+        assert_eq!(conn.state, ConnState::Connecting);
+        map.connections.insert((1234, 50002), conn);
+
+        drop(peer);
+        let queued_for_guest = map.drain_host_streams();
+
+        assert!(queued_for_guest, "an RST must be queued for the guest");
+        assert!(
+            map.connections.is_empty(),
+            "a Connecting connection whose host side closed must be reaped"
+        );
     }
 
     #[test]
