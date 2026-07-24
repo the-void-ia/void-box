@@ -155,7 +155,7 @@ pub enum InjectOutcome {
 /// completes without awaiting; the OAuth injector awaits the credential store,
 /// which serializes refreshes so concurrent requests share one token mint rather
 /// than each triggering their own. It runs inside the per-connection request
-/// task ([`server::proxy_request`]), so awaiting here never blocks the accept
+/// task (`server::proxy_request`), so awaiting here never blocks the accept
 /// loop or another sandbox's traffic.
 #[async_trait]
 pub trait CredentialInjector: Send + Sync {

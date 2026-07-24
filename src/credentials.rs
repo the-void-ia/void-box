@@ -294,7 +294,7 @@ const CREDENTIALS_LOCK_NAME: &str = ".voidbox-claude-credentials.lock";
 /// double-spend the single-use refresh token), and the rotated token is written
 /// back atomically so subsequent runs stay valid. This does not extend to the
 /// operator's own `claude-code`, which does not take the lock (see
-/// [`CREDENTIALS_LOCK_NAME`]).
+/// `CREDENTIALS_LOCK_NAME`).
 ///
 /// The injection proxy asks it for a currently-valid access token per request via
 /// [`access_token`](ClaudeOAuthStore::access_token); the durable refresh token
@@ -388,14 +388,14 @@ impl ClaudeOAuthStore {
 
     /// Replace the HTTP client so a loopback mock is reachable without the SSRF
     /// guard rejecting it. A test/override seam; the real path uses the SSRF-guarded
-    /// client from [`build_token_client`].
+    /// client from `build_token_client`.
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http = client;
         self
     }
 
     /// Return a currently-valid access token, refreshing if the cached one has
-    /// expired or is within [`ACCESS_TOKEN_SKEW`] of expiry. Serialized:
+    /// expired or is within `ACCESS_TOKEN_SKEW` of expiry. Serialized:
     /// concurrent callers wait on and reuse a single refresh.
     ///
     /// Fails closed (`Err`) rather than returning a stale token — the proxy turns
