@@ -200,6 +200,7 @@ impl VsockConnection {
                 HostReadOutcome::Data(n)
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => HostReadOutcome::NoData,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => HostReadOutcome::NoData,
             Err(_) => HostReadOutcome::Closed,
         }
     }

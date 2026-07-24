@@ -420,6 +420,12 @@ mod tests {
         let path_bytes = socket_path.as_os_str().as_bytes();
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(
+            path_bytes.len() < addr.sun_path.len(),
+            "socket path too long for sun_path; the test would silently bind a \
+             truncated path and pass vacuously: {}",
+            socket_path.display()
+        );
         for (dst, src) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
             *dst = *src as libc::c_char;
         }
