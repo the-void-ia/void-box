@@ -187,6 +187,17 @@ jobs:
         # would expand to `/boot/vmlinuz-` and force the run body to
         # override it anyway. Set everything in the run body via
         # `uname -r` and skip the dead env: block.
+        #
+        # The full suite takes well under a minute when healthy; the step
+        # timeout keeps a hung test from consuming the whole 60-minute job
+        # budget and attributes the cancellation to this step.
+        # VOID_BOX_DIAGNOSTIC=1 makes VM-creation/exec errors panic with
+        # the full error chain instead of gracefully skipping, so a boot
+        # failure on the runner surfaces as a red test with a cause rather
+        # than a silently green skip.
+        timeout-minutes: 20
+        env:
+          VOID_BOX_DIAGNOSTIC: "1"
         run: |
           KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
           if [ ! -f "$KERNEL_COPY" ]; then

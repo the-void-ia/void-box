@@ -19,6 +19,19 @@ use crate::{Error, Result};
 /// vsock port used by the guest agent
 pub const GUEST_AGENT_PORT: u32 = 1234;
 
+/// Bound on the blocking `connect(2)` to the userspace backend's Unix socket.
+///
+/// The backend's accept loop starts only once the guest driver reaches
+/// DRIVER_OK, and a listener's accept backlog is drained only by `accept(2)`
+/// — an attempt the client has already closed still occupies its slot. While
+/// the guest is booting, control-channel handshake retries can therefore
+/// fill the backlog, and an unbounded `connect(2)` on a full backlog blocks
+/// indefinitely, where the retry loop's deadline (checked between attempts)
+/// can never fire. Applying `SO_SNDTIMEO` for the duration of the connect
+/// turns that into an error the retry loop handles like any other failed
+/// attempt.
+const UNIX_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Reserved CIDs (see vsock(7))
 pub const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
 pub const VMADDR_CID_HYPERVISOR: u32 = 0;
@@ -198,28 +211,73 @@ impl VsockStream {
     /// Connect via AF_UNIX to the userspace vsock backend.
     ///
     /// Sends the target guest port as a 4-byte LE header after connecting.
+    ///
+    /// The `connect(2)` is bounded by [`UNIX_CONNECT_TIMEOUT`]; the timeout
+    /// is cleared once connected so the established stream keeps ordinary
+    /// blocking-write semantics.
     pub fn connect_unix(socket_path: &std::path::Path, port: u32) -> Result<Self> {
-        use std::os::unix::net::UnixStream;
+        use std::os::unix::ffi::OsStrExt;
 
-        let stream = UnixStream::connect(socket_path).map_err(|e| {
-            Error::Guest(format!(
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if socket_fd < 0 {
+            return Err(Error::Guest(format!(
+                "Failed to create Unix socket for vsock backend: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut stream = Self { fd: socket_fd };
+
+        stream
+            .set_send_timeout(Some(UNIX_CONNECT_TIMEOUT))
+            .map_err(|e| {
+                Error::Guest(format!(
+                    "Failed to set connect timeout on vsock Unix socket: {}",
+                    e
+                ))
+            })?;
+
+        let path_bytes = socket_path.as_os_str().as_bytes();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        if path_bytes.len() >= addr.sun_path.len() {
+            return Err(Error::Guest(format!(
+                "vsock Unix socket path too long: {}",
+                socket_path.display()
+            )));
+        }
+        for (dst, src) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+            *dst = *src as libc::c_char;
+        }
+
+        let connect_result = unsafe {
+            libc::connect(
+                socket_fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if connect_result < 0 {
+            return Err(Error::Guest(format!(
                 "Failed to connect to vsock Unix socket {}: {}",
                 socket_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        stream.set_send_timeout(None).map_err(|e| {
+            Error::Guest(format!(
+                "Failed to clear connect timeout on vsock Unix socket: {}",
                 e
             ))
         })?;
 
-        // Send the port number as a 4-byte LE header
         let port_bytes = port.to_le_bytes();
-        (&stream).write_all(&port_bytes).map_err(|e| {
+        stream.write_all(&port_bytes).map_err(|e| {
             Error::Guest(format!("Failed to send port to vsock Unix socket: {}", e))
         })?;
 
-        let fd = stream.as_raw_fd();
-        // Prevent the UnixStream from closing the fd — we own it now
-        std::mem::forget(stream);
-
-        Ok(Self { fd })
+        Ok(stream)
     }
 
     /// Duplicates the underlying file descriptor and returns a new [`VsockStream`].
@@ -242,6 +300,20 @@ impl VsockStream {
 
     /// Sets the read timeout (e.g. for handshake). Pass `None` for blocking.
     pub fn set_read_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
+        self.set_socket_timeout(libc::SO_RCVTIMEO, duration)
+    }
+
+    /// Sets the send timeout, which also bounds a blocking `connect(2)`.
+    /// Pass `None` for blocking.
+    fn set_send_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
+        self.set_socket_timeout(libc::SO_SNDTIMEO, duration)
+    }
+
+    fn set_socket_timeout(
+        &self,
+        option: libc::c_int,
+        duration: Option<Duration>,
+    ) -> std::io::Result<()> {
         let tv = match duration {
             None => libc::timeval {
                 tv_sec: 0,
@@ -256,7 +328,7 @@ impl VsockStream {
             libc::setsockopt(
                 self.fd,
                 libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
+                option,
                 &tv as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::timeval>() as libc::socklen_t,
             )
@@ -326,5 +398,71 @@ mod tests {
         assert_eq!(VMADDR_CID_HYPERVISOR, 0);
         assert_eq!(VMADDR_CID_LOCAL, 1);
         assert_eq!(VMADDR_CID_HOST, 2);
+    }
+
+    /// A listener whose accept queue is full must fail the connect attempt
+    /// rather than block it indefinitely: the userspace backend accepts only
+    /// after the guest driver reaches DRIVER_OK, so during boot the control
+    /// channel's handshake retries run against exactly this condition.
+    #[test]
+    fn connect_unix_fails_instead_of_blocking_on_full_backlog() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp_dir = std::env::temp_dir();
+        let socket_path =
+            tmp_dir.join(format!("void-box-backlog-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener_fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(listener_fd >= 0, "listener socket creation failed");
+
+        let path_bytes = socket_path.as_os_str().as_bytes();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+            *dst = *src as libc::c_char;
+        }
+        let bind_result = unsafe {
+            libc::bind(
+                listener_fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(bind_result, 0, "bind failed");
+        let listen_result = unsafe { libc::listen(listener_fd, 0) };
+        assert_eq!(listen_result, 0, "listen failed");
+
+        let mut queued = Vec::new();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        loop {
+            let path = socket_path.clone();
+            let attempt_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                let _ = attempt_tx.send(VsockStream::connect_unix(&path, GUEST_AGENT_PORT));
+            });
+            match result_rx.recv_timeout(UNIX_CONNECT_TIMEOUT + Duration::from_secs(5)) {
+                Ok(Ok(stream)) => {
+                    queued.push(stream);
+                    assert!(
+                        queued.len() < 64,
+                        "backlog 0 accepted {} connects without an accept(2); \
+                         expected the queue to fill almost immediately",
+                        queued.len()
+                    );
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    panic!(
+                        "connect_unix blocked past its timeout on a full accept \
+                         backlog instead of returning an error"
+                    );
+                }
+            }
+        }
+
+        unsafe { libc::close(listener_fd) };
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

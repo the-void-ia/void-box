@@ -902,30 +902,11 @@ fn worker_thread(
                     }
                 }
             } else {
-                // Data from a host stream — read and buffer
-                let _fd_idx = event.u64 as usize;
+                // Data from a host stream — read, buffer, and reap
+                // connections whose host application closed (their fds
+                // close on removal, which deregisters them from epoll).
                 if let Ok(mut map) = conn_map.lock() {
-                    // Find the connection by iterating (indexed by fd position)
-                    let conn_data: Vec<_> = map
-                        .connections
-                        .iter_mut()
-                        .filter(|(_, c)| {
-                            c.state == crate::devices::vsock_connection::ConnState::Connected
-                        })
-                        .map(|((gp, hp), c)| {
-                            let n = c.read_from_host();
-                            if n > 0 {
-                                let data = c.tx_buf.drain(..).collect::<Vec<_>>();
-                                Some((*gp, *hp, data))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    for entry in conn_data.into_iter().flatten() {
-                        let (gp, hp, data) = entry;
-                        map.queue_host_data(gp, hp, &data);
+                    if map.drain_host_streams() {
                         had_data = true;
                     }
                 }
@@ -943,23 +924,7 @@ fn worker_thread(
 
         // Also poll all connected streams periodically (every iteration)
         if let Ok(mut map) = conn_map.lock() {
-            let conn_data: Vec<_> = map
-                .connections
-                .iter_mut()
-                .filter(|(_, c)| c.state == crate::devices::vsock_connection::ConnState::Connected)
-                .filter_map(|((gp, hp), c)| {
-                    let n = c.read_from_host();
-                    if n > 0 {
-                        let data = c.tx_buf.drain(..).collect::<Vec<_>>();
-                        Some((*gp, *hp, data))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            for (gp, hp, data) in conn_data {
-                map.queue_host_data(gp, hp, &data);
+            if map.drain_host_streams() {
                 had_data = true;
             }
         }
