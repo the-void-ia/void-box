@@ -212,7 +212,7 @@ impl VsockStream {
     ///
     /// Sends the target guest port as a 4-byte LE header after connecting.
     ///
-    /// The `connect(2)` is bounded by [`UNIX_CONNECT_TIMEOUT`]; the timeout
+    /// The `connect(2)` is bounded by `UNIX_CONNECT_TIMEOUT`; the timeout
     /// is cleared once connected so the established stream keeps ordinary
     /// blocking-write semantics.
     pub fn connect_unix(socket_path: &std::path::Path, port: u32) -> Result<Self> {
