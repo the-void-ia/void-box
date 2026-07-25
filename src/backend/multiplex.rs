@@ -23,7 +23,7 @@
 //! 3. Writes the framed request through the shared [`FrameSender`] from
 //!    a `spawn_blocking` task — the send is a blocking write that a
 //!    `tokio` timeout could not preempt on an async task — bounded by
-//!    [`SEND_DEADLINE`].
+//!    the per-frame `SEND_DEADLINE`.
 //! 4. Awaits the matching response on its channel.
 //!
 //! A single dedicated reader thread owns the read half of the stream,
