@@ -900,7 +900,12 @@ all required gates are explicit.
   export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)   # Linux
   export VOID_BOX_KERNEL=target/vmlinux-arm64        # macOS
   ```
-- VM suites require usable KVM/vsock (not only device presence).
+- Guest image builds compile `guest-agent` for the musl target: `rustup target add $(uname -m)-unknown-linux-musl` once per host. `.cargo/config.toml` pins the linker to `<arch>-linux-musl-gcc`; on hosts without a musl cross-toolchain (e.g. Fedora), point cargo at the toolchain's bundled LLD instead — `guest-agent` is pure Rust and links statically with it (verified on x86_64 and aarch64):
+  ```bash
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld    # x86_64 host
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld   # aarch64 host
+  ```
+- VM suites require usable KVM/vsock (not only device presence). Beware: when `VOID_BOX_INITRAMFS` points at a missing file, the VM suites skip and still report `ok` — skip reasons go to test-captured stdout, invisible without `--nocapture`. Sub-second suite wall-times mean nothing booted; check that the image builds actually produced their artifacts before trusting a green run.
 
 ### Standard validation sequence
 
