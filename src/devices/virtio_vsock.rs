@@ -229,7 +229,7 @@ impl VsockStream {
         let mut stream = Self { fd: socket_fd };
 
         stream
-            .set_send_timeout(Some(UNIX_CONNECT_TIMEOUT))
+            .set_write_timeout(Some(UNIX_CONNECT_TIMEOUT))
             .map_err(|e| {
                 Error::Guest(format!(
                     "Failed to set connect timeout on vsock Unix socket: {}",
@@ -265,7 +265,7 @@ impl VsockStream {
             )));
         }
 
-        stream.set_send_timeout(None).map_err(|e| {
+        stream.set_write_timeout(None).map_err(|e| {
             Error::Guest(format!(
                 "Failed to clear connect timeout on vsock Unix socket: {}",
                 e
@@ -303,9 +303,10 @@ impl VsockStream {
         self.set_socket_timeout(libc::SO_RCVTIMEO, duration)
     }
 
-    /// Sets the send timeout, which also bounds a blocking `connect(2)`.
+    /// Sets the write timeout, bounding each blocking wait inside a
+    /// write (and, on a connecting socket, the blocking `connect(2)`).
     /// Pass `None` for blocking.
-    fn set_send_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_write_timeout(&self, duration: Option<Duration>) -> std::io::Result<()> {
         self.set_socket_timeout(libc::SO_SNDTIMEO, duration)
     }
 

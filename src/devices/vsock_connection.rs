@@ -153,6 +153,20 @@ pub struct VsockConnection {
     pub rx_cnt: u32,
     /// Pending data to send to the guest (buffered from host stream).
     pub tx_buf: Vec<u8>,
+    /// Guest→host bytes accepted from the guest but not yet fully
+    /// written to the host stream — the remainder of a short write on
+    /// the non-blocking stream. Private so it moves in lockstep with
+    /// `fwd_cnt`: credit advances only when bytes actually reach the
+    /// stream.
+    ///
+    /// Bytes before `host_write_pos` are already delivered. Flushing
+    /// advances the cursor instead of draining the front, so the flush
+    /// path never memmoves the backlog while the worker holds the
+    /// connection-map lock the vCPU threads need; the buffer is
+    /// compacted only when the next packet arrives.
+    host_write_buf: Vec<u8>,
+    /// Cursor into `host_write_buf`: bytes before it are delivered.
+    host_write_pos: usize,
 }
 
 impl VsockConnection {
@@ -170,6 +184,8 @@ impl VsockConnection {
             fwd_cnt: 0,
             rx_cnt: 0,
             tx_buf: Vec::new(),
+            host_write_buf: Vec::new(),
+            host_write_pos: 0,
         }
     }
 
@@ -205,9 +221,91 @@ impl VsockConnection {
         }
     }
 
-    /// Write data from guest to the host stream.
-    pub fn write_to_host(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.stream.write(data)
+    /// Deliver guest→host bytes to the host stream, preserving order.
+    ///
+    /// A single non-blocking `write` can accept only part of a packet;
+    /// treating `Ok(n)` as full delivery silently drops the tail of the
+    /// frame, and the host's multiplex reader then stalls mid-frame
+    /// waiting for bytes that never arrive. Bytes the stream does not
+    /// accept immediately are therefore buffered and re-attempted by
+    /// [`flush_host_writes`](Self::flush_host_writes) on the worker's
+    /// next sweep.
+    ///
+    /// `fwd_cnt` advances only for bytes actually written to the stream,
+    /// so buffered bytes stay counted against the credit advertised to
+    /// the guest and a stalled host application throttles the guest
+    /// instead of growing the buffer without bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream write fails (the connection must
+    /// be reset), or if buffering `data` would exceed the advertised
+    /// `buf_alloc`. A conforming guest never trips the credit bound —
+    /// it cannot have more than `buf_alloc` bytes outstanding — so the
+    /// check exists to cap host memory against an untrusted guest that
+    /// ignores credit.
+    pub fn write_to_host(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if self.host_write_pos > 0 {
+            self.host_write_buf.drain(..self.host_write_pos);
+            self.host_write_pos = 0;
+        }
+        if self.host_write_buf.len() + data.len() > self.buf_alloc as usize {
+            return Err(std::io::Error::other(format!(
+                "guest exceeded advertised credit: {} buffered + {} new > buf_alloc {}",
+                self.host_write_buf.len(),
+                data.len(),
+                self.buf_alloc
+            )));
+        }
+        self.host_write_buf.extend_from_slice(data);
+        self.flush_host_writes().map(|_| ())
+    }
+
+    /// Attempts to deliver buffered guest→host bytes to the host stream,
+    /// advancing `fwd_cnt` by the bytes delivered.
+    ///
+    /// Returns the number of bytes delivered by this call, so the
+    /// worker sweep can announce credit freed by a deferred flush.
+    /// Stops without error when the stream signals `WouldBlock`; the
+    /// worker retries on its next sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream write fails or reports
+    /// end-of-stream; the caller must reset the connection.
+    pub fn flush_host_writes(&mut self) -> std::io::Result<usize> {
+        let mut delivered = 0usize;
+        while self.host_write_pos < self.host_write_buf.len() {
+            match self
+                .stream
+                .write(&self.host_write_buf[self.host_write_pos..])
+            {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "host stream accepted no bytes",
+                    ));
+                }
+                Ok(written) => {
+                    self.host_write_pos += written;
+                    delivered += written;
+                    self.fwd_cnt = self.fwd_cnt.wrapping_add(written as u32);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if self.host_write_pos == self.host_write_buf.len() {
+            self.host_write_buf.clear();
+            self.host_write_pos = 0;
+        }
+        Ok(delivered)
+    }
+
+    /// Whether guest→host bytes are still waiting on the host stream.
+    pub fn has_pending_host_writes(&self) -> bool {
+        self.host_write_pos < self.host_write_buf.len()
     }
 }
 
@@ -399,11 +497,10 @@ impl VsockConnectionMap {
                     };
                     if conn.state == ConnState::Connected && !data.is_empty() {
                         match conn.write_to_host(data) {
-                            Ok(n) => {
-                                conn.fwd_cnt = conn.fwd_cnt.wrapping_add(n as u32);
+                            Ok(()) => {
                                 trace!(
-                                    "vsock: forwarded {} bytes to host (port={})",
-                                    n,
+                                    "vsock: accepted {} bytes for host (port={})",
+                                    data.len(),
                                     hdr.dst_port
                                 );
                             }
@@ -639,10 +736,11 @@ impl VsockConnectionMap {
     }
 
     /// Poll every connection's host stream once — regardless of state:
-    /// forward data on established connections to the guest, buffer data
-    /// read during `Connecting` in `tx_buf` (forwarded by `flush_tx_buf`
-    /// when the guest's OP_RESPONSE lands), and reap connections whose
-    /// host application closed.
+    /// retry buffered guest→host writes, forward data on established
+    /// connections to the guest, buffer data read during `Connecting` in
+    /// `tx_buf` (forwarded by `flush_tx_buf` when the guest's
+    /// OP_RESPONSE lands), and reap connections whose host application
+    /// closed.
     ///
     /// Reaping here is load-bearing, not hygiene, and it must cover every
     /// state. A closed-but-unreaped stream stays in the worker's
@@ -659,7 +757,25 @@ impl VsockConnectionMap {
     pub fn drain_host_streams(&mut self) -> bool {
         let mut forwards: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         let mut closed: Vec<(u32, u32)> = Vec::new();
+        let mut credit_updates: Vec<(u32, u32)> = Vec::new();
         for ((guest_port, host_port), conn) in self.connections.iter_mut() {
+            if conn.has_pending_host_writes() {
+                match conn.flush_host_writes() {
+                    // A deferred flush advances fwd_cnt with no other
+                    // packet to carry it, and the guest may be parked
+                    // on exhausted credit waiting for exactly this —
+                    // announce the freed credit unsolicited.
+                    Ok(delivered) if delivered > 0 => {
+                        credit_updates.push((*guest_port, *host_port));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("vsock: flushing buffered host write failed: {}", e);
+                        closed.push((*guest_port, *host_port));
+                        continue;
+                    }
+                }
+            }
             match conn.read_from_host() {
                 HostReadOutcome::Data(_) => {
                     if conn.state == ConnState::Connected {
@@ -676,11 +792,36 @@ impl VsockConnectionMap {
             self.queue_host_data(guest_port, host_port, &data);
             queued_for_guest = true;
         }
+        for (guest_port, host_port) in credit_updates {
+            self.queue_credit_update(guest_port, host_port);
+            queued_for_guest = true;
+        }
         for (guest_port, host_port) in closed {
             self.close_host_connection(guest_port, host_port);
             queued_for_guest = true;
         }
         queued_for_guest
+    }
+
+    /// Queue an unsolicited `OP_CREDIT_UPDATE` announcing the
+    /// connection's current `fwd_cnt` and `buf_alloc` to the guest.
+    fn queue_credit_update(&mut self, guest_port: u32, host_port: u32) {
+        let Some(conn) = self.connections.get(&(guest_port, host_port)) else {
+            return;
+        };
+        let update = VsockHeader {
+            src_cid: HOST_CID,
+            dst_cid: self.guest_cid,
+            src_port: host_port,
+            dst_port: guest_port,
+            len: 0,
+            r#type: 1,
+            op: VsockOp::CreditUpdate as u16,
+            flags: 0,
+            buf_alloc: conn.buf_alloc,
+            fwd_cnt: conn.fwd_cnt,
+        };
+        self.rx_queue.push((update, Vec::new()));
     }
 
     fn next_ephemeral_port(&self) -> u32 {
@@ -870,5 +1011,156 @@ mod tests {
             }
         }
         assert!(saw_rst, "the reap must queue an RST for the guest");
+    }
+
+    fn shrink_socket_buffer(fd: RawFd, option: libc::c_int) {
+        let size: libc::c_int = 4096;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "setsockopt failed");
+    }
+
+    /// A non-blocking stream that accepts only part of a packet must not
+    /// lose the tail: the remainder is buffered, later flushes deliver
+    /// it in order, and `fwd_cnt` covers exactly the delivered bytes.
+    #[test]
+    fn write_to_host_buffers_short_writes_without_data_loss() {
+        let (host_side, mut peer) = UnixStream::pair().unwrap();
+        shrink_socket_buffer(host_side.as_raw_fd(), libc::SO_SNDBUF);
+        shrink_socket_buffer(peer.as_raw_fd(), libc::SO_RCVBUF);
+        let mut conn = VsockConnection::new(1234, 50000, host_side);
+        conn.state = ConnState::Connected;
+
+        let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        conn.write_to_host(&payload).unwrap();
+        assert!(
+            conn.has_pending_host_writes(),
+            "with shrunken socket buffers a 128 KiB write must be short"
+        );
+        assert!(
+            (conn.fwd_cnt as usize) < payload.len(),
+            "fwd_cnt must cover only delivered bytes, not buffered ones"
+        );
+
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut read_buf = [0u8; 8192];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while received.len() < payload.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not complete within 30 s: {}/{} bytes received",
+                received.len(),
+                payload.len()
+            );
+            conn.flush_host_writes().unwrap();
+            match peer.read(&mut read_buf) {
+                Ok(0) => panic!("peer saw EOF before all bytes arrived"),
+                Ok(read_len) => received.extend_from_slice(&read_buf[..read_len]),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+        assert_eq!(received, payload, "every byte must arrive, in order");
+        assert_eq!(conn.fwd_cnt as usize, payload.len());
+        assert!(!conn.has_pending_host_writes());
+    }
+
+    /// A guest that keeps sending past the advertised credit window must
+    /// get an error (the caller resets the connection) instead of
+    /// growing the pending buffer without bound.
+    #[test]
+    fn write_to_host_rejects_credit_overrun() {
+        let (host_side, peer) = UnixStream::pair().unwrap();
+        shrink_socket_buffer(host_side.as_raw_fd(), libc::SO_SNDBUF);
+        shrink_socket_buffer(peer.as_raw_fd(), libc::SO_RCVBUF);
+        let mut conn = VsockConnection::new(1234, 50001, host_side);
+        conn.state = ConnState::Connected;
+
+        // Fill the advertised window; nobody reads the peer side, so
+        // nearly all of it stays buffered.
+        let window = conn.buf_alloc as usize;
+        conn.write_to_host(&vec![0u8; window]).unwrap();
+        assert!(conn.has_pending_host_writes());
+
+        let overrun = conn
+            .write_to_host(&[0u8; 64 * 1024])
+            .expect_err("writing past the credit window must fail");
+        assert!(
+            overrun.to_string().contains("credit"),
+            "unexpected error: {overrun}"
+        );
+        drop(peer);
+    }
+
+    /// A flush that delivers deferred bytes advances `fwd_cnt` with no
+    /// other packet to carry it; the sweep must announce the freed
+    /// credit unsolicited, or a guest parked on exhausted credit never
+    /// wakes.
+    #[test]
+    fn deferred_flush_announces_credit_update() {
+        let mut map = VsockConnectionMap::new_without_listener(42);
+        let (host_side, mut peer) = UnixStream::pair().unwrap();
+        shrink_socket_buffer(host_side.as_raw_fd(), libc::SO_SNDBUF);
+        shrink_socket_buffer(peer.as_raw_fd(), libc::SO_RCVBUF);
+        let mut conn = VsockConnection::new(1234, 50002, host_side);
+        conn.state = ConnState::Connected;
+
+        let payload = vec![7u8; 64 * 1024];
+        conn.write_to_host(&payload).unwrap();
+        assert!(conn.has_pending_host_writes());
+        map.connections.insert((1234, 50002), conn);
+
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut read_buf = [0u8; 8192];
+        let mut credit_update_count = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let pending = map
+                .connections
+                .get(&(1234, 50002))
+                .is_some_and(|c| c.has_pending_host_writes());
+            if !pending {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deferred flush did not complete within 30 s"
+            );
+            // Make room on the stream, then let the sweep flush.
+            match peer.read(&mut read_buf) {
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+            let queued_for_guest = map.drain_host_streams();
+            for (hdr, _) in map.drain_rx() {
+                if hdr.op == VsockOp::CreditUpdate as u16 {
+                    credit_update_count += 1;
+                    assert!(queued_for_guest, "a credit update must signal the guest");
+                    assert_eq!(hdr.dst_port, 1234);
+                    assert_eq!(hdr.src_port, 50002);
+                }
+            }
+        }
+        assert!(
+            credit_update_count > 0,
+            "deferred delivery must queue an unsolicited OP_CREDIT_UPDATE"
+        );
+        let final_fwd_cnt = map.connections.get(&(1234, 50002)).unwrap().fwd_cnt;
+        assert_eq!(final_fwd_cnt as usize, payload.len());
     }
 }

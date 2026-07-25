@@ -32,6 +32,10 @@ impl GuestStream for VsockStream {
         VsockStream::set_read_timeout(self, timeout)
     }
 
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        VsockStream::set_write_timeout(self, timeout)
+    }
+
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         std::os::unix::io::AsRawFd::as_raw_fd(self)
     }

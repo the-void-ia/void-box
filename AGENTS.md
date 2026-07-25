@@ -188,15 +188,17 @@ Dispatch per RPC:
 2. Caller registers a dispatch slot (oneshot or stream) keyed on
    that id.
 3. Caller writes the framed request through a shared `FrameSender`
-   behind a `Mutex` (serializes writes across concurrent RPCs).
+   behind a `Mutex` (serializes writes across concurrent RPCs). The
+   write runs on a `spawn_blocking` task with a per-wait send timeout
+   (`SO_SNDTIMEO`) on the stream and a hard per-frame deadline
+   covering mutex queueing and trickle-fed writes. A send that fails
+   before any byte reaches the stream fails only its own RPC; a send
+   that truncates a frame mid-write (or exceeds the deadline) marks
+   the channel dead — the wire can no longer be trusted for framing —
+   and the next RPC reconnects.
 4. Caller awaits the matching response on its slot channel.
 
-One dedicated reader thread per channel owns the read half of the
-stream, demultiplexes each incoming frame by its `request_id`, and
-delivers the message to the registered slot. When the reader detects
-end-of-stream or a fatal protocol error, it marks the channel dead,
-fails every still-pending slot, and exits. The next RPC reconstructs
-the channel.
+One dedicated reader thread per channel owns the read half of the stream, demultiplexes each incoming frame by its `request_id`, and delivers the message to the registered slot. The read half carries a bounded `SO_RCVTIMEO`: between read attempts the reader checks a shared shutdown flag (set by explicit shutdown, by a send that truncated a frame or exceeded the per-frame deadline, or when the last channel handle drops), so the reader can exit without waiting for EOF; the timeout never surfaces to the framing layer, so an idle-but-healthy channel is unaffected. A peer that stays silent while its socket stays open is indistinguishable from an idle one at this layer — bounding that is the per-RPC timeouts' job. When the reader sees end-of-stream, a fatal protocol error, or the shutdown flag, it marks the channel dead, fails every still-pending slot, and exits. The next RPC reconstructs the channel.
 
 ### Synchronous I/O wrapped in `spawn_blocking`
 
@@ -232,10 +234,17 @@ Every public `async fn` on `ControlChannel` follows the same shape:
 
 1. **Serialize** the outgoing message on the caller's async task
    (cheap, non-blocking).
-2. **Clone** the `Arc` fields (`connector`, `boot_wait_done`) and
-   copy `session_secret`.
-3. **`spawn_blocking`**: allocate `request_id` → register dispatch
-   slot → write framed request → await slot.
+2. **Establish** the multiplex channel lazily. The connect + handshake
+   runs in `spawn_blocking`, and the whole establishment await —
+   including the channel mutex and the blocking-task join — is bounded
+   by the connect deadline plus a fixed margin, because it runs before
+   any per-RPC timeout wrapper is armed.
+3. Allocate `request_id` → register dispatch slot → **`spawn_blocking`**
+   the framed-request write (bounded by the per-frame send deadline)
+   → await the slot on the async task. One-shot RPCs await under a
+   per-RPC timeout; exec awaits under the exec timeout unless service
+   mode requests none; telemetry streams await for the channel's
+   lifetime by design.
 
 Handshake (`connect_with_handshake_sync`) is a regular `fn` using
 `std::thread::sleep` for backoff. It runs once per channel lifetime

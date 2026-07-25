@@ -30,7 +30,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 use void_box_protocol::SessionSecret;
 
-use crate::backend::multiplex::{FrameSender, MultiplexChannel, Terminator};
+use crate::backend::multiplex::{FrameSender, MultiplexChannel, SendError, Terminator};
 use crate::guest::protocol::{
     ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, Message,
     MessageType, MkdirPRequest, MkdirPResponse, PtyOpenRequest, ReadFileRequest, ReadFileResponse,
@@ -69,6 +69,36 @@ pub const GUEST_AGENT_PORT: u32 = 1234;
 /// LLM inference (especially with local models via Ollama on CPU) can take
 /// 10+ minutes per turn for complex prompts with tool definitions.
 const DEFAULT_EXEC_READ_TIMEOUT: Duration = Duration::from_secs(1200);
+
+/// Per-blocking-wait bound on multiplex frame writes to the guest.
+///
+/// Applied as the send timeout (`SO_SNDTIMEO`) on the post-handshake
+/// writer half. The bound covers each blocking wait inside `write_all`,
+/// not the whole frame: a slow-but-draining guest resets it with every
+/// accepted chunk, so only a guest that stops draining the socket
+/// entirely trips it. A timed-out write may leave a truncated frame on
+/// the wire, so the multiplex layer marks the channel dead and the next
+/// RPC reconnects.
+const MULTIPLEX_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval at which the multiplex reader re-checks the channel's
+/// shutdown flag while blocked on a read.
+///
+/// Applied as `SO_RCVTIMEO` on the post-handshake reader half.
+/// [`GuestStreamReader`] swallows each timeout and retries, so the
+/// framing layer above never observes it; the interval only bounds how
+/// long reader-thread exit lags a shutdown or channel-death signal.
+const READER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Slack added to [`connect_deadline`] when bounding channel
+/// establishment at the async layer.
+///
+/// Establishment awaits the channel mutex and a `spawn_blocking` join,
+/// neither of which the inner connect/handshake deadline covers: a
+/// caller can spend up to a full deadline queued behind a concurrent
+/// establish before its own attempt starts. The margin gives the inner
+/// loop its full window in that worst case.
+const ESTABLISH_TIMEOUT_MARGIN: Duration = Duration::from_secs(30);
 
 /// Deadline for the connect/handshake loop against a booting guest.
 ///
@@ -114,6 +144,10 @@ fn resolve_exec_read_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
 pub trait GuestStream: Read + Write + Send {
     /// Sets the read timeout. `None` means blocking (no timeout).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Sets the write timeout, bounding each blocking wait inside a
+    /// write. `None` means blocking (no timeout).
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 
     /// Returns the underlying file descriptor for this stream.
     fn as_raw_fd(&self) -> RawFd;
@@ -241,14 +275,32 @@ impl ControlChannel {
     /// Returns the lazily-established [`MultiplexChannel`], constructing
     /// or reconstructing it if the current one is absent or dead.
     ///
+    /// Bounded end-to-end: this await runs *before* every per-RPC
+    /// timeout wrapper, so without its own deadline a wedged
+    /// establishment (a mutex holder that never returns, a blocking
+    /// task that never joins) would hang the RPC with no timer armed
+    /// anywhere.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Guest`] if the underlying connect + handshake
-    /// fails, or if the peer does not advertise
-    /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`].
+    /// fails, if the peer does not advertise
+    /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`], or if establishment exceeds
+    /// the connect deadline plus [`ESTABLISH_TIMEOUT_MARGIN`].
     ///
     /// [`PROTO_FLAG_SUPPORTS_MULTIPLEX`]: void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX
     async fn get_or_establish_channel(&self) -> Result<MultiplexChannel> {
+        let deadline = connect_deadline() + ESTABLISH_TIMEOUT_MARGIN;
+        match tokio::time::timeout(deadline, self.get_or_establish_channel_unbounded()).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Guest(format!(
+                "multiplex channel establishment timed out after {deadline:?} \
+                 (includes time queued behind concurrent establish attempts)"
+            ))),
+        }
+    }
+
+    async fn get_or_establish_channel_unbounded(&self) -> Result<MultiplexChannel> {
         let mut guard = self.channel.lock().await;
 
         if let Some(channel) = guard.as_ref() {
@@ -781,31 +833,83 @@ fn upgrade_stream_to_multiplex(
         ))
     })?;
 
-    reader_stream.set_read_timeout(None).map_err(|e| {
-        Error::Guest(format!(
-            "control_channel[{context}]: failed to clear read timeout on reader fd: {e}"
-        ))
-    })?;
+    // The dup'd fds share one underlying socket, so both timeouts apply
+    // to it: reads use the receive timeout, writes the send timeout.
+    // This also replaces the handshake read timeout left on the socket.
+    reader_stream
+        .set_read_timeout(Some(READER_SHUTDOWN_POLL_INTERVAL))
+        .map_err(|e| {
+            Error::Guest(format!(
+                "control_channel[{context}]: failed to set read timeout on reader fd: {e}"
+            ))
+        })?;
+    writer_stream
+        .set_write_timeout(Some(MULTIPLEX_SEND_TIMEOUT))
+        .map_err(|e| {
+            Error::Guest(format!(
+                "control_channel[{context}]: failed to set send timeout on writer fd: {e}"
+            ))
+        })?;
 
+    let shutdown = Arc::new(AtomicBool::new(false));
     let reader: Box<dyn Read + Send> = Box::new(GuestStreamReader {
         inner: reader_stream,
+        shutdown: Arc::clone(&shutdown),
     });
     let sender: Arc<dyn FrameSender> = Arc::new(StreamFrameSender {
         stream: StdMutex::new(writer_stream),
+        shutdown: Arc::clone(&shutdown),
     });
 
-    Ok(MultiplexChannel::new(reader, sender))
+    Ok(MultiplexChannel::new(reader, sender, shutdown))
 }
 
 /// Adapts a [`Box<dyn GuestStream>`] into [`Box<dyn Read + Send>`] for the
-/// multiplex reader thread.
+/// multiplex reader thread, giving the blocked reader a shutdown check.
+///
+/// The stream carries a bounded read timeout
+/// ([`READER_SHUTDOWN_POLL_INTERVAL`]); without one, a reader blocked on
+/// a peer that stalls without closing its fd is unreachable — channel
+/// death would be detectable only via EOF. The timeout must not escape
+/// this adapter: the framing layer above (`Message::read_from_sync`)
+/// treats any error as fatal, and a timeout surfacing between a frame's
+/// header and payload would kill a healthy channel that is merely idle.
+/// So timeouts are swallowed and the read retried, and when the shutdown
+/// flag is set the read reports end-of-stream, which drives the reader
+/// loop through its normal fail-pending-slots exit path.
 struct GuestStreamReader {
     inner: Box<dyn GuestStream>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Read for GuestStreamReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            match self.inner.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // On a conforming blocking socket the receive
+                    // timeout paces this loop at one iteration per
+                    // interval; if the fd were ever non-blocking,
+                    // `WouldBlock` would return instantly and the loop
+                    // would spin a core. The sleep caps that at ~100
+                    // iterations/s and is invisible next to the 1 s
+                    // tick on the normal path.
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                result => return result,
+            }
+        }
     }
 }
 
@@ -818,18 +922,62 @@ impl Read for GuestStreamReader {
 /// typically < 64 KiB, so contention is minimal.
 struct StreamFrameSender {
     stream: StdMutex<Box<dyn GuestStream>>,
+    /// Checked under the stream mutex before writing. A failed send may
+    /// leave a truncated frame on the wire; a sender already queued on
+    /// the mutex at that moment would otherwise append a well-formed
+    /// frame right after the truncated bytes, handing the guest's
+    /// framing layer garbage that can alias as a valid message. The
+    /// mutex-held check closes that window: once the channel is marked
+    /// dead, queued senders bail before touching the stream.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl FrameSender for StreamFrameSender {
-    fn send(&self, frame: &[u8]) -> Result<()> {
-        let mut guard = self
-            .stream
-            .lock()
-            .map_err(|_| Error::Guest("multiplex sender stream poisoned".into()))?;
-        guard
-            .write_all(frame)
-            .map_err(|e| Error::Guest(format!("frame send failed: {e}")))?;
+    fn send(&self, frame: &[u8]) -> std::result::Result<(), SendError> {
+        let mut guard = self.stream.lock().map_err(|_| {
+            SendError::NothingSent(Error::Guest("multiplex sender stream poisoned".into()))
+        })?;
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(SendError::NothingSent(Error::Guest(
+                "frame send failed: channel is shut down".into(),
+            )));
+        }
+        // Hand-rolled write loop instead of `write_all`: on failure the
+        // channel's fate depends on whether any byte of this frame
+        // reached the wire, and `write_all` discards that. A send
+        // timeout with zero progress (e.g. the socket buffer was
+        // already full under transient starvation) fails only this RPC;
+        // a mid-frame failure poisons the wire and kills the channel.
+        let mut written = 0usize;
+        while written < frame.len() {
+            match guard.write(&frame[written..]) {
+                Ok(0) => {
+                    let error = Error::Guest(format!(
+                        "frame send failed after {written}/{} bytes: stream accepted no bytes",
+                        frame.len()
+                    ));
+                    return Err(classify_send_error(written, error));
+                }
+                Ok(bytes_written) => written += bytes_written,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let error = Error::Guest(format!(
+                        "frame send failed after {written}/{} bytes: {e}",
+                        frame.len()
+                    ));
+                    return Err(classify_send_error(written, error));
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+fn classify_send_error(bytes_written: usize, error: Error) -> SendError {
+    if bytes_written == 0 {
+        SendError::NothingSent(error)
+    } else {
+        SendError::Truncated(error)
     }
 }
 
@@ -869,6 +1017,148 @@ fn ensure_response_type(msg: &Message, expected: MessageType, context: &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::net::UnixStream;
+
+    use crate::backend::multiplex::{build_frame, decode_payload};
+
+    /// [`GuestStream`] over a Unix socket pair, standing in for the
+    /// vsock transports — same fd semantics, no VM required.
+    struct UnixGuestStream {
+        stream: UnixStream,
+    }
+
+    impl Read for UnixGuestStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for UnixGuestStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    impl GuestStream for UnixGuestStream {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.stream.set_read_timeout(timeout)
+        }
+
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.stream.set_write_timeout(timeout)
+        }
+
+        fn as_raw_fd(&self) -> RawFd {
+            std::os::unix::io::AsRawFd::as_raw_fd(&self.stream)
+        }
+
+        fn try_clone_box(&self) -> io::Result<Box<dyn GuestStream>> {
+            Ok(Box::new(UnixGuestStream {
+                stream: self.stream.try_clone()?,
+            }))
+        }
+    }
+
+    /// The reader's bounded read timeout must never surface mid-frame: a
+    /// guest that pauses longer than the poll interval between a frame's
+    /// header bytes is idle, not dead, and the response must still be
+    /// delivered intact.
+    #[tokio::test]
+    async fn multiplex_reader_preserves_framing_across_timeout_ticks() {
+        let (host_side, mut guest_side) = UnixStream::pair().expect("socket pair");
+        let host_stream: Box<dyn GuestStream> = Box::new(UnixGuestStream { stream: host_side });
+        let channel = upgrade_stream_to_multiplex(host_stream, "test").expect("upgrade");
+
+        let guest = std::thread::spawn(move || {
+            let request = Message::read_from_sync(&mut guest_side).expect("read request");
+            let (request_id, _body) = decode_payload(&request.payload).expect("payload");
+            let frame = build_frame(MessageType::Pong, request_id, b"ack");
+            // Split the response mid-header, pausing past the reader's
+            // poll interval so a timeout fires with a frame in flight.
+            guest_side.write_all(&frame[..3]).expect("write head");
+            std::thread::sleep(READER_SHUTDOWN_POLL_INTERVAL + Duration::from_millis(300));
+            guest_side.write_all(&frame[3..]).expect("write tail");
+        });
+
+        // Derived from the poll interval so raising the production
+        // constant cannot silently turn this assertion into a timeout.
+        let outer_deadline = READER_SHUTDOWN_POLL_INTERVAL + Duration::from_secs(4);
+        let response = tokio::time::timeout(
+            outer_deadline,
+            channel.call(MessageType::Ping, b"hello".to_vec()),
+        )
+        .await
+        .expect("call must not hang")
+        .expect("split frame must still parse");
+        assert_eq!(response.msg_type, MessageType::Pong);
+        assert_eq!(response.payload, b"ack");
+        guest.join().expect("guest thread");
+    }
+
+    /// `shutdown()` must unblock a pending RPC whose guest went silent
+    /// without closing its fd — the case EOF-based death detection
+    /// cannot see.
+    #[tokio::test]
+    async fn multiplex_shutdown_fails_pending_rpc_on_silent_guest() {
+        let (host_side, guest_side) = UnixStream::pair().expect("socket pair");
+        let host_stream: Box<dyn GuestStream> = Box::new(UnixGuestStream { stream: host_side });
+        let channel = upgrade_stream_to_multiplex(host_stream, "test").expect("upgrade");
+
+        let pending_channel = channel.clone();
+        let pending = tokio::spawn(async move {
+            pending_channel
+                .call(MessageType::Ping, b"hello".to_vec())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        channel.shutdown();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("pending call must fail promptly after shutdown")
+            .expect("task must not panic");
+        assert!(result.is_err(), "pending call must error after shutdown");
+        // guest_side stayed open throughout: the channel died without EOF.
+        drop(guest_side);
+    }
+
+    /// Once the channel is marked dead, a sender that was queued on the
+    /// stream mutex must not write: the wire may hold a truncated frame,
+    /// and appending a well-formed frame after it would desynchronize
+    /// the guest's framing.
+    #[test]
+    fn frame_sender_refuses_to_write_after_shutdown() {
+        let (host_side, mut guest_side) = UnixStream::pair().expect("socket pair");
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let sender = StreamFrameSender {
+            stream: StdMutex::new(Box::new(UnixGuestStream { stream: host_side })),
+            shutdown: Arc::clone(&shutdown),
+        };
+
+        let err = sender
+            .send(b"frame bytes")
+            .expect_err("send after shutdown must fail");
+        assert!(
+            matches!(err, SendError::NothingSent(Error::Guest(ref msg)) if msg.contains("shut down")),
+            "expected a clean NothingSent failure, got {err:?}"
+        );
+
+        guest_side
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+        let mut probe = [0u8; 1];
+        let read_result = guest_side.read(&mut probe);
+        assert!(
+            read_result.is_err(),
+            "no bytes may reach the wire after shutdown"
+        );
+    }
 
     /// Env mutation is process-global; this is the only test touching the
     /// variable, and it restores the unset state before returning.

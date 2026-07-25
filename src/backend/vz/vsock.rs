@@ -31,6 +31,33 @@ impl VzSocketStream {
     pub fn from_fd(fd: RawFd) -> Self {
         Self { fd }
     }
+
+    fn set_socket_timeout(&self, option: libc::c_int, timeout: Option<Duration>) -> io::Result<()> {
+        let tv = match timeout {
+            Some(d) => libc::timeval {
+                tv_sec: d.as_secs() as libc::time_t,
+                tv_usec: d.subsec_micros() as libc::suseconds_t,
+            },
+            None => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        };
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                option,
+                &tv as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for VzSocketStream {
@@ -67,30 +94,11 @@ impl Write for VzSocketStream {
 
 impl GuestStream for VzSocketStream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let tv = match timeout {
-            Some(d) => libc::timeval {
-                tv_sec: d.as_secs() as libc::time_t,
-                tv_usec: d.subsec_micros() as libc::suseconds_t,
-            },
-            None => libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-        };
-        let ret = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        self.set_socket_timeout(libc::SO_RCVTIMEO, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_socket_timeout(libc::SO_SNDTIMEO, timeout)
     }
 
     fn as_raw_fd(&self) -> RawFd {

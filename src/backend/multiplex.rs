@@ -20,7 +20,10 @@
 //!
 //! 1. Allocates a fresh `request_id` via an [`AtomicU32`] counter.
 //! 2. Registers a dispatch slot (oneshot or stream) keyed on that id.
-//! 3. Writes the framed request through the shared [`FrameSender`].
+//! 3. Writes the framed request through the shared [`FrameSender`] from
+//!    a `spawn_blocking` task — the send is a blocking write that a
+//!    `tokio` timeout could not preempt on an async task — bounded by
+//!    [`SEND_DEADLINE`].
 //! 4. Awaits the matching response on its channel.
 //!
 //! A single dedicated reader thread owns the read half of the stream,
@@ -35,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +57,19 @@ pub const REQUEST_ID_PREFIX: usize = 4;
 /// Each exec streams `ExecOutputChunk` frames at up to a few hundred
 /// per second; 128 absorbs short bursts without blocking the reader.
 const STREAM_BUFFER: usize = 128;
+
+/// Hard ceiling on one frame send, covering mutex queueing and every
+/// blocking wait inside the write.
+///
+/// The stream's own send timeout bounds each blocking wait, not the
+/// whole frame: a peer that accepts a trickle of bytes resets it
+/// indefinitely, and a sender queued behind other writers waits with
+/// no timer of its own. RPC-level timeouts cannot bound this either —
+/// the exec and telemetry stream sends run before their response
+/// timeouts arm. Sixty seconds is far past any healthy send (frames
+/// normally clear in milliseconds), while still converting a wedged
+/// wire into an error instead of a permanent hang.
+const SEND_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How a response for a given request_id is delivered to its caller.
 ///
@@ -93,6 +109,31 @@ pub enum Terminator {
     ChannelLifetime,
 }
 
+/// Failure modes of [`FrameSender::send`], distinguished by what they
+/// imply about the wire.
+///
+/// The channel's fate after a failed send depends on whether any byte
+/// of the frame reached the stream: a send that failed cleanly leaves
+/// only whole frames on the wire and the channel can keep serving
+/// other RPCs, while a truncated frame desynchronizes the peer's
+/// framing layer and the channel must die.
+#[derive(Debug)]
+pub enum SendError {
+    /// The failure happened before any byte of this frame reached the
+    /// stream.
+    NothingSent(Error),
+    /// Part of the frame was written before the failure.
+    Truncated(Error),
+}
+
+impl SendError {
+    fn into_error(self) -> Error {
+        match self {
+            SendError::NothingSent(e) | SendError::Truncated(e) => e,
+        }
+    }
+}
+
 /// Writes framed messages to the shared guest connection.
 ///
 /// Implementations must be thread-safe and must ensure that bytes from
@@ -104,18 +145,21 @@ pub trait FrameSender: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Guest`] if the underlying stream write fails
-    /// or if the channel has been marked dead.
-    fn send(&self, frame: &[u8]) -> Result<()>;
+    /// Returns [`SendError::NothingSent`] if the write failed before
+    /// any byte reached the stream (including when the channel has
+    /// been marked dead), [`SendError::Truncated`] if the frame was
+    /// partially written.
+    fn send(&self, frame: &[u8]) -> std::result::Result<(), SendError>;
 }
 
 /// Handle to the persistent multiplexed control channel.
 ///
 /// Clones share the same underlying reader thread and pending-slot
-/// table. Dropping the final handle releases this shared state, but
-/// does not by itself shut down the reader thread; the reader exits
-/// only when the underlying connection is closed or a read error
-/// occurs.
+/// table. Dropping the final handle sets the shared shutdown flag;
+/// a reader whose stream checks the flag between bounded read
+/// attempts exits within one poll interval, while a reader on a
+/// plain blocking stream exits only when the connection closes or a
+/// read error occurs.
 #[derive(Clone)]
 pub struct MultiplexChannel {
     inner: Arc<Inner>,
@@ -125,6 +169,18 @@ struct Inner {
     writer: Arc<dyn FrameSender>,
     pending: Arc<Mutex<PendingTable>>,
     next_id: AtomicU32,
+    /// Cooperative shutdown signal shared with the reader's stream
+    /// adapter. Set when the channel is shut down, when a send
+    /// truncates a frame or exceeds [`SEND_DEADLINE`] (the wire can no
+    /// longer be trusted for framing), or when the last channel handle
+    /// drops.
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
 }
 
 struct PendingTable {
@@ -149,17 +205,28 @@ impl MultiplexChannel {
     /// dispatch fails — when the reader hits EOF, a protocol error, or
     /// sees the writer's [`FrameSender`] dropped.
     ///
+    /// `shutdown` is shared with the reader's stream: the channel sets it
+    /// on [`shutdown`](Self::shutdown), on a failed send, and when the
+    /// last handle drops, and a stream adapter that checks it between
+    /// bounded read attempts converts it into end-of-stream so the reader
+    /// exits without waiting for the peer to close.
+    ///
     /// # Errors
     ///
     /// Construction itself cannot fail; errors surface on the first
     /// [`call`](Self::call) or [`call_stream`](Self::call_stream) once
     /// the reader thread marks the channel dead.
-    pub fn new(reader: Box<dyn Read + Send>, writer: Arc<dyn FrameSender>) -> Self {
+    pub fn new(
+        reader: Box<dyn Read + Send>,
+        writer: Arc<dyn FrameSender>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
         let pending = Arc::new(Mutex::new(PendingTable::new()));
         let inner = Arc::new(Inner {
             writer,
             pending: Arc::clone(&pending),
             next_id: AtomicU32::new(1),
+            shutdown,
         });
 
         let reader_pending = Arc::clone(&pending);
@@ -196,7 +263,7 @@ impl MultiplexChannel {
         }
 
         let frame = build_frame(msg_type, request_id, &body);
-        if let Err(e) = self.inner.writer.send(&frame) {
+        if let Err(e) = self.send_frame(frame).await {
             let _ = self.remove_slot(request_id);
             return Err(e);
         }
@@ -258,7 +325,7 @@ impl MultiplexChannel {
         }
 
         let frame = build_frame(msg_type, request_id, &body);
-        if let Err(e) = self.inner.writer.send(&frame) {
+        if let Err(e) = self.send_frame(frame).await {
             let _ = self.remove_slot(request_id);
             return Err(e);
         }
@@ -309,7 +376,73 @@ impl MultiplexChannel {
         Ok(out_rx)
     }
 
-    /// Returns `true` if the reader thread has marked the channel dead.
+    /// Writes a serialized frame to the guest from a blocking task,
+    /// bounded end-to-end by [`SEND_DEADLINE`].
+    ///
+    /// The underlying send is blocking; running it on the caller's
+    /// async task would pin a runtime worker thread and make the RPC
+    /// un-preemptible by `tokio::time::timeout`.
+    ///
+    /// A [`SendError::Truncated`] failure kills the channel — the peer's
+    /// framing layer will misread everything after a partial frame. The
+    /// kill runs *inside* the blocking task so it survives caller
+    /// cancellation: a per-RPC timeout that drops this future must not
+    /// leave a truncated wire looking alive. A
+    /// [`SendError::NothingSent`] failure leaves the channel up — the
+    /// wire still holds only whole frames — so one stalled send (e.g. a
+    /// full socket buffer under transient host starvation) fails one
+    /// RPC instead of every in-flight RPC on the channel. Exceeding
+    /// [`SEND_DEADLINE`] kills the channel too: the detached write's
+    /// outcome is unknowable at that point.
+    async fn send_frame(&self, frame: Vec<u8>) -> Result<()> {
+        let writer = Arc::clone(&self.inner.writer);
+        let shutdown = Arc::clone(&self.inner.shutdown);
+        let pending = Arc::clone(&self.inner.pending);
+        let send_task = tokio::task::spawn_blocking(move || {
+            let result = writer.send(&frame);
+            if let Err(SendError::Truncated(ref e)) = result {
+                shutdown.store(true, Ordering::SeqCst);
+                mark_channel_dead(&pending, format!("send failed mid-frame: {e}"));
+            }
+            result
+        });
+
+        let joined = match tokio::time::timeout(SEND_DEADLINE, send_task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                self.kill(format!("send exceeded {SEND_DEADLINE:?}"));
+                return Err(Error::Guest(format!(
+                    "frame send exceeded {SEND_DEADLINE:?}"
+                )));
+            }
+        };
+        match joined {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(send_error)) => Err(send_error.into_error()),
+            Err(join_error) => {
+                self.kill(format!("send task panicked: {join_error}"));
+                Err(Error::Guest(format!(
+                    "multiplex send task panicked: {join_error}"
+                )))
+            }
+        }
+    }
+
+    /// Shuts the channel down: fails every pending dispatch, makes every
+    /// subsequent call error immediately, and signals the reader's stream
+    /// to stop, so the reader thread exits without waiting for the peer
+    /// to close the connection.
+    pub fn shutdown(&self) {
+        self.kill("channel shut down".to_string());
+    }
+
+    fn kill(&self, reason: String) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        mark_channel_dead(&self.inner.pending, reason);
+    }
+
+    /// Returns `true` if the channel has been marked dead — by the reader
+    /// thread, by a failed send, or by [`shutdown`](Self::shutdown).
     ///
     /// After this point, every [`call`](Self::call) and
     /// [`call_stream`](Self::call_stream) returns an error immediately.
@@ -545,14 +678,15 @@ mod tests {
     }
 
     impl FrameSender for FdFrameSender {
-        fn send(&self, frame: &[u8]) -> Result<()> {
-            let mut stream = self
-                .stream
-                .lock()
-                .map_err(|_| Error::Guest("frame sender poisoned".into()))?;
-            stream
-                .write_all(frame)
-                .map_err(|e| Error::Guest(format!("frame send failed: {e}")))?;
+        fn send(&self, frame: &[u8]) -> std::result::Result<(), SendError> {
+            let mut stream = self.stream.lock().map_err(|_| {
+                SendError::NothingSent(Error::Guest("frame sender poisoned".into()))
+            })?;
+            // Tests conservatively treat any write failure as a
+            // truncation so the dead-marking path is exercised.
+            stream.write_all(frame).map_err(|e| {
+                SendError::Truncated(Error::Guest(format!("frame send failed: {e}")))
+            })?;
             Ok(())
         }
     }
@@ -600,6 +734,10 @@ mod tests {
         (reader, writer, guest_side)
     }
 
+    fn test_shutdown_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn build_frame_layout_has_request_id_prefix() {
         let frame = build_frame(MessageType::Ping, 0xDEAD_BEEF, b"xyz");
@@ -630,7 +768,7 @@ mod tests {
             }],
         );
 
-        let channel = MultiplexChannel::new(reader, writer);
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
         let msg = tokio::time::timeout(
             Duration::from_secs(2),
             channel.call(MessageType::Ping, b"hello".to_vec()),
@@ -656,7 +794,7 @@ mod tests {
             }],
         );
 
-        let channel = MultiplexChannel::new(reader, writer);
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
         let mut rx = channel
             .call_stream(
                 MessageType::ExecRequest,
@@ -690,7 +828,7 @@ mod tests {
         }
         let _guest_thread = spawn_mock_guest(guest, replies);
 
-        let channel = MultiplexChannel::new(reader, writer);
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
         let mut handles = Vec::new();
         for index in 0..32 {
             let channel = channel.clone();
@@ -747,7 +885,7 @@ mod tests {
         let (reader, writer, guest) = mock_pair();
         let _guest_thread = spawn_mock_guest(guest, vec![MockReply { frames }]);
 
-        let channel = MultiplexChannel::new(reader, writer);
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
         let mut rx = channel
             .call_stream(
                 MessageType::ExecRequest,
@@ -780,7 +918,7 @@ mod tests {
         let (reader, writer, guest) = mock_pair();
         drop(guest);
 
-        let channel = MultiplexChannel::new(reader, writer);
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
         let err = tokio::time::timeout(
             Duration::from_secs(2),
             channel.call(MessageType::Ping, b"probe".to_vec()),
@@ -799,5 +937,86 @@ mod tests {
             ),
             other => panic!("expected Error::Guest, got {other:?}"),
         }
+    }
+
+    /// A guest that stops draining the socket must fail the send within
+    /// the stream's send timeout and kill the channel — not block the
+    /// caller indefinitely. The frame is sized well past any socket
+    /// buffer so `write_all` is guaranteed to hit the timeout.
+    #[tokio::test]
+    async fn send_timeout_marks_channel_dead() {
+        let (host_side, guest_side) = UnixStream::pair().expect("unix stream pair");
+        let writer_stream = host_side.try_clone().expect("clone write half");
+        writer_stream
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .expect("set write timeout");
+        let reader: Box<dyn Read + Send> = Box::new(host_side);
+        let writer: Arc<dyn FrameSender> = Arc::new(FdFrameSender {
+            stream: Mutex::new(writer_stream),
+        });
+
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
+        // Nobody reads guest_side; keep it alive so the socket stays open.
+        let oversized_body = vec![0u8; 8 * 1024 * 1024];
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            channel.call(MessageType::Ping, oversized_body),
+        )
+        .await
+        .expect("send against a non-draining peer must fail within the send timeout")
+        .expect_err("expected send failure");
+
+        match err {
+            Error::Guest(msg) => {
+                assert!(msg.contains("send failed"), "unexpected error: {msg}")
+            }
+            other => panic!("expected Error::Guest, got {other:?}"),
+        }
+        assert!(
+            channel.is_dead(),
+            "a failed send may leave a truncated frame on the wire; the channel must die"
+        );
+
+        let followup = channel.call(MessageType::Ping, b"probe".to_vec()).await;
+        let err = followup.expect_err("calls on a dead channel must fail immediately");
+        match err {
+            Error::Guest(msg) => assert!(msg.contains("dead"), "unexpected error: {msg}"),
+            other => panic!("expected Error::Guest, got {other:?}"),
+        }
+        drop(guest_side);
+    }
+
+    /// `shutdown()` must promptly fail a call whose response will never
+    /// arrive, and make subsequent calls fail immediately.
+    #[tokio::test]
+    async fn shutdown_fails_pending_and_future_calls() {
+        let (reader, writer, _guest_side) = mock_pair();
+        // No guest thread: the request is written into the socket buffer
+        // and no response ever comes, so the call stays pending.
+        let channel = MultiplexChannel::new(reader, writer, test_shutdown_flag());
+
+        let pending_channel = channel.clone();
+        let pending = tokio::spawn(async move {
+            pending_channel
+                .call(MessageType::Ping, b"probe".to_vec())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        channel.shutdown();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("pending call must fail promptly after shutdown")
+            .expect("pending task must not panic")
+            .expect_err("pending call must fail after shutdown");
+        match err {
+            Error::Guest(msg) => assert!(msg.contains("shut down"), "unexpected error: {msg}"),
+            other => panic!("expected Error::Guest, got {other:?}"),
+        }
+
+        assert!(channel.is_dead());
+        let followup = channel.call(MessageType::Ping, b"probe".to_vec()).await;
+        assert!(followup.is_err(), "calls after shutdown must fail");
     }
 }
