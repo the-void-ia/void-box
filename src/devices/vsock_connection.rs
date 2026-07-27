@@ -1095,12 +1095,14 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(500)))
             .expect("read timeout");
+        // The drop closes the stream with the client's port bytes still
+        // unread, which Linux reports as ECONNRESET rather than EOF.
         let mut probe = [0u8; 1];
-        assert_eq!(
-            client.read(&mut probe).expect("EOF, not a hang"),
-            0,
-            "dropped over-cap connection must read as closed"
-        );
+        match client.read(&mut probe) {
+            Ok(0) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("dropped over-cap connection must read as closed, got {other:?}"),
+        }
     }
 
     /// A connection whose guest-bound buffer reached the cap is not read
