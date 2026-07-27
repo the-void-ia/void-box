@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, spec YAML, or code sample that triggers the bug.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: void-box version
+      placeholder: e.g. 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Host platform and VM backend — the VMM has separate implementations per OS and architecture. macOS is Apple Silicon only.
+      options:
+        - Linux x86_64 (KVM)
+        - Linux aarch64/arm64 (KVM)
+        - macOS Apple Silicon (VZ)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS version
+      placeholder: e.g. Ubuntu 24.04, Fedora 43, macOS 15.1
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Host kernel (Linux/KVM only)
+      placeholder: uname -r
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      placeholder: rustc --version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error output
+      description: Relevant output, ideally with `VOIDBOX_LOG_LEVEL=debug`. Rendered as code automatically.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps — possible cause, workaround, related issues.

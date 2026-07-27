@@ -181,6 +181,30 @@ Small, local, obvious changes skip the RFC and go straight to a PR.
 
 The full process, numbering rules, statuses, and templates live in [`docs/rfc/README.md`](docs/rfc/README.md), with the decision records indexed in [`docs/adr/README.md`](docs/adr/README.md).
 
+## Issue Triage
+
+Open issues carry labels along three axes, plus a milestone when the issue belongs to an RFC implementation track. Every issue gets exactly one type label and at least one area label at creation; modifiers are added as applicable. The type and modifier vocabulary is repo-agnostic and reusable verbatim by other `the-void-ia` repos; the area vocabulary is local to this repo.
+
+**Type** — exactly one per issue: `bug`, `enhancement`, or `question`. `duplicate`, `invalid`, and `wontfix` are resolution labels applied when closing an issue, not types. `documentation` marks content work and may accompany a type label.
+
+**Area** — at least one per issue, meaning *where the fix lands*. Areas are deliberately coarser than the conventional-commit scopes; the mapping:
+
+| Area label | Covers (commit scopes) |
+|---|---|
+| `area:vmm` | `vmm`, vCPU, memory, snapshot/restore, boot/loader |
+| `area:vsock` | `vsock`, `control-channel`, multiplex protocol |
+| `area:network` | `slirp`, NAT, `9p` transport, proxy/egress |
+| `area:oci` | OCI image pull, unpack, rootfs switch |
+| `area:daemon` | daemon, service mode, sidecar/messaging, MCP |
+| `area:ci` | CI workflows and lanes |
+| `area:tests` | the fix lands in test code, not shipped behavior |
+
+Create a new area label only when a third open issue would use it; until then, apply the closest broader area.
+
+**Modifiers** — optional, and a closed list: `aarch64`, `macos`, `security`, `flaky`. `security` marks hardening work that is already public — undisclosed vulnerabilities go through private vulnerability reporting (see [`SECURITY.md`](SECURITY.md)), never public issues. `flaky` marks tests that fail intermittently in CI (the deflake queue); a flaky test may or may not also be `area:tests`, depending on where the fix lands. Adding a new modifier requires the same third-issue rule plus a concrete search query it serves.
+
+**Milestones** track RFC implementation work: one milestone per active track, named `RFC-NNNN <topic> implementation`, closed when the track ships. Milestone membership answers "what's left on this track"; area labels answer "where does the fix land" — the two are independent, so a CI lane for the aarch64 track is `area:ci` in the RFC-0003 milestone. Milestones carry no due dates, and there are no version-numbered release milestones.
+
 ## Pull Request Process
 
 1. **Update documentation** if you're changing user-facing features
