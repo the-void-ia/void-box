@@ -10,10 +10,36 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, trace, warn};
 
 use crate::Result;
+
+/// Cap on concurrent host-side connections — established plus those
+/// still owed their port prefix. The listener is serviced even while
+/// the guest driver is down, so without a cap a host process holding
+/// connections open would grow the map and fd set without bound.
+/// Accepts beyond the cap are dropped, closing the stream.
+const MAX_HOST_CONNECTIONS: usize = 128;
+
+/// How long an accepted host connection may take to deliver its 4-byte
+/// port prefix before it is dropped.
+const PORT_PREFIX_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Per-connection cap on bytes read off a host stream but not yet
+/// forwarded to the guest (`tx_buf`). At the cap the sweep stops
+/// reading that stream, so backpressure lands in the socket buffer
+/// (the client's writes block or hit their send timeout) instead of
+/// growing host memory while the guest is not draining. Reading — and
+/// with it host-side close detection — resumes once the buffer drains.
+const HOST_TO_GUEST_BUFFER_CAP: usize = 256 * 1024;
+
+/// Cap on total guest-bound packet data queued in `rx_queue`, the
+/// other place host data piles up while the driver is down. A live
+/// guest never approaches it; hitting it pauses host-stream reads for
+/// a sweep.
+const RX_QUEUE_BACKLOG_CAP: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Vsock packet header (virtio-vsock spec §5.10)
@@ -316,6 +342,28 @@ impl VsockConnection {
 /// Key for the connection map: (guest_port, host_port).
 pub type ConnKey = (u32, u32);
 
+/// An accepted host connection that has not yet delivered the 4-byte
+/// prefix naming its target guest port. The stream is non-blocking and
+/// the prefix is read incrementally, so a client that stalls
+/// mid-prefix never blocks the sweep (which runs under the
+/// connection-map lock the vCPU MMIO paths also need).
+struct PendingAccept {
+    stream: UnixStream,
+    port_buf: [u8; 4],
+    filled: usize,
+    accepted_at: Instant,
+}
+
+/// What a sweep decided about one pending accept.
+enum PendingOutcome {
+    /// Prefix complete — promote to a connection.
+    Ready,
+    /// Still waiting on prefix bytes, within the deadline.
+    Keep,
+    /// Closed, errored, or overran the deadline: drop it.
+    Discard(&'static str),
+}
+
 /// Manages all active vsock connections and the Unix listener socket.
 pub struct VsockConnectionMap {
     /// CID of the guest.
@@ -328,6 +376,11 @@ pub struct VsockConnectionMap {
     pub socket_path: Option<PathBuf>,
     /// Pending RX packets to inject into the guest (header + optional data).
     pub rx_queue: Vec<(VsockHeader, Vec<u8>)>,
+    /// Accepted host connections still owed their port prefix.
+    pending_accepts: Vec<PendingAccept>,
+    /// Set once a poisoned map mutex has been recovered, so the
+    /// recovery warning fires once per device rather than per sweep.
+    pub poison_warned: std::sync::atomic::AtomicBool,
 }
 
 impl VsockConnectionMap {
@@ -371,6 +424,8 @@ impl VsockConnectionMap {
             listener: Some(listener),
             socket_path: Some(socket_path.to_path_buf()),
             rx_queue: Vec::new(),
+            pending_accepts: Vec::new(),
+            poison_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -382,50 +437,102 @@ impl VsockConnectionMap {
             listener: None,
             socket_path: None,
             rx_queue: Vec::new(),
+            pending_accepts: Vec::new(),
+            poison_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Accept a pending connection from the Unix listener.
+    /// Service the Unix listener: accept every queued connection, then
+    /// poll connections still owed their 4-byte LE port prefix (the
+    /// first thing a host application sends, naming the guest port),
+    /// promoting completed ones to real connections.
     ///
-    /// The host application connects to the Unix socket and sends a 4-byte LE
-    /// port number as the first thing. This tells us which guest port to
-    /// connect to.
-    pub fn accept_incoming(&mut self) -> Option<(ConnKey, RawFd)> {
-        let listener = self.listener.as_ref()?;
-        let (stream, _) = match listener.accept() {
-            Ok(s) => s,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
-            Err(e) => {
-                warn!("vsock listener accept error: {}", e);
-                return None;
+    /// Wholly non-blocking. Returns the established fds for epoll
+    /// registration; establishing queues an `OP_REQUEST`, so a
+    /// non-empty return means the guest should be signaled.
+    pub fn service_listener(&mut self) -> Vec<RawFd> {
+        while let Some(listener) = self.listener.as_ref() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if self.connections.len() + self.pending_accepts.len() >= MAX_HOST_CONNECTIONS {
+                        warn!(
+                            "vsock: dropping accepted host connection: \
+                             {} connections already open (cap {})",
+                            self.connections.len() + self.pending_accepts.len(),
+                            MAX_HOST_CONNECTIONS
+                        );
+                        continue;
+                    }
+                    let _ = stream.set_nonblocking(true);
+                    self.pending_accepts.push(PendingAccept {
+                        stream,
+                        port_buf: [0u8; 4],
+                        filled: 0,
+                        accepted_at: Instant::now(),
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!("vsock listener accept error: {}", e);
+                    break;
+                }
             }
-        };
-
-        // Read the 4-byte port number from the connecting host application
-        let _ = stream.set_nonblocking(false);
-        let mut port_buf = [0u8; 4];
-        let mut tmp = stream.try_clone().ok()?;
-        // Give a brief timeout for the port read
-        let _ = tmp.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-        if tmp.read_exact(&mut port_buf).is_err() {
-            warn!("vsock: host connection didn't send port number");
-            return None;
         }
-        let guest_port = u32::from_le_bytes(port_buf);
-        drop(tmp);
+        self.poll_pending_accepts()
+    }
 
-        // Use an ephemeral host port
+    /// Poll every pending accept's prefix read once, promoting completed
+    /// prefixes to connections and dropping closed, errored, or
+    /// deadline-overrunning ones. Returns the established fds.
+    fn poll_pending_accepts(&mut self) -> Vec<RawFd> {
+        let mut established = Vec::new();
+        let mut index = 0;
+        while index < self.pending_accepts.len() {
+            let pending = &mut self.pending_accepts[index];
+            let outcome = loop {
+                if pending.filled == pending.port_buf.len() {
+                    break PendingOutcome::Ready;
+                }
+                match pending.stream.read(&mut pending.port_buf[pending.filled..]) {
+                    Ok(0) => break PendingOutcome::Discard("closed before sending its port"),
+                    Ok(bytes_read) => pending.filled += bytes_read,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if pending.accepted_at.elapsed() >= PORT_PREFIX_DEADLINE {
+                            break PendingOutcome::Discard("did not send its port in time");
+                        }
+                        break PendingOutcome::Keep;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break PendingOutcome::Discard("read error before sending its port"),
+                }
+            };
+            match outcome {
+                PendingOutcome::Keep => index += 1,
+                PendingOutcome::Discard(reason) => {
+                    warn!("vsock: dropping accepted host connection: {}", reason);
+                    self.pending_accepts.swap_remove(index);
+                }
+                PendingOutcome::Ready => {
+                    let ready = self.pending_accepts.swap_remove(index);
+                    let guest_port = u32::from_le_bytes(ready.port_buf);
+                    established.push(self.establish_connection(ready.stream, guest_port));
+                }
+            }
+        }
+        established
+    }
+
+    /// Register an accepted stream as a connection to `guest_port`,
+    /// queueing the `OP_REQUEST` that asks the guest to accept it.
+    fn establish_connection(&mut self, stream: UnixStream, guest_port: u32) -> RawFd {
         let host_port = self.next_ephemeral_port();
-
         let fd = stream.as_raw_fd();
         let conn = VsockConnection::new(guest_port, host_port, stream);
-        let key = (guest_port, host_port);
 
         debug!(
             "vsock: accepted host connection for guest port {} (host_port={})",
             guest_port, host_port
         );
-        // Queue a OP_REQUEST to the guest
         let hdr = VsockHeader {
             src_cid: HOST_CID,
             dst_cid: self.guest_cid,
@@ -440,8 +547,8 @@ impl VsockConnectionMap {
         };
         self.rx_queue.push((hdr, Vec::new()));
 
-        self.connections.insert(key, conn);
-        Some((key, fd))
+        self.connections.insert((guest_port, host_port), conn);
+        fd
     }
 
     /// Process a TX packet from the guest.
@@ -755,6 +862,10 @@ impl VsockConnectionMap {
     /// Returns `true` if anything was queued for the guest (data or RSTs),
     /// i.e. the guest should be signaled.
     pub fn drain_host_streams(&mut self) -> bool {
+        // Guest-bound backlog snapshot for this sweep's read decisions;
+        // data queued by this sweep is not re-counted, so the cap can
+        // overshoot by at most one read per connection.
+        let rx_backlog: usize = self.rx_queue.iter().map(|(_, data)| data.len()).sum();
         let mut forwards: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         let mut closed: Vec<(u32, u32)> = Vec::new();
         let mut credit_updates: Vec<(u32, u32)> = Vec::new();
@@ -775,6 +886,11 @@ impl VsockConnectionMap {
                         continue;
                     }
                 }
+            }
+            // A capped connection is not read this sweep, pushing
+            // backpressure into its socket buffer (see the cap consts).
+            if conn.tx_buf.len() >= HOST_TO_GUEST_BUFFER_CAP || rx_backlog >= RX_QUEUE_BACKLOG_CAP {
+                continue;
             }
             match conn.read_from_host() {
                 HostReadOutcome::Data(_) => {
@@ -857,6 +973,7 @@ impl VsockConnectionMap {
     pub fn reset_all(&mut self) {
         self.connections.clear();
         self.rx_queue.clear();
+        self.pending_accepts.clear();
         debug!("vsock: all connections reset");
     }
 }
@@ -902,6 +1019,151 @@ mod tests {
         assert_eq!(VsockOp::from_u16(1), VsockOp::Request);
         assert_eq!(VsockOp::from_u16(5), VsockOp::Rw);
         assert_eq!(VsockOp::from_u16(99), VsockOp::Invalid);
+    }
+
+    fn temp_socket_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "void-box-connmap-test-{}-{}.sock",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    /// A client that delivers its port prefix across multiple writes is
+    /// still established — the sweep accumulates the prefix without ever
+    /// blocking on the stream.
+    #[test]
+    fn service_listener_establishes_after_split_port_prefix() {
+        let path = temp_socket_path("split-prefix");
+        let mut map = VsockConnectionMap::new(42, &path).expect("bind listener");
+
+        let mut client = UnixStream::connect(&path).expect("connect");
+        let port_bytes = 4321u32.to_le_bytes();
+        client.write_all(&port_bytes[..2]).expect("first half");
+
+        let established = map.service_listener();
+        assert!(
+            established.is_empty(),
+            "half a prefix must not establish a connection"
+        );
+        assert_eq!(map.pending_accepts.len(), 1);
+
+        client.write_all(&port_bytes[2..]).expect("second half");
+        let established = map.service_listener();
+        assert_eq!(established.len(), 1, "full prefix must establish");
+        assert!(map.pending_accepts.is_empty());
+        assert!(
+            map.connections
+                .keys()
+                .any(|(guest_port, _)| *guest_port == 4321),
+            "connection must target the prefixed guest port"
+        );
+        assert!(
+            map.has_pending_rx(),
+            "OP_REQUEST must be queued for the guest"
+        );
+    }
+
+    /// Accepts beyond the connection cap are dropped — the client sees a
+    /// closed stream instead of the map growing without bound.
+    #[test]
+    fn service_listener_drops_connections_beyond_cap() {
+        let path = temp_socket_path("cap");
+        let mut map = VsockConnectionMap::new(42, &path).expect("bind listener");
+
+        // Saturate the cap with synthetic pending accepts whose peers
+        // stay open (so they neither complete nor get reaped).
+        let mut peers = Vec::new();
+        for _ in 0..MAX_HOST_CONNECTIONS {
+            let (local, peer) = UnixStream::pair().expect("socket pair");
+            local.set_nonblocking(true).expect("nonblocking");
+            peers.push(peer);
+            map.pending_accepts.push(PendingAccept {
+                stream: local,
+                port_buf: [0u8; 4],
+                filled: 0,
+                accepted_at: Instant::now(),
+            });
+        }
+
+        let mut client = UnixStream::connect(&path).expect("connect");
+        client.write_all(&1234u32.to_le_bytes()).expect("send port");
+        let established = map.service_listener();
+
+        assert!(established.is_empty(), "over-cap accept must not establish");
+        assert_eq!(map.pending_accepts.len(), MAX_HOST_CONNECTIONS);
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            client.read(&mut probe).expect("EOF, not a hang"),
+            0,
+            "dropped over-cap connection must read as closed"
+        );
+    }
+
+    /// A connection whose guest-bound buffer reached the cap is not read
+    /// further — backpressure stays in the socket buffer — and reading
+    /// resumes once the guest drains the buffer.
+    #[test]
+    fn drain_host_streams_stops_reading_at_buffer_cap() {
+        let mut map = VsockConnectionMap::new_without_listener(42);
+        let (host_side, mut peer) = UnixStream::pair().unwrap();
+        let mut conn = VsockConnection::new(1234, 50000, host_side);
+        // Connecting keeps read data parked in tx_buf.
+        conn.state = ConnState::Connecting;
+        conn.tx_buf = vec![0u8; HOST_TO_GUEST_BUFFER_CAP];
+        map.connections.insert((1234, 50000), conn);
+
+        peer.write_all(b"more data").unwrap();
+        map.drain_host_streams();
+        assert_eq!(
+            map.connections[&(1234, 50000)].tx_buf.len(),
+            HOST_TO_GUEST_BUFFER_CAP,
+            "capped connection must not be read"
+        );
+
+        map.connections
+            .get_mut(&(1234, 50000))
+            .unwrap()
+            .tx_buf
+            .clear();
+        map.drain_host_streams();
+        assert_eq!(
+            map.connections[&(1234, 50000)].tx_buf,
+            b"more data",
+            "reading must resume once the buffer drains"
+        );
+    }
+
+    /// A pending accept that overruns the prefix deadline is dropped on
+    /// the next sweep instead of occupying its slot forever.
+    #[test]
+    fn service_listener_drops_stalled_prefix_after_deadline() {
+        let mut map = VsockConnectionMap::new_without_listener(42);
+        let Some(expired) =
+            Instant::now().checked_sub(PORT_PREFIX_DEADLINE + Duration::from_millis(10))
+        else {
+            // Clock too young to backdate (process started < deadline ago).
+            return;
+        };
+        let (local, _peer) = UnixStream::pair().expect("socket pair");
+        local.set_nonblocking(true).expect("nonblocking");
+        map.pending_accepts.push(PendingAccept {
+            stream: local,
+            port_buf: [0u8; 4],
+            filled: 0,
+            accepted_at: expired,
+        });
+
+        let established = map.service_listener();
+        assert!(established.is_empty());
+        assert!(
+            map.pending_accepts.is_empty(),
+            "deadline-overrunning pending accept must be dropped"
+        );
+        assert!(map.connections.is_empty());
     }
 
     #[test]

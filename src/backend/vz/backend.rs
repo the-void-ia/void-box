@@ -874,7 +874,12 @@ impl VzBackend {
 
     fn clear_runtime_state(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        self.control_channel = None;
+        // Shut the control channel down rather than merely dropping the
+        // handle (streaming/telemetry tasks hold clones): pending RPCs
+        // fail promptly instead of waiting to observe EOF.
+        if let Some(channel) = self.control_channel.take() {
+            channel.shutdown();
+        }
         self.socket_device = None;
         self.vm = None;
         self.session_secret = None;

@@ -11,8 +11,9 @@ use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rustix::event::{eventfd, EventfdFlags};
 use tracing::{debug, trace, warn};
@@ -28,6 +29,36 @@ use crate::{Error, Result};
 
 /// VIRTIO_F_VERSION_1 — required for virtio-mmio v2 devices.
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+/// Interval of the worker's periodic sweep: the epoll wait bound in the
+/// normal path, and the sleep between sweeps in the degraded (no-epoll)
+/// path.
+const WORKER_TICK: Duration = Duration::from_millis(50);
+
+/// Deadline for joining the worker thread during device teardown. The
+/// worker re-checks its lifecycle flag every [`WORKER_TICK`]; hitting
+/// this means it is wedged, and teardown detaches it with a warning.
+const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the worker thread to exit.
+const WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Locks the connection map, recovering from a poisoned mutex: skipping
+/// every subsequent lock would leave the listener and every host stream
+/// silently unserviced, a worse outcome than one possibly-desynced
+/// connection. Warns once per device.
+fn lock_conn_map(conn_map: &Mutex<VsockConnectionMap>) -> MutexGuard<'_, VsockConnectionMap> {
+    match conn_map.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            if !guard.poison_warned.swap(true, Ordering::Relaxed) {
+                warn!("vsock-userspace: connection map mutex poisoned; recovering");
+            }
+            guard
+        }
+    }
+}
 
 /// Queue state for virtio-vsock (rx=0, tx=1, event=2)
 #[derive(Default)]
@@ -79,6 +110,10 @@ pub struct VirtioVsockUserspace {
     worker_handle: Option<JoinHandle<()>>,
     /// Flag to stop the worker.
     worker_running: Arc<AtomicBool>,
+    /// Set when [`stop_worker`](Self::stop_worker) gave up joining. A
+    /// detached worker may still write the call eventfd, so `Drop` must
+    /// leak the eventfds — closed descriptor numbers get reused.
+    worker_detached: bool,
 }
 
 impl VirtioVsockUserspace {
@@ -133,7 +168,7 @@ impl VirtioVsockUserspace {
             socket_path.display()
         );
 
-        Ok(Self {
+        let mut device = Self {
             cid,
             device_features: VIRTIO_F_VERSION_1,
             driver_features: 0,
@@ -165,7 +200,10 @@ impl VirtioVsockUserspace {
             socket_path,
             worker_handle: None,
             worker_running: Arc::new(AtomicBool::new(false)),
-        })
+            worker_detached: false,
+        };
+        device.start_worker();
+        Ok(device)
     }
 
     /// Get the Unix socket path for host connections.
@@ -291,9 +329,7 @@ impl VirtioVsockUserspace {
                     data.truncate(hdr.len as usize);
                 }
 
-                if let Ok(mut conn_map) = self.conn_map.lock() {
-                    conn_map.process_guest_tx(&hdr, &data);
-                }
+                lock_conn_map(&self.conn_map).process_guest_tx(&hdr, &data);
             }
 
             // Return the descriptor chain to the used ring
@@ -317,13 +353,7 @@ impl VirtioVsockUserspace {
             }
         };
 
-        let pending = {
-            let mut conn_map = match self.conn_map.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            conn_map.drain_rx()
-        };
+        let pending = lock_conn_map(&self.conn_map).drain_rx();
 
         if pending.is_empty() {
             return;
@@ -379,9 +409,15 @@ impl VirtioVsockUserspace {
         }
     }
 
-    /// Start the background worker thread that polls host streams and the
-    /// Unix listener for activity.
-    fn start_worker(&mut self, _mem: &GuestMemoryMmap) {
+    /// Start the background worker thread that services host streams and
+    /// the Unix listener. Idempotent.
+    ///
+    /// The worker's lifetime is the device's, not the driver's: it
+    /// starts at construction and survives guest resets, so connects
+    /// made while the driver is down are accepted and queued instead of
+    /// sitting in an unserviced accept backlog. It stops only through
+    /// [`stop_worker`](Self::stop_worker).
+    fn start_worker(&mut self) {
         if self.worker_running.load(Ordering::SeqCst) {
             return;
         }
@@ -406,6 +442,29 @@ impl VirtioVsockUserspace {
 
         self.worker_handle = Some(handle);
         debug!("vsock-userspace: worker thread started");
+    }
+
+    /// Stop the worker thread and join it, bounded by
+    /// [`WORKER_JOIN_DEADLINE`]; a worker that fails to exit is
+    /// detached with a warning rather than hanging teardown.
+    fn stop_worker(&mut self) {
+        self.worker_running.store(false, Ordering::SeqCst);
+        let Some(handle) = self.worker_handle.take() else {
+            return;
+        };
+        let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                warn!(
+                    "vsock-userspace: worker did not exit within {:?}; detaching it",
+                    WORKER_JOIN_DEADLINE
+                );
+                self.worker_detached = true;
+                return;
+            }
+            std::thread::sleep(WORKER_JOIN_POLL_INTERVAL);
+        }
+        let _ = handle.join();
     }
 
     /// Restore from snapshot state.
@@ -512,10 +571,8 @@ impl VirtioVsockUserspace {
             }
         }
 
-        // Start worker if device was in DRIVER_OK state
-        if (dev.status & 4) != 0 {
-            dev.start_worker(guest_memory);
-        }
+        // The worker already runs (started at construction), even for a
+        // snapshot taken before the guest driver reached DRIVER_OK.
 
         debug!("Restored userspace vsock MMIO (CID {})", cid);
         Ok(dev)
@@ -542,8 +599,8 @@ impl VirtioVsockUserspace {
         self.tx_queue = None;
         self.event_queue = None;
 
-        // Stop worker
-        self.worker_running.store(false, Ordering::SeqCst);
+        // The worker deliberately survives a driver reset — its
+        // lifetime is the device's (see `start_worker`).
     }
 }
 
@@ -683,8 +740,9 @@ impl VsockMmioDevice for VirtioVsockUserspace {
                 if value == 0 {
                     self.reset();
                 } else if (value & 4) != 0 {
-                    // DRIVER_OK — start the worker
-                    self.start_worker(guest_memory);
+                    // DRIVER_OK — defensive restart; the worker
+                    // normally already runs from construction.
+                    self.start_worker();
                 }
             }
             mmio::QUEUE_DESC_LOW => {
@@ -803,22 +861,22 @@ impl VsockMmioDevice for VirtioVsockUserspace {
         debug!("vsock-userspace: injected TRANSPORT_RESET event");
         Ok(())
     }
+
+    fn shutdown_worker(&mut self) {
+        self.stop_worker();
+    }
 }
 
 impl Drop for VirtioVsockUserspace {
     fn drop(&mut self) {
-        self.worker_running.store(false, Ordering::SeqCst);
+        // Stop and join the worker before closing fds; its epoll wait
+        // is bounded by WORKER_TICK, so no wakeup write is needed.
+        self.stop_worker();
 
-        // Wake the worker from epoll_wait by writing to a kick eventfd
-        if let Some(Some(fd)) = self.kick_eventfds.first() {
-            unsafe {
-                libc::eventfd_write(*fd, 1);
-            }
-        }
-
-        // Join worker thread before closing fds
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
+        // A detached worker may still write the call eventfd; leak the
+        // fds rather than let that write land on a reused descriptor.
+        if self.worker_detached {
+            return;
         }
 
         // Now safe to close eventfds
@@ -839,11 +897,16 @@ impl Drop for VirtioVsockUserspace {
 // Worker thread
 // ---------------------------------------------------------------------------
 
-/// Background worker that polls the Unix listener and host streams.
+/// Background worker that services the Unix listener and host streams.
 ///
 /// When data arrives from a host application, it buffers it in the
 /// connection map and writes to the RX call eventfd so the IRQ thread
 /// can inject an interrupt and process RX descriptors.
+///
+/// Every iteration unconditionally accepts pending connections and
+/// drains host streams; epoll is only a wakeup accelerator on top of
+/// that sweep, so any epoll failure degrades wakeup latency to one
+/// [`WORKER_TICK`] instead of leaving the listener unserviced.
 fn worker_thread(
     conn_map: Arc<Mutex<VsockConnectionMap>>,
     running: Arc<AtomicBool>,
@@ -852,80 +915,95 @@ fn worker_thread(
     call_rx_fd: Option<RawFd>,
 ) {
     use libc::{
-        epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
+        epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLET, EPOLLIN, EPOLL_CLOEXEC,
+        EPOLL_CTL_ADD,
     };
 
-    let epfd = unsafe { epoll_create1(EPOLL_CLOEXEC) };
+    // Edge-triggered: the sweep ignores the events, and level-triggered
+    // would re-fire nonstop for a stream deliberately left unread at
+    // its buffering cap, busy-spinning the loop.
+    let registration_events = EPOLLIN as u32 | EPOLLET as u32;
+
+    let mut epfd = unsafe { epoll_create1(EPOLL_CLOEXEC) };
     if epfd < 0 {
         warn!(
-            "vsock-userspace worker: epoll_create1 failed: {}",
-            std::io::Error::last_os_error()
+            "vsock-userspace worker: epoll_create1 failed: {}; \
+             falling back to a {:?} periodic sweep",
+            std::io::Error::last_os_error(),
+            WORKER_TICK
         );
-        return;
-    }
-
-    // Add listener fd to epoll
-    let listener_fd = conn_map.lock().ok().and_then(|m| m.listener_fd());
-    if let Some(lfd) = listener_fd {
-        let mut ev = epoll_event {
-            events: EPOLLIN as u32,
-            u64: 0xFFFF_FFFF, // sentinel for listener
-        };
-        unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &mut ev) };
+    } else {
+        // Register the listener for early wakeup on incoming connects.
+        let listener_fd = lock_conn_map(&conn_map).listener_fd();
+        if let Some(lfd) = listener_fd {
+            let mut ev = epoll_event {
+                events: registration_events,
+                u64: lfd as u64,
+            };
+            unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &mut ev) };
+        }
     }
 
     let mut events = [epoll_event { events: 0, u64: 0 }; 16];
 
     while running.load(Ordering::Relaxed) {
-        let nfds = unsafe { epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, 50) };
-        if nfds < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            warn!("vsock-userspace worker: epoll_wait: {}", e);
-            break;
-        }
-
-        let mut accepted_fds = Vec::new();
-        let mut had_data = false;
-
-        for event in events.iter().take(nfds as usize) {
-            if event.u64 == 0xFFFF_FFFF {
-                // Listener ready — accept incoming connections.
-                // accept_incoming() queues OP_REQUEST into rx_queue,
-                // so we must signal the guest to process it.
-                if let Ok(mut map) = conn_map.lock() {
-                    while let Some((_key, fd)) = map.accept_incoming() {
-                        accepted_fds.push(fd);
-                        had_data = true;
-                    }
-                }
-            } else {
-                // Data from a host stream — read, buffer, and reap
-                // connections whose host application closed (their fds
-                // close on removal, which deregisters them from epoll).
-                if let Ok(mut map) = conn_map.lock() {
-                    if map.drain_host_streams() {
-                        had_data = true;
-                    }
-                }
-            }
-        }
-
-        // Add newly accepted fds to epoll
-        for fd in accepted_fds {
-            let mut ev = epoll_event {
-                events: EPOLLIN as u32,
-                u64: fd as u64,
+        // Wait for activity or the tick. The returned events are not
+        // inspected — the sweep below services everything — so a failed
+        // wait costs only latency.
+        if epfd >= 0 {
+            let nfds = unsafe {
+                epoll_wait(
+                    epfd,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    WORKER_TICK.as_millis() as i32,
+                )
             };
-            unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev) };
+            if nfds < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    // Non-EINTR failures tend to repeat; drop epoll for
+                    // good and live on the periodic sweep.
+                    warn!(
+                        "vsock-userspace worker: epoll_wait: {}; \
+                         switching to a {:?} periodic sweep",
+                        e, WORKER_TICK
+                    );
+                    unsafe { libc::close(epfd) };
+                    epfd = -1;
+                }
+            }
+        } else {
+            std::thread::sleep(WORKER_TICK);
         }
 
-        // Also poll all connected streams periodically (every iteration)
-        if let Ok(mut map) = conn_map.lock() {
+        // Unconditional sweep: service the listener (established
+        // connections queue OP_REQUESTs, so the guest must be
+        // signaled), then drain host streams and reap closed
+        // connections (their fds close on removal, deregistering them
+        // from epoll).
+        let accepted_fds;
+        let mut had_data = false;
+        {
+            let mut map = lock_conn_map(&conn_map);
+            accepted_fds = map.service_listener();
+            if !accepted_fds.is_empty() {
+                had_data = true;
+            }
             if map.drain_host_streams() {
                 had_data = true;
+            }
+        }
+
+        // Register newly accepted fds for early wakeup (best-effort —
+        // the sweep services them even if registration fails).
+        if epfd >= 0 {
+            for fd in accepted_fds {
+                let mut ev = epoll_event {
+                    events: registration_events,
+                    u64: fd as u64,
+                };
+                unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev) };
             }
         }
 
@@ -939,8 +1017,84 @@ fn worker_thread(
         }
     }
 
-    unsafe {
-        libc::close(epfd);
+    if epfd >= 0 {
+        unsafe {
+            libc::close(epfd);
+        }
     }
     debug!("vsock-userspace worker thread exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    fn temp_socket_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "void-box-vsock-test-{}-{}.sock",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    /// The worker services the listener for the device's lifetime: it
+    /// runs before the guest driver reaches DRIVER_OK, and a STATUS=0
+    /// reset (guest reboot or panic) must not stop it.
+    #[test]
+    fn worker_runs_from_construction_and_survives_driver_reset() {
+        let mut dev = VirtioVsockUserspace::with_socket_path(3, temp_socket_path("lifecycle"))
+            .expect("create device");
+        assert!(
+            dev.worker_running.load(Ordering::SeqCst),
+            "worker must start with the device"
+        );
+
+        dev.reset();
+        assert!(
+            dev.worker_running.load(Ordering::SeqCst),
+            "driver reset must not stop the worker"
+        );
+        let handle = dev.worker_handle.as_ref().expect("worker handle");
+        assert!(!handle.is_finished(), "worker thread must still be alive");
+    }
+
+    /// A host application connecting while the guest driver is down must
+    /// be accepted and queued for the guest, not parked in the accept
+    /// backlog.
+    #[test]
+    fn host_connect_is_accepted_without_driver_ok() {
+        let path = temp_socket_path("accept");
+        let dev = VirtioVsockUserspace::with_socket_path(3, path.clone()).expect("create device");
+
+        let mut stream = UnixStream::connect(&path).expect("connect to device socket");
+        stream
+            .write_all(&1234u32.to_le_bytes())
+            .expect("send target port");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock_conn_map(&dev.conn_map).has_pending_rx() {
+            assert!(
+                Instant::now() < deadline,
+                "worker never accepted the connection"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The teardown hook stops and joins the worker.
+    #[test]
+    fn shutdown_worker_stops_and_joins_the_thread() {
+        let mut dev = VirtioVsockUserspace::with_socket_path(3, temp_socket_path("shutdown"))
+            .expect("create device");
+        dev.shutdown_worker();
+        assert!(!dev.worker_running.load(Ordering::SeqCst));
+        assert!(dev.worker_handle.is_none());
+        assert!(
+            !dev.worker_detached,
+            "worker must have been joined, not detached"
+        );
+    }
 }

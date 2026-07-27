@@ -31,6 +31,16 @@ pub struct VcpuHandle {
 }
 
 impl VcpuHandle {
+    /// vCPU index, for naming this thread in teardown diagnostics.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns `true` once the vCPU thread has exited.
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
     /// Wait for the vCPU thread to finish
     pub fn join(self) -> Result<()> {
         self.thread

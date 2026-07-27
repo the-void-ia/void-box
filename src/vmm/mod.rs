@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use void_box_protocol::SessionSecret;
 
 use crate::devices::serial::SerialDevice;
@@ -128,6 +129,45 @@ async fn dispatch_vm_command(
             });
         }
         VmCommand::Stop => running.store(false, Ordering::SeqCst),
+    }
+}
+
+/// Poll interval while waiting for a VM thread to exit during teardown.
+const TEARDOWN_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Per-thread deadline for VM teardown joins. Teardown completes in
+/// milliseconds normally; a thread that never exits (`kick()`'s
+/// `SIGRTMIN` interrupts `KVM_RUN`, not a futex wait) surfaces as an
+/// error naming it instead of hanging teardown forever.
+const TEARDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Waits for a teardown thread to report finished, bounded by `deadline`.
+/// On expiry, returns an error naming `thread_name`; the caller drops
+/// the join handle, detaching the stuck thread.
+fn wait_thread_finished(
+    thread_name: &str,
+    deadline: Duration,
+    is_finished: impl Fn() -> bool,
+) -> Result<()> {
+    let expiry = Instant::now() + deadline;
+    while !is_finished() {
+        if Instant::now() >= expiry {
+            return Err(Error::Vcpu(format!(
+                "{thread_name} thread did not exit within {deadline:?} during VM teardown"
+            )));
+        }
+        std::thread::sleep(TEARDOWN_JOIN_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+/// Runs a blocking teardown closure via `block_in_place`, which panics
+/// on a current-thread runtime (e.g. `#[tokio::test]`) — there the
+/// closure runs inline; teardown is the VM's last act.
+fn run_blocking_teardown<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(work),
+        _ => work(),
     }
 }
 
@@ -935,26 +975,26 @@ impl MicroVm {
             if is_diff { "diff" } else { "base" }
         );
 
-        // 1. Stop event loop and background threads
-        let _ = self.command_tx.send(VmCommand::Stop).await;
-        self.running.store(false, Ordering::SeqCst);
+        // 1. Signal every VM thread to exit (see `signal_teardown`).
+        self.signal_teardown();
 
-        // Kick vCPU threads out of KVM_RUN (HLT blocks indefinitely without this)
-        for handle in &self.vcpu_handles {
-            handle.kick();
-        }
-
-        // 2–3. Wait for vCPU + background threads (blocking joins).
-        // Wrapped in block_in_place to avoid stalling the tokio worker thread.
+        // 2–3. Wait for vCPU + background threads (blocking joins, each
+        // wait bounded by TEARDOWN_JOIN_DEADLINE).
         let (vcpu_states, event_loop_handle, vsock_irq_handle, net_poll_handle) = (
             &mut self.vcpu_handles,
             &mut self.event_loop_handle,
             &mut self.vsock_irq_handle,
             &mut self.net_poll_handle,
         );
-        let vcpu_states = tokio::task::block_in_place(|| {
+        let join_result = run_blocking_teardown(|| {
             let mut states = Vec::with_capacity(vcpu_states.len());
             for handle in vcpu_states.drain(..) {
+                wait_thread_finished(
+                    &format!("vCPU {}", handle.id()),
+                    TEARDOWN_JOIN_DEADLINE,
+                    || handle.is_finished(),
+                )
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
                 match handle.join_with_state() {
                     Ok(Some(state)) => states.push(state),
                     Ok(None) => {
@@ -966,25 +1006,43 @@ impl MicroVm {
                 }
             }
             if let Some(handle) = event_loop_handle.take() {
+                wait_thread_finished("event-loop", TEARDOWN_JOIN_DEADLINE, || {
+                    handle.is_finished()
+                })
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
                 let _ = handle.join();
             }
             if let Some(handle) = vsock_irq_handle.take() {
+                wait_thread_finished("vsock-irq", TEARDOWN_JOIN_DEADLINE, || handle.is_finished())
+                    .map_err(|e| Error::Snapshot(e.to_string()))?;
                 let _ = handle.join();
             }
             if let Some(handle) = net_poll_handle.take() {
+                wait_thread_finished("net-poll", TEARDOWN_JOIN_DEADLINE, || handle.is_finished())
+                    .map_err(|e| Error::Snapshot(e.to_string()))?;
                 let _ = handle.join();
             }
             Ok(states)
-        })?;
+        });
+
+        // Stop the vsock worker before capturing device state — it must
+        // not mutate connection state mid-capture. Runs even when a
+        // join failed, so the worker cannot leak with the listener.
+        self.shutdown_vsock_worker(join_result.is_ok());
+        let vcpu_states = join_result?;
         debug!("Captured {} vCPU states", vcpu_states.len());
 
         // 4. Capture VM-level state (vm_fd is still valid)
         let irqchip = CurrentArch::capture_irqchip(&self.vm)?;
         let arch_state = CurrentArch::capture_arch_vm_state(&self.vm)?;
 
-        // 5. Capture vsock device state
+        // 5. Capture vsock device state (recovering a poisoned mutex:
+        // `snapshot_state` only reads `&self` state).
         let vsock_state = if let Some(ref vsock_mmio) = self.virtio_vsock_mmio {
-            vsock_mmio.lock().unwrap().snapshot_state()
+            vsock_mmio
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot_state()
         } else {
             snapshot::VsockSnapshotState {
                 device_features: 1 << 32, // VIRTIO_F_VERSION_1
@@ -1379,56 +1437,96 @@ impl MicroVm {
 
         info!("Stopping MicroVm");
 
-        // Signal stop through command channel
-        let _ = self.command_tx.send(VmCommand::Stop).await;
+        self.signal_teardown();
 
-        // Signal vCPUs to stop
-        self.running.store(false, Ordering::SeqCst);
-
-        // Kick vCPU threads out of KVM_RUN (HLT blocks indefinitely without this)
-        for handle in &self.vcpu_handles {
-            handle.kick();
-        }
-
-        // Wait for vCPU + background threads (blocking joins). On a
-        // multi-thread runtime, block_in_place keeps the joins from
-        // stalling other tasks on this worker. block_in_place panics on a
-        // current-thread runtime (e.g. #[tokio::test]); joining inline is
-        // acceptable there — teardown is the VM's last act, and with
-        // `running` cleared and the vCPUs kicked the joins complete in
-        // milliseconds.
-        match tokio::runtime::Handle::current().runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.join_vm_threads())?;
-            }
-            _ => self.join_vm_threads()?,
-        }
+        // Wait for vCPU + background threads (blocking joins). The
+        // vsock worker is stopped even when a join failed, so it cannot
+        // leak with the listener.
+        let join_result = run_blocking_teardown(|| self.join_vm_threads_bounded());
+        self.shutdown_vsock_worker(join_result.is_ok());
+        join_result?;
 
         info!("MicroVm stopped");
         Ok(())
     }
 
-    /// Join the vCPU and background threads (blocking).
-    fn join_vm_threads(&mut self) -> Result<()> {
+    /// Signals every VM thread to exit, without waiting on any of them:
+    /// clear `running` and kick the vCPUs, shut the control channel down
+    /// (failing pending RPC slots wakes an event loop wedged inside a
+    /// dispatched command's await), then `try_send` a best-effort `Stop`
+    /// wake — a blocking send would park teardown on a wedged loop that
+    /// has stopped draining the channel.
+    fn signal_teardown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        for handle in &self.vcpu_handles {
+            handle.kick();
+        }
+        if let Some(channel) = self.control_channel.as_ref() {
+            channel.shutdown();
+        }
+        let _ = self.command_tx.try_send(VmCommand::Stop);
+    }
+
+    /// Join the vCPU and background threads (blocking), each wait
+    /// bounded by [`TEARDOWN_JOIN_DEADLINE`].
+    fn join_vm_threads_bounded(&mut self) -> Result<()> {
         for handle in self.vcpu_handles.drain(..) {
+            wait_thread_finished(
+                &format!("vCPU {}", handle.id()),
+                TEARDOWN_JOIN_DEADLINE,
+                || handle.is_finished(),
+            )?;
             handle.join()?;
         }
         if let Some(handle) = self.event_loop_handle.take() {
+            wait_thread_finished("event-loop", TEARDOWN_JOIN_DEADLINE, || {
+                handle.is_finished()
+            })?;
             handle
                 .join()
                 .map_err(|_| Error::Vcpu("Event loop panic".into()))?;
         }
         if let Some(handle) = self.vsock_irq_handle.take() {
+            wait_thread_finished("vsock-irq", TEARDOWN_JOIN_DEADLINE, || handle.is_finished())?;
             handle
                 .join()
                 .map_err(|_| Error::Vcpu("vsock-irq thread panic".into()))?;
         }
         if let Some(handle) = self.net_poll_handle.take() {
+            wait_thread_finished("net-poll", TEARDOWN_JOIN_DEADLINE, || handle.is_finished())?;
             handle
                 .join()
                 .map_err(|_| Error::Vcpu("net-poll thread panic".into()))?;
         }
         Ok(())
+    }
+
+    /// Stops the vsock backend's worker thread (its lifecycle flag is
+    /// not reached by clearing `running`). With every VM thread joined
+    /// (`after_clean_join`) the device mutex is uncontended and a
+    /// blocking lock is safe; after a failed join the wedged thread may
+    /// hold it, so only a try-lock is — on contention the worker is
+    /// left behind with a warning.
+    fn shutdown_vsock_worker(&self, after_clean_join: bool) {
+        let Some(vsock_mmio) = self.virtio_vsock_mmio.as_ref() else {
+            return;
+        };
+        if after_clean_join {
+            vsock_mmio
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .shutdown_worker();
+            return;
+        }
+        match vsock_mmio.try_lock() {
+            Ok(mut device) => device.shutdown_worker(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().shutdown_worker()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                warn!("vsock worker not stopped: device mutex held by a thread that failed to join")
+            }
+        }
     }
 }
 
@@ -2006,5 +2104,24 @@ mod tests {
     fn test_exec_output_failure() {
         let output = ExecOutput::new(vec![], b"failed\n".to_vec(), 1);
         assert!(!output.success());
+    }
+
+    /// A thread that has already exited joins immediately; a thread that
+    /// never exits turns into an error naming it instead of a hang.
+    #[test]
+    fn wait_thread_finished_bounds_the_wait_and_names_the_thread() {
+        let finished = std::thread::spawn(|| {});
+        wait_thread_finished("already-done", TEARDOWN_JOIN_DEADLINE, || {
+            finished.is_finished()
+        })
+        .expect("finished thread must join within the deadline");
+        finished.join().expect("join");
+
+        let err = wait_thread_finished("stuck-thread", Duration::from_millis(50), || false)
+            .expect_err("a never-finishing thread must error");
+        assert!(
+            err.to_string().contains("stuck-thread"),
+            "error must name the stuck thread: {err}"
+        );
     }
 }

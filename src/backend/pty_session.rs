@@ -130,6 +130,7 @@ impl PtySession {
         connector: &GuestConnector,
         session_secret: &SessionSecret,
         boot_wait_done: &std::sync::atomic::AtomicBool,
+        abort: &std::sync::atomic::AtomicBool,
         request: &PtyOpenRequest,
     ) -> Result<Self> {
         // PTY sessions open after the main control channel has already
@@ -141,6 +142,7 @@ impl PtySession {
             boot_wait_done,
             Duration::ZERO,
             Duration::from_secs(3),
+            abort,
             "pty-open",
         )?;
 

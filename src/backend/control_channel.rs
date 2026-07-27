@@ -203,8 +203,18 @@ pub struct ControlChannel {
     /// guest's virtio-vsock device is up. The userspace vsock backend
     /// buffers connects behind its worker and uses [`Duration::ZERO`].
     boot_wait: Duration,
+    /// Serializes establishment attempts so concurrent RPCs on a dead
+    /// channel produce one reconnect instead of a stampede.
+    establish_lock: Arc<AsyncMutex<()>>,
     /// Lazily-established multiplex channel. Re-established on death.
-    channel: Arc<AsyncMutex<Option<MultiplexChannel>>>,
+    ///
+    /// Sync mutex, locked only to clone or replace the handle, so
+    /// [`shutdown`](Self::shutdown) never waits on `establish_lock`
+    /// (held across a full connect deadline by a wedged establishment).
+    channel: Arc<StdMutex<Option<MultiplexChannel>>>,
+    /// Set by [`shutdown`](Self::shutdown); establishment refuses
+    /// once set.
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl ControlChannel {
@@ -233,7 +243,9 @@ impl ControlChannel {
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(false)),
             boot_wait,
-            channel: Arc::new(AsyncMutex::new(None)),
+            establish_lock: Arc::new(AsyncMutex::new(())),
+            channel: Arc::new(StdMutex::new(None)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -244,8 +256,30 @@ impl ControlChannel {
             session_secret,
             boot_wait_done: Arc::new(AtomicBool::new(true)),
             boot_wait: Duration::ZERO,
-            channel: Arc::new(AsyncMutex::new(None)),
+            establish_lock: Arc::new(AsyncMutex::new(())),
+            channel: Arc::new(StdMutex::new(None)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Shuts the channel down for VM teardown: fails every pending RPC
+    /// (including those with no timeout of their own, e.g. service-mode
+    /// execs), stops the reader thread, aborts an in-flight connect
+    /// loop, and makes establishment refuse. Idempotent.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let channel = self.lock_channel_slot().take();
+        if let Some(channel) = channel {
+            channel.shutdown();
+        }
+    }
+
+    fn lock_channel_slot(&self) -> std::sync::MutexGuard<'_, Option<MultiplexChannel>> {
+        // Held only to clone or replace the handle; poison recovery is
+        // safe and keeps shutdown working after a panicked RPC task.
+        self.channel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Sends a one-shot RPC through the multiplex channel and awaits a
@@ -301,20 +335,28 @@ impl ControlChannel {
     }
 
     async fn get_or_establish_channel_unbounded(&self) -> Result<MultiplexChannel> {
-        let mut guard = self.channel.lock().await;
+        let _establish_guard = self.establish_lock.lock().await;
 
-        if let Some(channel) = guard.as_ref() {
-            if !channel.is_dead() {
-                return Ok(channel.clone());
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Guest("control channel is shut down".into()));
+        }
+
+        {
+            let mut slot = self.lock_channel_slot();
+            if let Some(channel) = slot.as_ref() {
+                if !channel.is_dead() {
+                    return Ok(channel.clone());
+                }
+                debug!("control_channel: multiplex channel dead, reconstructing");
+                *slot = None;
             }
-            debug!("control_channel: multiplex channel dead, reconstructing");
-            *guard = None;
         }
 
         let connector = Arc::clone(&self.connector);
         let session_secret = self.session_secret.clone();
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
         let boot_wait = self.boot_wait;
+        let shutting_down = Arc::clone(&self.shutting_down);
 
         let channel = tokio::task::spawn_blocking(move || {
             establish_multiplex_channel(
@@ -323,13 +365,21 @@ impl ControlChannel {
                 &boot_wait_done,
                 boot_wait,
                 HANDSHAKE_READ_TIMEOUT,
+                &shutting_down,
                 "multiplex-establish",
             )
         })
         .await
         .map_err(|e| Error::Guest(format!("multiplex establish task panicked: {e}")))??;
 
-        *guard = Some(channel.clone());
+        // Re-check under the slot lock: a shutdown that raced this
+        // establishment must not be handed a fresh live channel.
+        let mut slot = self.lock_channel_slot();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            channel.shutdown();
+            return Err(Error::Guest("control channel is shut down".into()));
+        }
+        *slot = Some(channel.clone());
         Ok(channel)
     }
 
@@ -635,11 +685,13 @@ impl ControlChannel {
         let connector = Arc::clone(&self.connector);
         let session_secret = self.session_secret.clone();
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
+        let shutting_down = Arc::clone(&self.shutting_down);
         tokio::task::spawn_blocking(move || {
             super::pty_session::PtySession::open(
                 &connector,
                 &session_secret,
                 &boot_wait_done,
+                &shutting_down,
                 &request,
             )
         })
@@ -652,12 +704,17 @@ impl ControlChannel {
 ///
 /// Fully synchronous — intended to be called from `spawn_blocking` closures.
 /// Uses [`std::thread::sleep`] for backoff delays (not `tokio::time::sleep`).
+///
+/// `abort` is polled between attempts: a channel shutdown ends the
+/// retry loop within one backoff delay instead of running out the full
+/// connect deadline.
 pub(crate) fn connect_with_handshake_sync(
     connector: &GuestConnector,
     session_secret: &SessionSecret,
     boot_wait_done: &AtomicBool,
     boot_wait: Duration,
     handshake_timeout: Duration,
+    abort: &AtomicBool,
     context: &str,
 ) -> Result<Box<dyn GuestStream>> {
     // Mark the first attempt for logging / future diagnostics. We used to
@@ -689,6 +746,12 @@ pub(crate) fn connect_with_handshake_sync(
     let mut attempt_timeout = handshake_timeout;
 
     loop {
+        if abort.load(Ordering::SeqCst) {
+            return Err(Error::Guest(
+                "control_channel: connect aborted (channel shut down)".into(),
+            ));
+        }
+
         if Instant::now() >= deadline {
             warn!(
                 "control_channel[{context}]: deadline reached after {} connect/handshake attempts",
@@ -806,6 +869,7 @@ pub(crate) fn establish_multiplex_channel(
     boot_wait_done: &AtomicBool,
     boot_wait: Duration,
     handshake_timeout: Duration,
+    abort: &AtomicBool,
     context: &str,
 ) -> Result<MultiplexChannel> {
     let stream = connect_with_handshake_sync(
@@ -814,6 +878,7 @@ pub(crate) fn establish_multiplex_channel(
         boot_wait_done,
         boot_wait,
         handshake_timeout,
+        abort,
         context,
     )?;
     upgrade_stream_to_multiplex(stream, context)
@@ -1125,6 +1190,48 @@ mod tests {
             .expect("task must not panic");
         assert!(result.is_err(), "pending call must error after shutdown");
         // guest_side stayed open throughout: the channel died without EOF.
+        drop(guest_side);
+    }
+
+    /// `shutdown` must fail a pending RPC promptly even when the guest
+    /// went silent without closing its fd, and must refuse to
+    /// re-establish afterward.
+    #[tokio::test]
+    async fn control_channel_shutdown_fails_pending_and_refuses_reestablish() {
+        let (host_side, guest_side) = UnixStream::pair().expect("socket pair");
+        let host_stream: Box<dyn GuestStream> = Box::new(UnixGuestStream { stream: host_side });
+        let channel = upgrade_stream_to_multiplex(host_stream, "test").expect("upgrade");
+
+        let connector: GuestConnector =
+            Arc::new(|| Err(Error::Guest("no guest to connect to".into())));
+        let control = ControlChannel::new(connector, SessionSecret::new([0u8; 32]));
+        *control.lock_channel_slot() = Some(channel.clone());
+
+        let pending_channel = channel.clone();
+        let pending = tokio::spawn(async move {
+            pending_channel
+                .call(MessageType::Ping, b"hello".to_vec())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        control.shutdown();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("pending call must fail promptly after shutdown")
+            .expect("task must not panic");
+        assert!(result.is_err(), "pending call must error after shutdown");
+
+        let establish_err = match control.get_or_establish_channel().await {
+            Ok(_) => panic!("establishment after shutdown must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            establish_err.to_string().contains("shut down"),
+            "unexpected error: {establish_err}"
+        );
+        // guest_side stayed open throughout: no EOF was involved.
         drop(guest_side);
     }
 

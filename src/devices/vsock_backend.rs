@@ -57,4 +57,9 @@ pub trait VsockMmioDevice: Send {
     fn inject_transport_reset(&mut self, _mem: &GuestMemoryMmap) -> Result<()> {
         Ok(())
     }
+
+    /// Stop the device's background worker thread as part of VM
+    /// teardown — the VMM's `running` flag does not reach it. The vhost
+    /// backend has no worker (no-op by default).
+    fn shutdown_worker(&mut self) {}
 }
