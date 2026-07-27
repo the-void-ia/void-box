@@ -381,6 +381,10 @@ jobs:
           )"
           echo "Created verified commit ${oid} on ${branch}"
 
+          # GitHub renders single newlines in PR bodies as hard line
+          # breaks, so each prose paragraph below must stay on one
+          # print() line — only tables, lists, and code blocks may span
+          # multiple lines.
           body_file="$(mktemp)"
           python3 > "$body_file" <<'PY'
           import json, os
@@ -402,26 +406,21 @@ jobs:
               for a in skipped:
                   print(f"- `linux/{a}` — either already pinned to `{version}` or upstream artifact was unavailable (see job log).")
               print()
-          print("CI downloaded each artifact from the URL above and recorded the")
-          print("SHA-256 shown here.")
+          print("CI downloaded each artifact from the URL above and recorded the SHA-256 shown here.")
           print()
           print("## How to verify the SHA-256s")
           print()
           if agent == "claude-code":
-              print("CI cross-checks each download against Anthropic's `manifest.json`")
-              print("(CDN-edge integrity — same origin, so not an independent oracle).")
-              print("You can spot-check manually:")
+              print("CI cross-checks each download against Anthropic's `manifest.json` (CDN-edge integrity — same origin, so not an independent oracle). You can spot-check manually:")
               print()
               print("```bash")
               print(f"curl -fsSL https://downloads.claude.ai/claude-code-releases/{version}/manifest.json \\")
               print("  | jq '.platforms | {\"linux-x64\", \"linux-arm64\"} | map_values(.checksum)'")
               print("```")
               print()
-              print("The `linux-x64` / `linux-arm64` checksums must match the")
-              print("`linux/x86_64` / `linux/aarch64` rows above.")
+              print("The `linux-x64` / `linux-arm64` checksums must match the `linux/x86_64` / `linux/aarch64` rows above.")
           elif agent == "codex":
-              print("Upstream publishes per-asset digests on the GitHub release page:")
-              print(f"https://github.com/openai/codex/releases/tag/rust-v{version}")
+              print(f"Upstream publishes per-asset digests on the GitHub release page: https://github.com/openai/codex/releases/tag/rust-v{version}")
               print()
               print("Spot-check from the CLI:")
               print()
@@ -434,14 +433,7 @@ jobs:
           print()
           print("## Why this needs a human")
           print()
-          print("Once merged, the hashes above lock these binaries in place — every")
-          print("future build aborts unless the download matches byte-for-byte. CI")
-          print("just computed them from a single fetch against upstream, so merging")
-          print("without spot-checking trusts whatever upstream served at that one")
-          print("moment. The cross-check above is what catches a CDN-edge tamper or")
-          print("an upstream-account compromise before it propagates into our")
-          print("images. A surprise version jump (off-schedule, several releases at")
-          print("once, pre-release tag) is its own signal worth a second look.")
+          print("Once merged, the hashes above lock these binaries in place — every future build aborts unless the download matches byte-for-byte. CI just computed them from a single fetch against upstream, so merging without spot-checking trusts whatever upstream served at that one moment. The cross-check above is what catches a CDN-edge tamper or an upstream-account compromise before it propagates into our images. A surprise version jump (off-schedule, several releases at once, pre-release tag) is its own signal worth a second look.")
           PY
 
           # Open a PR only if none exists for this branch; the commit above
