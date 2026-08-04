@@ -1248,6 +1248,14 @@ fn tcp_port_forward_inbound_connect_succeeds() {
         }
     }
 
+    // Final receive attempt: the connector's result can land between the
+    // last in-loop poll and the deadline.
+    if connect_result.is_none() {
+        if let Ok(r) = rx.try_recv() {
+            connect_result = Some(r);
+        }
+    }
+
     // Contract 1.
     let connect_result =
         connect_result.expect("host TcpStream::connect did not complete within 5 s");

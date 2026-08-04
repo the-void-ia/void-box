@@ -38,7 +38,6 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux_benches {
     use super::*;
-    use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
 
@@ -1043,21 +1042,21 @@ mod linux_benches {
         const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
         const DRAIN_POLL: Duration = Duration::from_micros(100);
 
-        // Probe-bind to grab an ephemeral host port, then release the listener
-        // so SlirpBackend can bind it.  There is an inherent TOCTOU race
-        // between the drop and the SlirpBackend bind — acceptable for benches
-        // running on a loopback interface under controlled conditions.
-        let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind for host port");
-        let host_port = probe.local_addr().expect("probe local_addr").port();
-        drop(probe);
-
+        // Host port 0 = OS-assigned: the stack binds a free port directly,
+        // so there is no probe-drop-rebind race, and a disabled rule (bind
+        // failure is warn-only) fails the expect below instead of spinning
+        // the drain loop until the job times out.
         let mut stack = SlirpBackend::with_security(
             64,
             50,
             &["169.254.0.0/16".to_string()],
-            &[(host_port, GUEST_PORT)],
+            &[(0, GUEST_PORT)],
         )
         .expect("SlirpBackend::with_security");
+        let (host_port, _) = *stack
+            .port_forward_listener_ports()
+            .first()
+            .expect("port-forward listener must be bound");
 
         let mut out: Vec<Vec<u8>> = Vec::new();
 

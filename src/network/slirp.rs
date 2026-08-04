@@ -183,8 +183,9 @@ fn cold_branch() {}
 /// Build an epoll token for a port-forward listener FD.
 ///
 /// The high byte carries `PROTO_TAG_LISTEN`; the low 16 bits encode the
-/// host port. Each port-forward rule has a distinct host port, so tokens
-/// are unique across all registered listeners.
+/// host port. Callers pass the port actually bound (read back from the
+/// listener, never a rule's requested 0), so tokens are unique across
+/// all registered listeners.
 fn flow_token_for_listener(host_port: u16) -> u64 {
     PROTO_TAG_LISTEN | u64::from(host_port)
 }
@@ -3322,7 +3323,9 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 /// A rule's `host_port` of 0 binds an OS-assigned free port. The port
 /// actually bound is read back from the listener and written into the
 /// rule, so the stored rules and the returned map never disagree on a
-/// resolved port.
+/// resolved port. Fixed-port rules bind before port-0 rules, so an
+/// OS-assigned port can never take a port another rule requests
+/// explicitly.
 ///
 /// Rules whose listener setup fails — bind, non-blocking mode,
 /// local-address readback, or epoll registration — are skipped with a
@@ -3334,59 +3337,80 @@ pub(crate) fn bind_port_forward_listeners(
     epoll: &Arc<EpollDispatch>,
 ) -> HashMap<u16, (TcpListener, u16)> {
     let mut listeners = HashMap::new();
-    for port_forward in &mut nat.port_forwards {
-        if port_forward.proto != nat::ForwardProto::Tcp {
-            continue;
-        }
-        let requested_port = port_forward.host_port;
-        let guest_port = port_forward.guest_port;
-        let listener = match TcpListener::bind(("127.0.0.1", requested_port)) {
-            Ok(l) => l,
-            Err(bind_error) => {
-                warn!(
-                    host_port = requested_port,
-                    error = %bind_error,
-                    "SLIRP port-forward: bind failed, rule disabled"
-                );
+    // Fixed-port rules bind first: a port-0 rule bound earlier could be
+    // handed a port another rule requests explicitly (the kernel assigns
+    // OS ports from ip_local_port_range), silently disabling the explicit
+    // rule.
+    for bind_fixed_ports in [true, false] {
+        for port_forward in &mut nat.port_forwards {
+            if port_forward.proto != nat::ForwardProto::Tcp {
                 continue;
             }
-        };
-        if let Err(nb_error) = listener.set_nonblocking(true) {
-            warn!(
-                host_port = requested_port,
-                error = %nb_error,
-                "SLIRP port-forward: set_nonblocking failed, rule disabled"
-            );
-            continue;
-        }
-        let host_port = match listener.local_addr() {
-            Ok(addr) => addr.port(),
-            Err(addr_error) => {
-                warn!(
-                    host_port = requested_port,
-                    error = %addr_error,
-                    "SLIRP port-forward: local_addr failed, rule disabled"
-                );
+            if (port_forward.host_port != 0) != bind_fixed_ports {
                 continue;
             }
-        };
-        let token = flow_token_for_listener(host_port);
-        if let Err(reg_error) = epoll.register(listener.as_raw_fd(), token, RegisterMode::Read) {
-            warn!(
-                host_port,
-                error = %reg_error,
-                "SLIRP port-forward: epoll register failed, rule disabled"
-            );
-            continue;
+            bind_one_port_forward(port_forward, epoll, &mut listeners);
         }
-        debug!(
-            host_port,
-            guest_port, "SLIRP port-forward: listening on 127.0.0.1 (epoll-driven)"
-        );
-        port_forward.host_port = host_port;
-        listeners.insert(host_port, (listener, guest_port));
     }
     listeners
+}
+
+/// Bind and register the listener for one TCP port-forward rule, keying
+/// `listeners` by the port actually bound and writing that port back into
+/// the rule. A failure at any stage disables the rule with a `WARN` and
+/// leaves the rule's requested port untouched.
+fn bind_one_port_forward(
+    port_forward: &mut nat::PortForward,
+    epoll: &Arc<EpollDispatch>,
+    listeners: &mut HashMap<u16, (TcpListener, u16)>,
+) {
+    let requested_port = port_forward.host_port;
+    let guest_port = port_forward.guest_port;
+    let listener = match TcpListener::bind(("127.0.0.1", requested_port)) {
+        Ok(l) => l,
+        Err(bind_error) => {
+            warn!(
+                host_port = requested_port,
+                error = %bind_error,
+                "SLIRP port-forward: bind failed, rule disabled"
+            );
+            return;
+        }
+    };
+    if let Err(nb_error) = listener.set_nonblocking(true) {
+        warn!(
+            host_port = requested_port,
+            error = %nb_error,
+            "SLIRP port-forward: set_nonblocking failed, rule disabled"
+        );
+        return;
+    }
+    let host_port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(addr_error) => {
+            warn!(
+                host_port = requested_port,
+                error = %addr_error,
+                "SLIRP port-forward: local_addr failed, rule disabled"
+            );
+            return;
+        }
+    };
+    let token = flow_token_for_listener(host_port);
+    if let Err(reg_error) = epoll.register(listener.as_raw_fd(), token, RegisterMode::Read) {
+        warn!(
+            host_port,
+            error = %reg_error,
+            "SLIRP port-forward: epoll register failed, rule disabled"
+        );
+        return;
+    }
+    debug!(
+        host_port,
+        guest_port, "SLIRP port-forward: listening on 127.0.0.1 (epoll-driven)"
+    );
+    port_forward.host_port = host_port;
+    listeners.insert(host_port, (listener, guest_port));
 }
 
 impl Default for SlirpBackend {
@@ -3968,5 +3992,9 @@ mod tests {
         assert_eq!(resolved.len(), 1, "one resolved pair for one bound rule");
         assert_ne!(resolved[0].0, 0, "host port 0 must resolve to a real port");
         assert_eq!(resolved[0].1, 80, "guest port carried through unchanged");
+        assert_eq!(
+            one.nat.port_forwards[0].host_port, resolved[0].0,
+            "resolved port written back into the stored rule"
+        );
     }
 }
