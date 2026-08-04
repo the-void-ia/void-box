@@ -1227,6 +1227,27 @@ fn tcp_port_forward_inbound_connect_succeeds() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    // The deadline can expire between injecting the SYN-ACK (first pass
+    // of the final iteration) and draining the stack's handshake ACK;
+    // one final drain closes that window without extending the deadline.
+    if saw_synthesized_syn && !saw_ack_after_synack {
+        let mut out = Vec::new();
+        stack.drain_to_guest(&mut out);
+        frames_drained += out.len();
+        for frame in &out {
+            let Some((_seq, _ack, src_port, dst_port, ctrl)) = parse_tcp_to_guest_full(frame)
+            else {
+                continue;
+            };
+            if ctrl == TcpControl::None
+                && dst_port == GUEST_PORT
+                && high_port_for_ack == Some(src_port)
+            {
+                saw_ack_after_synack = true;
+            }
+        }
+    }
+
     // Contract 1.
     let connect_result =
         connect_result.expect("host TcpStream::connect did not complete within 5 s");
