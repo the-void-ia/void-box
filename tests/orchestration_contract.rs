@@ -503,6 +503,10 @@ fn from_event_id_returns_subsequent_events() {
         r#"{"file":"nonexistent.yaml","run_id":"resume-test"}"#,
     );
 
+    // The daemon fails this run asynchronously; wait for the terminal state so
+    // both GETs below observe the same frozen event stream.
+    wait_until_terminal(addr, "resume-test", 5_000);
+
     // Get all events
     let (_, all_events) = http_request(addr, "GET", "/v1/runs/resume-test/events", "");
     let all_events = all_events.as_array().unwrap();
@@ -539,6 +543,10 @@ fn from_event_id_missing_marker_returns_all() {
         r#"{"file":"nonexistent.yaml","run_id":"resume-missing"}"#,
     );
 
+    // The daemon fails this run asynchronously; wait for the terminal state so
+    // both GETs below observe the same frozen event stream.
+    wait_until_terminal(addr, "resume-missing", 5_000);
+
     // Resume with a non-existent event_id → should return all
     let (_, resumed) = http_request(
         addr,
@@ -548,7 +556,7 @@ fn from_event_id_missing_marker_returns_all() {
     );
     let resumed = resumed.as_array().unwrap();
 
-    // Get all events (after resume call to avoid race with async event emission)
+    // Get all events
     let (_, all_events) = http_request(addr, "GET", "/v1/runs/resume-missing/events", "");
     let all_events = all_events.as_array().unwrap();
     assert_eq!(resumed.len(), all_events.len());
