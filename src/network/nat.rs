@@ -29,8 +29,10 @@ pub enum ForwardProto {
 pub struct PortForward {
     /// Transport protocol; TCP or UDP.
     pub proto: ForwardProto,
-    /// Host port to bind. Connections to `127.0.0.1:host_port` are
-    /// proxied into the guest at `guest_port`.
+    /// Host port to bind; 0 requests an OS-assigned free port. Once the
+    /// listener is bound the rule carries the resolved port, and
+    /// connections to `127.0.0.1:host_port` are proxied into the guest
+    /// at `guest_port`.
     pub host_port: u16,
     /// Guest port the forwarded connection terminates at.
     pub guest_port: u16,

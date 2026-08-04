@@ -742,8 +742,8 @@ impl SlirpBackend {
     /// Create a SLIRP stack with security parameters.
     ///
     /// `port_forwards` maps host ports to guest ports as `(host_port, guest_port)` pairs.
-    /// Each entry is stored in [`nat::Rules`] as a TCP forward rule; host listeners are
-    /// spawned in sub-task B (5.5b) and not yet active.
+    /// A `host_port` of 0 binds an OS-assigned free port; the resolved
+    /// pairs are reported by [`Self::port_forward_listener_ports`].
     pub fn with_security(
         max_concurrent_connections: usize,
         max_connections_per_second: u32,
@@ -794,7 +794,7 @@ impl SlirpBackend {
             })
             .collect();
 
-        let nat = nat::Rules {
+        let mut nat = nat::Rules {
             gateway_loopback: true,
             deny_cidrs,
             port_forwards: nat_port_forwards,
@@ -813,8 +813,11 @@ impl SlirpBackend {
         let epoll_waker = epoll_inner.waker();
         let epoll = Arc::new(epoll_inner);
 
-        // Bind listeners for port-forwards and register their FDs with epoll.
-        let port_forward_listeners = bind_port_forward_listeners(&nat, &epoll);
+        // Bind listeners for port-forwards and register their FDs with
+        // epoll; rules requesting host port 0 get their resolved port
+        // written back, so a bound rule's stored port is the port
+        // actually bound.
+        let port_forward_listeners = bind_port_forward_listeners(&mut nat, &epoll);
 
         Ok(Self {
             queue,
@@ -844,6 +847,23 @@ impl SlirpBackend {
             flow_keys_scratch: Vec::new(),
             cached_now: Instant::now(),
         })
+    }
+
+    /// Returns the resolved `(host_port, guest_port)` pair of every live
+    /// TCP port-forward listener, sorted by host port.
+    ///
+    /// A rule whose listener setup fails is disabled with only a warning,
+    /// so a rule may have no pair here; a rule requesting host port 0 is
+    /// bound to an OS-assigned port and appears with the port actually
+    /// bound.
+    pub fn port_forward_listener_ports(&self) -> Vec<(u16, u16)> {
+        let mut pairs: Vec<(u16, u16)> = self
+            .port_forward_listeners
+            .iter()
+            .map(|(host_port, (_, guest_port))| (*host_port, *guest_port))
+            .collect();
+        pairs.sort_unstable();
+        pairs
     }
 
     /// Returns the wall-clock instant captured at the start of the
@@ -3297,27 +3317,34 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 }
 
 /// Bind one `TcpListener` per TCP port-forward rule, register each with
-/// `epoll`, and return a map from host port to `(listener, guest_port)`.
+/// `epoll`, and return a map from bound host port to `(listener, guest_port)`.
 ///
-/// Rules whose bind or `set_nonblocking` calls fail are skipped with a
-/// `WARN` log; the returned map contains only the rules that succeeded.
-/// When `nat.port_forwards` contains no TCP rules the map is empty.
+/// A rule's `host_port` of 0 binds an OS-assigned free port. The port
+/// actually bound is read back from the listener and written into the
+/// rule, so the stored rules and the returned map never disagree on a
+/// resolved port.
+///
+/// Rules whose listener setup fails — bind, non-blocking mode,
+/// local-address readback, or epoll registration — are skipped with a
+/// `WARN` log and keep their requested port; the returned map contains
+/// only the rules that succeeded. When `nat.port_forwards` contains no
+/// TCP rules the map is empty.
 pub(crate) fn bind_port_forward_listeners(
-    nat: &nat::Rules,
+    nat: &mut nat::Rules,
     epoll: &Arc<EpollDispatch>,
 ) -> HashMap<u16, (TcpListener, u16)> {
     let mut listeners = HashMap::new();
-    for port_forward in &nat.port_forwards {
+    for port_forward in &mut nat.port_forwards {
         if port_forward.proto != nat::ForwardProto::Tcp {
             continue;
         }
-        let host_port = port_forward.host_port;
+        let requested_port = port_forward.host_port;
         let guest_port = port_forward.guest_port;
-        let listener = match TcpListener::bind(("127.0.0.1", host_port)) {
+        let listener = match TcpListener::bind(("127.0.0.1", requested_port)) {
             Ok(l) => l,
             Err(bind_error) => {
                 warn!(
-                    host_port,
+                    host_port = requested_port,
                     error = %bind_error,
                     "SLIRP port-forward: bind failed, rule disabled"
                 );
@@ -3326,12 +3353,23 @@ pub(crate) fn bind_port_forward_listeners(
         };
         if let Err(nb_error) = listener.set_nonblocking(true) {
             warn!(
-                host_port,
+                host_port = requested_port,
                 error = %nb_error,
                 "SLIRP port-forward: set_nonblocking failed, rule disabled"
             );
             continue;
         }
+        let host_port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(addr_error) => {
+                warn!(
+                    host_port = requested_port,
+                    error = %addr_error,
+                    "SLIRP port-forward: local_addr failed, rule disabled"
+                );
+                continue;
+            }
+        };
         let token = flow_token_for_listener(host_port);
         if let Err(reg_error) = epoll.register(listener.as_raw_fd(), token, RegisterMode::Read) {
             warn!(
@@ -3345,6 +3383,7 @@ pub(crate) fn bind_port_forward_listeners(
             host_port,
             guest_port, "SLIRP port-forward: listening on 127.0.0.1 (epoll-driven)"
         );
+        port_forward.host_port = host_port;
         listeners.insert(host_port, (listener, guest_port));
     }
     listeners
@@ -3914,14 +3953,20 @@ mod tests {
             "zero listeners for empty port_forwards"
         );
 
-        // One TCP port-forward: exactly one listener.
-        let one =
-            SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[(18080, 80)])
-                .expect("SlirpBackend::with_security (one forward)");
+        // One TCP port-forward on host port 0: exactly one listener, bound
+        // to an OS-assigned port. A hardcoded port would collide with
+        // other processes on shared CI runners, disabling the rule
+        // silently.
+        let one = SlirpBackend::with_security(64, 50, &["169.254.0.0/16".to_string()], &[(0, 80)])
+            .expect("SlirpBackend::with_security (one forward)");
         assert_eq!(
             one.port_forward_listeners.len(),
             1,
             "one listener for one TCP port-forward rule"
         );
+        let resolved = one.port_forward_listener_ports();
+        assert_eq!(resolved.len(), 1, "one resolved pair for one bound rule");
+        assert_ne!(resolved[0].0, 0, "host port 0 must resolve to a real port");
+        assert_eq!(resolved[0].1, 80, "guest port carried through unchanged");
     }
 }

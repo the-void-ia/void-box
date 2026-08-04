@@ -28,7 +28,8 @@ pub struct NetworkConfig {
     pub mac_address: Option<String>,
     /// Enable NAT for outbound connections
     pub enable_nat: bool,
-    /// Host port forwards (host_port, guest_port)
+    /// Host port forwards (host_port, guest_port); a host port of 0
+    /// binds an OS-assigned free port
     pub port_forwards: Vec<(u16, u16)>,
 }
 
@@ -61,7 +62,9 @@ impl NetworkConfig {
         self
     }
 
-    /// Add a port forward
+    /// Add a port forward. A `host_port` of 0 binds an OS-assigned free
+    /// port; the resolved port is reported by
+    /// `SlirpBackend::port_forward_listener_ports`.
     pub fn port_forward(mut self, host_port: u16, guest_port: u16) -> Self {
         self.port_forwards.push((host_port, guest_port));
         self
