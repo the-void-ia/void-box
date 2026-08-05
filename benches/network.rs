@@ -952,8 +952,8 @@ mod linux_benches {
         stack.insert_synthetic_synsent_entry(guest_port, high_port, our_seq, host_stream);
     }
 
-    /// Microbench for the inbound SYN-ACK state-machine transition added in
-    /// 5.5b.1 (`TcpNatState::SynSent` → `Established`). Each iteration
+    /// Microbench for the inbound port-forward SYN-ACK state-machine
+    /// transition (`TcpNatState::SynSent` → `Established`). Each iteration
     /// (re)builds a `SlirpBackend`, seeds one `SynSent` entry, feeds a
     /// synthetic guest SYN-ACK frame to `process_guest_frame`, and lets
     /// the bench timer capture the `process_guest_frame` cost.
