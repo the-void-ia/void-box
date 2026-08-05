@@ -99,9 +99,22 @@ jobs:
           grep -E "^(model name|hypervisor)" /proc/cpuinfo | sort -u
 
       - name: Enable KVM access
+        # A udev rule, not just a one-shot chmod: later steps load kernel
+        # modules (`apt-get install linux-modules-*`, `modprobe`), and the
+        # udev events they fire re-apply device permissions — a plain
+        # chmod here is silently reverted to the image default
+        # (0660 root:kvm, with the runner user not in the kvm group)
+        # before the benches run. The rule makes 0666 the default udev
+        # re-applies; the trigger applies it to the existing nodes now.
         run: |
-          sudo chmod a+rw /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm-rw-all.rules
+          echo 'KERNEL=="vhost-vsock", MODE="0666"' \
+            | sudo tee -a /etc/udev/rules.d/99-kvm-rw-all.rules
+          sudo udevadm control --reload-rules
           sudo modprobe vhost_vsock || true
+          sudo udevadm trigger --name-match=kvm --name-match=vhost-vsock || true
+          sudo chmod a+rw /dev/kvm
           sudo chmod a+rw /dev/vhost-vsock 2>/dev/null || true
           ls -la /dev/kvm
           ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present"
@@ -213,6 +226,19 @@ jobs:
           VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
         run: |
+          # pipefail: without it the harness's exit code is swallowed by
+          # `tee` and a failing strict harness still passes the step.
+          set -o pipefail
+          # Re-grant right before use — udev events between the early
+          # grant and this step can re-apply image-default permissions.
+          sudo chmod a+rw /dev/kvm /dev/vhost-vsock 2>/dev/null || true
+          # Usable-KVM probe: actually open /dev/kvm (what Kvm::new()
+          # does), not just test for existence. Skip only when the
+          # runner genuinely cannot provide KVM even after the grant.
+          if ! (exec 3<>/dev/kvm) 2>/dev/null; then
+            echo "::warning::/dev/kvm not usable (open failed after access grant); skipping wall-clock harness"
+            exit 0
+          fi
           if [ ! -e /dev/vhost-vsock ]; then
             echo "::warning::/dev/vhost-vsock not available; skipping wall-clock harness"
             exit 0
@@ -251,6 +277,16 @@ jobs:
           VOID_BOX_KERNEL: ${{ github.workspace }}/target/vmlinux-slim-x86_64
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
         run: |
+          # pipefail: without it the harness's exit code is swallowed by
+          # `tee` and the step only fails later at the missing JSON.
+          set -o pipefail
+          # Re-grant + usable-KVM probe — same rationale as the
+          # wall-clock harness step above.
+          sudo chmod a+rw /dev/kvm /dev/vhost-vsock 2>/dev/null || true
+          if ! (exec 3<>/dev/kvm) 2>/dev/null; then
+            echo "::warning::/dev/kvm not usable (open failed after access grant); skipping voidbox-network-bench"
+            exit 0
+          fi
           if [ ! -e /dev/vhost-vsock ]; then
             echo "::warning::/dev/vhost-vsock not available; skipping voidbox-network-bench"
             exit 0
