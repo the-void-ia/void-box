@@ -1738,10 +1738,11 @@ impl SlirpBackend {
         entry.guest_window = u32::from(tcp.window_len()) << entry.guest_window_scale;
 
         // Inbound port-forward: guest's SYN-ACK completing the host-initiated
-        // 3-way handshake.  We synthesized a SYN to the guest (5.5b.2/5.5b.3);
-        // the guest's kernel accepted it and replied with SYN+ACK.  Send an ACK
-        // back so the guest's TCP stack transitions to Established on its side,
-        // then record our state as Established too.
+        // 3-way handshake.  process_pending_inbound_accepts synthesized a SYN
+        // to the guest (via synthesize_inbound_syn); the guest's kernel
+        // accepted it and replied with SYN+ACK.  Send an ACK back so the
+        // guest's TCP stack transitions to Established on its side, then
+        // record our state as Established too.
         //
         // NatKey for the inbound flow: guest_src_port = guest service port,
         // dst_ip = SLIRP_GATEWAY_IP, dst_port = the ephemeral high port we
@@ -3251,7 +3252,8 @@ fn build_tcp_packet_static(
 /// Caller pushes the returned bytes into `inject_to_guest`. The guest's
 /// kernel sees an inbound TCP SYN, routes it to whatever's bound at
 /// `guest_port`, and emits a SYN-ACK that `handle_tcp_frame` matches
-/// to the seeded `SynSent` flow_table entry (5.5b.1).
+/// to the `SynSent` flow_table entry seeded by
+/// `process_pending_inbound_accepts`.
 #[cfg(any(test, feature = "bench-helpers"))]
 pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
     build_tcp_packet_static(
@@ -3269,7 +3271,6 @@ pub fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> 
 }
 
 #[cfg(not(any(test, feature = "bench-helpers")))]
-#[allow(dead_code)] // consumed in 5.5b.3
 fn synthesize_inbound_syn(high_port: u16, guest_port: u16, our_seq: u32) -> Vec<u8> {
     build_tcp_packet_static(
         SLIRP_GATEWAY_IP,
@@ -3490,15 +3491,16 @@ impl SlirpBackend {
 /// `SlirpBackend` that allow unit tests and divan benches to insert synthetic
 /// flow entries without widening the visibility of private types.
 /// The full behavioral contract for the SynSent → Established transition is
-/// pinned in the E2E test `tcp_inbound_syn_ack_completes_handshake` below and
-/// will be further exercised end-to-end in task 5.5b.5
-/// (`tcp_port_forward_inbound` in `tests/network_baseline.rs`).
+/// pinned in the unit test `tcp_inbound_syn_ack_completes_handshake` below and
+/// exercised end-to-end by `tcp_port_forward_inbound_connect_succeeds` in
+/// `tests/network_baseline.rs`.
 #[cfg(any(test, feature = "bench-helpers"))]
 impl SlirpBackend {
     /// Insert a synthetic `SynSent` entry into the flow table.
     ///
     /// Used by `tcp_inbound_syn_ack_completes_handshake` to pre-seed the state
-    /// that would normally be created by `synthesize_inbound_syn` (5.5b.2).
+    /// that `process_pending_inbound_accepts` would normally create when
+    /// draining an inbound accept.
     ///
     /// `guest_port`: the guest's listening service port (e.g. 8080).
     /// `high_port`:  the ephemeral source port we used for the synthesized SYN.
@@ -3841,8 +3843,8 @@ mod tests {
     ///   (a) transitions the flow state to Established, and
     ///   (b) queues exactly one plain ACK frame towards the guest.
     ///
-    /// The full E2E behavioral contract (including host-listener wiring) will be
-    /// pinned in `tests/network_baseline.rs::tcp_port_forward_inbound` (task 5.5b.5).
+    /// The full E2E behavioral contract (including host-listener wiring) is
+    /// pinned in `tests/network_baseline.rs::tcp_port_forward_inbound_connect_succeeds`.
     #[test]
     fn tcp_inbound_syn_ack_completes_handshake() {
         use std::net::TcpListener;
@@ -3905,9 +3907,11 @@ mod tests {
     /// from the channel, inserts a `SynSent` flow-table entry, and queues a
     /// synthesized SYN frame for injection to the guest.
     ///
-    /// This pins the contract for task 5.5b.3.  The test is white-box: it uses
-    /// `push_inbound_accept` (a `#[cfg(test)]` helper that injects into the
-    /// internal channel) so we don't need a real listener thread.
+    /// This pins the accept-draining half of the inbound port-forward path
+    /// (listener accept → SynSent seeding → SYN injection).  The test is
+    /// white-box: it uses `push_inbound_accept` (a `#[cfg(test)]` helper that
+    /// injects into the internal channel) so we don't need a real listener
+    /// thread.
     #[test]
     fn process_pending_inbound_accepts_seeds_synsent_and_queues_syn() {
         use std::net::TcpListener;
