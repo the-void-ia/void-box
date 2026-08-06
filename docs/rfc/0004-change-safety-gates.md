@@ -8,7 +8,7 @@
 
 ## Summary
 
-This RFC defines the checks a change must clear before it merges, and closes the gaps that let unsafe changes pass today. A green build should mean the change was validated, not just that nothing objected. The gates are format and lint, a test suite that runs real scenarios and fails when it cannot run them, a dependency vulnerability audit, and two independent reviews for security and performance. The first three block a merge. The two reviews are advisory: they surface risk for a human to judge.
+This RFC defines the checks a change must clear before it merges, and closes the gaps that let unsafe changes pass today. A green build must mean the change was validated, not merely that nothing objected. The gates are format and lint, a test suite that runs real scenarios and fails when it cannot run them, a dependency vulnerability audit, and two independent reviews for security and performance. The first three block a merge. The two reviews are advisory: they surface risk for a human to judge.
 
 ## Motivation / problem
 
@@ -42,7 +42,7 @@ Tests are the primary gate. They must satisfy two properties: they must actually
 
 The fix is to separate capability from failure. First detect capability: KVM, vsock, and a kernel and initramfs must all be present. If any is missing, skip, and report the test as skipped with the reason. This keeps a Mac or a machine without KVM quiet, as `AGENTS.md` intends. If the machine is capable and the boot or an RPC then fails, fail the test — always, with no flag to set. A machine that can boot but did not is a bug. Put this logic in the shared preflight helper (`tests/common/vm_preflight.rs`) and in the per-suite `create_started_backend`, so every suite behaves the same.
 
-CI needs one assertion in the other direction. A runner meant to boot VMs should not skip them silently if it loses `/dev/kvm`. Set `VOID_BOX_REQUIRE_VM=1` on those jobs: when it is set, a failed capability check fails the job instead of skipping. As a backstop, check that the initramfs artifact exists and that the number of tests that ran matches the suite's size; a suite that finishes in under a second booted nothing.
+CI needs one assertion in the other direction. A runner meant to boot VMs must not skip them silently if it loses `/dev/kvm`. Set `VOID_BOX_REQUIRE_VM=1` on those jobs: when it is set, a failed capability check fails the job instead of skipping. As a backstop, check that the initramfs artifact exists and that the number of tests that ran matches the suite's size; a suite that finishes in under a second booted nothing.
 
 macOS is different. `tests/conformance.rs:41` reports the VZ backend as always available, and the hosted macOS runner cannot boot nested VZ. So VZ integration runs on a real macOS host, not in CI, and CI treats the VZ suites as advisory. A contributor without a Mac cannot run these suites, and must say so in the pull request or report, so the gap is visible rather than assumed.
 
@@ -52,7 +52,7 @@ macOS is different. `tests/conformance.rs:41` reports the VZ backend as always a
 
 void-box's security analysis lives in a separate private repository. Its conclusions are distilled into a checked-in file, `docs/security/invariants.md`: one entry per invariant, each naming the mechanism that enforces it, the code it lives in, and what a change that breaks it looks like. The file carries mechanisms only, with no exploit detail, so it is safe in public source and present in every clone.
 
-Both reviews run locally, before merge, and separately from the change's author, so a review is not the author checking their own work. For the security review, more than one model should look at the change where possible. The contributor spawns an independent agent from each model family they have — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better. Which ones to run depends on the tools the contributor uses. This review reads the invariants file and the diff, flags a change that touches a security boundary or breaks a documented invariant, and cites the file and line as evidence. Examples of the invariants it checks:
+Both reviews run locally, before merge, and separately from the change's author, so a review is not the author checking their own work. For the security review, more than one model reviews the change where possible. The contributor spawns an independent agent from each model family they have — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better. Which ones to run depends on the tools the contributor uses. This review reads the invariants file and the diff, flags a change that touches a security boundary or breaks a documented invariant, and cites the file and line as evidence. Examples of the invariants it checks:
 
 - Privileged guest file operations resolve paths in the kernel (`openat2` with `RESOLVE_NO_SYMLINKS` in `guest-agent/src/fs_guard.rs`), never by string.
 - The session secret is compared in constant time.
@@ -96,7 +96,7 @@ Trustworthy gates also open a later option: automating more of the development l
 
 - Failing the tests when they do not run turns a silent pass into a visible failure on machines without KVM or vsock. The "did not run" state must stay distinct from "failed".
 - The reviews check known invariants and past measurements. A novel issue that matches none of them passes. The reviews narrow the work; they do not replace human judgment.
-- Without a dedicated perf host, the before-and-after delta depends on a quiet machine, and a contributor may not be able to run it at all. A flagged regression should be confirmed with a second run, and a skipped run must be called out in the PR.
+- Without a dedicated perf host, the before-and-after delta depends on a quiet machine, and a contributor may not be able to run it at all. Confirm a flagged regression with a second run. Call out a skipped run in the PR.
 - VZ integration runs on a Mac, not CI. A VZ-only regression can slip through if that run is skipped and not called out in the PR.
 - The invariants file can fall behind the private analysis. Keep it in sync when the analysis changes.
 
