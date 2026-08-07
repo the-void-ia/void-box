@@ -32,7 +32,7 @@ A change must clear five gates. Three exist already and need only to be enforced
 | Security review | advisory | new |
 | Performance review | advisory | new |
 
-Format, lint, and audit already run and are objective. The only change is to require them on merge. The rest of this section covers the gates that need work.
+Format, lint, and audit already run and are objective; the only change is to require them on merge.
 
 ### Tests that validate real scenarios
 
@@ -48,11 +48,21 @@ macOS is different. `tests/conformance.rs:41` reports the VZ backend as always a
 
 **They must cover the real paths.** Several scenario suites exist but do not run in CI: `oci_integration`, `kvm_integration`, `e2e_sidecar`, `e2e_service_mode`, and `e2e_agent_mcp`. Wire them into the gate, so that boot, command execution, OCI root switch, host-directory mounts, snapshot and restore, network egress, service mode, and the sidecar and MCP paths are validated on every change. Add fuzzing for the host-side parsers that read guest-controlled data — the vsock frame decoder, the virtqueue reader, and the 9p message parser. That is the largest untested surface and the one the threat model weighs most.
 
+### The two reviews
+
+The security review and the performance review are advisory. Each runs on the diff, separately from the change's author, so a review is not the author checking their own work.
+
+Both run locally for now. Running them in CI is the goal, but that cost is deferred until the project needs it. Until then a contributor runs each review on their own machine and reports the result (see "What the pull request must report").
+
+Each review has two parts. An objective part gives a pass or fail: the documented invariants for security, the benchmark for performance. An agent part adds judgment a fixed check cannot give — one or more AI agents read the diff and reason about it. The agent part is advisory and never blocks a merge.
+
+The agents' prompt and command live in the repo: a script a human can run, and a skill an agent can invoke. The skill wraps the script, so the prompt has one home and the review is not reinvented per change.
+
 ### Security review
 
 void-box's security analysis lives in a separate private repository. Its conclusions are distilled into a checked-in file, `docs/security/invariants.md`: one entry per invariant, each naming the mechanism that enforces it, the code it lives in, and what a change that breaks it looks like. The file carries mechanisms only, with no exploit detail, so it is safe in public source and present in every clone.
 
-Both reviews run locally, before merge, and separately from the change's author, so a review is not the author checking their own work. For the security review, more than one model reviews the change where possible. The contributor spawns an independent agent from each model family they have — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better. Which ones to run depends on the tools the contributor uses. This review reads the invariants file and the diff, flags a change that touches a security boundary or breaks a documented invariant, and cites the file and line as evidence. Examples of the invariants it checks:
+For the security review, more than one model reviews the change where possible. The contributor spawns an independent agent from each model family they have — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better. Which ones to run depends on the tools the contributor uses. The review reads the invariants file and the diff, flags a change that touches a security boundary or breaks a documented invariant, and cites the file and line as evidence. Examples of the invariants it checks:
 
 - Privileged guest file operations resolve paths in the kernel (`openat2` with `RESOLVE_NO_SYMLINKS` in `guest-agent/src/fs_guard.rs`), never by string.
 - The session secret is compared in constant time.
@@ -60,13 +70,15 @@ Both reviews run locally, before merge, and separately from the change's author,
 - No new secret is passed on the kernel command line.
 - OCI image unpack tolerates an entry it cannot apply, instead of aborting the whole image.
 
-The review is advisory. It surfaces findings; a human decides. It never edits code.
+It surfaces findings; a human decides. It never edits code.
 
 ### Performance review
 
 void-box ships a startup benchmark, `voidbox-startup-bench`, that boots a VM and measures the time to boot. It prints percentiles but never fails on a slow result. Add `--assert-cold-p50-ms` and `--assert-warm-p50-ms` flags, so a boot slower than a fixed floor fails in the binary itself.
 
-There is no dedicated host for performance benchmarking today, and setting one up is not justified yet; revisit as the project grows. Contributors run the benchmark on their own machine or VM, and results are not comparable across different hardware. So the review compares a change against its base commit on the same machine — a before-and-after delta — and flags a regression beyond a margin. There is no tuned margin yet; start with a generous one and tighten it in later iterations. CI's nested virtualization is too noisy even for the delta, so on CI the review is advisory and catches only gross regressions. A contributor who cannot run the benchmark — for example, on a machine that cannot boot the VM — must say so in the pull request or the report, so the missing check is visible rather than assumed. The review never edits code.
+There is no dedicated host for performance benchmarking today, and setting one up is not justified yet; revisit as the project grows. Contributors run the benchmark on their own machine or VM, and results are not comparable across different hardware. So the review compares a change against its base commit on the same machine — a before-and-after delta — and flags a regression beyond a margin. There is no tuned margin yet; start with a generous one and tighten it in later iterations. CI's nested virtualization is too noisy even for the delta, so on CI the review is advisory and catches only gross regressions. A contributor who cannot run the benchmark — for example, on a machine that cannot boot the VM — must say so in the pull request or the report, so the missing check is visible rather than assumed.
+
+The benchmark is the objective part. An agent part adds what the benchmark cannot do: one or more AI agents read the diff and look for performance regressions the numbers miss — a new allocation on a hot path, extra work per RPC, a lock held across I/O, a blocking call on the async runtime, or an accidental O(n²) in a loop. Like the security review, this part is advisory, uses the repo's reviewer script and skill, and never edits code.
 
 ### Enforcement
 
@@ -106,6 +118,6 @@ Sequenced, smallest first. Each step stands on its own.
 
 - **M0 — Honest tests and enforcement.** Split capability from failure in the shared preflight: skip when the machine cannot run VMs, fail when a capable machine's boot or RPC fails. Add the `VOID_BOX_REQUIRE_VM=1` assertion so capable CI runners fail instead of skipping, plus the artifact and suite-size checks. Add the benchmark `--assert-*` flags. Make format, lint, test, and audit blocking, and remove the stale required check. Add the report section to the PR template.
 - **M1 — Coverage.** Wire the CI-absent scenario suites into the gate. Add fuzzing for the vsock, virtqueue, and 9p parsers.
-- **M2 — Reviews.** Land `docs/security/invariants.md`, then the security and performance reviews as advisory subagents. The performance review compares against the base commit on the same machine, and a contributor who cannot run it says so in the PR.
+- **M2 — Reviews.** Land `docs/security/invariants.md`, plus the reviewer script and skill that carry the agents' prompt and command. Then the security and performance reviews as advisory, local-for-now subagents: security against the invariants, performance against the benchmark delta and an agent pass over the diff. A contributor who cannot run a review says so in the PR.
 
 Nothing here changes runtime code or wire formats. On acceptance, file ADRs for the test-honesty contract and the advisory-review design.
