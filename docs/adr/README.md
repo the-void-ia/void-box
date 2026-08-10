@@ -27,3 +27,5 @@ An ADR is distinct from an RFC. An RFC (in [`../rfc/`](../rfc/README.md)) is a p
 | 0006 | Enforce VZ egress in-guest with an eBPF cgroup connect-filter | Accepted | 2026-06-27 | [0006-vz-in-guest-ebpf-egress-enforcement.md](0006-vz-in-guest-ebpf-egress-enforcement.md) |
 | 0007 | Fix the aarch64/KVM guest-physical memory map to the QEMU `virt` layout | Accepted | 2026-07-14 | [0007-aarch64-guest-memory-map.md](0007-aarch64-guest-memory-map.md) |
 | 0008 | Per-platform virtio device discovery — DTB on aarch64, cmdline on x86_64, shared slot table | Accepted | 2026-07-14 | [0008-per-platform-device-discovery.md](0008-per-platform-device-discovery.md) |
+| 0009 | Separate capability from failure in the VM test gate | Accepted | 2026-08-07 | [0009-vm-test-capability-vs-failure.md](0009-vm-test-capability-vs-failure.md) |
+| 0010 | Review security and performance with advisory local AI agents | Accepted | 2026-08-07 | [0010-advisory-local-reviews.md](0010-advisory-local-reviews.md) |

@@ -1,10 +1,10 @@
 # RFC-0004: Gates for deciding a change is safe to ship
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Authors:** Cristian Spinetta
 - **Created:** 2026-07-29
-- **Discussion:** (pending PR)
-- **Related ADRs:** — (none yet; filed on acceptance)
+- **Discussion:** [PR #148](https://github.com/the-void-ia/void-box/pull/148)
+- **Related ADRs:** ADR-0009, ADR-0010
 
 ## Summary
 
@@ -14,7 +14,7 @@ This RFC defines the checks a change must clear before it merges, and closes the
 
 A change can reach `main` today without being validated.
 
-First, the integration tests that boot a real VM report success when no VM boots. `create_started_backend` in `tests/conformance.rs:113-134` returns `None` when the backend is unavailable, the kernel or initramfs is unset, or the boot fails. Each test then returns early, and the harness records `ok`. These suites cover `src/vmm`, `src/devices`, `src/backend`, and `guest-agent` — the code where a bug is most dangerous — so the checks that matter most can pass without running. `AGENTS.md` warns about this. One CI step guards against it with `VOID_BOX_DIAGNOSTIC=1`, which turns a skip into a failure, but the other VM suites do not.
+First, the integration tests that boot a real VM report success when no VM boots. `create_started_backend` in `tests/conformance.rs:113-134` returns `None` when the backend is unavailable, the kernel or initramfs is unset, or the boot fails. Each test then returns early, and the harness records `ok`. These suites cover `src/vmm`, `src/devices`, `src/backend`, and `guest-agent` — the code where a bug is most dangerous — so the checks that matter most can pass without running. `AGENTS.md` warns about this. One CI step guards against it with `VOID_BOX_DIAGNOSTIC=1`, which turns a raised boot or RPC error into a failure; the other VM suites do not, and even that guard passes a capable machine that skips without raising an error.
 
 Second, some failures have no check at all. Nothing fuzzes the host-side parsers that read guest-controlled bytes. No memory-safety tooling covers the 265 `unsafe` blocks in `src` and `guest-agent`. There is no performance gate, so a boot that is three times slower still merges.
 
@@ -54,7 +54,11 @@ The security review and the performance review are advisory. Each runs on the di
 
 Both run locally for now. Running them in CI is the goal, but that cost is deferred until the project needs it. Until then a contributor runs each review on their own machine and reports the result (see "What the pull request must report").
 
-Each review has two parts. An objective part gives a pass or fail: the documented invariants for security, the benchmark for performance. An agent part adds judgment a fixed check cannot give — one or more AI agents read the diff and reason about it. The agent part is advisory and never blocks a merge.
+Each review pairs an anchor with agent judgment, but the anchors differ. Performance has an objective anchor: the benchmark fails in the binary when a boot is slower than the floor. Security has a required checklist — the documented invariants the agent must check — which no code mechanically enforces. On top of the anchor, one or more AI agents read the diff and review it for their domain, catching problems the anchor does not encode. The agent review is advisory and never blocks a merge.
+
+Where the contributor has more than one model, run each review under each — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better; which ones depends on the tools the contributor has. A contributor who cannot run a review says so in the pull request, so the gap is visible rather than assumed.
+
+A finding must clear a bar, in either review. It must be introduced by the diff, not pre-existing. It must name the specific thing it breaks — the invariant or mechanism for security, the hot path and the added cost for performance — and cite `file:line`. If the agent cannot meet that bar, it omits the finding. Style, refactor advice, and problems the change does not touch are out of scope.
 
 The agents' prompt and command live in the repo: a script a human can run, and a skill an agent can invoke. The skill wraps the script, so the prompt has one home and the review is not reinvented per change.
 
@@ -62,9 +66,9 @@ The agents' prompt and command live in the repo: a script a human can run, and a
 
 void-box's security analysis lives in a separate private repository. Its conclusions are distilled into a checked-in file, `docs/security/invariants.md`: one entry per invariant, each naming the mechanism that enforces it, the code it lives in, and what a change that breaks it looks like. The file carries mechanisms only, with no exploit detail, so it is safe in public source and present in every clone.
 
-For the security review, more than one model reviews the change where possible. The contributor spawns an independent agent from each model family they have — for example a Claude Code agent and a Codex agent — so models trained differently reach their own verdicts. One is enough; two of different lineage is better. Which ones to run depends on the tools the contributor uses. The review reads the invariants file and the diff, flags a change that touches a security boundary or breaks a documented invariant, and cites the file and line as evidence. Examples of the invariants it checks:
+The reviewing agent reads the diff and looks for security problems the change introduces, with the invariants file as its baseline. It also reasons beyond that baseline — a new capability the guest gains, a widened trust boundary, guest input reaching a privileged path unvalidated, a secret reaching a new place — subject to the finding standard above. The baseline invariants it must always check:
 
-- Privileged guest file operations resolve paths in the kernel (`openat2` with `RESOLVE_NO_SYMLINKS` in `guest-agent/src/fs_guard.rs`), never by string.
+- Privileged guest file operations resolve paths in the kernel (`openat2` with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` in `guest-agent/src/fs_guard.rs`), never by string.
 - The session secret is compared in constant time.
 - Host-side parsers of guest data cap the size before allocating.
 - No new secret is passed on the kernel command line.
@@ -78,7 +82,7 @@ void-box ships a startup benchmark, `voidbox-startup-bench`, that boots a VM and
 
 There is no dedicated host for performance benchmarking today, and setting one up is not justified yet; revisit as the project grows. Contributors run the benchmark on their own machine or VM, and results are not comparable across different hardware. So the review compares a change against its base commit on the same machine — a before-and-after delta — and flags a regression beyond a margin. There is no tuned margin yet; start with a generous one and tighten it in later iterations. CI's nested virtualization is too noisy even for the delta, so on CI the review is advisory and catches only gross regressions. A contributor who cannot run the benchmark — for example, on a machine that cannot boot the VM — must say so in the pull request or the report, so the missing check is visible rather than assumed.
 
-The benchmark is the objective part. An agent part adds what the benchmark cannot do: one or more AI agents read the diff and look for performance regressions the numbers miss — a new allocation on a hot path, extra work per RPC, a lock held across I/O, a blocking call on the async runtime, or an accidental O(n²) in a loop. Like the security review, this part is advisory, uses the repo's reviewer script and skill, and never edits code.
+The benchmark is the objective anchor, but it covers only boot and restore latency. The agent part covers the rest — the runtime hot paths a boot benchmark never exercises — so one or more AI agents read the diff for regressions the numbers miss: a new allocation on a hot path, extra work per RPC, a lock held across I/O, a blocking call on the async runtime, or an accidental O(n²) in a loop. These findings have no benchmark behind them, so they carry more uncertainty than a measured regression. No runtime or RPC micro-benchmark exists to anchor them yet. Like the security review, this part is advisory, follows the finding standard above, uses the repo's reviewer script and skill, and never edits code.
 
 ### Enforcement
 
@@ -105,7 +109,7 @@ Trustworthy gates also open a later option: automating more of the development l
 
 **Add memory-safety tooling (miri, sanitizers) across the codebase.** `miri` cannot execute the ioctl, mmap, and FFI code that holds most of the `unsafe`. Fuzzing the guest-facing parsers hits the highest-risk subset for far less effort, so it comes first.
 
-**Make the security and performance reviews block a merge.** A review that blocks on a judgment call produces false stops and trains people to route around it. Advisory reviews surface risk and leave the decision with a human. The objective parts — an invariant regression, a boot slower than the floor — are enforced by the tests and the benchmark, not by the review.
+**Make the security and performance reviews block a merge.** A review that blocks on a judgment call produces false stops and trains people to route around it. Advisory reviews surface risk and leave the decision with a human. The one objective piece — a boot slower than the floor — is enforced by the benchmark, not by the review; the security invariants are a checklist the agent applies, not a mechanical gate.
 
 **Parallel VM test fleets and autonomous fix loops.** The VM gate is serial: each suite runs single-threaded and boots one guest at a time. Parallel fleets add cost without buying coverage, and that machinery is disproportionate for a solo, pre-release project.
 
@@ -116,6 +120,12 @@ Trustworthy gates also open a later option: automating more of the development l
 - Without a dedicated perf host, the before-and-after delta depends on a quiet machine, and a contributor may not be able to run it at all. Confirm a flagged regression with a second run. Call out a skipped run in the PR.
 - VZ integration runs on a Mac, not CI. A VZ-only regression can slip through if that run is skipped and not called out in the PR.
 - The invariants file can fall behind the private analysis. Keep it in sync when the analysis changes.
+
+## Unresolved questions
+
+- What regression margin does the performance review start with, and how is it tightened? The first cut is a generous margin, refined in later iterations.
+- When do the reviews move from local to CI? They run locally for now to defer cost; the trigger to run them in CI is not set.
+- What anchors the performance agent's runtime findings? The benchmark covers boot and restore latency only; no runtime or RPC micro-benchmark exists to anchor the rest yet.
 
 ## Rollout / implementation plan
 
