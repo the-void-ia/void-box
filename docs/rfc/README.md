@@ -14,7 +14,8 @@ Small, local, obvious changes skip the RFC and go straight to a PR.
 
 1. **Propose — RFC.** The contributor writes an RFC in `docs/rfc/` (next number, status `Draft`), opens it as a PR, and gets review. The RFC is where the discussion and alternatives live. Iterate until it is `Accepted` (or `Rejected` / `Withdrawn`).
 2. **Record — ADR(s).** Once the RFC is accepted, distill the concrete, load-bearing decisions into one or more ADRs in `docs/adr/` (status `Accepted`). An RFC is a proposal and a narrative; an ADR is a single atomic decision and its consequences. One RFC can yield several ADRs.
-3. **Implement.** Build it, linking the PR(s) back to the RFC and ADR numbers. The RFC/ADRs are the historical record of *why*; the current state of the system lives in the code and in living docs (`docs/architecture.md`), not in the RFC.
+3. **Track — milestone and issues.** When the RFC is accepted, create a GitHub milestone named `RFC-NNNN <topic> implementation`, and open a tracking issue for each of the RFC's milestones (M0, M1, …) assigned to it. Label each issue by the scheme in [`CONTRIBUTING.md`](../../CONTRIBUTING.md#issue-triage) — one type, at least one area, any modifiers. Close the milestone when the track ships.
+4. **Implement.** Build it, linking each PR to its tracking issue and to the RFC and ADR numbers. The RFC/ADRs are the historical record of *why*; the current state of the system lives in the code and in living docs (`docs/architecture.md`), not in the RFC.
 
 ### Drift is handled by superseding, not editing
 
