@@ -86,11 +86,16 @@ The gates only help if they block. Move the status-check ruleset from report-onl
 
 ### What the pull request must report
 
-A green build only means something if a reader knows what actually ran. The pull request records this, so a skipped or missing check is visible rather than assumed. The PR template carries a section for it.
+The pull request records what the contributor validated locally, so the approver can decide whether more is needed before merging. The approver checks CI separately. The PR template carries this block:
 
-For each review that ran, state four things. The tool and the model it used — for example, Claude Code with a Claude model, or Codex with an OpenAI model. What it reviewed and how — the branch diff, read-only, checked against `docs/security/invariants.md`. What it flagged, and how each flag was resolved: fixed, or dismissed with a one-line reason. If only one model was available, or none, say that.
-
-For the gates, state what ran and where. Name the host OS and architecture. Say whether the VM suites booted a guest, or were skipped because the machine could not. Give the result of format, lint, tests, and audit, and the performance delta with the machine it ran on. List any gate that did not run and why — no KVM means the Linux VM suites did not boot, no Mac means VZ did not run, and a benchmark that could not run is called out here.
+```
+## Local validation
+- Host: <os/arch>
+- VM suites: booted (<suites>) | skipped (<no KVM | no Mac>)
+- Perf bench: <cold/warm p50 delta vs base> on <machine> | not run (<reason>)
+- Security review: <agent/model; …> — <findings, each fixed | dismissed (reason)> | none (<reason>)
+- Perf review: <agent/model; …> — <findings, each fixed | dismissed (reason)> | none (<reason>)
+```
 
 Trustworthy gates also open a later option: automating more of the development loop, such as letting a coding agent iterate against them until they pass. That is out of scope here, and depends on this foundation being in place first.
 
