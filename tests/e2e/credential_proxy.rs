@@ -56,17 +56,6 @@ const REAL_KEY: &str = "sk-ant-e2e-real-host-held-secret";
 
 type CapturedHeaders = Arc<Mutex<Option<HeaderMap>>>;
 
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-}
-
 fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = PathBuf::from(std::env::var("VOID_BOX_KERNEL").ok()?);
     let initramfs = PathBuf::from(std::env::var("VOID_BOX_INITRAMFS").ok()?);
@@ -80,19 +69,16 @@ fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
 }
 
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available");
-        return None;
-    }
-    let (kernel, initramfs) = vm_artifacts().or_else(|| {
-        eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-        None
-    })?;
+    vm_preflight::start_backend_or_gate(backend_config()).await
+}
+
+fn backend_config() -> Option<BackendConfig> {
+    let (kernel, initramfs) = vm_artifacts()?;
 
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).ok()?;
 
-    let config = BackendConfig {
+    Some(BackendConfig {
         memory_mb: 256,
         vcpus: 1,
         kernel,
@@ -117,16 +103,7 @@ async fn start_backend() -> Option<Box<dyn VmmBackend>> {
         },
         snapshot: None,
         enable_snapshots: false,
-    };
-
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    })
 }
 
 /// Mock TLS upstream recording request headers.
