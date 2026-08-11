@@ -139,6 +139,23 @@ pub fn fail_capable_boot(context: &str, err: impl std::fmt::Display) {
     );
 }
 
+/// Wrap a fallible VM operation — a backend start, a `VoidBox::run`, an RPC —
+/// whose failure on a capable machine is a real bug, not a skip. `Ok` returns
+/// the value; `Err` goes through [`fail_capable_boot`], so it panics on Linux
+/// (and on macOS under `VOID_BOX_REQUIRE_VM=1`) and prints an advisory skip
+/// otherwise. Call it only after the machine is confirmed capable, via
+/// [`vm_capable_or_gate`] or [`start_backend_or_gate`].
+#[allow(dead_code)]
+pub fn checked_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            fail_capable_boot(context, e);
+            None
+        }
+    }
+}
+
 /// Bring up a VM backend for a test, or gate. This is the single entry point a
 /// backend-level suite should use. It handles all three of the cases a caller
 /// would otherwise have to wire by hand: the config is absent (kernel or
@@ -168,13 +185,8 @@ pub async fn start_backend_or_gate(config: Option<BackendConfig>) -> Option<Box<
     }
 
     let mut backend = create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            fail_capable_boot("backend start", e);
-            None
-        }
-    }
+    checked_vm(backend.start(config).await, "backend start")?;
+    Some(backend)
 }
 
 #[cfg(target_os = "macos")]

@@ -13,19 +13,18 @@ mod pty_tests {
     use void_box_protocol::PtyOpenRequest;
 
     fn skip_reason() -> Option<String> {
-        if let Err(err) = vm_preflight::require_kvm_usable() {
-            return Some(err);
+        let kernel = std::env::var_os("VOID_BOX_KERNEL").map(std::path::PathBuf::from);
+        let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(std::path::PathBuf::from);
+        let reason = match (kernel.as_deref(), initramfs.as_deref()) {
+            (Some(k), Some(i)) => vm_preflight::detect_capability(k, Some(i)).err(),
+            _ => Some("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS not set".to_string()),
+        };
+        if let Some(ref r) = reason {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VM is not available: {r}");
+            }
         }
-        if let Err(err) = vm_preflight::require_vsock_usable() {
-            return Some(err);
-        }
-        if std::env::var("VOID_BOX_KERNEL").is_err() {
-            return Some("VOID_BOX_KERNEL not set".into());
-        }
-        if std::env::var("VOID_BOX_INITRAMFS").is_err() {
-            return Some("VOID_BOX_INITRAMFS not set".into());
-        }
-        None
+        reason
     }
 
     fn test_sandbox() -> Result<std::sync::Arc<Sandbox>, Box<dyn std::error::Error>> {

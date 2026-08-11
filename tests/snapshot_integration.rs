@@ -44,23 +44,17 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
 /// Run preflight checks; returns `None` (with eprintln) if the environment
 /// is not suitable for KVM snapshot tests.
 fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping snapshot test: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping snapshot test: {e}");
-        return None;
-    }
     let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
+        if vm_preflight::require_vm() {
+            panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
+        }
         eprintln!(
             "skipping snapshot test: \
              set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
         );
         return None;
     };
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping snapshot test: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
     Some((kernel, initramfs))
@@ -73,16 +67,6 @@ fn test_memory_mb() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256)
-}
-
-/// Diagnostic mode for the Azure CI flakiness investigation. When `VOID_BOX_DIAGNOSTIC=1`
-/// is set, the snapshot tests stop swallowing VM-creation and exec errors via
-/// graceful early-return and instead panic with the full error chain so the
-/// failing step is visible in CI output. Off by default so the local runs that
-/// gracefully skip on missing KVM keep their existing behaviour.
-#[allow(dead_code)]
-pub(crate) fn diagnostic_mode() -> bool {
-    matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1"))
 }
 
 /// Format an error and its `source()` chain, one cause per line.
@@ -102,10 +86,10 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// Helper used by the snapshot tests: under `diagnostic_mode()` it panics with
-/// the full error chain (top message + every `source()`), otherwise it just
-/// `eprintln!`s and returns `None` so the test gracefully ends. The
-/// macro-shaped name keeps call sites short.
+/// Helper used by the snapshot tests: unwrap a fallible VM operation, or panic
+/// with the full error chain. Capability is gated in `preflight()` before the
+/// tests run, so any error that reaches here is a real failure on a capable
+/// machine, not a skip. The `Option<T>` return keeps the call sites short.
 #[allow(dead_code)]
 pub(crate) fn diag_or_skip<T, E>(label: &str, result: Result<T, E>) -> Option<T>
 where
@@ -115,11 +99,9 @@ where
         Ok(v) => Some(v),
         Err(e) => {
             let chain = format_error_chain(&e);
-            if diagnostic_mode() {
-                panic!("[{label}] failed under VOID_BOX_DIAGNOSTIC=1: {chain}");
-            }
-            eprintln!("  {label}: {chain}");
-            None
+            panic!(
+                "[{label}] VM operation failed on a capable machine (real failure, not a skip): {chain}"
+            );
         }
     }
 }

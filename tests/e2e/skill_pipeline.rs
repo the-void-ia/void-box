@@ -55,25 +55,18 @@ fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
 /// Build an VoidBox pointing at real KVM artifacts.
 /// Returns None if KVM or artifacts are unavailable (test will skip).
 fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<VoidBox> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
     let (kernel, initramfs) = match kvm_artifacts() {
         Some(a) => a,
         None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset or their files are missing");
+            }
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
             return None;
         }
     };
 
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)) {
-        eprintln!("skipping: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
         return None;
     }
 
@@ -87,13 +80,7 @@ fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<VoidBox
         builder = builder.skill(skill);
     }
 
-    match builder.build() {
-        Ok(ab) => Some(ab),
-        Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {}", e);
-            None
-        }
-    }
+    vm_preflight::checked_vm(builder.build(), "skill_pipeline build")
 }
 
 // ===========================================================================
@@ -116,15 +103,9 @@ async fn test_agent_box_with_local_skill() {
         None => return,
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
     };
 
     // Basic checks
@@ -174,15 +155,9 @@ async fn test_agent_box_with_multiple_skills() {
         None => return,
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
     };
 
     assert!(!result.agent_result.is_error);
@@ -229,15 +204,9 @@ async fn test_agent_box_with_mcp_skill() {
         None => return,
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
     };
 
     assert!(!result.agent_result.is_error);
@@ -290,15 +259,9 @@ async fn test_agent_box_mixed_skills() {
         None => return,
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
     };
 
     assert!(!result.agent_result.is_error);

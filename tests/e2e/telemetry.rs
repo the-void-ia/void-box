@@ -46,18 +46,12 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
 
 /// Try to build a VoidBoxConfig. Returns `None` if KVM or artifacts are unavailable.
 fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
     let (kernel, initramfs) = match kvm_artifacts_from_env() {
         Some(a) => a,
         None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
+            }
             eprintln!(
                 "skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS \
                  (use scripts/build_test_image.sh)"
@@ -66,8 +60,7 @@ fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
         }
     };
 
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
 
@@ -86,25 +79,18 @@ fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
 
 /// Build a Sandbox::local() backed by a real KVM VM.
 fn build_test_sandbox() -> Option<Arc<Sandbox>> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
     let (kernel, initramfs) = match kvm_artifacts_from_env() {
         Some(a) => a,
         None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
+            }
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
             return None;
         }
     };
 
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
 
@@ -114,30 +100,22 @@ fn build_test_sandbox() -> Option<Arc<Sandbox>> {
         builder = builder.initramfs(p);
     }
 
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping: failed to build sandbox: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(builder.build(), "telemetry sandbox build")
 }
 
 /// Build a Sandbox::local() with custom env vars for claudio configuration.
 fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
+    let (kernel, initramfs) = match kvm_artifacts_from_env() {
+        Some(a) => a,
+        None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
+            }
+            return None;
+        }
+    };
 
-    let (kernel, initramfs) = kvm_artifacts_from_env()?;
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
 
@@ -151,13 +129,7 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
         builder = builder.env(k, v);
     }
 
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping: failed to build sandbox: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(builder.build(), "telemetry sandbox build")
 }
 
 /// Helper: run claudio in a sandbox with given scenario env vars, return parsed result.

@@ -478,20 +478,12 @@ fn build_sandbox_with_oci_mount(
     oci_dir: &std::path::Path,
     _read_only: bool,
 ) -> Option<Arc<Sandbox>> {
-    #[cfg(target_os = "linux")]
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping VM OCI test: {e}");
-        return None;
-    }
-    #[cfg(target_os = "linux")]
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping VM OCI test: {e}");
-        return None;
-    }
-
     let (kernel, initramfs) = match vm_artifacts_from_env() {
         Some(a) => a,
         None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
+            }
             eprintln!(
                 "skipping VM OCI test: \
                  set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
@@ -500,8 +492,7 @@ fn build_sandbox_with_oci_mount(
         }
     };
 
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping VM OCI test: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
 
@@ -535,13 +526,7 @@ fn build_sandbox_with_oci_mount(
         }
     }
 
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping VM OCI test: failed to build sandbox: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(builder.build(), "oci sandbox build")
 }
 
 #[cfg(target_os = "linux")]
@@ -750,27 +735,18 @@ fn example_spec_oci_skills() {
 #[tokio::test]
 #[ignore = "requires VM backend + kernel/initramfs + network (pulls alpine:3.20)"]
 async fn vm_oci_alpine_os_release() {
-    #[cfg(target_os = "linux")]
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return;
-    }
-    #[cfg(target_os = "linux")]
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return;
-    }
-
     let (kernel, initramfs) = match vm_artifacts_from_env() {
         Some(a) => a,
         None => {
+            if vm_preflight::require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
+            }
             eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
             return;
         }
     };
 
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return;
     }
 
@@ -818,12 +794,9 @@ async fn vm_oci_alpine_os_release() {
         }
     }
 
-    let sandbox = match builder.build() {
-        Ok(sb) => sb,
-        Err(e) => {
-            eprintln!("skipping: failed to build sandbox: {e}");
-            return;
-        }
+    let Some(sandbox) = vm_preflight::checked_vm(builder.build(), "oci alpine sandbox build")
+    else {
+        return;
     };
 
     // 3. Exec `cat /etc/os-release` — after pivot_root this is alpine's file.
