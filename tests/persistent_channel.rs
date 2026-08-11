@@ -27,21 +27,6 @@ use void_box_protocol::SessionSecret;
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
-}
-
 fn backend_config() -> Option<BackendConfig> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
@@ -111,24 +96,7 @@ fn backend_config() -> Option<BackendConfig> {
 }
 
 async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available on this platform");
-        return None;
-    }
-
-    let Some(config) = backend_config() else {
-        eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-        return None;
-    };
-
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(backend_config()).await
 }
 
 /// Number of serial `exec` calls fired through the persistent channel.

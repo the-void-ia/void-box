@@ -32,22 +32,6 @@ use void_box_protocol::SessionSecret;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when the platform's VM backend is available.
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true // Virtualization.framework is always available on macOS 13+
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
-}
-
 fn backend_config() -> Option<BackendConfig> {
     backend_config_with(
         vec!["169.254.0.0/16".into()],
@@ -111,43 +95,11 @@ fn backend_config_with(
 }
 
 async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available on this platform");
-        return None;
-    }
-
-    let config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return None;
-        }
-    };
-
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {}", e);
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(backend_config()).await
 }
 
 async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available on this platform");
-        return None;
-    }
-
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {}", e);
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(Some(config)).await
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {

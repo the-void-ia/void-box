@@ -36,34 +36,14 @@ use void_box_protocol::SessionSecret;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when the platform's VM backend is available.
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true // Virtualization.framework is always available on macOS 13+
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
-}
-
-/// Build a `BackendConfig` with a mount. Returns `None` (skips) if the backend
-/// or kernel artifacts are unavailable.
+/// Build a `BackendConfig` with a mount. Returns `None` (skips) if the kernel
+/// artifacts are unavailable; capability and start are handled by
+/// `vm_preflight::start_backend_or_gate`.
 fn build_config_with_mount(
     host_dir: &Path,
     guest_path: &str,
     read_only: bool,
 ) -> Option<BackendConfig> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available on this platform");
-        return None;
-    }
-
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
     if kernel.as_os_str().is_empty() {
@@ -138,15 +118,8 @@ async fn create_started_backend_with_mount(
     guest_path: &str,
     read_only: bool,
 ) -> Option<Box<dyn VmmBackend>> {
-    let config = build_config_with_mount(host_dir, guest_path, read_only)?;
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(build_config_with_mount(host_dir, guest_path, read_only))
+        .await
 }
 
 /// Execute a shell command inside the guest, returning the ExecOutput.

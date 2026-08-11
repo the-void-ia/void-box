@@ -7,6 +7,8 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 use kvm_ioctls::{Cap, Kvm};
 
+use void_box::backend::{create_backend, BackendConfig, VmmBackend};
+
 #[allow(dead_code)]
 pub fn require_kernel_artifacts(kernel: &Path, initramfs: Option<&Path>) -> Result<(), String> {
     if !kernel.exists() {
@@ -80,6 +82,99 @@ pub fn require_vsock_usable() -> Result<(), String> {
 #[allow(dead_code)]
 pub fn require_vsock_usable() -> Result<(), String> {
     Err("no supported vsock-capable VM backend on this platform".to_string())
+}
+
+/// True when `VOID_BOX_REQUIRE_VM=1`. A runner meant to boot VMs must fail,
+/// not skip, when it cannot — this turns an incapable machine into a hard
+/// error instead of a silent skip.
+#[allow(dead_code)]
+pub fn require_vm() -> bool {
+    matches!(std::env::var("VOID_BOX_REQUIRE_VM").as_deref(), Ok("1"))
+}
+
+/// Full capability check for a VM test: the kernel and initramfs artifacts
+/// exist, and the platform VM backend is usable (KVM + vsock on Linux, VZ on
+/// macOS). `Ok(())` means this machine can run VM tests.
+#[allow(dead_code)]
+pub fn detect_capability(kernel: &Path, initramfs: Option<&Path>) -> Result<(), String> {
+    require_kernel_artifacts(kernel, initramfs)?;
+    require_kvm_usable()?;
+    require_vsock_usable()?;
+    Ok(())
+}
+
+/// Decide capability and gate accordingly. Returns `true` when the machine can
+/// run VM tests. On an incapable machine it prints the skip reason and returns
+/// `false`, so the caller can `return` — unless `VOID_BOX_REQUIRE_VM=1`, in
+/// which case it panics, because a runner that is meant to be capable and is
+/// not is a broken runner, not a legitimate skip.
+#[allow(dead_code)]
+pub fn vm_capable_or_gate(kernel: &Path, initramfs: Option<&Path>) -> bool {
+    match detect_capability(kernel, initramfs) {
+        Ok(()) => true,
+        Err(reason) => {
+            if require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but the machine cannot run VM tests: {reason}");
+            }
+            eprintln!("skipping: {reason}");
+            false
+        }
+    }
+}
+
+/// Handle a backend that failed to start or an RPC that failed on a machine
+/// already confirmed capable. A capable machine that did not boot is a bug,
+/// not a skip. On Linux this always panics. On macOS it panics only under
+/// `VOID_BOX_REQUIRE_VM=1`: the hosted macOS runner reports VZ as available but
+/// cannot boot nested VZ, so VZ stays advisory there — validate it on a real
+/// Mac with `VOID_BOX_REQUIRE_VM=1`.
+#[allow(dead_code)]
+pub fn fail_capable_boot(context: &str, err: impl std::fmt::Display) {
+    let strict = cfg!(target_os = "linux") || require_vm();
+    if strict {
+        panic!("{context}: VM failed on a capable machine (a real failure, not a skip): {err}");
+    }
+    eprintln!(
+        "skipping ({context}): {err} [advisory on this host; set VOID_BOX_REQUIRE_VM=1 to enforce]"
+    );
+}
+
+/// Bring up a VM backend for a test, or gate. This is the single entry point a
+/// backend-level suite should use. It handles all three of the cases a caller
+/// would otherwise have to wire by hand: the config is absent (kernel or
+/// initramfs env not set), the machine is not capable, and a capable machine
+/// fails to boot. A caller therefore cannot forget the fail-on-capable-boot
+/// rule, because it lives here.
+///
+/// Returns `Some(backend)` when a VM booted, and `None` when the machine cannot
+/// run VM tests (the caller should `return`). It panics when a capable machine
+/// fails to boot — Linux always, macOS under `VOID_BOX_REQUIRE_VM=1` — and when
+/// `VOID_BOX_REQUIRE_VM=1` but the machine is not configured or not capable.
+#[allow(dead_code)]
+pub async fn start_backend_or_gate(config: Option<BackendConfig>) -> Option<Box<dyn VmmBackend>> {
+    let config = match config {
+        Some(c) => c,
+        None => {
+            if require_vm() {
+                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset or their files are missing");
+            }
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return None;
+        }
+    };
+
+    if !vm_capable_or_gate(&config.kernel, config.initramfs.as_deref()) {
+        return None;
+    }
+
+    let mut backend = create_backend();
+    match backend.start(config).await {
+        Ok(()) => Some(backend),
+        Err(e) => {
+            fail_capable_boot("backend start", e);
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
