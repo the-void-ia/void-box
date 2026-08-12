@@ -114,7 +114,7 @@ install_kernel_modules_from_deb() {
 
   echo "[void-box] Downloading kernel modules (${kmod_version}-generic, ${deb_arch})..."
   echo "[void-box] URL: ${kmod_url}"
-  if ! curl -fsSL "$kmod_url" -o "$tmp/modules.deb"; then
+  if ! curl $VOIDBOX_CURL_RETRY -fsSL "$kmod_url" -o "$tmp/modules.deb"; then
     echo "[void-box] WARNING: failed to download kernel modules"
     rm -rf "$tmp"
     return 1

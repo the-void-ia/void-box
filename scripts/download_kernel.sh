@@ -85,7 +85,9 @@ DEB_PATH="target/${KERNEL_DEB}"
 
 echo "[kernel] Downloading kernel ${KERNEL_FULL_VER} (${DEB_ARCH})..."
 echo "[kernel] URL: ${KERNEL_URL}"
-curl -fSL -o "$DEB_PATH" "$KERNEL_URL"
+# Retry transient failures (curl 35 / connection reset) on a slow or flaky path;
+# --connect-timeout bounds a slow-connect stall before the next attempt.
+curl --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 -fSL -o "$DEB_PATH" "$KERNEL_URL"
 
 # ---- Verify SHA256 checksum ----
 echo "[kernel] Verifying SHA256 checksum..."

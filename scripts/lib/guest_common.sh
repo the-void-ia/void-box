@@ -2,6 +2,13 @@
 # Shared helpers for building void-box guest images.
 # Sourced by build_guest_image.sh — not meant to be run directly.
 
+# Retry transient failures on the launchpad.net downloads below: a slow or
+# flaky path otherwise fails the whole build (observed as curl 35 / connection
+# reset). --retry-all-errors also retries HTTP/transfer errors; --connect-timeout
+# bounds a slow-connect stall before the next attempt. Expanded unquoted so the
+# flags word-split into argv.
+VOIDBOX_CURL_RETRY="--retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30"
+
 # ── Rootfs skeleton ───────────────────────────────────────────────────────────
 
 prepare_rootfs() {

@@ -24,7 +24,7 @@ ensure_busybox_macos() {
   local tmp
   tmp=$(mktemp -d)
   local deb_url="https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb"
-  if curl -fsSL "$deb_url" -o "$tmp/busybox-static.deb"; then
+  if curl $VOIDBOX_CURL_RETRY -fsSL "$deb_url" -o "$tmp/busybox-static.deb"; then
     (cd "$tmp" && ar x busybox-static.deb && tar xf data.tar* ./usr/bin/busybox 2>/dev/null)
     if [[ -f "$tmp/usr/bin/busybox" ]]; then
       cp "$tmp/usr/bin/busybox" "$cached"
@@ -78,7 +78,7 @@ install_claude_code_libs_macos() {
 
   # libc6
   local libc6_url="https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.39-0ubuntu8.4_arm64.deb"
-  if curl -fsSL "$libc6_url" -o "$tmp/libc6.deb"; then
+  if curl $VOIDBOX_CURL_RETRY -fsSL "$libc6_url" -o "$tmp/libc6.deb"; then
     (cd "$tmp" && ar x libc6.deb && tar xf data.tar* \
       ./usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 \
       ./usr/lib/aarch64-linux-gnu/libc.so.6 \
@@ -96,7 +96,7 @@ install_claude_code_libs_macos() {
 
   # libstdc++6
   local stdcpp_url="https://launchpad.net/ubuntu/+archive/primary/+files/libstdc++6_14.2.0-4ubuntu2~24.04_arm64.deb"
-  if curl -fsSL "$stdcpp_url" -o "$tmp/libstdcpp.deb"; then
+  if curl $VOIDBOX_CURL_RETRY -fsSL "$stdcpp_url" -o "$tmp/libstdcpp.deb"; then
     (cd "$tmp" && ar x libstdcpp.deb && tar xf data.tar* \
       ./usr/lib/aarch64-linux-gnu/libstdc++.so.6 \
       ./usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33 2>/dev/null)
@@ -108,7 +108,7 @@ install_claude_code_libs_macos() {
 
   # libgcc-s1
   local libgcc_url="https://launchpad.net/ubuntu/+archive/primary/+files/libgcc-s1_14.2.0-4ubuntu2~24.04_arm64.deb"
-  if curl -fsSL "$libgcc_url" -o "$tmp/libgcc.deb"; then
+  if curl $VOIDBOX_CURL_RETRY -fsSL "$libgcc_url" -o "$tmp/libgcc.deb"; then
     (cd "$tmp" && ar x libgcc.deb && tar xf data.tar* \
       ./usr/lib/aarch64-linux-gnu/libgcc_s.so.1 2>/dev/null)
     cp "$tmp"/usr/lib/aarch64-linux-gnu/libgcc_s.so.1 "$guest_libdir/" 2>/dev/null || true
@@ -143,7 +143,7 @@ install_kernel_modules_macos() {
   tmp=$(mktemp -d)
 
   echo "[void-box] Downloading Ubuntu ARM64 kernel modules (${kmod_version}-generic)..."
-  if curl -fsSL "$kmod_url" -o "$tmp/modules.deb"; then
+  if curl $VOIDBOX_CURL_RETRY -fsSL "$kmod_url" -o "$tmp/modules.deb"; then
     (cd "$tmp" && ar x modules.deb)
 
     # Ubuntu ships data.tar, data.tar.zst, or data.tar.xz — not always plain data.tar.
