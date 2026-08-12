@@ -54,7 +54,9 @@ fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
         );
         return None;
     };
-    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
+    // Snapshot tests force the userspace vsock backend, so they do not need the
+    // host /dev/vhost-vsock device.
+    if !vm_preflight::vm_capable_or_gate_userspace_vsock(&kernel, initramfs.as_deref()) {
         return None;
     }
     Some((kernel, initramfs))
@@ -86,12 +88,10 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// Helper used by the snapshot tests: unwrap a fallible VM operation, or panic
-/// with the full error chain. Capability is gated in `preflight()` before the
-/// tests run, so any error that reaches here is a real failure on a capable
-/// machine, not a skip. The `Option<T>` return keeps the call sites short.
+/// Unwrap a fallible VM op, or panic with the full error chain. Capability is
+/// gated in `preflight()`, so any error here is a real failure, not a skip.
 #[allow(dead_code)]
-pub(crate) fn diag_or_skip<T, E>(label: &str, result: Result<T, E>) -> Option<T>
+pub(crate) fn expect_capable<T, E>(label: &str, result: Result<T, E>) -> Option<T>
 where
     E: std::error::Error + 'static,
 {
@@ -227,27 +227,20 @@ async fn snapshot_cold_boot_vs_restore() {
     // --- Cold boot ---
     eprintln!("[cold_boot_vs_restore] Booting VM...");
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = expect_capable(
+        "[cold_boot_vs_restore] MicroVm::new",
+        MicroVm::new(cfg).await,
+    ) else {
+        return;
     };
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("  VM not running after cold boot");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("  guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("  exec failed: {e}"),
+    let Some(output) = expect_capable(
+        "[cold_boot_vs_restore] cold exec",
+        vm.exec("echo", &["ready"]).await,
+    ) else {
+        return;
     };
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
@@ -266,15 +259,12 @@ async fn snapshot_cold_boot_vs_restore() {
 
     eprintln!("[cold_boot_vs_restore] Taking cold snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
+    let Some(snapshot_path) = expect_capable(
+        "[cold_boot_vs_restore] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config())
+            .await,
+    ) else {
+        return;
     };
     let snap_time = snap_start.elapsed();
     eprintln!(
@@ -312,12 +302,11 @@ async fn snapshot_cold_boot_vs_restore() {
     // --- Restore ---
     eprintln!("[cold_boot_vs_restore] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
+    let Some(mut restored_vm) = expect_capable(
+        "[cold_boot_vs_restore] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    ) else {
+        return;
     };
     let restore_time = restore_start.elapsed();
     eprintln!(
@@ -393,21 +382,16 @@ async fn snapshot_diff_restore() {
 
     // --- Cold boot ---
     eprintln!("[diff_restore] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = expect_capable("[diff_restore] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
+    let Some(output) = expect_capable(
+        "[diff_restore] cold exec",
+        vm.exec("echo", &["ready"]).await,
+    ) else {
+        return;
     };
     assert!(output.success());
     eprintln!("[diff_restore] Cold boot OK");
@@ -422,16 +406,12 @@ async fn snapshot_diff_restore() {
 
     eprintln!("[diff_restore] Taking base snapshot...");
     let base_snap_start = Instant::now();
-    let base_path = match vm
-        .snapshot(&base_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  base snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(base_path) = expect_capable(
+        "[diff_restore] base snapshot",
+        vm.snapshot(&base_dir, config_hash.clone(), snap_config())
+            .await,
+    ) else {
+        return;
     };
     let base_snap_time = base_snap_start.elapsed();
     eprintln!(
@@ -445,13 +425,11 @@ async fn snapshot_diff_restore() {
 
     // --- Restore from base ---
     eprintln!("[diff_restore] Restoring from base snapshot...");
-    let restored_vm = match MicroVm::from_snapshot(&base_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  base restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(restored_vm) = expect_capable(
+        "[diff_restore] base from_snapshot",
+        MicroVm::from_snapshot(&base_path).await,
+    ) else {
+        return;
     };
     eprintln!("[diff_restore] Restored VM CID={}", restored_vm.cid());
 
@@ -467,13 +445,11 @@ async fn snapshot_diff_restore() {
     assert!(exec_ok, "base-restored VM exec must succeed");
 
     // Run another command to dirty more guest pages
-    let output = match restored_vm.exec("echo", &["dirty-pages"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec after dirty tracking failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(output) = expect_capable(
+        "[diff_restore] dirty exec",
+        restored_vm.exec("echo", &["dirty-pages"]).await,
+    ) else {
+        return;
     };
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "dirty-pages");
@@ -485,21 +461,18 @@ async fn snapshot_diff_restore() {
 
     eprintln!("[diff_restore] Taking diff snapshot...");
     let diff_snap_start = Instant::now();
-    let diff_path = match restored_vm
-        .snapshot_diff(
-            diff_dir.path(),
-            config_hash.clone(),
-            snap_config(),
-            parent_id,
-        )
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  diff snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(diff_path) = expect_capable(
+        "[diff_restore] snapshot_diff",
+        restored_vm
+            .snapshot_diff(
+                diff_dir.path(),
+                config_hash.clone(),
+                snap_config(),
+                parent_id,
+            )
+            .await,
+    ) else {
+        return;
     };
     let diff_snap_time = diff_snap_start.elapsed();
     eprintln!(
@@ -537,13 +510,11 @@ async fn snapshot_diff_restore() {
     // --- Restore from diff ---
     eprintln!("[diff_restore] Restoring from diff snapshot...");
     let diff_restore_start = Instant::now();
-    let mut diff_restored_vm = match MicroVm::from_snapshot(&diff_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  diff restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(mut diff_restored_vm) = expect_capable(
+        "[diff_restore] diff from_snapshot",
+        MicroVm::from_snapshot(&diff_path).await,
+    ) else {
+        return;
     };
     let diff_restore_time = diff_restore_start.elapsed();
     eprintln!(
@@ -607,22 +578,15 @@ async fn snapshot_multi_vcpu() {
     // --- Cold boot with 4 vCPUs ---
     eprintln!("[multi_vcpu] Booting VM with {} vCPUs...", num_vcpus);
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = expect_capable("[multi_vcpu] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
+    let Some(output) = expect_capable("[multi_vcpu] cold exec", vm.exec("echo", &["ready"]).await)
+    else {
+        return;
     };
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
@@ -638,15 +602,12 @@ async fn snapshot_multi_vcpu() {
 
     eprintln!("[multi_vcpu] Taking snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config_vcpus(num_vcpus))
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
+    let Some(snapshot_path) = expect_capable(
+        "[multi_vcpu] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config_vcpus(num_vcpus))
+            .await,
+    ) else {
+        return;
     };
     let snap_time = snap_start.elapsed();
     eprintln!("[multi_vcpu] Snapshot captured in {:.1?}", snap_time);
@@ -690,12 +651,11 @@ async fn snapshot_multi_vcpu() {
     // --- Restore ---
     eprintln!("[multi_vcpu] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
+    let Some(mut restored_vm) = expect_capable(
+        "[multi_vcpu] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    ) else {
+        return;
     };
     let restore_time = restore_start.elapsed();
     eprintln!(
@@ -753,34 +713,26 @@ async fn snapshot_net_restore() {
     // --- Cold boot with networking ---
     eprintln!("[net_restore] Booting VM with networking...");
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
+    let Some(vm) = expect_capable("[net_restore] MicroVm::new", MicroVm::new(cfg).await) else {
+        return;
     };
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
+    let Some(output) = expect_capable("[net_restore] cold exec", vm.exec("echo", &["ready"]).await)
+    else {
+        return;
     };
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
     eprintln!("[net_restore] Cold boot OK ({:.1?})", cold_boot_time);
 
     // Verify networking works before snapshot
-    let net_check = match vm.exec("ip", &["link", "show", "eth0"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  net check failed: {e}");
-            return;
-        }
+    let Some(net_check) = expect_capable(
+        "[net_restore] pre-snapshot net check",
+        vm.exec("ip", &["link", "show", "eth0"]).await,
+    ) else {
+        return;
     };
     eprintln!(
         "[net_restore] Pre-snapshot eth0: exit={}, stdout='{}'",
@@ -796,15 +748,12 @@ async fn snapshot_net_restore() {
 
     eprintln!("[net_restore] Taking snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config_net())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
+    let Some(snapshot_path) = expect_capable(
+        "[net_restore] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config_net())
+            .await,
+    ) else {
+        return;
     };
     let snap_time = snap_start.elapsed();
     eprintln!("[net_restore] Snapshot captured in {:.1?}", snap_time);
@@ -837,12 +786,11 @@ async fn snapshot_net_restore() {
     // --- Restore ---
     eprintln!("[net_restore] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
+    let Some(mut restored_vm) = expect_capable(
+        "[net_restore] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    ) else {
+        return;
     };
     let restore_time = restore_start.elapsed();
     eprintln!(
@@ -937,10 +885,10 @@ async fn snapshot_cli_create_and_list() {
 
     // --- Cold boot ---
     eprintln!("[cli_create_list] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_create_list] MicroVm::new", MicroVm::new(cfg).await) else {
+    let Some(vm) = expect_capable("[cli_create_list] MicroVm::new", MicroVm::new(cfg).await) else {
         return;
     };
-    let Some(output) = diag_or_skip(
+    let Some(output) = expect_capable(
         "[cli_create_list] vm.exec",
         vm.exec("echo", &["ready"]).await,
     ) else {
@@ -964,17 +912,11 @@ async fn snapshot_cli_create_and_list() {
         "[cli_create_list] Taking snapshot (hash={})...",
         &config_hash[..16]
     );
-    match vm
-        .snapshot(&snap_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_create_list] snapshot",
+        vm.snapshot(&snap_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     // --- Verify list_snapshots() finds it ---
     let snapshots = snapshot::list_snapshots().expect("list_snapshots");
@@ -1014,10 +956,10 @@ async fn snapshot_cli_delete() {
 
     // --- Cold boot ---
     eprintln!("[cli_delete] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_delete] MicroVm::new", MicroVm::new(cfg).await) else {
+    let Some(vm) = expect_capable("[cli_delete] MicroVm::new", MicroVm::new(cfg).await) else {
         return;
     };
-    let Some(output) = diag_or_skip("[cli_delete] vm.exec", vm.exec("echo", &["ready"]).await)
+    let Some(output) = expect_capable("[cli_delete] vm.exec", vm.exec("echo", &["ready"]).await)
     else {
         return;
     };
@@ -1036,17 +978,11 @@ async fn snapshot_cli_delete() {
     std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
 
     eprintln!("[cli_delete] Taking snapshot...");
-    match vm
-        .snapshot(&snap_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_delete] snapshot",
+        vm.snapshot(&snap_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     // Verify it exists
     assert!(snap_dir.exists(), "snapshot dir must exist before delete");
@@ -1093,10 +1029,10 @@ async fn snapshot_cli_create_diff() {
 
     // --- Cold boot & base snapshot ---
     eprintln!("[cli_create_diff] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_create_diff] MicroVm::new", MicroVm::new(cfg).await) else {
+    let Some(vm) = expect_capable("[cli_create_diff] MicroVm::new", MicroVm::new(cfg).await) else {
         return;
     };
-    let Some(output) = diag_or_skip(
+    let Some(output) = expect_capable(
         "[cli_create_diff] vm.exec",
         vm.exec("echo", &["ready"]).await,
     ) else {
@@ -1119,17 +1055,11 @@ async fn snapshot_cli_create_diff() {
         "[cli_create_diff] Taking base snapshot (hash={})...",
         &config_hash[..16]
     );
-    match vm
-        .snapshot(&base_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  base snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_create_diff] base snapshot",
+        vm.snapshot(&base_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     let base_mem_size = std::fs::metadata(VmSnapshot::memory_path(&base_dir))
         .unwrap()
@@ -1141,13 +1071,11 @@ async fn snapshot_cli_create_diff() {
 
     // --- Restore from base, enable dirty tracking, exec, take diff ---
     eprintln!("[cli_create_diff] Restoring from base snapshot...");
-    let restored_vm = match MicroVm::from_snapshot(&base_dir).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  base restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(restored_vm) = expect_capable(
+        "[cli_create_diff] base from_snapshot",
+        MicroVm::from_snapshot(&base_dir).await,
+    ) else {
+        return;
     };
 
     eprintln!("[cli_create_diff] Enabling dirty page tracking...");
@@ -1155,13 +1083,11 @@ async fn snapshot_cli_create_diff() {
         .enable_dirty_tracking()
         .expect("enable dirty tracking");
 
-    let output = match restored_vm.exec("echo", &["snapshot-ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec after dirty tracking failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
+    let Some(output) = expect_capable(
+        "[cli_create_diff] dirty exec",
+        restored_vm.exec("echo", &["snapshot-ready"]).await,
+    ) else {
+        return;
     };
     assert!(output.success());
     eprintln!("[cli_create_diff] Guest-agent ready after dirty tracking");
@@ -1171,22 +1097,18 @@ async fn snapshot_cli_create_diff() {
     std::fs::create_dir_all(&diff_dir).expect("create diff snapshot dir");
 
     eprintln!("[cli_create_diff] Taking diff snapshot...");
-    let diff_path = match restored_vm
-        .snapshot_diff(
-            &diff_dir,
-            config_hash.clone(),
-            snap_config(),
-            config_hash.clone(),
-        )
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  diff snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            let _ = std::fs::remove_dir_all(&diff_dir);
-            return;
-        }
+    let Some(diff_path) = expect_capable(
+        "[cli_create_diff] snapshot_diff",
+        restored_vm
+            .snapshot_diff(
+                &diff_dir,
+                config_hash.clone(),
+                snap_config(),
+                config_hash.clone(),
+            )
+            .await,
+    ) else {
+        return;
     };
 
     // --- Verify list_snapshots() includes both base and diff ---
@@ -1265,11 +1187,11 @@ async fn auto_snapshot_round_trip() {
 
     // --- Cold boot ---
     eprintln!("[auto_snapshot] Booting VM...");
-    let Some(vm) = diag_or_skip("[auto_snapshot] MicroVm::new", MicroVm::new(cfg).await) else {
+    let Some(vm) = expect_capable("[auto_snapshot] MicroVm::new", MicroVm::new(cfg).await) else {
         return;
     };
 
-    let Some(output) = diag_or_skip(
+    let Some(output) = expect_capable(
         "[auto_snapshot] vm.exec (cold boot)",
         vm.exec("echo", &["ready"]).await,
     ) else {
@@ -1292,23 +1214,19 @@ async fn auto_snapshot_round_trip() {
 
     eprintln!("[auto_snapshot] Taking snapshot...");
     let start = Instant::now();
-    let snap_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
+    let Some(snap_path) = expect_capable(
+        "[auto_snapshot] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config())
+            .await,
+    ) else {
+        return;
     };
 
-    let mut restored_vm = match MicroVm::from_snapshot(&snap_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
+    let Some(mut restored_vm) = expect_capable(
+        "[auto_snapshot] from_snapshot",
+        MicroVm::from_snapshot(&snap_path).await,
+    ) else {
+        return;
     };
     let elapsed = start.elapsed();
     eprintln!("[auto_snapshot] Snapshot + restore took {:.1?}", elapsed);

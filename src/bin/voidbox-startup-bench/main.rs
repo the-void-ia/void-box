@@ -68,17 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Threshold gates: when set, the process exits non-zero if the measured
     // cold/warm `total` p50 exceeds the given bound in milliseconds. Without
-    // these flags the bench only prints and always exits 0.
-    let assert_cold_p50_ms = args
-        .iter()
-        .position(|a| a == "--assert-cold-p50-ms")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok());
-    let assert_warm_p50_ms = args
-        .iter()
-        .position(|a| a == "--assert-warm-p50-ms")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok());
+    // these flags the bench only prints and always exits 0. A flag present but
+    // missing/malformed its value is a hard error, so a typo cannot silently
+    // disable the gate.
+    let assert_cold_p50_ms = parse_ms_flag(&args, "--assert-cold-p50-ms")?;
+    let assert_warm_p50_ms = parse_ms_flag(&args, "--assert-warm-p50-ms")?;
     if assert_cold_p50_ms.is_some() && warm_only {
         return Err("--assert-cold-p50-ms cannot be combined with --warm-only".into());
     }
@@ -128,9 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report("cold.boot", cold.iter().map(|s| s.boot));
         report("cold.stop", cold.iter().map(|s| s.stop));
         let cold_p50 = report("cold.total", cold.iter().map(|s| s.total));
-        if let (Some(limit_ms), Some(p50)) = (assert_cold_p50_ms, cold_p50) {
-            check_p50("cold.total", p50, limit_ms, &mut failures);
-        }
+        assert_phase("cold.total", assert_cold_p50_ms, cold_p50, &mut failures);
     }
 
     if !cold_only {
@@ -153,9 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report("warm.boot", warm.iter().map(|s| s.boot));
         report("warm.stop", warm.iter().map(|s| s.stop));
         let warm_p50 = report("warm.total", warm.iter().map(|s| s.total));
-        if let (Some(limit_ms), Some(p50)) = (assert_warm_p50_ms, warm_p50) {
-            check_p50("warm.total", p50, limit_ms, &mut failures);
-        }
+        assert_phase("warm.total", assert_warm_p50_ms, warm_p50, &mut failures);
     }
 
     if !failures.is_empty() {
@@ -172,13 +162,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Record a threshold breach when `p50` exceeds `limit_ms` milliseconds.
-fn check_p50(label: &str, p50: Duration, limit_ms: u64, failures: &mut Vec<String>) {
-    let p50_ms = p50.as_secs_f64() * 1000.0;
-    if p50_ms > limit_ms as f64 {
-        failures.push(format!(
-            "{label} p50 {p50_ms:.1}ms exceeds threshold {limit_ms}ms"
-        ));
+/// Parse a `--flag <milliseconds>` gate. Absent flag → `None`; present flag with
+/// a missing or non-numeric value → hard error (a typo must not disable the gate).
+fn parse_ms_flag(args: &[String], flag: &str) -> Result<Option<u64>, String> {
+    let Some(i) = args.iter().position(|a| a == flag) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(i + 1)
+        .ok_or_else(|| format!("{flag} requires a value in milliseconds"))?;
+    let ms = value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} value '{value}' is not a valid u64 (milliseconds)"))?;
+    Ok(Some(ms))
+}
+
+/// Record a threshold breach for `label`. When a bound is set but the phase
+/// produced no p50 (no iterations), that is itself a failure — the gate must not
+/// silently pass because nothing ran.
+fn assert_phase(
+    label: &str,
+    limit_ms: Option<u64>,
+    p50: Option<Duration>,
+    failures: &mut Vec<String>,
+) {
+    let Some(limit_ms) = limit_ms else {
+        return;
+    };
+    match p50 {
+        Some(p50) => {
+            let p50_ms = p50.as_secs_f64() * 1000.0;
+            if p50_ms > limit_ms as f64 {
+                failures.push(format!(
+                    "{label} p50 {p50_ms:.1}ms exceeds threshold {limit_ms}ms"
+                ));
+            }
+        }
+        None => failures.push(format!("{label}: no samples to assert (increase --iters)")),
     }
 }
 

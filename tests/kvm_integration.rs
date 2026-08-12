@@ -47,46 +47,25 @@ fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
     Some((kernel, initramfs))
 }
 
-/// Build a `Sandbox::local()` backed by a real KVM VM.
+/// Build a `Sandbox::local()` backed by a real KVM VM, or gate.
 ///
-/// Returns `None` if KVM or artifacts are not available, printing a reason
-/// to stderr so the caller test can early-return without failing.
+/// Skips when artifacts are unset or the machine is incapable; on a capable
+/// machine a build failure panics via `checked_vm`. Returns `None` on a skip.
 fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping KVM sandbox test: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping KVM sandbox test: {e}");
-        return None;
-    }
-
     let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        eprintln!(
-            "skipping KVM sandbox test: \
-             set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
-        );
+        vm_preflight::skip_or_require("VOID_BOX_KERNEL is unset");
         return None;
     };
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping KVM sandbox test: {e}");
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
         return None;
     }
 
     let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
-
     if let Some(ref initramfs_path) = initramfs {
         builder = builder.initramfs(initramfs_path);
     }
 
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping KVM sandbox test: failed to build sandbox: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(builder.build(), "kvm_integration sandbox build")
 }
 
 /// Basic smoke test: boot a real VM and run a trivial command inside it.
@@ -100,12 +79,12 @@ fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_real_vm_exec_uname() {
     let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        eprintln!(
-            "skipping kvm_real_vm_exec_uname: \
-             set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
-        );
+        vm_preflight::skip_or_require("VOID_BOX_KERNEL is unset");
         return;
     };
+    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
+        return;
+    }
 
     // Build VM configuration.
     let mut cfg = VoidBoxConfig::new()
@@ -126,19 +105,16 @@ async fn kvm_real_vm_exec_uname() {
         .await
         .expect("failed to create KVM-backed MicroVm");
 
-    // Try to run uname; if the VM isn't healthy or guest comms fail, treat this
-    // as a soft skip and, where possible, dump serial output for debugging.
+    // Run uname. On a capable machine a boot or guest-comms failure is a real
+    // failure: dump serial output for VmNotRunning, then panic.
     let output = match vm.exec("uname", &["-a"]).await {
         Ok(out) => out,
         Err(Error::VmNotRunning) => {
             let serial_bytes = vm.read_serial_output();
             let console = String::from_utf8_lossy(&serial_bytes);
-            eprintln!("kvm_real_vm_exec_uname: VM not running, guest console:\n{console}");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("kvm_real_vm_exec_uname: guest communication error: {msg}");
-            return;
+            panic!(
+                "guest exec uname: VM not running on a capable machine; guest console:\n{console}"
+            );
         }
         Err(e) => panic!("failed to execute uname inside guest: {e}"),
     };
@@ -168,17 +144,11 @@ async fn kvm_sandbox_echo_parity() {
         return;
     };
 
-    let output = match sandbox.exec("echo", &["hello", "world"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("kvm_sandbox_echo_parity: VM not running; skipping test");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("kvm_sandbox_echo_parity: guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("failed to exec echo in KVM sandbox: {e}"),
+    let Some(output) = vm_preflight::checked_vm(
+        sandbox.exec("echo", &["hello", "world"]).await,
+        "guest exec echo (kvm_integration)",
+    ) else {
+        return;
     };
 
     assert!(
@@ -200,17 +170,11 @@ async fn kvm_sandbox_stdin_pipe() {
     };
 
     let msg = b"hello from stdin over KVM";
-    let output = match sandbox.exec_with_stdin("cat", &[], msg).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("kvm_sandbox_stdin_pipe: VM not running; skipping test");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("kvm_sandbox_stdin_pipe: guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("failed to exec cat in KVM sandbox: {e}"),
+    let Some(output) = vm_preflight::checked_vm(
+        sandbox.exec_with_stdin("cat", &[], msg).await,
+        "guest exec cat (kvm_integration)",
+    ) else {
+        return;
     };
 
     assert!(output.success());
@@ -237,21 +201,14 @@ async fn kvm_workflow_pipe_uppercase() {
         .pipe("step1", "step2")
         .build();
 
-    let observed = match workflow
-        .observe(ObserveConfig::test())
-        .run_in(sandbox)
-        .await
-    {
-        Ok(obs) => obs,
-        Err(Error::VmNotRunning) => {
-            eprintln!("kvm_workflow_pipe_uppercase: VM not running; skipping test");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("kvm_workflow_pipe_uppercase: guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("workflow execution in KVM sandbox failed: {e}"),
+    let Some(observed) = vm_preflight::checked_vm(
+        workflow
+            .observe(ObserveConfig::test())
+            .run_in(sandbox)
+            .await,
+        "workflow run (kvm_integration)",
+    ) else {
+        return;
     };
 
     if !observed.result.success() {
@@ -306,21 +263,14 @@ async fn kvm_claude_workflow_plan_apply() {
         .output("apply")
         .build();
 
-    let observed = match workflow
-        .observe(ObserveConfig::test())
-        .run_in(sandbox)
-        .await
-    {
-        Ok(obs) => obs,
-        Err(Error::VmNotRunning) => {
-            eprintln!("kvm_claude_workflow_plan_apply: VM not running; skipping test");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("kvm_claude_workflow_plan_apply: guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("KVM claude workflow failed: {e}"),
+    let Some(observed) = vm_preflight::checked_vm(
+        workflow
+            .observe(ObserveConfig::test())
+            .run_in(sandbox)
+            .await,
+        "claude workflow run (kvm_integration)",
+    ) else {
+        return;
     };
 
     if !observed.result.success() {

@@ -154,16 +154,12 @@ async fn start_mock_upstream() -> (SocketAddr, CapturedHeaders) {
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    match backend
-        .exec("sh", &["-c", script], &[], &[], None, Some(30))
-        .await
-    {
-        Ok(out) => Some(out),
-        Err(e) => {
-            eprintln!("guest exec error: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(
+        backend
+            .exec("sh", &["-c", script], &[], &[], None, Some(30))
+            .await,
+        "guest exec (credential_proxy)",
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -19,10 +19,11 @@
 //!
 //! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
 
-use std::path::PathBuf;
-
 #[path = "common/vm_preflight.rs"]
 mod vm_preflight;
+
+#[path = "common/provision.rs"]
+mod provision;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::sidecar;
@@ -43,20 +44,8 @@ fn backend_config_with(
     network_deny_list: Vec<String>,
     command_allowlist: Vec<String>,
 ) -> Option<BackendConfig> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
+    let kernel = provision::kernel();
+    let initramfs = provision::test_initramfs();
 
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).ok()?;
@@ -95,24 +84,26 @@ fn backend_config_with(
 }
 
 async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    vm_preflight::start_backend_or_gate(backend_config()).await
+    create_started_backend_with_config(backend_config()?).await
 }
 
 async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
-    vm_preflight::start_backend_or_gate(Some(config)).await
+    // Artifacts are provisioned and capability is no longer probed, so a boot
+    // failure here is a real failure on a machine asked to run VM tests.
+    let mut backend = void_box::backend::create_backend();
+    match backend.start(config).await {
+        Ok(()) => Some(backend),
+        Err(err) => panic!("backend start failed on a capable machine: {err}"),
+    }
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    match backend
-        .exec("sh", &["-c", script], &[], &[], None, Some(30))
-        .await
-    {
-        Ok(out) => Some(out),
-        Err(e) => {
-            eprintln!("guest exec error: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(
+        backend
+            .exec("sh", &["-c", script], &[], &[], None, Some(30))
+            .await,
+        "guest exec (conformance)",
+    )
 }
 
 // ===========================================================================

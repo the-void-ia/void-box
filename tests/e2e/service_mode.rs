@@ -141,18 +141,13 @@ fn wait_for_terminal(addr: SocketAddr, run_id: &str, timeout: Duration) -> serde
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + Claude auth"]
 async fn e2e_service_mode_output_publication() {
-    if let Err(err) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: VM backend not available: {err}");
-        return;
-    }
-    if let Err(err) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: vsock not available: {err}");
-        return;
-    }
     let Some((kernel, initramfs)) = vm_artifacts() else {
-        eprintln!("skipping: VOID_BOX_KERNEL / VOID_BOX_INITRAMFS not set");
+        vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
         return;
     };
+    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
+        return;
+    }
     let Some(provider_block) = service_provider_block() else {
         eprintln!("skipping: neither ANTHROPIC_API_KEY nor claude-personal auth is available");
         return;

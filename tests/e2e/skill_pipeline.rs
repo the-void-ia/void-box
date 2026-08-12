@@ -309,19 +309,14 @@ async fn test_pipeline_two_stages_kvm() {
         None => return,
     };
 
-    let result = match Pipeline::named("two_stage_test", box1)
-        .pipe(box2)
-        .run()
-        .await
-    {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("Pipeline::run failed: {e}"),
+    let Some(result) = vm_preflight::checked_vm(
+        Pipeline::named("two_stage_test", box1)
+            .pipe(box2)
+            .run()
+            .await,
+        "skill_pipeline pipeline run",
+    ) else {
+        return;
     };
 
     // Verify pipeline structure
@@ -375,15 +370,10 @@ async fn test_agent_box_with_input_data_kvm() {
     };
 
     let input = br#"{"symbols": ["AAPL", "NVDA"], "period": "30d"}"#;
-    let result = match ab.run(Some(input), None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
+    let Some(result) =
+        vm_preflight::checked_vm(ab.run(Some(input), None).await, "skill_pipeline run")
+    else {
+        return;
     };
 
     assert_eq!(result.box_name, "input_box");

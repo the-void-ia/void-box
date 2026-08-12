@@ -60,21 +60,16 @@ fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + ANTHROPIC_API_KEY"]
 async fn real_claude_uses_void_mcp_tools() {
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
     let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
             return;
         }
     };
+    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
+        return;
+    }
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
         eprintln!("skipping: set ANTHROPIC_API_KEY");
         return;
@@ -146,17 +141,10 @@ async fn real_claude_uses_void_mcp_tools() {
 
     eprintln!("running real Claude Code with void-mcp...");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "guest run (agent_mcp)")
+    else {
+        handle.stop().await;
+        return;
     };
 
     eprintln!("=== Claude Result ===");
@@ -231,18 +219,10 @@ async fn diagnostic_void_mcp_starts_in_guest() {
     use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
     use void_box_protocol::SessionSecret;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
     let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
             return;
         }
     };
@@ -291,12 +271,10 @@ async fn diagnostic_void_mcp_starts_in_guest() {
         enable_snapshots: false,
     };
 
-    let mut backend = void_box::backend::create_backend();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("skipping: backend start failed: {e}");
+    let Some(backend) = vm_preflight::start_backend_or_gate(Some(config)).await else {
         handle.stop().await;
         return;
-    }
+    };
 
     // Test 1: void-mcp binary exists
     let out = backend

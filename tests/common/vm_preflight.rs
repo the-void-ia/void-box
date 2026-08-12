@@ -1,8 +1,6 @@
 #[cfg(target_os = "linux")]
 use std::fs::File;
-use std::path::Path;
-#[cfg(target_os = "macos")]
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use kvm_ioctls::{Cap, Kvm};
@@ -72,10 +70,14 @@ pub fn require_vsock_usable() -> Result<(), String> {
     Ok(())
 }
 
+// On macOS, VZ provides vsock internally. Capability is confirmed by
+// `require_vz_usable` (through `require_kvm_usable`), so there is no separate
+// host device to probe, and calling `require_vz_usable` again here would only
+// duplicate the `sw_vers` probe.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub fn require_vsock_usable() -> Result<(), String> {
-    require_vz_usable()
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -84,50 +86,95 @@ pub fn require_vsock_usable() -> Result<(), String> {
     Err("no supported vsock-capable VM backend on this platform".to_string())
 }
 
-/// True when `VOID_BOX_REQUIRE_VM=1`. A runner meant to boot VMs must fail,
-/// not skip, when it cannot — this turns an incapable machine into a hard
-/// error instead of a silent skip.
+/// True when `VOID_BOX_REQUIRE_VM=1`: an incapable machine must fail, not skip.
 #[allow(dead_code)]
 pub fn require_vm() -> bool {
     matches!(std::env::var("VOID_BOX_REQUIRE_VM").as_deref(), Ok("1"))
 }
 
-/// Full capability check for a VM test: the kernel and initramfs artifacts
-/// exist, and the platform VM backend is usable (KVM + vsock on Linux, VZ on
-/// macOS). `Ok(())` means this machine can run VM tests.
+/// Capability check: kernel/initramfs artifacts exist and the VM backend is
+/// usable (KVM + `/dev/vhost-vsock` on Linux, VZ on macOS).
 #[allow(dead_code)]
 pub fn detect_capability(kernel: &Path, initramfs: Option<&Path>) -> Result<(), String> {
+    detect_capability_inner(kernel, initramfs, true)
+}
+
+fn detect_capability_inner(
+    kernel: &Path,
+    initramfs: Option<&Path>,
+    require_vhost_vsock: bool,
+) -> Result<(), String> {
     require_kernel_artifacts(kernel, initramfs)?;
     require_kvm_usable()?;
-    require_vsock_usable()?;
+    if require_vhost_vsock {
+        require_vsock_usable()?;
+    }
     Ok(())
 }
 
-/// Decide capability and gate accordingly. Returns `true` when the machine can
-/// run VM tests. On an incapable machine it prints the skip reason and returns
-/// `false`, so the caller can `return` — unless `VOID_BOX_REQUIRE_VM=1`, in
-/// which case it panics, because a runner that is meant to be capable and is
-/// not is a broken runner, not a legitimate skip.
+/// Gate an incapable or unconfigured machine: panic under
+/// `VOID_BOX_REQUIRE_VM=1`, otherwise print the reason. The caller returns after
+/// calling this.
+#[allow(dead_code)]
+pub fn skip_or_require(reason: &str) {
+    if require_vm() {
+        panic!("VOID_BOX_REQUIRE_VM=1 but this machine cannot run VM tests: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// `true` when the machine can run VM tests; otherwise gates via
+/// [`skip_or_require`] and returns `false` so the caller can `return`.
 #[allow(dead_code)]
 pub fn vm_capable_or_gate(kernel: &Path, initramfs: Option<&Path>) -> bool {
     match detect_capability(kernel, initramfs) {
         Ok(()) => true,
         Err(reason) => {
-            if require_vm() {
-                panic!("VOID_BOX_REQUIRE_VM=1 but the machine cannot run VM tests: {reason}");
-            }
-            eprintln!("skipping: {reason}");
+            skip_or_require(&reason);
             false
         }
     }
 }
 
-/// Handle a backend that failed to start or an RPC that failed on a machine
-/// already confirmed capable. A capable machine that did not boot is a bug,
-/// not a skip. On Linux this always panics. On macOS it panics only under
-/// `VOID_BOX_REQUIRE_VM=1`: the hosted macOS runner reports VZ as available but
-/// cannot boot nested VZ, so VZ stays advisory there — validate it on a real
-/// Mac with `VOID_BOX_REQUIRE_VM=1`.
+/// Like `vm_capable_or_gate`, but does not require `/dev/vhost-vsock`. For
+/// suites that force the userspace vsock backend (the snapshot tests), which do
+/// not use the host vhost-vsock device.
+#[allow(dead_code)]
+pub fn vm_capable_or_gate_userspace_vsock(kernel: &Path, initramfs: Option<&Path>) -> bool {
+    match detect_capability_inner(kernel, initramfs, false) {
+        Ok(()) => true,
+        Err(reason) => {
+            skip_or_require(&reason);
+            false
+        }
+    }
+}
+
+/// Read `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` and gate on capability. Returns
+/// the paths when the machine can run VM tests; prints a skip reason and returns
+/// `None` otherwise (panicking under `VOID_BOX_REQUIRE_VM=1`). Use at the top of
+/// a `VoidBox`/`Sandbox`-level suite that builds its own config.
+#[allow(dead_code)]
+pub fn artifacts_or_gate() -> Option<(PathBuf, Option<PathBuf>)> {
+    let kernel = std::env::var_os("VOID_BOX_KERNEL")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let Some(kernel) = kernel else {
+        skip_or_require("VOID_BOX_KERNEL is unset");
+        return None;
+    };
+    if !vm_capable_or_gate(&kernel, initramfs.as_deref()) {
+        return None;
+    }
+    Some((kernel, initramfs))
+}
+
+/// A VM op that failed on a capable machine is a bug, not a skip. Panics on
+/// Linux always; on macOS only under `VOID_BOX_REQUIRE_VM=1`, since the hosted
+/// macOS runner reports VZ available but cannot boot nested VZ (advisory there).
 #[allow(dead_code)]
 pub fn fail_capable_boot(context: &str, err: impl std::fmt::Display) {
     let strict = cfg!(target_os = "linux") || require_vm();
@@ -139,12 +186,9 @@ pub fn fail_capable_boot(context: &str, err: impl std::fmt::Display) {
     );
 }
 
-/// Wrap a fallible VM operation — a backend start, a `VoidBox::run`, an RPC —
-/// whose failure on a capable machine is a real bug, not a skip. `Ok` returns
-/// the value; `Err` goes through [`fail_capable_boot`], so it panics on Linux
-/// (and on macOS under `VOID_BOX_REQUIRE_VM=1`) and prints an advisory skip
-/// otherwise. Call it only after the machine is confirmed capable, via
-/// [`vm_capable_or_gate`] or [`start_backend_or_gate`].
+/// Wrap a fallible VM op (start, `VoidBox::run`, an RPC): `Ok` returns the
+/// value; `Err` goes through [`fail_capable_boot`]. Call only after capability
+/// is confirmed.
 #[allow(dead_code)]
 pub fn checked_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Option<T> {
     match result {
@@ -156,26 +200,16 @@ pub fn checked_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) 
     }
 }
 
-/// Bring up a VM backend for a test, or gate. This is the single entry point a
-/// backend-level suite should use. It handles all three of the cases a caller
-/// would otherwise have to wire by hand: the config is absent (kernel or
-/// initramfs env not set), the machine is not capable, and a capable machine
-/// fails to boot. A caller therefore cannot forget the fail-on-capable-boot
-/// rule, because it lives here.
-///
-/// Returns `Some(backend)` when a VM booted, and `None` when the machine cannot
-/// run VM tests (the caller should `return`). It panics when a capable machine
-/// fails to boot — Linux always, macOS under `VOID_BOX_REQUIRE_VM=1` — and when
-/// `VOID_BOX_REQUIRE_VM=1` but the machine is not configured or not capable.
+/// Bring up a VM backend, or gate. Skips when the config is absent or the
+/// machine is incapable; fails a capable machine's boot via [`checked_vm`].
+/// Returns `None` (caller returns) on a skip; panics on a capable-boot failure
+/// or under `VOID_BOX_REQUIRE_VM=1`.
 #[allow(dead_code)]
 pub async fn start_backend_or_gate(config: Option<BackendConfig>) -> Option<Box<dyn VmmBackend>> {
     let config = match config {
         Some(c) => c,
         None => {
-            if require_vm() {
-                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset or their files are missing");
-            }
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
             return None;
         }
     };
@@ -203,28 +237,6 @@ fn require_vz_usable() -> Result<(), String> {
         return Err(format!(
             "Virtualization.framework backend requires Apple Silicon; found arch {}",
             std::env::consts::ARCH
-        ));
-    }
-
-    let product_version = Command::new("sw_vers")
-        .args(["-productVersion"])
-        .output()
-        .map_err(|e| format!("failed to query macOS version via sw_vers: {e}"))?;
-    if !product_version.status.success() {
-        return Err("sw_vers -productVersion failed".to_string());
-    }
-
-    let version = String::from_utf8_lossy(&product_version.stdout);
-    let major = version
-        .trim()
-        .split('.')
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .ok_or_else(|| format!("unable to parse macOS version '{}'", version.trim()))?;
-    if major < 14 {
-        return Err(format!(
-            "macOS {} is too old for VZ snapshot parity tests; require macOS 14+",
-            version.trim()
         ));
     }
 

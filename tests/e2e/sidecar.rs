@@ -32,17 +32,6 @@ use void_box_protocol::SessionSecret;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-}
-
 fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
     let kernel = PathBuf::from(kernel);
@@ -61,10 +50,6 @@ fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
 }
 
 fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<BackendConfig> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available");
-        return None;
-    }
     let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
@@ -109,40 +94,20 @@ fn build_network_config() -> Option<BackendConfig> {
 }
 
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
-    let config = build_network_config()?;
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(build_network_config()).await
 }
 
 async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Option<Box<dyn VmmBackend>> {
-    let config = build_network_config_with_deny_list(deny_list)?;
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    vm_preflight::start_backend_or_gate(build_network_config_with_deny_list(deny_list)).await
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    match backend
-        .exec("sh", &["-c", script], &[], &[], None, Some(30))
-        .await
-    {
-        Ok(out) => Some(out),
-        Err(e) => {
-            eprintln!("guest exec error: {e}");
-            None
-        }
-    }
+    vm_preflight::checked_vm(
+        backend
+            .exec("sh", &["-c", script], &[], &[], None, Some(30))
+            .await,
+        "guest exec (sidecar)",
+    )
 }
 
 // ===========================================================================
@@ -541,23 +506,14 @@ async fn claudio_discovers_injected_messaging_skill() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
     let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
             return;
         }
     };
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        eprintln!("skipping: kernel/initramfs not found");
+    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
         return;
     }
 
@@ -595,17 +551,10 @@ async fn claudio_discovers_injected_messaging_skill() {
     };
 
     // Run claudio — it scans skills dir and reports discoveries
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "guest run (sidecar)")
+    else {
+        handle.stop().await;
+        return;
     };
 
     eprintln!("claudio result_text: {}", result.agent_result.result_text);
@@ -724,23 +673,14 @@ async fn claudio_discovers_void_mcp_tools() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
     let (kernel, initramfs) = match vm_artifacts() {
         Some(a) => a,
         None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
             return;
         }
     };
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        eprintln!("skipping: kernel/initramfs not found");
+    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
         return;
     }
 
@@ -781,17 +721,10 @@ async fn claudio_discovers_void_mcp_tools() {
         }
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
+    let Some(result) = vm_preflight::checked_vm(ab.run(None, None).await, "guest run (sidecar)")
+    else {
+        handle.stop().await;
+        return;
     };
 
     eprintln!("claudio result: {}", result.agent_result.result_text);
