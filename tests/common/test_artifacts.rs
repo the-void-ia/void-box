@@ -357,12 +357,24 @@ fn resolve_busybox() -> Result<PathBuf, String> {
 
 /// True when `path` is a static ELF (no dynamic interpreter). A dynamic busybox
 /// packs a `/bin/sh` that cannot exec in the minimal guest, yet still lists in
-/// the cpio, so existence alone is not enough. Uses `ldd`: a static binary lists
-/// no shared-object dependencies (`=>`). If `ldd` is unavailable, assume static
-/// rather than block the build.
+/// the cpio, so existence alone is not enough. Uses `ldd`, reading both streams:
+/// a shared-object dependency (`=>`) means dynamic; the explicit "not a dynamic
+/// executable" / "statically linked" line is required as positive proof, so a
+/// non-ELF, foreign-arch, or otherwise uninspectable file is not waved through
+/// on empty output. If `ldd` itself is missing, assume static rather than block.
 fn is_static(path: &Path) -> bool {
     match Command::new("ldd").arg(path).output() {
-        Ok(output) => !String::from_utf8_lossy(&output.stdout).contains("=>"),
+        Ok(output) => {
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if report.contains("=>") {
+                return false;
+            }
+            report.contains("not a dynamic executable") || report.contains("statically linked")
+        }
         Err(_) => true,
     }
 }
