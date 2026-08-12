@@ -5,25 +5,17 @@
 //! authentication. They are parameterized over the backend so the same suite
 //! runs on both KVM (Linux) and VZ (macOS).
 //!
-//! ## Prerequisites
+//! Kernel and initramfs are auto-provisioned by [`test_artifacts`] under
+//! `--ignored`; `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides
+//! that skip the build. All tests are `#[ignore]`, so a plain `cargo test`
+//! never provisions or boots a VM.
 //!
 //! ```bash
-//! # Build the test initramfs:
-//! scripts/build_test_image.sh
-//!
-//! # Run:
-//! VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//! VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
 //! cargo test --test conformance -- --ignored --test-threads=1
 //! ```
-//!
-//! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
-
-#[path = "common/provision.rs"]
-mod provision;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::sidecar;
@@ -33,7 +25,7 @@ use void_box_protocol::SessionSecret;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn backend_config() -> Option<BackendConfig> {
+fn backend_config() -> BackendConfig {
     backend_config_with(
         vec!["169.254.0.0/16".into()],
         vec!["echo".into(), "sh".into(), "cat".into(), "test".into()],
@@ -43,14 +35,13 @@ fn backend_config() -> Option<BackendConfig> {
 fn backend_config_with(
     network_deny_list: Vec<String>,
     command_allowlist: Vec<String>,
-) -> Option<BackendConfig> {
-    let kernel = provision::kernel();
-    let initramfs = provision::test_initramfs();
+) -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
-    Some(BackendConfig {
+    BackendConfig {
         // Must satisfy the documented sizing formula (AGENTS.md "VM memory
         // sizing"): compressed + uncompressed initramfs + 208 MB overhead.
         // A dev image with distro kernel modules and BusyBox exceeds the
@@ -80,30 +71,28 @@ fn backend_config_with(
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
-async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    create_started_backend_with_config(backend_config()?).await
+async fn create_started_backend() -> Box<dyn VmmBackend> {
+    create_started_backend_with_config(backend_config()).await
 }
 
-async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
+async fn create_started_backend_with_config(config: BackendConfig) -> Box<dyn VmmBackend> {
     // Artifacts are provisioned and capability is no longer probed, so a boot
     // failure here is a real failure on a machine asked to run VM tests.
     let mut backend = void_box::backend::create_backend();
     match backend.start(config).await {
-        Ok(()) => Some(backend),
+        Ok(()) => backend,
         Err(err) => panic!("backend start failed on a capable machine: {err}"),
     }
 }
 
-async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    vm_preflight::checked_vm(
-        backend
-            .exec("sh", &["-c", script], &[], &[], None, Some(30))
-            .await,
-        "guest exec (conformance)",
-    )
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
+    backend
+        .exec("sh", &["-c", script], &[], &[], None, Some(30))
+        .await
+        .expect("guest exec (conformance) failed")
 }
 
 // ===========================================================================
@@ -114,10 +103,7 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::Ex
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_echo() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     let output = backend
         .exec("echo", &["hello", "world"], &[], &[], None, Some(30))
@@ -137,10 +123,7 @@ async fn conformance_exec_echo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_nonzero_exit() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     let output = backend
         .exec("sh", &["-c", "exit 42"], &[], &[], None, Some(30))
@@ -158,10 +141,7 @@ async fn conformance_exec_nonzero_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_write_file() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     // Under an allowlisted write root (post-openat2-hardening the
     // guest-agent refuses host-driven writes outside /workspace, /home,
@@ -201,10 +181,7 @@ async fn conformance_write_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_mkdir_p() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     backend
         .mkdir_p("/workspace/conformance/nested/dir")
@@ -235,10 +212,7 @@ async fn conformance_mkdir_p() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_streaming() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     let (mut chunk_rx, done_rx) = backend
         .exec_streaming("echo", &["streaming-test"], &[], None, Some(30))
@@ -277,10 +251,7 @@ async fn conformance_exec_streaming() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_timeout() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     // Sleep for 60s but with a 2s timeout — should be killed. The backend
     // may surface the kill either as a non-zero exit code or as a guest
@@ -308,10 +279,7 @@ async fn conformance_exec_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_lifecycle() {
-    let mut backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let mut backend = create_started_backend().await;
 
     assert!(
         backend.is_running(),
@@ -332,7 +300,7 @@ async fn conformance_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts + network"]
 async fn conformance_network_deny_list_blocks_guest_host_gateway() {
-    let config = match backend_config_with(
+    let config = backend_config_with(
         vec![format!("{}/32", void_box::backend::guest_host_gateway())],
         vec![
             "echo".into(),
@@ -341,18 +309,9 @@ async fn conformance_network_deny_list_blocks_guest_host_gateway() {
             "test".into(),
             "wget".into(),
         ],
-    ) {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    );
 
-    let backend = match create_started_backend_with_config(config).await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend_with_config(config).await;
 
     let handle = sidecar::start_sidecar(
         "run-conformance-deny",
@@ -370,10 +329,6 @@ async fn conformance_network_deny_list_blocks_guest_host_gateway() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert_eq!(
         out.exit_code,
@@ -393,7 +348,7 @@ async fn conformance_network_deny_list_blocks_guest_host_gateway() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts + network"]
 async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_access() {
-    let config = match backend_config_with(
+    let config = backend_config_with(
         vec!["203.0.113.0/24".into()],
         vec![
             "echo".into(),
@@ -402,18 +357,9 @@ async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_ac
             "test".into(),
             "wget".into(),
         ],
-    ) {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    );
 
-    let backend = match create_started_backend_with_config(config).await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend_with_config(config).await;
 
     let handle = sidecar::start_sidecar(
         "run-conformance-allow",
@@ -431,10 +377,6 @@ async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_ac
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(out.success(), "wget failed: {}", out.stderr_str());
     let parsed: serde_json::Value =
@@ -453,10 +395,7 @@ async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_ac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_file_stat() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     backend
         .write_file("/workspace/stat_test.txt", b"hello")
@@ -483,10 +422,7 @@ async fn conformance_file_stat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_read_file_native() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     let content = b"native read file test content";
     backend
@@ -510,10 +446,7 @@ async fn conformance_read_file_native() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_file_rpc_while_exec_running() {
-    let backend = match create_started_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = create_started_backend().await;
 
     backend
         .write_file("/workspace/concurrent_test.txt", b"concurrent")
