@@ -8,7 +8,9 @@
 //! `kernel_pin.sh`, and when the initramfs is built for that pinned kernel the
 //! provisioner passes the same pin as `VOID_BOX_KMOD_VERSION`, so the bundled
 //! modules match the kernel's vermagic. A host-kernel override instead pairs
-//! with the host's own modules.
+//! with the host's own modules. An explicit `VOID_BOX_INITRAMFS` is trusted as
+//! given — neither validated nor checked against the kernel — so pairing it
+//! correctly is the operator's responsibility.
 //!
 //! A provisioning failure panics with an actionable message: a machine that
 //! cannot supply artifacts fails loudly rather than skipping green. Reuse is
@@ -39,9 +41,19 @@ const PROVISION_LOCK: &str = "target/.void-box-provision.lock";
 /// initramfs. A stale image would run yesterday's guest code and still pass.
 const INITRAMFS_INPUTS: &[&str] = &[
     "guest-agent/src",
+    "guest-agent/Cargo.toml",
     "claudio/src",
+    "claudio/Cargo.toml",
     "void-message/src",
+    "void-message/Cargo.toml",
     "void-mcp/src",
+    "void-mcp/Cargo.toml",
+    // The guest binaries build against void-box-protocol by path, so a protocol
+    // change alters the packed binaries without touching a guest src/ tree.
+    // Cargo.lock and the linker config likewise change what gets built.
+    "void-box-protocol/src",
+    "Cargo.lock",
+    ".cargo/config.toml",
     "scripts/build_test_image.sh",
     "scripts/lib",
 ];
@@ -69,7 +81,14 @@ fn resolve_artifacts() -> Result<(PathBuf, PathBuf), String> {
     // download needs pinned modules; a host-kernel override pairs with the
     // host's modules. Resolve the kernel first so the initramfs can follow it.
     let (kernel, kernel_pinned) = match env_artifact("VOID_BOX_KERNEL")? {
-        Some(path) => (path, false),
+        // A kernel override counts as pinned only when it *is* the downloaded
+        // pinned kernel — the path `download_kernel.sh` and AGENTS.md tell you to
+        // export. Then the initramfs must bundle matching pinned modules. Any
+        // other override is treated as the host kernel, paired with host modules.
+        Some(path) => {
+            let pinned = same_path(&path, &downloaded_kernel_path());
+            (path, pinned)
+        }
         None => (provision_kernel()?, true),
     };
 
@@ -111,8 +130,11 @@ fn provision_kernel() -> Result<PathBuf, String> {
     if cache_valid(&out, &key) {
         return Ok(out); // produced while we waited for the lock
     }
-    // download_kernel.sh treats an existing OUT_FILE as a cache hit, so remove a
-    // possibly partial or stale kernel first to force a clean re-download.
+    // Invalidate the stamp before touching the file so a concurrent reader on the
+    // unlocked fast path cannot trust the in-place kernel while the download is in
+    // flight. Also remove the file: download_kernel.sh treats an existing OUT_FILE
+    // as a cache hit and would skip a clean re-download.
+    let _ = fs::remove_file(stamp_path(&out));
     let _ = fs::remove_file(&out);
     run_script(
         "download_kernel.sh",
@@ -162,6 +184,9 @@ fn provision_initramfs(kernel_pinned: bool) -> Result<PathBuf, String> {
 }
 
 fn build_initramfs(final_path: &Path, kernel_pinned: bool) -> Result<(), String> {
+    // Under the lock no other build is active, so clear temp/staging leftovers a
+    // previously killed build may have orphaned before we make our own.
+    sweep_orphan_temps();
     // Build into per-process temp paths, then rename on success, so an
     // interrupted build never leaves a truncated cache file for a later run to
     // reuse. OUT_DIR is under target/ (build_test_image.sh `rm -rf`s it).
@@ -211,12 +236,21 @@ fn build_initramfs(final_path: &Path, kernel_pinned: bool) -> Result<(), String>
 fn validate_initramfs(cpio_gz: &Path, kernel_pinned: bool) -> Result<(), String> {
     let listing = Command::new("bash")
         .arg("-c")
-        .arg("gzip -dc \"$1\" | cpio -t 2>/dev/null")
+        .arg("set -o pipefail; gzip -dc \"$1\" | cpio -t")
         .arg("_")
         .arg(cpio_gz.as_os_str())
         .current_dir(MANIFEST_DIR)
         .output()
         .map_err(|err| format!("could not inspect the built initramfs: {err}"))?;
+    // A failed pipeline (e.g. `cpio` not installed) yields empty output; without
+    // this check that would be misreported below as "no /bin/busybox".
+    if !listing.status.success() {
+        return Err(format!(
+            "could not list the built initramfs {} (is `cpio` installed?): {}",
+            cpio_gz.display(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        ));
+    }
     let entries = String::from_utf8_lossy(&listing.stdout);
 
     if !entries.contains("bin/busybox") {
@@ -227,14 +261,24 @@ fn validate_initramfs(cpio_gz: &Path, kernel_pinned: bool) -> Result<(), String>
             cpio_gz.display()
         ));
     }
-    // The pinned kernel needs vsock as a module; a host kernel may build it in,
-    // so only require the module when we bundled the pinned pair.
-    if kernel_pinned && !entries.contains("vsock.ko") {
-        return Err(format!(
-            "the built initramfs {} has no vsock.ko; the guest control channel \
-             cannot come up. Check VOID_BOX_KMOD_VERSION module download.",
-            cpio_gz.display()
-        ));
+    // The pinned kernel needs the full vsock module chain; a host kernel may
+    // build it in, so only require the modules when we bundled the pinned pair.
+    // The base vsock.ko alone is not enough — the transport needs all three.
+    // (virtio_mmio is not required: the pinned kernel has it built in.)
+    if kernel_pinned {
+        for module in [
+            "vsock.ko",
+            "vmw_vsock_virtio_transport_common.ko",
+            "vmw_vsock_virtio_transport.ko",
+        ] {
+            if !entries.contains(module) {
+                return Err(format!(
+                    "the built initramfs {} is missing {module}; the guest control \
+                     channel cannot come up (check the VOID_BOX_KMOD_VERSION download).",
+                    cpio_gz.display()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -283,24 +327,44 @@ fn newest_mtime(path: &Path) -> u128 {
 fn resolve_busybox() -> Result<PathBuf, String> {
     if let Some(raw) = std::env::var_os("BUSYBOX").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(raw);
-        if path.is_file() {
-            return Ok(path);
+        if !path.is_file() {
+            return Err(format!(
+                "BUSYBOX is set to {} but no file exists there",
+                path.display()
+            ));
         }
-        return Err(format!(
-            "BUSYBOX is set to {} but no file exists there",
-            path.display()
-        ));
+        if !is_static(&path) {
+            return Err(format!(
+                "BUSYBOX at {} is dynamically linked; its /bin/sh cannot run in \
+                 the minimal guest. Point BUSYBOX at a static busybox.",
+                path.display()
+            ));
+        }
+        return Ok(path);
     }
     for candidate in ["/bin/busybox", "/usr/bin/busybox", "/sbin/busybox"] {
-        if Path::new(candidate).is_file() {
-            return Ok(PathBuf::from(candidate));
+        let path = Path::new(candidate);
+        if path.is_file() && is_static(path) {
+            return Ok(path.to_path_buf());
         }
     }
     Err(
-        "no busybox found for the test initramfs; install busybox-static \
-         (Debian/Ubuntu) or busybox (Fedora), or set BUSYBOX=/path/to/busybox"
+        "no static busybox found for the test initramfs; install busybox-static \
+         (Debian/Ubuntu) or busybox (Fedora), or set BUSYBOX=/path/to/static-busybox"
             .to_string(),
     )
+}
+
+/// True when `path` is a static ELF (no dynamic interpreter). A dynamic busybox
+/// packs a `/bin/sh` that cannot exec in the minimal guest, yet still lists in
+/// the cpio, so existence alone is not enough. Uses `ldd`: a static binary lists
+/// no shared-object dependencies (`=>`). If `ldd` is unavailable, assume static
+/// rather than block the build.
+fn is_static(path: &Path) -> bool {
+    match Command::new("ldd").arg(path).output() {
+        Ok(output) => !String::from_utf8_lossy(&output.stdout).contains("=>"),
+        Err(_) => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +412,29 @@ fn repo_path(rel: &str) -> PathBuf {
     Path::new(MANIFEST_DIR).join(rel)
 }
 
+/// True when both paths resolve to the same file on disk.
+fn same_path(a: &Path, b: &Path) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Remove `<cache>.<pid>.tmp` files and `<staging>-<pid>` dirs a killed build may
+/// have orphaned. Call only while holding the provisioning lock, so no live build
+/// owns one.
+fn sweep_orphan_temps() {
+    let Ok(entries) = fs::read_dir(repo_path("target")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("void-box-test-rootfs.cpio.gz.") && name.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        } else if name.starts_with("void-box-test-rootfs-staging-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Host arch as the scripts and `std::env::consts` both spell it.
 fn arch() -> &'static str {
     std::env::consts::ARCH
@@ -362,7 +449,9 @@ fn deb_arch() -> &'static str {
     }
 }
 
-/// Pinned kernel version from `kernel_pin.sh`: `(VOIDBOX_KERNEL_VER, _UPLOAD)`.
+/// Pinned kernel version `(ver, upload)`. Honors a `KERNEL_VER` / `KERNEL_UPLOAD`
+/// operator override the same way `download_kernel.sh` does, so the stamp and the
+/// module pin follow the kernel actually downloaded, not the file's default.
 fn kernel_pin() -> Result<(String, String), String> {
     KERNEL_PIN.get_or_init(read_kernel_pin).clone()
 }
@@ -375,7 +464,7 @@ fn pin_tuple() -> Result<String, String> {
 fn read_kernel_pin() -> Result<(String, String), String> {
     let output = Command::new("bash")
         .arg("-c")
-        .arg("source scripts/lib/kernel_pin.sh && printf '%s\\n%s\\n' \"$VOIDBOX_KERNEL_VER\" \"$VOIDBOX_KERNEL_UPLOAD\"")
+        .arg("source scripts/lib/kernel_pin.sh && printf '%s\\n%s\\n' \"${KERNEL_VER:-$VOIDBOX_KERNEL_VER}\" \"${KERNEL_UPLOAD:-$VOIDBOX_KERNEL_UPLOAD}\"")
         .current_dir(MANIFEST_DIR)
         .output()
         .map_err(|err| format!("could not read scripts/lib/kernel_pin.sh: {err}"))?;
@@ -392,10 +481,11 @@ fn read_kernel_pin() -> Result<(String, String), String> {
     Ok((ver, upload))
 }
 
-/// Run a provisioning script from the repo root, inheriting the environment
-/// (so any operator-set `KERNEL_VER`, `VOID_BOX_MODULES_DIR`, etc. pass through)
-/// plus `extra_env`. `ARCH` is always set explicitly so the produced filename
-/// matches the path the provisioner expects.
+/// Run a provisioning script from the repo root, inheriting the environment plus
+/// `extra_env`. `ARCH` is set explicitly so the produced filename matches the
+/// path the provisioner expects. A `KERNEL_VER` override is folded into the cache
+/// fingerprint via [`kernel_pin`]; other content-affecting passthroughs like
+/// `VOID_BOX_MODULES_DIR` are not, so they take effect only on a cold build.
 fn run_script(script: &str, extra_env: &[(&str, &OsStr)], goal: &str) -> Result<(), String> {
     let script_path = repo_path(&format!("scripts/{script}"));
     let mut cmd = Command::new("bash");
