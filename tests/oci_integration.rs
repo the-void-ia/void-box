@@ -9,31 +9,25 @@
 //!   - Linux: `VoidBoxConfig::kernel_cmdline()`
 //!   - macOS: `vz::config::build_kernel_cmdline()`
 //!
-//! **Group 3** (VM E2E, `#[ignore]`): Boot a real VM and verify OCI rootfs
-//! mounts are visible in the guest.
-//!   - Linux: KVM — needs `/dev/kvm`, `VOID_BOX_KERNEL`, `VOID_BOX_INITRAMFS`
-//!   - macOS: VZ  — needs `VOID_BOX_KERNEL`, `VOID_BOX_INITRAMFS`
+//! **Group 3** (VM E2E, `#[ignore]`): Boot a real VM — KVM on Linux, VZ on
+//! macOS — and verify OCI rootfs mounts are visible in the guest. Kernel and
+//! initramfs are auto-provisioned by [`test_artifacts`] under `--ignored`;
+//! `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides that skip
+//! the build.
 //!
 //! ```bash
 //! # Mock + cmdline tests (no hardware):
 //! cargo test --test oci_integration
 //!
-//! # Linux KVM E2E:
-//! VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//! VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz \
-//! cargo test --test oci_integration -- --ignored --test-threads=1
-//!
-//! # macOS VZ E2E:
-//! VOID_BOX_KERNEL=/path/to/vmlinuz \
-//! VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz \
+//! # VM E2E (Linux/KVM and macOS/VZ):
 //! cargo test --test oci_integration -- --ignored --test-threads=1
 //! ```
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::agent_box::VoidBox;
 use void_box::backend::MountConfig;
@@ -455,13 +449,6 @@ workflow:
 // Group 3: VM E2E tests (require hardware, `#[ignore]`)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Load kernel + initramfs paths from environment variables.
-fn vm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = PathBuf::from(std::env::var_os("VOID_BOX_KERNEL")?);
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
-}
-
 /// Create a temporary directory that mimics a minimal OCI rootfs.
 fn create_fake_oci_rootfs() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -474,39 +461,21 @@ fn create_fake_oci_rootfs() -> tempfile::TempDir {
 /// Build a sandbox that mounts `oci_dir` at `/mnt/oci-rootfs` and sets
 /// `oci_rootfs` in the sandbox config.  Works on both Linux (KVM) and
 /// macOS (VZ) — the `Sandbox::local()` builder picks the right backend.
-fn build_sandbox_with_oci_mount(
-    oci_dir: &std::path::Path,
-    _read_only: bool,
-) -> Option<Arc<Sandbox>> {
-    let (kernel, initramfs) = match vm_artifacts_from_env() {
-        Some(a) => a,
-        None => {
-            if vm_preflight::require_vm() {
-                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
-            }
-            eprintln!(
-                "skipping VM OCI test: \
-                 set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
-            );
-            return None;
-        }
-    };
+fn build_sandbox_with_oci_mount(oci_dir: &std::path::Path, _read_only: bool) -> Arc<Sandbox> {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
-        return None;
-    }
-
-    let mut builder = Sandbox::local().memory_mb(1536).vcpus(1).kernel(&kernel);
+    let mut builder = Sandbox::local()
+        .memory_mb(1536)
+        .vcpus(1)
+        .kernel(&kernel)
+        .initramfs(&initramfs);
 
     #[cfg(target_os = "linux")]
     {
-        let disk = match build_test_oci_rootfs_disk(oci_dir) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skipping VM OCI test: failed to build OCI disk: {e}");
-                return None;
-            }
-        };
+        let disk = test_artifacts::expect_vm(
+            build_test_oci_rootfs_disk(oci_dir),
+            "build the OCI rootfs disk",
+        );
         builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
     }
 
@@ -520,13 +489,7 @@ fn build_sandbox_with_oci_mount(
         builder = builder.mount(mount).oci_rootfs("/mnt/oci-rootfs");
     }
 
-    if let Some(ref p) = initramfs {
-        if p.exists() {
-            builder = builder.initramfs(p);
-        }
-    }
-
-    vm_preflight::checked_vm(builder.build(), "oci sandbox build")
+    test_artifacts::expect_vm(builder.build(), "oci sandbox build")
 }
 
 #[cfg(target_os = "linux")]
@@ -596,9 +559,7 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, S
 #[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
 async fn vm_oci_rootfs_mount_visible() {
     let oci_dir = create_fake_oci_rootfs();
-    let Some(sandbox) = build_sandbox_with_oci_mount(oci_dir.path(), true) else {
-        return;
-    };
+    let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
     // After OCI setup, guest-agent pivots into the OCI rootfs.
     let output = match sandbox.exec("/bin/cat", &["/oci-marker.txt"]).await {
@@ -627,9 +588,7 @@ async fn vm_oci_rootfs_mount_visible() {
 #[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
 async fn vm_oci_rootfs_readonly() {
     let oci_dir = create_fake_oci_rootfs();
-    let Some(sandbox) = build_sandbox_with_oci_mount(oci_dir.path(), true) else {
-        return;
-    };
+    let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
     let output = match sandbox.exec("/bin/touch", &["/should-write.txt"]).await {
         Ok(out) => out,
@@ -735,20 +694,7 @@ fn example_spec_oci_skills() {
 #[tokio::test]
 #[ignore = "requires VM backend + kernel/initramfs + network (pulls alpine:3.20)"]
 async fn vm_oci_alpine_os_release() {
-    let (kernel, initramfs) = match vm_artifacts_from_env() {
-        Some(a) => a,
-        None => {
-            if vm_preflight::require_vm() {
-                panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
-            }
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
-
-    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
-        return;
-    }
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     // 1. Pull and extract alpine:3.20 (uses cache at ~/.voidbox/oci/).
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -766,16 +712,17 @@ async fn vm_oci_alpine_os_release() {
     // 2. Build sandbox:
     //    - Linux/KVM: attach OCI rootfs as virtio-blk + /dev/vda pivot.
     //    - Non-Linux: legacy mount-based path.
-    let mut builder = Sandbox::local().memory_mb(1536).vcpus(1).kernel(&kernel);
+    let mut builder = Sandbox::local()
+        .memory_mb(1536)
+        .vcpus(1)
+        .kernel(&kernel)
+        .initramfs(&initramfs);
     #[cfg(target_os = "linux")]
     {
-        let disk = match build_test_oci_rootfs_disk(&rootfs_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skipping: failed to build OCI disk for alpine rootfs: {e}");
-                return;
-            }
-        };
+        let disk = test_artifacts::expect_vm(
+            build_test_oci_rootfs_disk(&rootfs_path),
+            "build the OCI rootfs disk for the alpine rootfs",
+        );
         builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
     }
     #[cfg(not(target_os = "linux"))]
@@ -788,16 +735,7 @@ async fn vm_oci_alpine_os_release() {
         builder = builder.mount(mount).oci_rootfs("/mnt/oci-rootfs");
     }
 
-    if let Some(ref p) = initramfs {
-        if p.exists() {
-            builder = builder.initramfs(p);
-        }
-    }
-
-    let Some(sandbox) = vm_preflight::checked_vm(builder.build(), "oci alpine sandbox build")
-    else {
-        return;
-    };
+    let sandbox = test_artifacts::expect_vm(builder.build(), "oci alpine sandbox build");
 
     // 3. Exec `cat /etc/os-release` — after pivot_root this is alpine's file.
     let output = match sandbox.exec("/bin/cat", &["/etc/os-release"]).await {

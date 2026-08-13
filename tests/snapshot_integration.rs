@@ -5,24 +5,21 @@
 //! snapshot (stopping the VM), restores it, and compares cold-boot vs restore
 //! latency.
 //!
-//! Requirements (same as `kvm_integration.rs`):
-//! - `/dev/kvm` present and accessible
-//! - Environment variables:
-//!   - `VOID_BOX_KERNEL`    -> path to vmlinux or bzImage
-//!   - `VOID_BOX_INITRAMFS` -> path to initramfs (cpio.gz)
+//! Requires `/dev/kvm` present and accessible. Kernel and initramfs are
+//! auto-provisioned by [`test_artifacts`] under `--ignored`; `VOID_BOX_KERNEL`
+//! / `VOID_BOX_INITRAMFS` are optional overrides that skip the build. All VM
+//! tests are `#[ignore]`, so a plain `cargo test` never provisions or boots a
+//! VM.
 //!
 //! ```bash
-//! export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-//! export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
-//!
 //! cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::vmm::config::{VoidBoxConfig, VsockBackendType};
 use void_box::vmm::snapshot::{self, SnapshotConfig, VmSnapshot};
@@ -33,33 +30,14 @@ use void_box::Error;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Load kernel + initramfs paths from environment.
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
-}
-
-/// Run preflight checks; returns `None` (with eprintln) if the environment
-/// is not suitable for KVM snapshot tests.
+/// Provision the kernel + initramfs this suite boots. Capability is not
+/// probed: these tests force the userspace vsock backend, so the host needs no
+/// `/dev/vhost-vsock`, and any VM-op error is a real failure that
+/// [`expect_capable`] surfaces. The `Option` shape is kept so call sites read
+/// the same as the other VM suites.
 fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        if vm_preflight::require_vm() {
-            panic!("VOID_BOX_REQUIRE_VM=1 but VOID_BOX_KERNEL is unset");
-        }
-        eprintln!(
-            "skipping snapshot test: \
-             set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
-        );
-        return None;
-    };
-    // Snapshot tests force the userspace vsock backend, so they do not need the
-    // host /dev/vhost-vsock device.
-    if !vm_preflight::vm_capable_or_gate_userspace_vsock(&kernel, initramfs.as_deref()) {
-        return None;
-    }
-    Some((kernel, initramfs))
+    let (kernel, initramfs) = test_artifacts::artifacts();
+    Some((kernel, Some(initramfs)))
 }
 
 /// Test memory size in MB. Override with `VOID_BOX_TEST_MEMORY_MB` for the

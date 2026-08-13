@@ -15,11 +15,10 @@
 //!
 //! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
 
-use std::path::PathBuf;
 use std::time::Instant;
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::vz::snapshot::VzSnapshotMeta;
 use void_box::backend::vz::VzBackend;
@@ -31,26 +30,13 @@ use void_box_protocol::SessionSecret;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn backend_config() -> Option<BackendConfig> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
+fn backend_config() -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 256,
         vcpus: 1,
         kernel,
@@ -75,7 +61,7 @@ fn backend_config() -> Option<BackendConfig> {
         },
         snapshot: None,
         enable_snapshots: true,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,13 +73,7 @@ fn backend_config() -> Option<BackendConfig> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
 async fn snapshot_vz_round_trip() {
-    let config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    let config = backend_config();
 
     // Keep a copy for the restore config
     let restore_config = config.clone();
@@ -102,10 +82,7 @@ async fn snapshot_vz_round_trip() {
     eprintln!("[vz_snapshot] Booting VM...");
     let cold_start = Instant::now();
     let mut backend = VzBackend::new();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("[vz_snapshot] start failed: {e}");
-        return;
-    }
+    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
     let cold_boot_time = cold_start.elapsed();
     eprintln!("[vz_snapshot] Cold boot OK ({:.1?})", cold_boot_time);
 
@@ -200,20 +177,11 @@ async fn snapshot_vz_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
 async fn auto_snapshot_vz_round_trip() {
-    let config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    let config = backend_config();
 
     eprintln!("[vz_auto_snapshot] Booting VM...");
     let mut backend = VzBackend::new();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("[vz_auto_snapshot] start failed: {e}");
-        return;
-    }
+    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
 
     let output = backend
         .exec("echo", &["before-auto-snap"], &[], &[], None, Some(30))
@@ -267,25 +235,14 @@ async fn auto_snapshot_vz_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
 async fn snapshot_vz_restore_overrides_drifting_config() {
-    let save_config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    let save_config = backend_config();
     assert!(!save_config.network, "save config must have network=false");
 
-    // Match the other VZ tests: if the runner can't cold-boot a VM at all
-    // (nested virtualization unavailable, missing entitlements, resource
-    // contention), skip cleanly rather than fail the build. The regression
-    // this test exists for lives on the restore path below — if the cold
-    // boot never succeeds, there is nothing to regress against.
+    // The regression this test exists for lives on the restore path below; the
+    // cold boot here is a precondition. On a capable Apple Silicon host a boot
+    // failure is a real failure, not a skip.
     let mut backend = VzBackend::new();
-    if let Err(e) = backend.start(save_config.clone()).await {
-        eprintln!("[vz_restore_drift] skipping: cold boot failed: {e}");
-        return;
-    }
+    test_artifacts::expect_vm(backend.start(save_config.clone()).await, "vz backend start");
     backend
         .exec("echo", &["pre"], &[], &[], None, Some(30))
         .await
@@ -333,13 +290,7 @@ async fn snapshot_vz_restore_overrides_drifting_config() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
 async fn snapshot_vz_cli_create_and_list() {
-    let config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    let config = backend_config();
 
     let kernel = config.kernel.clone();
     let initramfs = config.initramfs.clone();
@@ -347,10 +298,7 @@ async fn snapshot_vz_cli_create_and_list() {
     // --- Cold boot ---
     eprintln!("[vz_cli_list] Booting VM...");
     let mut backend = VzBackend::new();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("[vz_cli_list] start failed: {e}");
-        return;
-    }
+    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
 
     let output = backend
         .exec("echo", &["ready"], &[], &[], None, Some(30))
@@ -404,13 +352,7 @@ async fn snapshot_vz_cli_create_and_list() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
 async fn snapshot_vz_cli_delete() {
-    let config = match backend_config() {
-        Some(c) => c,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
+    let config = backend_config();
 
     let kernel = config.kernel.clone();
     let initramfs = config.initramfs.clone();
@@ -418,10 +360,7 @@ async fn snapshot_vz_cli_delete() {
     // --- Cold boot ---
     eprintln!("[vz_cli_delete] Booting VM...");
     let mut backend = VzBackend::new();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("[vz_cli_delete] start failed: {e}");
-        return;
-    }
+    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
 
     let output = backend
         .exec("echo", &["ready"], &[], &[], None, Some(30))

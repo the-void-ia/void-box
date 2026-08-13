@@ -3,29 +3,21 @@
 //!
 //! These tests boot an actual micro-VM via KVM and execute commands inside
 //! the guest using the real vsock + guest-agent path, instead of the mock
-//! sandbox. They are **opt-in**:
+//! sandbox.
 //!
-//! - Require `/dev/kvm` to be present and accessible.
-//! - Require environment variables pointing to guest artifacts:
-//!   - `VOID_BOX_KERNEL`    -> path to vmlinux or bzImage
-//!   - `VOID_BOX_INITRAMFS` -> path to initramfs (cpio.gz) that boots
-//!     the guest-agent as PID 1.
-//!
-//! All tests are marked `#[ignore]` so they only run when explicitly
-//! requested, e.g.:
+//! Kernel and initramfs are auto-provisioned by [`test_artifacts`] under
+//! `--ignored`; `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides
+//! that skip the build. All tests are `#[ignore]`, so a plain `cargo test`
+//! never provisions or boots a VM.
 //!
 //! ```bash
-//! export VOID_BOX_KERNEL=/path/to/vmlinux
-//! export VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz
-//!
 //! cargo test --test kvm_integration -- --ignored
 //! ```
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::observe::ObserveConfig;
 use void_box::sandbox::Sandbox;
@@ -34,38 +26,23 @@ use void_box::vmm::MicroVm;
 use void_box::workflow::{Workflow, WorkflowExt};
 use void_box::Error;
 
-/// Load kernel + initramfs paths from environment.
-///
-/// - VOID_BOX_KERNEL:    required
-/// - VOID_BOX_INITRAMFS: optional but strongly recommended
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
+/// Build a `Sandbox::local()` backed by a real KVM VM, auto-provisioning the
+/// kernel and test initramfs. A build failure panics — artifacts are present,
+/// so it is a real failure rather than a skip.
+fn build_local_kvm_sandbox() -> Arc<Sandbox> {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
+    let builder = Sandbox::local()
+        // Must satisfy the documented sizing formula (AGENTS.md "VM memory
+        // sizing"): compressed + uncompressed initramfs + 208 MB overhead.
+        // The test image carries BusyBox, claudio, and kernel modules, so it
+        // exceeds the 256 MB this suite used with the smaller generic image.
+        .memory_mb(1024)
+        .vcpus(1)
+        .kernel(&kernel)
+        .initramfs(&initramfs);
 
-    Some((kernel, initramfs))
-}
-
-/// Build a `Sandbox::local()` backed by a real KVM VM, or gate.
-///
-/// Skips when artifacts are unset or the machine is incapable; on a capable
-/// machine a build failure panics via `checked_vm`. Returns `None` on a skip.
-fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        vm_preflight::skip_or_require("VOID_BOX_KERNEL is unset");
-        return None;
-    };
-    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
-        return None;
-    }
-
-    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
-    if let Some(ref initramfs_path) = initramfs {
-        builder = builder.initramfs(initramfs_path);
-    }
-
-    vm_preflight::checked_vm(builder.build(), "kvm_integration sandbox build")
+    test_artifacts::expect_vm(builder.build(), "kvm_integration sandbox build")
 }
 
 /// Basic smoke test: boot a real VM and run a trivial command inside it.
@@ -78,24 +55,16 @@ fn build_local_kvm_sandbox() -> Option<Arc<Sandbox>> {
 #[tokio::test]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_real_vm_exec_uname() {
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        vm_preflight::skip_or_require("VOID_BOX_KERNEL is unset");
-        return;
-    };
-    if !vm_preflight::vm_capable_or_gate(&kernel, initramfs.as_deref()) {
-        return;
-    }
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-    // Build VM configuration.
-    let mut cfg = VoidBoxConfig::new()
-        .memory_mb(256)
+    // Build VM configuration. Memory follows the AGENTS.md sizing formula for
+    // the test image (see `build_local_kvm_sandbox`).
+    let cfg = VoidBoxConfig::new()
+        .memory_mb(1024)
         .vcpus(1)
         .kernel(&kernel)
+        .initramfs(&initramfs)
         .enable_vsock(true);
-
-    if let Some(ref initramfs_path) = initramfs {
-        cfg = cfg.initramfs(initramfs_path);
-    }
 
     // Validate early so we fail fast on misconfiguration.
     cfg.validate().expect("invalid VoidBoxConfig for KVM test");
@@ -140,16 +109,12 @@ async fn kvm_real_vm_exec_uname() {
 #[tokio::test]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_sandbox_echo_parity() {
-    let Some(sandbox) = build_local_kvm_sandbox() else {
-        return;
-    };
+    let sandbox = build_local_kvm_sandbox();
 
-    let Some(output) = vm_preflight::checked_vm(
+    let output = test_artifacts::expect_vm(
         sandbox.exec("echo", &["hello", "world"]).await,
         "guest exec echo (kvm_integration)",
-    ) else {
-        return;
-    };
+    );
 
     assert!(
         output.success(),
@@ -165,17 +130,13 @@ async fn kvm_sandbox_echo_parity() {
 #[tokio::test]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_sandbox_stdin_pipe() {
-    let Some(sandbox) = build_local_kvm_sandbox() else {
-        return;
-    };
+    let sandbox = build_local_kvm_sandbox();
 
     let msg = b"hello from stdin over KVM";
-    let Some(output) = vm_preflight::checked_vm(
+    let output = test_artifacts::expect_vm(
         sandbox.exec_with_stdin("cat", &[], msg).await,
         "guest exec cat (kvm_integration)",
-    ) else {
-        return;
-    };
+    );
 
     assert!(output.success());
     assert_eq!(output.stdout, msg);
@@ -186,9 +147,7 @@ async fn kvm_sandbox_stdin_pipe() {
 #[tokio::test]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_workflow_pipe_uppercase() {
-    let Some(sandbox) = build_local_kvm_sandbox() else {
-        return;
-    };
+    let sandbox = build_local_kvm_sandbox();
 
     let workflow = Workflow::define("kvm-pipe-test")
         .step(
@@ -201,15 +160,13 @@ async fn kvm_workflow_pipe_uppercase() {
         .pipe("step1", "step2")
         .build();
 
-    let Some(observed) = vm_preflight::checked_vm(
+    let observed = test_artifacts::expect_vm(
         workflow
             .observe(ObserveConfig::test())
             .run_in(sandbox)
             .await,
         "workflow run (kvm_integration)",
-    ) else {
-        return;
-    };
+    );
 
     if !observed.result.success() {
         eprintln!(
@@ -242,14 +199,12 @@ async fn kvm_workflow_pipe_uppercase() {
 
 /// KVM-backed Claude-in-void workflow: plan -> apply using claude-code in the guest.
 ///
-/// Requires a guest image that includes `/usr/local/bin/claude-code` (e.g. from
-/// `scripts/build_guest_image.sh`). Opt-in: run with `--ignored`.
+/// The auto-provisioned test image installs `claudio` as
+/// `/usr/local/bin/claude-code`, so the guest exec resolves deterministically.
 #[tokio::test]
-#[ignore = "requires KVM + guest image with claude-code; see module docs"]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn kvm_claude_workflow_plan_apply() {
-    let Some(sandbox) = build_local_kvm_sandbox() else {
-        return;
-    };
+    let sandbox = build_local_kvm_sandbox();
 
     let workflow = Workflow::define("kvm-claude-in-void")
         .step("plan", |ctx| async move {
@@ -263,15 +218,13 @@ async fn kvm_claude_workflow_plan_apply() {
         .output("apply")
         .build();
 
-    let Some(observed) = vm_preflight::checked_vm(
+    let observed = test_artifacts::expect_vm(
         workflow
             .observe(ObserveConfig::test())
             .run_in(sandbox)
             .await,
         "claude workflow run (kvm_integration)",
-    ) else {
-        return;
-    };
+    );
 
     if !observed.result.success() {
         eprintln!(
