@@ -29,6 +29,8 @@ slow-timeout = { period = "90s", terminate-after = 4 }
 # under VOID_BOX_REQUIRE_VM=1. --no-fail-fast collects every result so one broken
 # suite does not mask the others; the `vm` group caps concurrency across all
 # suites at once, so cross-suite parallelism — not just within a suite — is the
-# win. `max-threads = 2` was chosen so two of the heaviest VMs (3 GB production
-# images) fit an 8 GB runner; on conformance it already cut 97.6s -> 30.5s (3.2x)
-# at ~130 MB peak.
+# win. `max-threads = 2` keeps two of the group's heaviest VMs within a small
+# runner: the group spans 256 MB suites up to the 3 GB production-image suites
+# run locally (e2e_agent_mcp, e2e_service_mode); the Linux CI subset tops out at
+# persistent_channel's 2 GB. On conformance it cut 97.6s -> 30.5s (3.2x) at
+# ~130 MB peak; the full CI lane runs in ~114s vs ~284s summed sequentially.
