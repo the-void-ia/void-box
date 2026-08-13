@@ -1,22 +1,27 @@
-//! End-to-end credential-proxy integration test.
+//! End-to-end credential-proxy provisioning test.
 //!
 //! Boots a real VM, stands up the host-side injection proxy plus a mock TLS
 //! upstream, and provisions the guest the way a real run does: writes the
 //! per-sandbox CA into the guest and stages the `/etc/hosts` redirect of the
 //! upstream name to the gateway, which the real guest-agent mirrors into
-//! `/etc/hosts` with its own privileged write. Asserts that:
-//! - the guest never holds the real credential (env + the provisioned files),
-//! - the guest-agent mirrors the proxy's host aliases into `/etc/hosts`,
-//! - a client provisioned exactly as this guest was — same per-sandbox CA and
-//!   proxy token, same base URL — gets the host-held key injected upstream.
+//! `/etc/hosts` with its own privileged write. It asserts:
+//! - the guest-agent mirrors the proxy's host aliases into the guest's
+//!   `/etc/hosts` (observed guest state — the part that needs a real VM);
+//! - the host-computed provisioning artifacts (env + staged CA file) carry no
+//!   real key (a check on `build_guest_provisioning`'s output);
+//! - a client presenting those same artifacts — per-sandbox CA, proxy token,
+//!   base URL, placeholder key — authenticates through the proxy binding and has
+//!   the real key injected upstream.
 //!
-//! The injecting call is driven host-side, not from the guest's own HTTP
-//! client: the deterministic image ships busybox, whose built-in `ssl_client`
-//! cannot complete a handshake with the rustls proxy (it hangs). The bytes on
-//! the wire — SNI, proxy token, CA trust — are identical to what the guest
-//! sends, so the proxy cannot distinguish the origin. The injection mechanism
-//! itself (token check, key replacement, token strip) is covered without a VM
-//! in `tests/proxy.rs`; this suite adds the real-guest provisioning tie-in.
+//! Scope and limits: the injecting request is a host-side `reqwest` client, not
+//! the guest's own HTTP client. The deterministic image ships busybox, whose
+//! built-in TLS cannot complete a handshake with the rustls proxy, so the guest
+//! cannot drive the call. This test therefore does not verify the guest client's
+//! own env-to-header transform — that `ANTHROPIC_API_KEY` /
+//! `ANTHROPIC_CUSTOM_HEADERS` / `ANTHROPIC_BASE_URL` become the right wire
+//! headers, or that it loads the staged CA. Only a manual run with a real client
+//! covers that. The proxy's injection mechanism (token check, key replacement,
+//! token strip) is covered without a VM in `tests/proxy.rs`.
 //!
 //! ## Prerequisites
 //!
@@ -60,13 +65,17 @@ const REAL_KEY: &str = "sk-ant-e2e-real-host-held-secret";
 
 type CapturedHeaders = Arc<Mutex<Option<HeaderMap>>>;
 
-async fn start_backend() -> Box<dyn VmmBackend> {
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+async fn start_backend() -> Option<Box<dyn VmmBackend>> {
     let mut backend = void_box::backend::create_backend();
-    test_artifacts::expect_vm(
+    match test_artifacts::vm_start(
         backend.start(backend_config()).await,
         "backend start (credential_proxy)",
-    );
-    backend
+    ) {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
+    }
 }
 
 fn backend_config() -> BackendConfig {
@@ -118,7 +127,12 @@ async fn start_mock_upstream() -> (SocketAddr, CapturedHeaders) {
             .expect("upstream config");
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    let listener = TcpListener::bind(("0.0.0.0", 0)).await.expect("bind mock");
+    // Bind loopback, not the 0.0.0.0 wildcard: the address is fed to reqwest's
+    // `.resolve`, and a wildcard is a listen address, not a stable dial target
+    // (connect(0.0.0.0) is not loopback on every platform).
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind mock");
     let addr = listener.local_addr().expect("mock addr");
     let captured: CapturedHeaders = Arc::new(Mutex::new(None));
 
@@ -161,8 +175,10 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutpu
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
-async fn guest_call_is_credential_injected_and_leaks_no_key() {
-    let backend = start_backend().await;
+async fn provisioning_mirrors_hosts_and_injects_without_leaking_real_key() {
+    let Some(backend) = start_backend().await else {
+        return;
+    };
     let (mock_addr, captured) = start_mock_upstream().await;
 
     // Proxy upstream client trusts the self-signed mock and routes the upstream
@@ -227,11 +243,12 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         );
     }
 
-    // Prove injection through the *same* binding this guest was provisioned for,
-    // using the guest's own per-sandbox CA, proxy token, and base URL. The call
-    // is driven host-side because the deterministic image's busybox `ssl_client`
-    // hangs on a handshake with the rustls proxy; the on-the-wire request — SNI,
-    // proxy token, CA trust — is byte-identical to what the guest itself sends.
+    // Present the guest's own provisioning artifacts — per-sandbox CA, proxy
+    // token, base URL, placeholder key — from a host-side client with a working
+    // TLS stack, and prove the proxy injects the real key. The request carries
+    // the same SNI, proxy token, CA trust, and placeholder the guest would
+    // present (the inputs the proxy keys on). It is not the guest's own client,
+    // so its TLS stack and env-to-header behavior are out of scope here.
     let provisioned_token_header = provisioning
         .env
         .iter()
@@ -249,6 +266,19 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
         .map(|(_, v)| v.clone())
         .expect("provisioning sets ANTHROPIC_BASE_URL");
+    // A regressed base URL (wrong host or port) must fail here, not be masked by
+    // the explicit `.resolve` below that re-derives the port from `binding`.
+    let parsed_base = reqwest::Url::parse(&base_url).expect("base URL parses");
+    assert_eq!(
+        parsed_base.host_str(),
+        Some(UPSTREAM_HOST),
+        "provisioned base URL host"
+    );
+    assert_eq!(
+        parsed_base.port(),
+        Some(binding.port),
+        "provisioned base URL port"
+    );
 
     // Trust the CA the guest was given (not `danger_accept_invalid_certs`), so a
     // broken CA chain fails the test, and route the upstream name to the binding

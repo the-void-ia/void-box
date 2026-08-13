@@ -86,6 +86,70 @@ pub fn expect_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -
     })
 }
 
+/// The outcome of a VM backend `start()` attempt.
+#[allow(dead_code)]
+#[must_use = "SkipIncapable means the test must return early"]
+pub enum VmStart {
+    /// The backend started; the test proceeds.
+    Ready,
+    /// The host itself cannot virtualize (no nested virtualization, or no
+    /// accessible `/dev/kvm`). The caller must `return` — the test skips. Only
+    /// produced when `VOID_BOX_REQUIRE_VM=1` is unset.
+    SkipIncapable,
+}
+
+/// Classify a VM backend `start()` result, separating a host that genuinely
+/// cannot virtualize from a real boot failure on a capable host.
+///
+/// A crisp capability-absence signal — the hypervisor is unavailable, or
+/// `/dev/kvm` is missing or inaccessible — yields [`VmStart::SkipIncapable`], so
+/// the test skips with a loud reason instead of a silent green. Every other
+/// error (a boot timeout, a handshake failure, an RPC error) panics: those occur
+/// on a capable host and must fail. `VOID_BOX_REQUIRE_VM=1` turns even a
+/// capability absence into a failure, so a CI runner asserted capable cannot
+/// launder a lost hypervisor into a skip.
+#[allow(dead_code)]
+pub fn vm_start<E: std::fmt::Display>(result: Result<(), E>, context: &str) -> VmStart {
+    let Err(err) = result else {
+        return VmStart::Ready;
+    };
+    let message = err.to_string();
+    let require_vm = std::env::var("VOID_BOX_REQUIRE_VM").as_deref() == Ok("1");
+    if is_capability_absence(&message) {
+        if require_vm {
+            panic!("{context}: VOID_BOX_REQUIRE_VM=1 but the host cannot virtualize: {message}");
+        }
+        eprintln!(
+            "SKIP [{context}]: host cannot run VM tests (capability absent) — {message}. \
+             Set VOID_BOX_REQUIRE_VM=1 to treat this as a failure."
+        );
+        return VmStart::SkipIncapable;
+    }
+    panic!(
+        "{context}: VM operation failed on a capable machine (a real failure, not a skip): {message}"
+    );
+}
+
+/// Crisp, unambiguous signals that the host itself cannot virtualize — as
+/// opposed to a boot or RPC failure on a capable host. Kept deliberately narrow:
+/// the VZ "not available" message, and the specific start-time errnos behind
+/// `Error::Kvm` when `/dev/kvm` is absent, inaccessible, or unsupported. A
+/// generic `KVM error:` (e.g. `Invalid argument` from a config bug) is not
+/// listed, so it fails rather than skips.
+fn is_capability_absence(message: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        // macOS VZ: nested virtualization unavailable on this hardware.
+        "Virtualization is not available on this hardware",
+        // Linux KVM: /dev/kvm missing, inaccessible, or the feature absent.
+        "KVM error: Permission denied",
+        "KVM error: No such file or directory",
+        "KVM error: No such device",
+        "KVM error: Operation not supported",
+        "KVM error: Function not implemented",
+    ];
+    SIGNALS.iter().any(|signal| message.contains(signal))
+}
+
 /// Read `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` for the heavy suites that need a
 /// non-test image (real Claude / Codex) and cannot auto-build it. Returns the
 /// paths, or `None` after printing a skip reason — panicking under
