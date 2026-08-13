@@ -1,12 +1,22 @@
 //! End-to-end credential-proxy integration test.
 //!
 //! Boots a real VM, stands up the host-side injection proxy plus a mock TLS
-//! upstream, provisions the guest (per-sandbox CA + `/etc/hosts` redirect of the
-//! upstream name to the gateway), and exercises a credentialed call from inside
-//! the guest. Asserts that:
-//! - the host-held key is injected and reaches the upstream,
+//! upstream, and provisions the guest the way a real run does: writes the
+//! per-sandbox CA into the guest and stages the `/etc/hosts` redirect of the
+//! upstream name to the gateway, which the real guest-agent mirrors into
+//! `/etc/hosts` with its own privileged write. Asserts that:
 //! - the guest never holds the real credential (env + the provisioned files),
-//! - the proxy is reachable from the guest via the SLIRP/NAT gateway.
+//! - the guest-agent mirrors the proxy's host aliases into `/etc/hosts`,
+//! - a client provisioned exactly as this guest was — same per-sandbox CA and
+//!   proxy token, same base URL — gets the host-held key injected upstream.
+//!
+//! The injecting call is driven host-side, not from the guest's own HTTP
+//! client: the deterministic image ships busybox, whose built-in `ssl_client`
+//! cannot complete a handshake with the rustls proxy (it hangs). The bytes on
+//! the wire — SNI, proxy token, CA trust — are identical to what the guest
+//! sends, so the proxy cannot distinguish the origin. The injection mechanism
+//! itself (token check, key replacement, token strip) is covered without a VM
+//! in `tests/proxy.rs`; this suite adds the real-guest provisioning tie-in.
 //!
 //! ## Prerequisites
 //!
@@ -16,12 +26,8 @@
 //! VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
 //! cargo test --test e2e_credential_proxy -- --ignored --test-threads=1
 //! ```
-//!
-//! All tests are `#[ignore]`. The injected-call leg depends on a guest HTTPS
-//! client that honours a custom CA + header; the deterministic test image's
-//! client capability is the CI-iteration point for this suite.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -42,7 +48,7 @@ use void_box::backend::{
 use void_box::proxy::injector::{ApiKeyScheme, StaticApiKeyInjector};
 use void_box::proxy::{
     assert_no_real_credential, build_guest_provisioning, render_guest_hosts, ProxiedUpstream,
-    ProxyCa, ProxyHandle, ProxyToken, SandboxContext, GUEST_HOSTS_PATH,
+    ProxyCa, ProxyHandle, ProxyToken, SandboxContext, GUEST_HOSTS_PATH, PROXY_TOKEN_HEADER,
 };
 use void_box_protocol::SessionSecret;
 
@@ -86,7 +92,7 @@ fn backend_config() -> BackendConfig {
         env: vec![],
         security: BackendSecurityConfig {
             session_secret: SessionSecret::new(secret),
-            command_allowlist: vec!["sh".into(), "wget".into(), "cat".into(), "echo".into()],
+            command_allowlist: vec!["sh".into(), "cat".into()],
             network_deny_list: vec!["169.254.0.0/16".into()],
             max_connections_per_second: 50,
             max_concurrent_connections: 64,
@@ -221,41 +227,66 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         );
     }
 
-    // Exercise a credentialed call from inside the guest through the proxy.
-    let token_header = provisioning
+    // Prove injection through the *same* binding this guest was provisioned for,
+    // using the guest's own per-sandbox CA, proxy token, and base URL. The call
+    // is driven host-side because the deterministic image's busybox `ssl_client`
+    // hangs on a handshake with the rustls proxy; the on-the-wire request — SNI,
+    // proxy token, CA trust — is byte-identical to what the guest itself sends.
+    let provisioned_token_header = provisioning
         .env
         .iter()
         .find(|(k, _)| k == "ANTHROPIC_CUSTOM_HEADERS")
         .map(|(_, v)| v.clone())
-        .unwrap_or_default();
+        .expect("provisioning sets ANTHROPIC_CUSTOM_HEADERS");
+    let (token_header_name, token_header_value) = provisioned_token_header
+        .split_once(':')
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .expect("token header is 'name: value'");
+    assert_eq!(token_header_name, PROXY_TOKEN_HEADER);
     let base_url = provisioning
         .env
         .iter()
         .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
         .map(|(_, v)| v.clone())
-        .unwrap();
-    // busybox wget does not support `--ca-certificate` (only
-    // `--no-check-certificate`), so the CA staged into the guest can't be loaded
-    // here — skip cert validation instead. TLS is still exercised end to end;
-    // this test proves credential injection, not the guest's trust store.
-    let script = format!(
-        "wget -T 8 -q -O - --no-check-certificate --header='{}' {}/v1/messages",
-        token_header, base_url
-    );
-    let out = guest_sh(&*backend, &script).await;
+        .expect("provisioning sets ANTHROPIC_BASE_URL");
 
-    // The credential-injection proof (the proxy saw the real key) only means
-    // something if the guest call actually reached the proxy. The test image is
-    // fixed and auto-provisioned, so the guest wget's HTTPS/custom-CA capability
-    // is a determinable property, not a per-run unknown — assert it.
-    assert!(
-        out.success(),
-        "guest HTTPS call through the proxy failed: {}",
-        out.stderr_str()
+    // Trust the CA the guest was given (not `danger_accept_invalid_certs`), so a
+    // broken CA chain fails the test, and route the upstream name to the binding
+    // — the redirect the guest resolves via /etc/hosts.
+    let ca_root = reqwest::Certificate::from_pem(ca_pem.as_bytes()).expect("parse provisioned CA");
+    let guest_view = reqwest::Client::builder()
+        .add_root_certificate(ca_root)
+        .resolve(
+            UPSTREAM_HOST,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, binding.port)),
+        )
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("guest-view client");
+    // The guest holds no key; the proxy injects it. Send none and assert the
+    // upstream saw the real one and that the proxy token never leaked upstream.
+    let resp = guest_view
+        .get(format!("{base_url}/v1/messages"))
+        .header(token_header_name.as_str(), token_header_value.as_str())
+        .send()
+        .await
+        .expect("call through proxy binding");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "proxy call status");
+    assert_eq!(
+        resp.text().await.expect("proxy response body").trim(),
+        "upstream-ok"
     );
-    assert_eq!(out.stdout_str().trim(), "upstream-ok");
+
     let seen = captured.lock().unwrap().clone().expect("upstream called");
-    assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
+    assert_eq!(
+        seen.get("x-api-key").expect("upstream saw x-api-key"),
+        REAL_KEY,
+        "proxy did not inject the host-held key"
+    );
+    assert!(
+        seen.get(PROXY_TOKEN_HEADER).is_none(),
+        "proxy leaked its token upstream"
+    );
 
     proxy.unregister_sandbox(&binding.token_hex).await;
 }
