@@ -239,7 +239,7 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     // here — skip cert validation instead. TLS is still exercised end to end;
     // this test proves credential injection, not the guest's trust store.
     let script = format!(
-        "wget -q -O - --no-check-certificate --header='{}' {}/v1/messages",
+        "wget -T 8 -q -O - --no-check-certificate --header='{}' {}/v1/messages",
         token_header, base_url
     );
     let out = guest_sh(&*backend, &script).await;
