@@ -2,7 +2,7 @@
 
 - **Status:** Superseded by ADR-0011
 - **Date:** 2026-08-07
-- **Related:** ADR-0011; RFC-0004
+- **Related:** RFC-0004
 
 ## Context
 

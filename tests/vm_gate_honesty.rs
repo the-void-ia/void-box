@@ -69,10 +69,17 @@ fn real_failure_fails_never_skips() {
 /// VM lane, which sets it.
 #[test]
 fn incapability_skips_when_not_required() {
+    // Save and restore the var so the test never leaves the process env mutated.
+    let saved = std::env::var("VOID_BOX_REQUIRE_VM").ok();
     std::env::remove_var("VOID_BOX_REQUIRE_VM");
     let result: Result<(), String> = Err("hypervisor unavailable: no /dev/kvm".into());
+    let outcome = vm_start(result, "meta");
+    match saved {
+        Some(value) => std::env::set_var("VOID_BOX_REQUIRE_VM", value),
+        None => std::env::remove_var("VOID_BOX_REQUIRE_VM"),
+    }
     assert!(
-        matches!(vm_start(result, "meta"), VmStart::SkipIncapable),
+        matches!(outcome, VmStart::SkipIncapable),
         "a genuine incapability must skip when REQUIRE_VM is unset"
     );
 }
