@@ -234,9 +234,13 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
         .map(|(_, v)| v.clone())
         .unwrap();
+    // busybox wget does not support `--ca-certificate` (only
+    // `--no-check-certificate`), so the CA staged into the guest can't be loaded
+    // here — skip cert validation instead. TLS is still exercised end to end;
+    // this test proves credential injection, not the guest's trust store.
     let script = format!(
-        "wget -q -O - --ca-certificate={} --header='{}' {}/v1/messages",
-        provisioning.ca_file.0, token_header, base_url
+        "wget -q -O - --no-check-certificate --header='{}' {}/v1/messages",
+        token_header, base_url
     );
     let out = guest_sh(&*backend, &script).await;
 
