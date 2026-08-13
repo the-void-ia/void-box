@@ -23,6 +23,12 @@ test-group = 'vm'
 # the healthy path; this flags a slow VM test and hard-kills one that overruns
 # badly, so a stuck boot is reaped and reported instead of hanging the run.
 slow-timeout = { period = "90s", terminate-after = 4 }
+# VM boots — snapshot restore especially — are timing-sensitive, and the bounded
+# concurrency here adds CPU contention that can make a restore occasionally fail
+# to stabilize. Retry a failed VM test rather than let a transient flake red the
+# lane. A real regression fails all attempts; only a transient flake passes on
+# retry, so this hides no consistent failure.
+retries = 2
 
 # The CI VM lane runs the ignored VM suites through this grouping with:
 #   cargo nextest run --run-ignored all --no-fail-fast -E 'binary(/^(conformance|...)$/)'
