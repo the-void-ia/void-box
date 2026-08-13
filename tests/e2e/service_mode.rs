@@ -1,25 +1,18 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-#[path = "../common/net.rs"]
-mod test_net;
 /// End-to-end test for `agent.mode: service` lifecycle.
 ///
 /// Exercises the full stack: daemon API -> runtime -> VoidBox -> VM -> guest-agent.
 /// Verifies that a service agent publishes output while still running, that
 /// messaging/MCP is active, and that cancel works after publication.
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
+#[path = "../common/net.rs"]
+mod test_net;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    Some((PathBuf::from(kernel), PathBuf::from(initramfs)))
-}
 
 fn service_provider_block() -> Option<&'static str> {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
@@ -141,13 +134,9 @@ fn wait_for_terminal(addr: SocketAddr, run_id: &str, timeout: Duration) -> serde
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + Claude auth"]
 async fn e2e_service_mode_output_publication() {
-    let Some((kernel, initramfs)) = vm_artifacts() else {
-        vm_preflight::skip_or_require("VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset");
+    let Some((kernel, initramfs)) = test_artifacts::env_artifacts_or_skip() else {
         return;
     };
-    if !vm_preflight::vm_capable_or_gate(&kernel, Some(&initramfs)) {
-        return;
-    }
     let Some(provider_block) = service_provider_block() else {
         eprintln!("skipping: neither ANTHROPIC_API_KEY nor claude-personal auth is available");
         return;

@@ -18,8 +18,8 @@
 
 use std::path::PathBuf;
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box_protocol::SessionSecret;
@@ -27,24 +27,11 @@ use void_box_protocol::SessionSecret;
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
-fn backend_config() -> Option<BackendConfig> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
+fn backend_config() -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
     // Under VOID_BOX_DIAGNOSTIC=1, route the guest serial console to a file so
     // the Azure-CI handshake-deadline failure leaves a host-readable trail
@@ -67,7 +54,7 @@ fn backend_config() -> Option<BackendConfig> {
         GuestConsoleSink::Disabled
     };
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 2048,
         vcpus: 2,
         kernel,
@@ -92,11 +79,16 @@ fn backend_config() -> Option<BackendConfig> {
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
-async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    vm_preflight::start_backend_or_gate(backend_config()).await
+async fn create_started_backend() -> Box<dyn VmmBackend> {
+    let mut backend = void_box::backend::create_backend();
+    test_artifacts::expect_vm(
+        backend.start(backend_config()).await,
+        "backend start (persistent_channel)",
+    );
+    backend
 }
 
 /// Number of serial `exec` calls fired through the persistent channel.
@@ -109,9 +101,7 @@ const SERIAL_EXEC_COUNT: usize = 100;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn persistent_channel_serial_exec_many() {
-    let Some(backend) = create_started_backend().await else {
-        return;
-    };
+    let backend = create_started_backend().await;
 
     let t_start = std::time::Instant::now();
     for index in 0..SERIAL_EXEC_COUNT {
@@ -149,9 +139,7 @@ async fn persistent_channel_concurrent_exec() {
         .with_test_writer()
         .try_init();
 
-    let Some(backend) = create_started_backend().await else {
-        return;
-    };
+    let backend = create_started_backend().await;
     let backend: std::sync::Arc<dyn VmmBackend> = std::sync::Arc::from(backend);
 
     let mut handles = Vec::with_capacity(CONCURRENT_EXEC_COUNT);
