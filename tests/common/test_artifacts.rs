@@ -136,7 +136,8 @@ pub fn vm_start<E: std::fmt::Display>(result: Result<(), E>, context: &str) -> V
 /// every KVM ioctl, and on aarch64 the same errnos (e.g. ENOENT from
 /// `KVM_ARM_VCPU_INIT` on an unknown feature bit) arise from real boot
 /// regressions that must fail, not skip.
-fn is_capability_absence(message: &str) -> bool {
+#[allow(dead_code)]
+pub fn is_capability_absence(message: &str) -> bool {
     const SIGNALS: &[&str] = &[
         // Linux KVM: `Error::HypervisorUnavailable`, raised only at the cold-boot
         // probe sites (opening `/dev/kvm`, the extension check). A plain

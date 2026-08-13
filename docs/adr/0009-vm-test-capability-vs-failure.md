@@ -1,8 +1,8 @@
 # ADR-0009: Separate capability from failure in the VM test gate
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0011
 - **Date:** 2026-08-07
-- **Related:** RFC-0004
+- **Related:** ADR-0011; RFC-0004
 
 ## Context
 
