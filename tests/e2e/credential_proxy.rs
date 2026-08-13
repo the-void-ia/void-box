@@ -263,11 +263,21 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("guest-view client");
-    // The guest holds no key; the proxy injects it. Send none and assert the
-    // upstream saw the real one and that the proxy token never leaked upstream.
+    // The guest carries a non-secret placeholder key (provisioning sets it in the
+    // guest env); the proxy replaces it with the host-held real key. Injection is
+    // gated on the credential header already being present, so send the same
+    // placeholder the guest was given, then assert the upstream saw the real key
+    // (never the placeholder) and that the proxy token never leaked upstream.
+    let placeholder_key = provisioning
+        .env
+        .iter()
+        .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+        .map(|(_, v)| v.clone())
+        .expect("provisioning sets a placeholder ANTHROPIC_API_KEY");
     let resp = guest_view
         .get(format!("{base_url}/v1/messages"))
         .header(token_header_name.as_str(), token_header_value.as_str())
+        .header("x-api-key", placeholder_key.as_str())
         .send()
         .await
         .expect("call through proxy binding");
@@ -278,10 +288,15 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     );
 
     let seen = captured.lock().unwrap().clone().expect("upstream called");
+    let upstream_key = seen.get("x-api-key").expect("upstream saw x-api-key");
     assert_eq!(
-        seen.get("x-api-key").expect("upstream saw x-api-key"),
-        REAL_KEY,
+        upstream_key, REAL_KEY,
         "proxy did not inject the host-held key"
+    );
+    assert_ne!(
+        upstream_key,
+        placeholder_key.as_str(),
+        "guest placeholder key leaked upstream"
     );
     assert!(
         seen.get(PROXY_TOKEN_HEADER).is_none(),
