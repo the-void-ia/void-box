@@ -148,9 +148,12 @@ jobs:
           # an incapable machine must fail, not skip silently.
           VOID_BOX_REQUIRE_VM: "1"
         run: |
+          # Do not exit green when /dev/vhost-vsock is missing: VOID_BOX_REQUIRE_VM=1
+          # asserts this runner is capable, so a lost device must fail the suites
+          # that need it, not skip. snapshot_integration uses userspace vsock and
+          # runs regardless. Warn for the log, then proceed.
           if [ ! -e /dev/vhost-vsock ]; then
-            echo "Skipping e2e: /dev/vhost-vsock is not available on this runner."
-            exit 0
+            echo "::warning::/dev/vhost-vsock is not available; vhost-vsock suites will fail (REQUIRE_VM=1)."
           fi
 
           # Detect kernel version at runtime (env context can't run commands)
