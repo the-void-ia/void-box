@@ -265,9 +265,8 @@ async fn diagnostic_void_mcp_starts_in_guest() {
             panic!("void-mcp not in guest image — rebuild with scripts/build_test_image.sh");
         }
         Err(e) => {
-            eprintln!("exec failed: {e}");
             handle.stop().await;
-            return;
+            panic!("guest exec failed on a booted VM: {e}");
         }
     }
 
@@ -296,7 +295,8 @@ async fn diagnostic_void_mcp_starts_in_guest() {
             );
         }
         Err(e) => {
-            eprintln!("void-mcp exec failed: {e}");
+            handle.stop().await;
+            panic!("void-mcp handshake exec failed on a booted VM: {e}");
         }
     }
 

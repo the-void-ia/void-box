@@ -240,19 +240,18 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     );
     let out = guest_sh(&*backend, &script).await;
 
-    if out.success() {
-        assert_eq!(out.stdout_str().trim(), "upstream-ok");
-        let seen = captured.lock().unwrap().clone().expect("upstream called");
-        assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
-    } else {
-        // The deterministic test image's wget may lack HTTPS/custom-CA
-        // support; the host-side proxy + no-credential-in-guest path above is still asserted.
-        eprintln!(
-            "note: guest HTTPS call did not succeed (client capability); \
-             stderr: {}",
-            out.stderr_str()
-        );
-    }
+    // The credential-injection proof (the proxy saw the real key) only means
+    // something if the guest call actually reached the proxy. The test image is
+    // fixed and auto-provisioned, so the guest wget's HTTPS/custom-CA capability
+    // is a determinable property, not a per-run unknown — assert it.
+    assert!(
+        out.success(),
+        "guest HTTPS call through the proxy failed: {}",
+        out.stderr_str()
+    );
+    assert_eq!(out.stdout_str().trim(), "upstream-ok");
+    let seen = captured.lock().unwrap().clone().expect("upstream called");
+    assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
 
     proxy.unregister_sandbox(&binding.token_hex).await;
 }

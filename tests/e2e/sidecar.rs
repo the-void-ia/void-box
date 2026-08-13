@@ -473,9 +473,8 @@ async fn claudio_discovers_injected_messaging_skill() {
     {
         Ok(ab) => ab,
         Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {e}");
             handle.stop().await;
-            return;
+            panic!("VoidBox build failed on a capable machine: {e}");
         }
     };
 
@@ -540,11 +539,11 @@ async fn guest_uses_void_message_cli() {
     // Test: void-message health
     let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message health");
     let out = guest_sh(&*backend, &script).await;
-    if !out.success() {
-        eprintln!("skipping: void-message not available: {}", out.stderr_str());
-        handle.stop().await;
-        return;
-    }
+    assert!(
+        out.success(),
+        "void-message health failed in the auto-provisioned test image: {}",
+        out.stderr_str()
+    );
     let health: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
     assert_eq!(health["status"], "ok");
 
@@ -623,9 +622,8 @@ async fn claudio_discovers_void_mcp_tools() {
     {
         Ok(ab) => ab,
         Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {e}");
             handle.stop().await;
-            return;
+            panic!("VoidBox build failed on a capable machine: {e}");
         }
     };
 

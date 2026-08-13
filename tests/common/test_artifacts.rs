@@ -112,7 +112,7 @@ pub fn env_artifacts_or_skip() -> Option<(PathBuf, PathBuf)> {
             );
             Some((kernel, initramfs))
         }
-        _ => {
+        (None, None) => {
             let reason = "VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset (this suite needs a staged non-test image)";
             assert!(
                 std::env::var("VOID_BOX_REQUIRE_VM").as_deref() != Ok("1"),
@@ -121,6 +121,9 @@ pub fn env_artifacts_or_skip() -> Option<(PathBuf, PathBuf)> {
             eprintln!("skipping: {reason}");
             None
         }
+        // Exactly one set is a configuration error, not a reason to skip: it
+        // usually means an operator typo, and silently skipping hides it.
+        _ => panic!("set both VOID_BOX_KERNEL and VOID_BOX_INITRAMFS, or neither"),
     }
 }
 
@@ -314,15 +317,26 @@ fn validate_initramfs(cpio_gz: &Path, kernel_pinned: bool) -> Result<(), String>
     // The base vsock.ko alone is not enough — the transport needs all three.
     // (virtio_mmio is not required: the pinned kernel has it built in.)
     if kernel_pinned {
+        // The vsock chain is needed by every suite (the control channel); the 9p
+        // chain by e2e_mount; overlay.ko by oci_integration. The pinned kernel
+        // builds virtio_blk/ext4/virtio_net/virtio_mmio in, so those are not
+        // modules and are not required here. `install_kernel_modules_from_deb`
+        // only warns on a missing module, so this is the check that catches a
+        // Launchpad tar-layout shift before it becomes a confusing guest error.
         for module in [
             "vsock.ko",
             "vmw_vsock_virtio_transport_common.ko",
             "vmw_vsock_virtio_transport.ko",
+            "netfs.ko",
+            "9pnet.ko",
+            "9p.ko",
+            "9pnet_virtio.ko",
+            "overlay.ko",
         ] {
             if !entries.contains(module) {
                 return Err(format!(
-                    "the built initramfs {} is missing {module}; the guest control \
-                     channel cannot come up (check the VOID_BOX_KMOD_VERSION download).",
+                    "the built initramfs {} is missing {module}; a guest mount or the \
+                     control channel cannot come up (check the VOID_BOX_KMOD_VERSION download).",
                     cpio_gz.display()
                 ));
             }
