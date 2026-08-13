@@ -33,8 +33,11 @@ impl Vm {
     pub fn new(memory_mb: usize) -> Result<Self> {
         let memory_size = (memory_mb as u64) * 1024 * 1024;
 
-        // Open /dev/kvm
-        let kvm = Kvm::new().map_err(Error::Kvm)?;
+        // Open /dev/kvm. A failure here (device absent, or present but not
+        // readable/writable by this user) is a genuine hypervisor absence, not a
+        // boot failure — surface it as such so callers can tell the two apart.
+        let kvm = Kvm::new()
+            .map_err(|e| Error::HypervisorUnavailable(format!("cannot open /dev/kvm: {e}")))?;
         debug!("KVM API version: {}", kvm.get_api_version());
 
         // Check required extensions
@@ -72,7 +75,11 @@ impl Vm {
 
         for (cap, name) in required_caps {
             if !kvm.check_extension(cap) {
-                return Err(Error::Kvm(kvm_ioctls::Error::new(libc::ENOTSUP)));
+                // A missing required capability means this host's KVM cannot run
+                // our VMs — a hypervisor absence, not a boot failure.
+                return Err(Error::HypervisorUnavailable(format!(
+                    "required KVM capability {name} unsupported"
+                )));
             }
             debug!("KVM capability {} available", name);
         }

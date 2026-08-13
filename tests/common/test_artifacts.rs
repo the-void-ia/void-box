@@ -130,22 +130,21 @@ pub fn vm_start<E: std::fmt::Display>(result: Result<(), E>, context: &str) -> V
     );
 }
 
-/// Crisp, unambiguous signals that the host itself cannot virtualize — as
-/// opposed to a boot or RPC failure on a capable host. Kept deliberately narrow:
-/// the VZ "not available" message, and the specific start-time errnos behind
-/// `Error::Kvm` when `/dev/kvm` is absent, inaccessible, or unsupported. A
-/// generic `KVM error:` (e.g. `Invalid argument` from a config bug) is not
-/// listed, so it fails rather than skips.
+/// Signals that the host itself cannot virtualize — as opposed to a boot or RPC
+/// failure on a capable host. Both are typed capability-absence markers, not
+/// errno guesses: an errno string is unsafe because `Error::Kvm` is raised at
+/// every KVM ioctl, and on aarch64 the same errnos (e.g. ENOENT from
+/// `KVM_ARM_VCPU_INIT` on an unknown feature bit) arise from real boot
+/// regressions that must fail, not skip.
 fn is_capability_absence(message: &str) -> bool {
     const SIGNALS: &[&str] = &[
-        // macOS VZ: nested virtualization unavailable on this hardware.
+        // Linux KVM: `Error::HypervisorUnavailable`, raised only at the cold-boot
+        // probe sites (opening `/dev/kvm`, the extension check). A plain
+        // `KVM error: ...` from any other ioctl is a real failure, not matched.
+        "hypervisor unavailable",
+        // macOS VZ: Apple's hardware-availability message. Config errors take a
+        // different path (`VZ config validation: ...`) and are not matched.
         "Virtualization is not available on this hardware",
-        // Linux KVM: /dev/kvm missing, inaccessible, or the feature absent.
-        "KVM error: Permission denied",
-        "KVM error: No such file or directory",
-        "KVM error: No such device",
-        "KVM error: Operation not supported",
-        "KVM error: Function not implemented",
     ];
     SIGNALS.iter().any(|signal| message.contains(signal))
 }

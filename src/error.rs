@@ -181,6 +181,15 @@ pub enum Error {
     #[error("KVM error: {0}")]
     Kvm(#[from] kvm_ioctls::Error),
 
+    /// The host cannot run a hypervisor at all: `/dev/kvm` is absent or
+    /// inaccessible, or a required KVM capability is missing. Produced only at
+    /// the cold-boot probe sites (opening `/dev/kvm`, the extension check), so it
+    /// is distinct from an [`Error::Kvm`] at any other ioctl — those are real
+    /// failures on a capable host. VM tests treat this as a genuine capability
+    /// absence (a skip), never a failure.
+    #[error("hypervisor unavailable: {0}")]
+    HypervisorUnavailable(String),
+
     /// Backend-related errors (cross-platform)
     #[error("Backend error: {0}")]
     Backend(String),
