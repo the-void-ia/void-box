@@ -33,11 +33,11 @@ fn build_local_kvm_sandbox() -> Arc<Sandbox> {
     let (kernel, initramfs) = test_artifacts::artifacts();
 
     let builder = Sandbox::local()
-        // Must satisfy the documented sizing formula (AGENTS.md "VM memory
-        // sizing"): compressed + uncompressed initramfs + 208 MB overhead.
-        // The test image carries BusyBox, claudio, and kernel modules, so it
-        // exceeds the 256 MB this suite used with the smaller generic image.
-        .memory_mb(1024)
+        // The test image is a few MB compressed and uncompressed, so 256 MB
+        // clears the AGENTS.md "VM memory sizing" minimum (compressed +
+        // uncompressed + 208 MB overhead) with room to spare. Keep it small:
+        // this suite boots its VMs in parallel, so every MB is multiplied.
+        .memory_mb(256)
         .vcpus(1)
         .kernel(&kernel)
         .initramfs(&initramfs);
@@ -60,7 +60,7 @@ async fn kvm_real_vm_exec_uname() {
     // Build VM configuration. Memory follows the AGENTS.md sizing formula for
     // the test image (see `build_local_kvm_sandbox`).
     let cfg = VoidBoxConfig::new()
-        .memory_mb(1024)
+        .memory_mb(256)
         .vcpus(1)
         .kernel(&kernel)
         .initramfs(&initramfs)
@@ -168,24 +168,25 @@ async fn kvm_workflow_pipe_uppercase() {
         "workflow run (kvm_integration)",
     );
 
-    if !observed.result.success() {
-        eprintln!(
-            "kvm_workflow_pipe_uppercase: workflow exit_code={} output='{}'",
-            observed.result.exit_code,
-            observed.result.output_str()
-        );
-        for (name, step) in &observed.result.step_outputs {
-            eprintln!(
-                "  step {name}: exit_code={} stdout='{}' stderr='{}'",
+    let steps: String = observed
+        .result
+        .step_outputs
+        .iter()
+        .map(|(name, step)| {
+            format!(
+                "\n  step {name}: exit_code={} stdout='{}' stderr='{}'",
                 step.exit_code,
                 step.stdout_str(),
                 step.stderr_str()
-            );
-        }
-        // Treat non-zero exit as environment-specific flakiness for KVM,
-        // since the functional logic is already covered by mock tests.
-        return;
-    }
+            )
+        })
+        .collect();
+    let diag = format!(
+        "kvm_workflow_pipe_uppercase: workflow exit_code={} output='{}'{steps}",
+        observed.result.exit_code,
+        observed.result.output_str()
+    );
+    assert!(observed.result.success(), "{diag}");
 
     assert_eq!(observed.result.output_str().trim(), "HELLO");
 
@@ -226,22 +227,25 @@ async fn kvm_claude_workflow_plan_apply() {
         "claude workflow run (kvm_integration)",
     );
 
-    if !observed.result.success() {
-        eprintln!(
-            "kvm_claude_workflow_plan_apply: workflow exit_code={} output='{}'",
-            observed.result.exit_code,
-            observed.result.output_str()
-        );
-        for (name, step) in &observed.result.step_outputs {
-            eprintln!(
-                "  step {name}: exit_code={} stdout='{}' stderr='{}'",
+    let steps: String = observed
+        .result
+        .step_outputs
+        .iter()
+        .map(|(name, step)| {
+            format!(
+                "\n  step {name}: exit_code={} stdout='{}' stderr='{}'",
                 step.exit_code,
                 step.stdout_str(),
                 step.stderr_str()
-            );
-        }
-        return;
-    }
+            )
+        })
+        .collect();
+    let diag = format!(
+        "kvm_claude_workflow_plan_apply: workflow exit_code={} output='{}'{steps}",
+        observed.result.exit_code,
+        observed.result.output_str()
+    );
+    assert!(observed.result.success(), "{diag}");
 
     assert!(
         observed

@@ -15,14 +15,18 @@
 //! cargo test --test telemetry
 //! ```
 //!
-//! Run KVM end-to-end test:
+//! Kernel and initramfs for the KVM tests are auto-provisioned by
+//! [`test_artifacts`] under `--ignored`; `VOID_BOX_KERNEL` /
+//! `VOID_BOX_INITRAMFS` are optional overrides. The KVM tests are `#[ignore]`,
+//! so a plain `cargo test` never provisions or boots a VM.
+//!
+//! Run KVM end-to-end tests:
 //! ```bash
-//! export VOID_BOX_KERNEL=/path/to/vmlinux
-//! export VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz
 //! cargo test --test telemetry -- --ignored
 //! ```
 
-use std::path::PathBuf;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::guest::protocol::{
     ExecResponse, Message, MessageType, ProcessMetrics, SystemMetrics, TelemetryBatch,
@@ -568,10 +572,8 @@ fn observer_integration_telemetry_plus_spans() {
 
 /// Full KVM end-to-end: boot a VM, subscribe to telemetry, validate batches.
 ///
-/// Requires:
-/// - `/dev/kvm` accessible
-/// - `VOID_BOX_KERNEL` env var → path to vmlinux/bzImage
-/// - `VOID_BOX_INITRAMFS` env var → path to rootfs.cpio.gz
+/// Requires `/dev/kvm` to be accessible; the kernel and initramfs are
+/// auto-provisioned.
 ///
 /// ```bash
 /// cargo test --test telemetry kvm_telemetry_end_to_end -- --ignored
@@ -582,24 +584,15 @@ async fn kvm_telemetry_end_to_end() {
     use void_box::vmm::config::VoidBoxConfig;
     use void_box::vmm::MicroVm;
 
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        eprintln!(
-            "skipping kvm_telemetry_end_to_end: \
-             set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS"
-        );
-        return;
-    };
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     // Build VM
-    let mut cfg = VoidBoxConfig::new()
+    let cfg = VoidBoxConfig::new()
         .memory_mb(256)
         .vcpus(1)
         .kernel(&kernel)
+        .initramfs(&initramfs)
         .enable_vsock(true);
-
-    if let Some(ref initramfs_path) = initramfs {
-        cfg = cfg.initramfs(initramfs_path);
-    }
 
     cfg.validate().expect("invalid VoidBoxConfig");
 
@@ -608,15 +601,11 @@ async fn kvm_telemetry_end_to_end() {
         .expect("failed to create KVM-backed MicroVm");
 
     // Verify the VM boots by running a trivial command first
-    match vm.exec("echo", &["telemetry-test"]).await {
-        Ok(output) => {
-            assert!(output.success(), "echo failed: {}", output.stderr_str());
-        }
-        Err(e) => {
-            eprintln!("kvm_telemetry_end_to_end: exec failed, skipping: {e}");
-            return;
-        }
-    }
+    let output = test_artifacts::expect_vm(
+        vm.exec("echo", &["telemetry-test"]).await,
+        "guest exec (telemetry kvm)",
+    );
+    assert!(output.success(), "echo failed: {}", output.stderr_str());
 
     // Start telemetry subscription
     let telemetry_observer = if std::env::var("VOIDBOX_OTLP_ENDPOINT").is_ok()
@@ -627,55 +616,51 @@ async fn kvm_telemetry_end_to_end() {
         Observer::test()
     };
     let opts = TelemetrySubscribeRequest::default(); // 1s interval, no kernel threads
-    match vm.start_telemetry(telemetry_observer, opts).await {
-        Ok(_agg) => {}
-        Err(e) => {
-            eprintln!("kvm_telemetry_end_to_end: start_telemetry failed: {e}");
-            let _ = vm.stop().await;
-            return;
-        }
-    }
+    test_artifacts::expect_vm(
+        vm.start_telemetry(telemetry_observer, opts).await,
+        "start_telemetry",
+    );
 
     // Wait for a few telemetry batches (guest streams every 1s with default opts)
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // Check that telemetry data was received
-    if let Some(agg) = vm.telemetry() {
-        if let Some(batch) = agg.latest_batch() {
-            eprintln!("Received telemetry batch seq={}", batch.seq);
-            assert!(batch.seq > 0, "expected at least 2 batches after 7s");
+    let batch = vm
+        .telemetry()
+        .expect("telemetry aggregator missing after start_telemetry")
+        .latest_batch()
+        .expect("no telemetry batch received after 5s");
 
-            if let Some(ref sys) = batch.system {
-                eprintln!(
-                    "  cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
-                    sys.cpu_percent,
-                    sys.memory_used_bytes,
-                    sys.memory_total_bytes,
-                    sys.net_rx_bytes,
-                    sys.net_tx_bytes,
-                    sys.procs_running,
-                    sys.open_fds,
-                );
-                assert!(sys.memory_total_bytes > 0, "memory_total should be > 0");
-            }
+    eprintln!("Received telemetry batch seq={}", batch.seq);
+    assert!(batch.seq > 0, "expected at least 2 batches after 5s");
 
-            eprintln!("  {} processes reported:", batch.processes.len());
-            for p in &batch.processes {
-                eprintln!(
-                    "    pid={} comm={:16} state={} rss={:>10}",
-                    p.pid, p.comm, p.state, p.rss_bytes,
-                );
-            }
-            assert!(
-                !batch.processes.is_empty(),
-                "expected at least one process (the guest-agent)"
-            );
-        } else {
-            eprintln!("kvm_telemetry_end_to_end: no telemetry batches received yet");
-        }
-    } else {
-        eprintln!("kvm_telemetry_end_to_end: telemetry aggregator not available");
+    let sys = batch
+        .system
+        .as_ref()
+        .expect("batch should contain system metrics");
+    eprintln!(
+        "  cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
+        sys.cpu_percent,
+        sys.memory_used_bytes,
+        sys.memory_total_bytes,
+        sys.net_rx_bytes,
+        sys.net_tx_bytes,
+        sys.procs_running,
+        sys.open_fds,
+    );
+    assert!(sys.memory_total_bytes > 0, "memory_total should be > 0");
+
+    eprintln!("  {} processes reported:", batch.processes.len());
+    for p in &batch.processes {
+        eprintln!(
+            "    pid={} comm={:16} state={} rss={:>10}",
+            p.pid, p.comm, p.state, p.rss_bytes,
+        );
     }
+    assert!(
+        !batch.processes.is_empty(),
+        "expected at least one process (the guest-agent)"
+    );
 
     // Flush OTel data before stopping (no-op when OTel is not configured)
     let _ = void_box::observe::flush_global_otel();
@@ -694,23 +679,15 @@ async fn kvm_telemetry_with_kernel_threads() {
     use void_box::vmm::config::VoidBoxConfig;
     use void_box::vmm::MicroVm;
 
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        eprintln!(
-            "skipping kvm_telemetry_with_kernel_threads: \
-             set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS"
-        );
-        return;
-    };
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-    let mut cfg = VoidBoxConfig::new()
+    let cfg = VoidBoxConfig::new()
         .memory_mb(256)
         .vcpus(1)
         .kernel(&kernel)
+        .initramfs(&initramfs)
         .enable_vsock(true);
 
-    if let Some(ref initramfs_path) = initramfs {
-        cfg = cfg.initramfs(initramfs_path);
-    }
     cfg.validate().expect("invalid VoidBoxConfig");
 
     let mut vm = MicroVm::new(cfg)
@@ -718,13 +695,11 @@ async fn kvm_telemetry_with_kernel_threads() {
         .expect("failed to create KVM-backed MicroVm");
 
     // Verify VM boots
-    match vm.exec("echo", &["kernel-thread-test"]).await {
-        Ok(output) => assert!(output.success(), "echo failed: {}", output.stderr_str()),
-        Err(e) => {
-            eprintln!("kvm_telemetry_with_kernel_threads: exec failed, skipping: {e}");
-            return;
-        }
-    }
+    let output = test_artifacts::expect_vm(
+        vm.exec("echo", &["kernel-thread-test"]).await,
+        "guest exec (telemetry kvm)",
+    );
+    assert!(output.success(), "echo failed: {}", output.stderr_str());
 
     // Subscribe with kernel threads included
     let opts = TelemetrySubscribeRequest {
@@ -732,55 +707,53 @@ async fn kvm_telemetry_with_kernel_threads() {
         include_kernel_threads: true,
     };
     let telemetry_observer = Observer::test();
-    match vm.start_telemetry(telemetry_observer, opts).await {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("kvm_telemetry_with_kernel_threads: start_telemetry failed: {e}");
-            let _ = vm.stop().await;
-            return;
-        }
-    }
+    test_artifacts::expect_vm(
+        vm.start_telemetry(telemetry_observer, opts).await,
+        "start_telemetry",
+    );
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    if let Some(agg) = vm.telemetry() {
-        if let Some(batch) = agg.latest_batch() {
-            if let Some(ref sys) = batch.system {
-                eprintln!(
-                    "System: cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
-                    sys.cpu_percent,
-                    sys.memory_used_bytes,
-                    sys.memory_total_bytes,
-                    sys.net_rx_bytes,
-                    sys.net_tx_bytes,
-                    sys.procs_running,
-                    sys.open_fds,
-                );
-            }
-            eprintln!(
-                "Received batch seq={}, {} processes:",
-                batch.seq,
-                batch.processes.len()
-            );
-            for p in &batch.processes {
-                eprintln!(
-                    "    pid={:<5} comm={:20} state={} rss={:>10}",
-                    p.pid, p.comm, p.state, p.rss_bytes,
-                );
-            }
-            // With kernel threads included, we should see some processes with zero RSS
-            let zero_rss_count = batch.processes.iter().filter(|p| p.rss_bytes == 0).count();
-            eprintln!(
-                "  {} processes with zero RSS (likely kernel threads)",
-                zero_rss_count
-            );
-            // Kernel threads like kthreadd, ksoftirqd, etc. should appear
-            assert!(
-                zero_rss_count > 0,
-                "expected kernel threads (zero RSS) when include_kernel_threads=true"
-            );
-        }
+    let batch = vm
+        .telemetry()
+        .expect("telemetry aggregator missing after start_telemetry")
+        .latest_batch()
+        .expect("no telemetry batch received after 5s");
+
+    if let Some(ref sys) = batch.system {
+        eprintln!(
+            "System: cpu={}% mem_used={} mem_total={} net_rx={} net_tx={} procs={} fds={}",
+            sys.cpu_percent,
+            sys.memory_used_bytes,
+            sys.memory_total_bytes,
+            sys.net_rx_bytes,
+            sys.net_tx_bytes,
+            sys.procs_running,
+            sys.open_fds,
+        );
     }
+    eprintln!(
+        "Received batch seq={}, {} processes:",
+        batch.seq,
+        batch.processes.len()
+    );
+    for p in &batch.processes {
+        eprintln!(
+            "    pid={:<5} comm={:20} state={} rss={:>10}",
+            p.pid, p.comm, p.state, p.rss_bytes,
+        );
+    }
+    // With kernel threads included, we should see some processes with zero RSS
+    let zero_rss_count = batch.processes.iter().filter(|p| p.rss_bytes == 0).count();
+    eprintln!(
+        "  {} processes with zero RSS (likely kernel threads)",
+        zero_rss_count
+    );
+    // Kernel threads like kthreadd, ksoftirqd, etc. should appear
+    assert!(
+        zero_rss_count > 0,
+        "expected kernel threads (zero RSS) when include_kernel_threads=true"
+    );
 
     vm.stop().await.expect("failed to stop VM");
 }
@@ -821,16 +794,4 @@ fn make_sample_batch(seq: u64) -> TelemetryBatch {
         ],
         trace_context: None,
     }
-}
-
-/// Load kernel + initramfs paths from environment (same as kvm_integration.rs).
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
-    if !kernel.exists() {
-        return None;
-    }
-
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
 }

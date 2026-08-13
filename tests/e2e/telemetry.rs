@@ -177,26 +177,20 @@ async fn test_default_scenario() {
         ..Default::default()
     };
     let provider = void_box::llm::LlmProvider::Claude;
-    match sandbox.exec_agent(&provider, "exec_agent test", opts).await {
-        Ok(result2) => {
-            assert!(!result2.is_error, "exec_agent should not error");
-            assert!(
-                !result2.session_id.is_empty(),
-                "exec_agent should have session_id"
-            );
-            assert!(
-                !result2.tool_calls.is_empty(),
-                "exec_agent should have tool calls"
-            );
-            eprintln!("  [C] exec_agent() works correctly");
-        }
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("guest does not have `claude-code` in PATH") =>
-        {
-            eprintln!("  [C] skipped exec_agent() check: {}", msg);
-        }
-        Err(e) => panic!("exec_agent failed: {e}"),
-    }
+    let result2 = test_artifacts::expect_vm(
+        sandbox.exec_agent(&provider, "exec_agent test", opts).await,
+        "exec_agent",
+    );
+    assert!(!result2.is_error, "exec_agent should not error");
+    assert!(
+        !result2.session_id.is_empty(),
+        "exec_agent should have session_id"
+    );
+    assert!(
+        !result2.tool_calls.is_empty(),
+        "exec_agent should have tool calls"
+    );
+    eprintln!("  [C] exec_agent() works correctly");
 
     // Note: we don't call sandbox.stop() -- vCPU threads are blocked in KVM_RUN
     // and won't exit until the process ends. The Drop impl handles cleanup.
@@ -265,12 +259,14 @@ async fn test_telemetry_aggregator() {
     let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
 
     // Warmup: ensure VM is ready
-    let _warmup = vm
-        .exec(
+    test_artifacts::expect_vm(
+        vm.exec(
             "claude-code",
             &["-p", "warmup", "--output-format", "stream-json"],
         )
-        .await;
+        .await,
+        "warmup exec",
+    );
 
     let observer = void_box::observe::Observer::test();
     let opts = void_box::guest::protocol::TelemetrySubscribeRequest::default();

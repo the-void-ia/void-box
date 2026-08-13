@@ -700,13 +700,13 @@ async fn vm_oci_alpine_os_release() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir = PathBuf::from(&home).join(".voidbox/oci");
     let client = voidbox_oci::OciClient::new(cache_dir);
-    let rootfs_path = match client.resolve_rootfs("alpine:3.20").await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping: failed to pull alpine:3.20: {e}");
-            return;
-        }
-    };
+    // A pull/extract failure is a real regression in the OCI path, not a reason
+    // to skip: this test is `--ignored`, so it only runs where network is
+    // expected.
+    let rootfs_path = client
+        .resolve_rootfs("alpine:3.20")
+        .await
+        .expect("pull and extract alpine:3.20");
     eprintln!("OCI rootfs extracted to: {}", rootfs_path.display());
 
     // 2. Build sandbox:
@@ -794,14 +794,11 @@ workflow:
     let spec_path = dir.path().join("alpine-resolve.yaml");
     std::fs::write(&spec_path, yaml).unwrap();
 
-    let report =
-        match void_box::runtime::run_file(&spec_path, None, None, None, None, None, None).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("runtime_run_file_resolves_oci_image: failed: {e}");
-                return;
-            }
-        };
+    // Mock mode: no VM is booted, so there is no capability to gate on and any
+    // error is a real regression in the spec → OCI-resolution path.
+    let report = void_box::runtime::run_file(&spec_path, None, None, None, None, None, None)
+        .await
+        .expect("run_file");
 
     // The mock sandbox's echo returns "resolved-ok\n".
     // The important part is that run_file succeeded, which means
@@ -863,6 +860,8 @@ async fn guest_image_pull_and_extract() {
         Err(e) => {
             // If caller did not explicitly configure a registry/image, treat an
             // unavailable localhost test registry as "not configured" and skip.
+            // This is a test-infra skip (no local registry running), not a
+            // VM-capability skip: an explicitly configured registry panics.
             if image_ref_env.is_none() && image_ref.starts_with("localhost:5555/") {
                 eprintln!("skipping: test registry not available at localhost:5555 ({e})");
                 return;
