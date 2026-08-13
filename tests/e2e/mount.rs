@@ -5,27 +5,18 @@
 //! host directory, configures a mount, boots the VM, and runs commands inside
 //! the guest to validate the mount behavior.
 //!
-//! ## Prerequisites
+//! Kernel and initramfs are auto-provisioned by [`test_artifacts`] under
+//! `--ignored`; `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides.
+//! All tests are `#[ignore]`, so a plain `cargo test` never provisions or boots.
 //!
-//! 1. Build the test initramfs:
-//!    ```bash
-//!    scripts/build_test_image.sh          # Linux
-//!    scripts/download_kernel.sh           # macOS
-//!    ```
-//!
-//! 2. Run with:
-//!    ```bash
-//!    VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!    VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-//!    cargo test --test e2e_mount -- --ignored --test-threads=1
-//!    ```
-//!
-//! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
+//! ```bash
+//! cargo test --test e2e_mount -- --ignored --test-threads=1
+//! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::{
     BackendConfig, BackendSecurityConfig, GuestConsoleSink, MountConfig, VmmBackend,
@@ -36,37 +27,14 @@ use void_box_protocol::SessionSecret;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `BackendConfig` with a mount. Returns `None` (skips) if the kernel
-/// artifacts are unavailable; capability and start are handled by
-/// `vm_preflight::start_backend_or_gate`.
-fn build_config_with_mount(
-    host_dir: &Path,
-    guest_path: &str,
-    read_only: bool,
-) -> Option<BackendConfig> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        eprintln!("skipping: set VOID_BOX_KERNEL");
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        eprintln!("skipping: set VOID_BOX_INITRAMFS");
-        return None;
-    }
-
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        eprintln!("skipping: kernel/initramfs not found or unreadable");
-        return None;
-    }
+/// Build a `BackendConfig` with a mount, auto-provisioning the test artifacts.
+fn build_config_with_mount(host_dir: &Path, guest_path: &str, read_only: bool) -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 256,
         vcpus: 1,
         kernel,
@@ -109,22 +77,24 @@ fn build_config_with_mount(
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
-/// Create and start a VM backend with a mount. Returns `None` on soft failures.
+/// Create and start a VM backend with a mount, or panic on a capable machine.
 async fn create_started_backend_with_mount(
     host_dir: &Path,
     guest_path: &str,
     read_only: bool,
-) -> Option<Box<dyn VmmBackend>> {
-    vm_preflight::start_backend_or_gate(build_config_with_mount(host_dir, guest_path, read_only))
-        .await
+) -> Box<dyn VmmBackend> {
+    let config = build_config_with_mount(host_dir, guest_path, read_only);
+    let mut backend = void_box::backend::create_backend();
+    test_artifacts::expect_vm(backend.start(config).await, "backend start (mount)");
+    backend
 }
 
 /// Execute a shell command inside the guest, returning the ExecOutput.
-async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    vm_preflight::checked_vm(
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
+    test_artifacts::expect_vm(
         backend
             .exec("sh", &["-c", script], &[], &[], None, Some(30))
             .await,
@@ -140,18 +110,13 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::Ex
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_write_read() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
         "echo 'hello 9p' > /mnt/shared/test.txt && cat /mnt/shared/test.txt",
     )
     .await;
-    let Some(out) = out else { return };
 
     assert!(
         out.success(),
@@ -172,14 +137,9 @@ async fn mount_rw_write_read() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_host_visible() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(&*backend, "echo 'from guest' > /mnt/shared/host_check.txt").await;
-    let Some(out) = out else { return };
     assert!(out.success(), "write failed: {}", out.stderr_str());
 
     let host_file = host_dir.path().join("host_check.txt");
@@ -198,18 +158,13 @@ async fn mount_rw_host_visible() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_mkdir_nested() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
         "mkdir -p /mnt/shared/a/b/c/d && echo ok > /mnt/shared/a/b/c/d/deep.txt && cat /mnt/shared/a/b/c/d/deep.txt",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(out.success(), "mkdir -p failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "ok");
 
@@ -227,11 +182,7 @@ async fn mount_rw_mkdir_nested() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_rename_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
@@ -239,7 +190,6 @@ async fn mount_rw_rename_file() {
          test ! -e /mnt/shared/old.txt && cat /mnt/shared/new.txt",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(out.success(), "rename failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "data");
 
@@ -257,11 +207,7 @@ async fn mount_rw_rename_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_delete_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
@@ -269,7 +215,6 @@ async fn mount_rw_delete_file() {
          test ! -e /mnt/shared/remove_me.txt && echo deleted",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(out.success(), "delete failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "deleted");
 
@@ -286,11 +231,7 @@ async fn mount_rw_delete_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_chmod() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
@@ -298,7 +239,6 @@ async fn mount_rw_chmod() {
          stat -c '%a' /mnt/shared/script.sh",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(out.success(), "chmod failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "755");
 
@@ -313,11 +253,7 @@ async fn mount_rw_chmod() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_large_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     // Write ~1MB of data (1024 lines × 1024 chars each)
     let out = guest_sh(
@@ -326,7 +262,6 @@ async fn mount_rw_large_file() {
          stat -c '%s' /mnt/shared/large.bin",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(
         out.success(),
         "large file write failed: {}",
@@ -352,18 +287,13 @@ async fn mount_rw_large_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_ro_cannot_write() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await;
 
     let out = guest_sh(
         &*backend,
         "echo nope > /mnt/shared/should_fail.txt 2>&1; echo $?",
     )
     .await;
-    let Some(out) = out else { return };
 
     // The echo $? captures the exit code of the write attempt
     let stdout = out.stdout_str();
@@ -390,14 +320,9 @@ async fn mount_ro_can_read() {
     let host_dir = tempfile::tempdir().unwrap();
     std::fs::write(host_dir.path().join("readme.txt"), "hello from host\n").unwrap();
 
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await;
 
     let out = guest_sh(&*backend, "cat /mnt/shared/readme.txt").await;
-    let Some(out) = out else { return };
     assert!(out.success(), "read failed: {}", out.stderr_str());
     assert_eq!(out.stdout_str().trim(), "hello from host");
 
@@ -417,18 +342,13 @@ async fn mount_host_preexisting() {
     std::fs::create_dir(host_dir.path().join("subdir")).unwrap();
     std::fs::write(host_dir.path().join("subdir/c.txt"), "ccc\n").unwrap();
 
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     let out = guest_sh(
         &*backend,
         "cat /mnt/shared/a.txt /mnt/shared/b.txt /mnt/shared/subdir/c.txt",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(
         out.success(),
         "read pre-existing failed: {}",
@@ -451,11 +371,7 @@ async fn mount_host_preexisting() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_empty_dir() {
     let host_dir = tempfile::tempdir().unwrap();
-    let Some(backend) =
-        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
-    else {
-        return;
-    };
+    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
 
     // Verify empty, then write
     let out = guest_sh(
@@ -463,7 +379,6 @@ async fn mount_empty_dir() {
         "ls /mnt/shared/ | wc -l && echo 'first file' > /mnt/shared/new.txt && cat /mnt/shared/new.txt",
     )
     .await;
-    let Some(out) = out else { return };
     assert!(out.success(), "empty dir test failed: {}", out.stderr_str());
 
     let stdout = out.stdout_str();

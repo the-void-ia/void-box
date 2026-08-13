@@ -46,39 +46,30 @@ use void_box::proxy::{
 };
 use void_box_protocol::SessionSecret;
 
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
-
-use std::path::PathBuf;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 const UPSTREAM_HOST: &str = "api.anthropic.com";
 const REAL_KEY: &str = "sk-ant-e2e-real-host-held-secret";
 
 type CapturedHeaders = Arc<Mutex<Option<HeaderMap>>>;
 
-fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let kernel = PathBuf::from(std::env::var("VOID_BOX_KERNEL").ok()?);
-    let initramfs = PathBuf::from(std::env::var("VOID_BOX_INITRAMFS").ok()?);
-    if kernel.as_os_str().is_empty() || initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
-    Some((kernel, initramfs))
+async fn start_backend() -> Box<dyn VmmBackend> {
+    let mut backend = void_box::backend::create_backend();
+    test_artifacts::expect_vm(
+        backend.start(backend_config()).await,
+        "backend start (credential_proxy)",
+    );
+    backend
 }
 
-async fn start_backend() -> Option<Box<dyn VmmBackend>> {
-    vm_preflight::start_backend_or_gate(backend_config()).await
-}
-
-fn backend_config() -> Option<BackendConfig> {
-    let (kernel, initramfs) = vm_artifacts()?;
+fn backend_config() -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 256,
         vcpus: 1,
         kernel,
@@ -103,7 +94,7 @@ fn backend_config() -> Option<BackendConfig> {
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
 /// Mock TLS upstream recording request headers.
@@ -153,8 +144,8 @@ async fn start_mock_upstream() -> (SocketAddr, CapturedHeaders) {
     (addr, captured)
 }
 
-async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    vm_preflight::checked_vm(
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
+    test_artifacts::expect_vm(
         backend
             .exec("sh", &["-c", script], &[], &[], None, Some(30))
             .await,
@@ -165,10 +156,7 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::Ex
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_call_is_credential_injected_and_leaks_no_key() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
-    };
+    let backend = start_backend().await;
     let (mock_addr, captured) = start_mock_upstream().await;
 
     // Proxy upstream client trusts the self-signed mock and routes the upstream
@@ -223,15 +211,14 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
         )
         .await
         .expect("stage proxy hosts");
-    if let Some(out) = guest_sh(&*backend, "cat /etc/hosts").await {
-        for (ip, host) in &provisioning.host_aliases {
-            assert!(
-                out.stdout_str().contains(&format!("{ip} {host}")),
-                "guest-agent did not mirror proxy alias '{ip} {host}' into /etc/hosts; \
-                 got: {}",
-                out.stdout_str()
-            );
-        }
+    let out = guest_sh(&*backend, "cat /etc/hosts").await;
+    for (ip, host) in &provisioning.host_aliases {
+        assert!(
+            out.stdout_str().contains(&format!("{ip} {host}")),
+            "guest-agent did not mirror proxy alias '{ip} {host}' into /etc/hosts; \
+             got: {}",
+            out.stdout_str()
+        );
     }
 
     // Exercise a credentialed call from inside the guest through the proxy.
@@ -253,20 +240,18 @@ async fn guest_call_is_credential_injected_and_leaks_no_key() {
     );
     let out = guest_sh(&*backend, &script).await;
 
-    if let Some(out) = out {
-        if out.success() {
-            assert_eq!(out.stdout_str().trim(), "upstream-ok");
-            let seen = captured.lock().unwrap().clone().expect("upstream called");
-            assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
-        } else {
-            // The deterministic test image's wget may lack HTTPS/custom-CA
-            // support; the host-side proxy + no-credential-in-guest path above is still asserted.
-            eprintln!(
-                "note: guest HTTPS call did not succeed (client capability); \
-                 stderr: {}",
-                out.stderr_str()
-            );
-        }
+    if out.success() {
+        assert_eq!(out.stdout_str().trim(), "upstream-ok");
+        let seen = captured.lock().unwrap().clone().expect("upstream called");
+        assert_eq!(seen.get("x-api-key").unwrap(), REAL_KEY);
+    } else {
+        // The deterministic test image's wget may lack HTTPS/custom-CA
+        // support; the host-side proxy + no-credential-in-guest path above is still asserted.
+        eprintln!(
+            "note: guest HTTPS call did not succeed (client capability); \
+             stderr: {}",
+            out.stderr_str()
+        );
     }
 
     proxy.unregister_sandbox(&binding.token_hex).await;

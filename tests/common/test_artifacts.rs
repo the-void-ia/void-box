@@ -76,6 +76,54 @@ pub fn artifacts() -> (PathBuf, PathBuf) {
     }
 }
 
+/// Unwrap a fallible VM op (backend start, a guest RPC), or panic. Capability is
+/// not probed and artifacts are provisioned, so an error here is a real failure
+/// on a machine asked to run VM tests — never a skip, on any platform.
+#[allow(dead_code)]
+pub fn expect_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+    result.unwrap_or_else(|err| {
+        panic!("{context}: VM operation failed on a capable machine (a real failure, not a skip): {err}")
+    })
+}
+
+/// Read `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` for the heavy suites that need a
+/// non-test image (real Claude / Codex) and cannot auto-build it. Returns the
+/// paths, or `None` after printing a skip reason — panicking under
+/// `VOID_BOX_REQUIRE_VM=1`. These suites are an explicit opt-in: their image is
+/// large, hash-pinned, and (for agent runs) needs real credentials, so requiring
+/// the operator to stage it — rather than auto-provisioning — is deliberate.
+#[allow(dead_code)]
+pub fn env_artifacts_or_skip() -> Option<(PathBuf, PathBuf)> {
+    let kernel = std::env::var_os("VOID_BOX_KERNEL").filter(|v| !v.is_empty());
+    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").filter(|v| !v.is_empty());
+    match (kernel, initramfs) {
+        (Some(kernel), Some(initramfs)) => {
+            let kernel = PathBuf::from(kernel);
+            let initramfs = PathBuf::from(initramfs);
+            assert!(
+                kernel.is_file(),
+                "VOID_BOX_KERNEL is set but not a file: {}",
+                kernel.display()
+            );
+            assert!(
+                initramfs.is_file(),
+                "VOID_BOX_INITRAMFS is set but not a file: {}",
+                initramfs.display()
+            );
+            Some((kernel, initramfs))
+        }
+        _ => {
+            let reason = "VOID_BOX_KERNEL / VOID_BOX_INITRAMFS are unset (this suite needs a staged non-test image)";
+            assert!(
+                std::env::var("VOID_BOX_REQUIRE_VM").as_deref() != Ok("1"),
+                "VOID_BOX_REQUIRE_VM=1 but {reason}"
+            );
+            eprintln!("skipping: {reason}");
+            None
+        }
+    }
+}
+
 fn resolve_artifacts() -> Result<(PathBuf, PathBuf), String> {
     // The kernel source decides the initramfs's module source: a pinned
     // download needs pinned modules; a host-kernel override pairs with the
