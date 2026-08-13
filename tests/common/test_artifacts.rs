@@ -101,8 +101,8 @@ pub enum VmStart {
 /// Classify a VM backend `start()` result, separating a host that genuinely
 /// cannot virtualize from a real boot failure on a capable host.
 ///
-/// A crisp capability-absence signal — the hypervisor is unavailable, or
-/// `/dev/kvm` is missing or inaccessible — yields [`VmStart::SkipIncapable`], so
+/// A capability-absence signal — the hypervisor is unavailable, or `/dev/kvm`
+/// is missing or inaccessible — yields [`VmStart::SkipIncapable`], so
 /// the test skips with a loud reason instead of a silent green. Every other
 /// error (a boot timeout, a handshake failure, an RPC error) panics: those occur
 /// on a capable host and must fail. `VOID_BOX_REQUIRE_VM=1` turns even a

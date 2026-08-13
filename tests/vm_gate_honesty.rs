@@ -17,9 +17,13 @@ use test_artifacts::{is_capability_absence, vm_start, VmStart};
 /// hardware-availability message.
 #[test]
 fn recognizes_genuine_hypervisor_absence() {
-    assert!(is_capability_absence(
-        "hypervisor unavailable: cannot open /dev/kvm: Permission denied (os error 13)"
-    ));
+    // Build the KVM case from the real error type, not a literal, so a change to
+    // the variant's Display that is not mirrored in the classifier's signals
+    // breaks this test — the exact drift it exists to catch.
+    let kvm_absent =
+        void_box::Error::HypervisorUnavailable("cannot open /dev/kvm: Permission denied".into());
+    assert!(is_capability_absence(&kvm_absent.to_string()));
+    // VZ's message is Apple's, surfaced verbatim through `Error::Backend`.
     assert!(is_capability_absence(
         "Backend error: VZ config validation: Internal error. \
          Virtualization is not available on this hardware."

@@ -808,14 +808,16 @@ cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
 ```
 
-Ignored/VM suites. These auto-provision the pinned kernel and test initramfs into `target/` on first run, so `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` need not be set — an explicit override still wins (ADR-0011). On a machine that genuinely cannot virtualize they skip loudly, but the reason prints only with `--nocapture`; on a machine you believe is capable, set `VOID_BOX_REQUIRE_VM=1` so a skip becomes a failure and nothing hides. A real boot or RPC failure always fails.
+Ignored/VM suites. The deterministic suites auto-provision the pinned kernel and test initramfs into `target/` on first run, so `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` need not be set — an explicit override still wins (ADR-0011). The heavy agent suites `e2e_agent_mcp` and `e2e_service_mode` are the exception: they need a staged production image via those env vars and skip when it is absent. On a machine that genuinely cannot virtualize the suites skip loudly, but the reason prints only with `--nocapture`; on a machine you believe is capable, set `VOID_BOX_REQUIRE_VM=1` so a skip becomes a failure and nothing hides. A real boot or RPC failure always fails.
 
-To run the VM suites with bounded parallelism instead of one at a time — the Linux CI lane does this — use nextest (each VM-booting binary joins the `vm` test group in `.config/nextest.toml`, capped at two concurrent boots):
+To run the VM suites with bounded parallelism instead of one at a time, use nextest — each VM-booting binary joins the `vm` test group in `.config/nextest.toml`, capped at two concurrent boots. This runs every VM suite locally on a capable machine:
 
 ```bash
-cargo nextest run --run-ignored only --no-fail-fast \
+VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
   -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
+
+The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs.
 
 The explicit-artifact form (env override; still one suite at a time):
 
