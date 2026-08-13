@@ -100,6 +100,14 @@ jobs:
         with:
           targets: ${{ matrix.musl-target }}
 
+      # cargo-nextest runs the VM suites with bounded cross-suite parallelism
+      # (the `vm` test group in .config/nextest.toml), replacing the strictly
+      # sequential `cargo test --test-threads=1` lane.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # ---- Cargo cache ----
       # Swatinem/rust-cache is Rust-aware: it caches `~/.cargo/registry`
       # and `~/.cargo/git` whole, but prunes `target/` to drop workspace
@@ -129,6 +137,10 @@ jobs:
 
       # ---- E2E KVM tests ----
       - name: Run E2E KVM tests
+        # Was ~7 sequential suites plus a separate snapshot step; now a single
+        # nextest run. The whole VM lane finishes well inside this budget when
+        # healthy, and the timeout keeps a hung boot from consuming the job.
+        timeout-minutes: 30
         env:
           VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
@@ -155,58 +167,15 @@ jobs:
           ls -la "$VOID_BOX_KERNEL"
           ls -la "$VOID_BOX_INITRAMFS"
 
-          # Run E2E tests (--ignored to include KVM tests, sequential to avoid resource contention)
-          cargo test --test e2e_telemetry -- --ignored --test-threads=1
-
-          # Run mount integration tests (full suite, including the three
-          # RW tests that were previously skipped — see #52). The
-          # virtio-9p server now translates metadata uid/gid to the
-          # guest sandbox uid (1000) for RW mounts, so guest sandbox
-          # writes against host tempdirs owned by the runner uid no
-          # longer hit EPERM/EACCES on the cache revalidation path.
-          cargo test --test e2e_mount -- --ignored --test-threads=1
-
-          # Persistent multiplex channel under concurrent + serial RPC load.
-          cargo test --test persistent_channel -- --ignored --test-threads=1
-
-          # Skill-install + MCP exec path (exercises unified ControlChannel)
-          cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-
-          # PTY exit-code propagation and teardown. pty_command_not_allowed is
-          # skipped: it asserts the guest rejects a non-allowlisted program, but
-          # the allowlist loads at guest boot from a file only the agent-box
-          # provisioning path writes, which this direct attach_pty path never
-          # stages — so the guest allows all commands. Tracked in #99.
-          cargo test --test e2e_pty -- --ignored --test-threads=1 \
-            --skip pty_command_not_allowed
-
-          # Credential-injection proxy: TLS-terminate, inject the host-held key,
-          # and assert no real credential reaches the guest.
-          cargo test --test e2e_credential_proxy -- --ignored --test-threads=1
-
-      - name: Run snapshot integration tests
-        # `KERNEL_VERSION` is not defined in this workflow, so a literal
-        # `env: VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}`
-        # would expand to `/boot/vmlinuz-` and force the run body to
-        # override it anyway. Set everything in the run body via
-        # `uname -r` and skip the dead env: block.
-        #
-        # The full suite takes well under a minute when healthy; the step
-        # timeout keeps a hung test from consuming the whole 60-minute job
-        # budget and attributes the cancellation to this step.
-        # A snapshot boot failure already fails on Linux via the honest gate.
-        # VOID_BOX_REQUIRE_VM=1 additionally makes an incapable runner fail
-        # rather than skip, so a capable CI runner that loses KVM cannot go
-        # silently green.
-        timeout-minutes: 20
-        env:
-          VOID_BOX_REQUIRE_VM: "1"
-        run: |
-          KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
-          if [ ! -f "$KERNEL_COPY" ]; then
-            echo "::error::expected kernel copy at $KERNEL_COPY (staged by 'Run E2E KVM tests' step)"
-            exit 1
-          fi
-          export VOID_BOX_KERNEL="$KERNEL_COPY"
-          export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
-          cargo test --test snapshot_integration -- --ignored --test-threads=1
+          # One nextest run for every deterministic VM suite. The `vm` test
+          # group (.config/nextest.toml) caps how many VMs boot at once, so the
+          # suites run with bounded cross-suite parallelism instead of strictly
+          # serially; --no-fail-fast collects every result rather than stopping
+          # at the first failure. snapshot_integration is included here (it was a
+          # separate step). pty_command_not_allowed stays excluded: it asserts
+          # the guest rejects a non-allowlisted program, but the allowlist loads
+          # at guest boot from a file only the agent-box provisioning path
+          # writes, which this direct attach_pty path never stages — so the guest
+          # allows all commands (#99).
+          cargo nextest run --run-ignored all --no-fail-fast -E \
+            'binary(/^(e2e_telemetry|e2e_mount|persistent_channel|e2e_skill_pipeline|e2e_pty|e2e_credential_proxy|snapshot_integration)$/) & not test(pty_command_not_allowed)'

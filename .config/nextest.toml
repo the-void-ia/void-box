@@ -1,0 +1,34 @@
+# nextest configuration for void-box.
+#
+# Only `cargo nextest` reads this file; plain `cargo test` is unaffected.
+#
+# The VM integration suites each boot a micro-VM (a vCPU plus hundreds of MB of
+# guest RAM), so how many can run at once is bounded by host RAM and CPU, not by
+# core count. The `vm` test group caps their concurrency; every other test runs
+# at full nextest parallelism. Raising `max-threads` trades wall-clock for peak
+# resource use — too high risks OOM or a failed boot (which now fails honestly,
+# it does not skip), so keep it conservative and tune per runner.
+
+[test-groups.vm]
+max-threads = 2
+
+# Assign every VM-booting test binary to the bounded group. The list is the
+# suites whose tests call `backend.start()` / `MicroVm::new()` / `Sandbox::exec`;
+# non-VM unit and integration binaries are intentionally excluded so they keep
+# full parallelism.
+[[profile.default.overrides]]
+filter = 'binary(/^(conformance|oci_integration|snapshot_integration|snapshot_vz_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
+test-group = 'vm'
+# A wedged guest boot is a real failure, not a hang. The per-RPC timeouts cover
+# the healthy path; this flags a slow VM test and hard-kills one that overruns
+# badly, so a stuck boot is reaped and reported instead of hanging the run.
+slow-timeout = { period = "90s", terminate-after = 4 }
+
+# The CI VM lane runs the ignored VM suites through this grouping with:
+#   cargo nextest run --run-ignored all --no-fail-fast -E 'binary(/^(conformance|...)$/)'
+# under VOID_BOX_REQUIRE_VM=1. --no-fail-fast collects every result so one broken
+# suite does not mask the others; the `vm` group caps concurrency across all
+# suites at once, so cross-suite parallelism — not just within a suite — is the
+# win. `max-threads = 2` was chosen so two of the heaviest VMs (3 GB production
+# images) fit an 8 GB runner; on conformance it already cut 97.6s -> 30.5s (3.2x)
+# at ~130 MB peak.
