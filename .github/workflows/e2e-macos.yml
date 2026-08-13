@@ -88,11 +88,18 @@ jobs:
           ls -la "$VOID_BOX_KERNEL"
           ls -la "$VOID_BOX_INITRAMFS"
 
-          # Run conformance tests (--ignored to include VM tests, sequential to avoid resource contention)
-          cargo test --test conformance -- --ignored --test-threads=1
+          # Run conformance tests (--ignored to include VM tests, sequential to avoid resource contention).
+          # This runner (macos-14) has no nested virtualization, so the VZ
+          # backend reports "Virtualization is not available on this hardware"
+          # and these tests skip loudly (VOID_BOX_REQUIRE_VM is intentionally
+          # unset here). --nocapture surfaces the per-test SKIP reason so the
+          # skip is visible, not a silent green. Running real VZ e2e in CI is
+          # tracked in https://github.com/the-void-ia/void-box/issues/158.
+          cargo test --test conformance -- --ignored --test-threads=1 --nocapture
 
       - name: Snapshot round-trip
         env:
           VOID_BOX_KERNEL: /tmp/void-box-kernel
           VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
-        run: cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
+        # Skips loudly on this virt-less runner (see the conformance step and #158).
+        run: cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1 --nocapture

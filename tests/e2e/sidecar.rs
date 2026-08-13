@@ -74,18 +74,22 @@ fn build_network_config() -> BackendConfig {
     build_network_config_with_deny_list(vec!["169.254.0.0/16".into()])
 }
 
-async fn start_backend() -> Box<dyn VmmBackend> {
+async fn start_backend() -> Option<Box<dyn VmmBackend>> {
     start_backend_with_config(build_network_config()).await
 }
 
-async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Box<dyn VmmBackend> {
+async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Option<Box<dyn VmmBackend>> {
     start_backend_with_config(build_network_config_with_deny_list(deny_list)).await
 }
 
-async fn start_backend_with_config(config: BackendConfig) -> Box<dyn VmmBackend> {
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+async fn start_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
     let mut backend = void_box::backend::create_backend();
-    test_artifacts::expect_vm(backend.start(config).await, "backend start (sidecar)");
-    backend
+    match test_artifacts::vm_start(backend.start(config).await, "backend start (sidecar)") {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
+    }
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
@@ -104,7 +108,9 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutpu
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_sidecar_health() {
-    let backend = start_backend().await;
+    let Some(backend) = start_backend().await else {
+        return;
+    };
 
     // Start sidecar on host (random port)
     let handle = sidecar::start_sidecar(
@@ -144,7 +150,9 @@ async fn guest_reads_sidecar_health() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_inbox_and_posts_intent() {
-    let backend = start_backend().await;
+    let Some(backend) = start_backend().await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-e2e",
@@ -225,7 +233,9 @@ async fn guest_reads_inbox_and_posts_intent() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_context() {
-    let backend = start_backend().await;
+    let Some(backend) = start_backend().await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-e2e",
@@ -264,7 +274,9 @@ async fn guest_reads_context() {
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_cannot_reach_denied_host_gateway() {
     let gateway_cidr = format!("{}/32", void_box::backend::guest_host_gateway());
-    let backend = start_backend_with_deny_list(vec![gateway_cidr.clone()]).await;
+    let Some(backend) = start_backend_with_deny_list(vec![gateway_cidr.clone()]).await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-deny-e2e",
@@ -313,7 +325,9 @@ async fn guest_cannot_reach_denied_host_gateway() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
-    let backend = start_backend_with_deny_list(vec!["203.0.113.0/24".into()]).await;
+    let Some(backend) = start_backend_with_deny_list(vec!["203.0.113.0/24".into()]).await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-allow-e2e",
@@ -352,7 +366,9 @@ async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_full_agent_flow() {
-    let backend = start_backend().await;
+    let Some(backend) = start_backend().await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-e2e",
@@ -505,7 +521,9 @@ async fn claudio_discovers_injected_messaging_skill() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs with void-message"]
 async fn guest_uses_void_message_cli() {
-    let backend = start_backend().await;
+    let Some(backend) = start_backend().await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-cli-e2e",

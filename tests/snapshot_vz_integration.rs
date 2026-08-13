@@ -82,7 +82,10 @@ async fn snapshot_vz_round_trip() {
     eprintln!("[vz_snapshot] Booting VM...");
     let cold_start = Instant::now();
     let mut backend = VzBackend::new();
-    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
+    match test_artifacts::vm_start(backend.start(config).await, "vz backend start") {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
     let cold_boot_time = cold_start.elapsed();
     eprintln!("[vz_snapshot] Cold boot OK ({:.1?})", cold_boot_time);
 
@@ -181,7 +184,10 @@ async fn auto_snapshot_vz_round_trip() {
 
     eprintln!("[vz_auto_snapshot] Booting VM...");
     let mut backend = VzBackend::new();
-    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
+    match test_artifacts::vm_start(backend.start(config).await, "vz backend start") {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
 
     let output = backend
         .exec("echo", &["before-auto-snap"], &[], &[], None, Some(30))
@@ -242,7 +248,10 @@ async fn snapshot_vz_restore_overrides_drifting_config() {
     // cold boot here is a precondition. On a capable Apple Silicon host a boot
     // failure is a real failure, not a skip.
     let mut backend = VzBackend::new();
-    test_artifacts::expect_vm(backend.start(save_config.clone()).await, "vz backend start");
+    match test_artifacts::vm_start(backend.start(save_config.clone()).await, "vz backend start") {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
     backend
         .exec("echo", &["pre"], &[], &[], None, Some(30))
         .await
@@ -298,7 +307,10 @@ async fn snapshot_vz_cli_create_and_list() {
     // --- Cold boot ---
     eprintln!("[vz_cli_list] Booting VM...");
     let mut backend = VzBackend::new();
-    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
+    match test_artifacts::vm_start(backend.start(config).await, "vz backend start") {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
 
     let output = backend
         .exec("echo", &["ready"], &[], &[], None, Some(30))
@@ -360,7 +372,10 @@ async fn snapshot_vz_cli_delete() {
     // --- Cold boot ---
     eprintln!("[vz_cli_delete] Booting VM...");
     let mut backend = VzBackend::new();
-    test_artifacts::expect_vm(backend.start(config).await, "vz backend start");
+    match test_artifacts::vm_start(backend.start(config).await, "vz backend start") {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
 
     let output = backend
         .exec("echo", &["ready"], &[], &[], None, Some(30))

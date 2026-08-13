@@ -238,10 +238,13 @@ async fn diagnostic_void_mcp_starts_in_guest() {
     };
 
     let mut backend = void_box::backend::create_backend();
-    test_artifacts::expect_vm(
+    match test_artifacts::vm_start(
         backend.start(config).await,
         "backend start (agent_mcp diagnostic)",
-    );
+    ) {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
+    }
 
     // Test 1: void-mcp binary exists
     let out = backend

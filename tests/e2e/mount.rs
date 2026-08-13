@@ -80,16 +80,20 @@ fn build_config_with_mount(host_dir: &Path, guest_path: &str, read_only: bool) -
     }
 }
 
-/// Create and start a VM backend with a mount, or panic on a capable machine.
+/// Create and start a VM backend with a mount, or `None` when the host
+/// genuinely cannot virtualize (the caller skips). A real boot failure on a
+/// capable host panics inside `vm_start`.
 async fn create_started_backend_with_mount(
     host_dir: &Path,
     guest_path: &str,
     read_only: bool,
-) -> Box<dyn VmmBackend> {
+) -> Option<Box<dyn VmmBackend>> {
     let config = build_config_with_mount(host_dir, guest_path, read_only);
     let mut backend = void_box::backend::create_backend();
-    test_artifacts::expect_vm(backend.start(config).await, "backend start (mount)");
-    backend
+    match test_artifacts::vm_start(backend.start(config).await, "backend start (mount)") {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
+    }
 }
 
 /// Execute a shell command inside the guest, returning the ExecOutput.
@@ -110,7 +114,11 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutpu
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_write_read() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -137,7 +145,11 @@ async fn mount_rw_write_read() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_host_visible() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(&*backend, "echo 'from guest' > /mnt/shared/host_check.txt").await;
     assert!(out.success(), "write failed: {}", out.stderr_str());
@@ -158,7 +170,11 @@ async fn mount_rw_host_visible() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_mkdir_nested() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -182,7 +198,11 @@ async fn mount_rw_mkdir_nested() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_rename_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -207,7 +227,11 @@ async fn mount_rw_rename_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_delete_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -231,7 +255,11 @@ async fn mount_rw_delete_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_chmod() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -253,7 +281,11 @@ async fn mount_rw_chmod() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_rw_large_file() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     // Write ~1MB of data (1024 lines × 1024 chars each)
     let out = guest_sh(
@@ -287,7 +319,11 @@ async fn mount_rw_large_file() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_ro_cannot_write() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -320,7 +356,11 @@ async fn mount_ro_can_read() {
     let host_dir = tempfile::tempdir().unwrap();
     std::fs::write(host_dir.path().join("readme.txt"), "hello from host\n").unwrap();
 
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", true).await
+    else {
+        return;
+    };
 
     let out = guest_sh(&*backend, "cat /mnt/shared/readme.txt").await;
     assert!(out.success(), "read failed: {}", out.stderr_str());
@@ -342,7 +382,11 @@ async fn mount_host_preexisting() {
     std::fs::create_dir(host_dir.path().join("subdir")).unwrap();
     std::fs::write(host_dir.path().join("subdir/c.txt"), "ccc\n").unwrap();
 
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     let out = guest_sh(
         &*backend,
@@ -371,7 +415,11 @@ async fn mount_host_preexisting() {
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn mount_empty_dir() {
     let host_dir = tempfile::tempdir().unwrap();
-    let backend = create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await;
+    let Some(backend) =
+        create_started_backend_with_mount(host_dir.path(), "/mnt/shared", false).await
+    else {
+        return;
+    };
 
     // Verify empty, then write
     let out = guest_sh(

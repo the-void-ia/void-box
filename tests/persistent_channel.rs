@@ -82,13 +82,17 @@ fn backend_config() -> BackendConfig {
     }
 }
 
-async fn create_started_backend() -> Box<dyn VmmBackend> {
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
     let mut backend = void_box::backend::create_backend();
-    test_artifacts::expect_vm(
+    match test_artifacts::vm_start(
         backend.start(backend_config()).await,
         "backend start (persistent_channel)",
-    );
-    backend
+    ) {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
+    }
 }
 
 /// Number of serial `exec` calls fired through the persistent channel.
@@ -101,7 +105,9 @@ const SERIAL_EXEC_COUNT: usize = 100;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn persistent_channel_serial_exec_many() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     let t_start = std::time::Instant::now();
     for index in 0..SERIAL_EXEC_COUNT {
@@ -139,7 +145,9 @@ async fn persistent_channel_concurrent_exec() {
         .with_test_writer()
         .try_init();
 
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
     let backend: std::sync::Arc<dyn VmmBackend> = std::sync::Arc::from(backend);
 
     let mut handles = Vec::with_capacity(CONCURRENT_EXEC_COUNT);

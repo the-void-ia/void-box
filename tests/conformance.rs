@@ -74,17 +74,17 @@ fn backend_config_with(
     }
 }
 
-async fn create_started_backend() -> Box<dyn VmmBackend> {
+async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
     create_started_backend_with_config(backend_config()).await
 }
 
-async fn create_started_backend_with_config(config: BackendConfig) -> Box<dyn VmmBackend> {
-    // Artifacts are provisioned and capability is no longer probed, so a boot
-    // failure here is a real failure on a machine asked to run VM tests.
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
     let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => backend,
-        Err(err) => panic!("backend start failed on a capable machine: {err}"),
+    match test_artifacts::vm_start(backend.start(config).await, "backend start (conformance)") {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
     }
 }
 
@@ -103,7 +103,9 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutpu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_echo() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     let output = backend
         .exec("echo", &["hello", "world"], &[], &[], None, Some(30))
@@ -123,7 +125,9 @@ async fn conformance_exec_echo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_nonzero_exit() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     let output = backend
         .exec("sh", &["-c", "exit 42"], &[], &[], None, Some(30))
@@ -141,7 +145,9 @@ async fn conformance_exec_nonzero_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_write_file() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     // Under an allowlisted write root (post-openat2-hardening the
     // guest-agent refuses host-driven writes outside /workspace, /home,
@@ -181,7 +187,9 @@ async fn conformance_write_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_mkdir_p() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     backend
         .mkdir_p("/workspace/conformance/nested/dir")
@@ -212,7 +220,9 @@ async fn conformance_mkdir_p() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_streaming() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     let (mut chunk_rx, done_rx) = backend
         .exec_streaming("echo", &["streaming-test"], &[], None, Some(30))
@@ -251,7 +261,9 @@ async fn conformance_exec_streaming() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_exec_timeout() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     // Sleep for 60s but with a 2s timeout — should be killed. The backend
     // may surface the kill either as a non-zero exit code or as a guest
@@ -279,7 +291,9 @@ async fn conformance_exec_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_lifecycle() {
-    let mut backend = create_started_backend().await;
+    let Some(mut backend) = create_started_backend().await else {
+        return;
+    };
 
     assert!(
         backend.is_running(),
@@ -311,7 +325,9 @@ async fn conformance_network_deny_list_blocks_guest_host_gateway() {
         ],
     );
 
-    let backend = create_started_backend_with_config(config).await;
+    let Some(backend) = create_started_backend_with_config(config).await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-conformance-deny",
@@ -359,7 +375,9 @@ async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_ac
         ],
     );
 
-    let backend = create_started_backend_with_config(config).await;
+    let Some(backend) = create_started_backend_with_config(config).await else {
+        return;
+    };
 
     let handle = sidecar::start_sidecar(
         "run-conformance-allow",
@@ -395,7 +413,9 @@ async fn conformance_unrelated_network_deny_list_preserves_guest_host_gateway_ac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_file_stat() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     backend
         .write_file("/workspace/stat_test.txt", b"hello")
@@ -422,7 +442,9 @@ async fn conformance_file_stat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_read_file_native() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     let content = b"native read file test content";
     backend
@@ -446,7 +468,9 @@ async fn conformance_read_file_native() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VM backend + kernel/initramfs artifacts"]
 async fn conformance_file_rpc_while_exec_running() {
-    let backend = create_started_backend().await;
+    let Some(backend) = create_started_backend().await else {
+        return;
+    };
 
     backend
         .write_file("/workspace/concurrent_test.txt", b"concurrent")
