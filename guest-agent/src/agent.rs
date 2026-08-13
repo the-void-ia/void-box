@@ -1,0 +1,3614 @@
+//! Guest Agent for void-box VMs
+//!
+//! This agent runs as the init process (PID 1) inside the micro-VM and handles:
+//! - Communication with the host via vsock
+//! - Command execution requests
+//! - File transfers
+//! - Process management
+//!
+//! The implementation is Linux-only (it uses `pivot_root`, vsock, and other
+//! Linux syscalls). The crate root gates this module on `target_os = "linux"`
+//! and builds an inert stub elsewhere, so a workspace build needs no per-crate
+//! exclusion on non-Linux hosts.
+
+mod fs_guard;
+mod pty;
+
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::RawFd;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use subtle::ConstantTimeEq;
+
+// Import shared wire-format types from the protocol crate (single source of truth).
+use void_box_protocol::{
+    ExecOutputChunk, ExecRequest, ExecResponse, FileStatRequest, FileStatResponse, MessageType,
+    MkdirPRequest, MkdirPResponse, ProcessMetrics, PtyOpenRequest, ReadFileRequest,
+    ReadFileResponse, SystemMetrics, TelemetryBatch, TelemetrySubscribeRequest, WriteFileRequest,
+    WriteFileResponse, MAX_MESSAGE_SIZE,
+};
+
+/// vsock port we listen on
+const LISTEN_PORT: u32 = 1234;
+
+/// Host CID
+#[allow(dead_code)]
+const HOST_CID: u32 = 2;
+
+const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
+
+// Mirrors `ALLOWED_WRITE_ROOTS` for the host-driven `ReadFile` RPC.
+// The current host call sites of `send_read_file` all read paths under
+// `/workspace` (`src/runtime.rs` `persist_workflow_artifacts` reads
+// `/workspace/result.json` and per-artifact paths joined onto
+// `/workspace/`; `src/agent_box.rs` reads `BoxConfig::output_file` which
+// defaults to `/workspace/output.json`), so the baseline of
+// `/workspace`, `/home`, `/etc/voidbox` is sufficient. Convenience is
+// not justification for widening — document a concrete reason here when
+// changing this list.
+const ALLOWED_READ_ROOTS: [&str; 3] = ["/workspace", "/home", "/etc/voidbox"];
+
+/// Parsed session secret from kernel cmdline (set once at startup).
+static SESSION_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+static OCI_ROOTFS_SETUP_ONCE: std::sync::Once = std::sync::Once::new();
+
+// OCI setup status — lock-free, panic-safe.
+const OCI_NOT_RUN: u8 = 0;
+const OCI_STARTING: u8 = 1;
+const OCI_OK: u8 = 2;
+const OCI_OK_SWITCH_ROOT: u8 = 3;
+const OCI_FAIL_CMDLINE_READ: u8 = 10;
+const OCI_FAIL_BLOCK_MOUNT: u8 = 11;
+const OCI_FAIL_NO_OCI_ROOTFS: u8 = 12;
+const OCI_FAIL_ROOTFS_MISSING: u8 = 13;
+const OCI_FAIL_ROOTFS_EMPTY: u8 = 14;
+const OCI_FAIL_MKDIR: u8 = 15;
+const OCI_FAIL_OVERLAY_TMPFS: u8 = 16;
+const OCI_FAIL_OVERLAY_DIR: u8 = 17;
+const OCI_FAIL_OVERLAY_MOUNT: u8 = 18;
+const OCI_FAIL_SWITCH_ROOT_CHROOT: u8 = 19;
+const OCI_FAIL_SWITCH_ROOT_MOVE: u8 = 20;
+const OCI_FAIL_PIVOT_ROOT_EBUSY: u8 = 21;
+const OCI_FAIL_PIVOT_ROOT_EPERM: u8 = 22;
+const OCI_FAIL_PIVOT_ROOT_ENOENT: u8 = 23;
+const OCI_FAIL_PIVOT_ROOT: u8 = 24;
+const OCI_FAIL_MOUNT_SHARED: u8 = 25;
+const OCI_FAIL_LOWER_MOUNT: u8 = 26;
+
+static OCI_SETUP_STATUS: AtomicU8 = AtomicU8::new(OCI_NOT_RUN);
+/// Stores the last OCI setup error detail (e.g., mount failure reasons).
+static OCI_SETUP_ERROR_DETAIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static NETWORK_DENY_LIST_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Serializes writes to the host vsock fd so concurrent writers never
+/// interleave bytes on the wire.
+///
+/// The multiplex control channel carries telemetry streams, exec
+/// output chunks, and RPC responses on a single connection, all
+/// written from different threads. `libc::write` on a stream socket is
+/// only guaranteed atomic up to the kernel's internal buffer slot; a
+/// frame that takes multiple syscalls (partial writes, or writes
+/// larger than the atomic boundary) could otherwise interleave with
+/// another thread's frame and corrupt the wire.
+static CONN_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+const NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
+
+/// The credential proxy stages the guest `/etc/hosts` content here (an allowed
+/// write root) rather than writing `/etc/hosts` directly, which `fs_guard`
+/// forbids. On receiving a `WriteFile` for this path, the guest-agent mirrors the
+/// content into `/etc/hosts` with its own privileged write, so the host never
+/// needs write access to `/etc`. Kept in sync with `GUEST_HOSTS_PATH` host-side.
+const PROXY_HOSTS_CONFIG_PATH: &str = "/etc/voidbox/hosts";
+
+fn oci_status_str(code: u8) -> &'static str {
+    match code {
+        OCI_NOT_RUN => "not-run",
+        OCI_STARTING => "starting",
+        OCI_OK => "ok",
+        OCI_OK_SWITCH_ROOT => "ok-switch-root",
+        OCI_FAIL_CMDLINE_READ => "cmdline-read-failed",
+        OCI_FAIL_BLOCK_MOUNT => "block-mount-failed",
+        OCI_FAIL_NO_OCI_ROOTFS => "no-oci-rootfs",
+        OCI_FAIL_ROOTFS_MISSING => "rootfs-path-missing",
+        OCI_FAIL_ROOTFS_EMPTY => "rootfs-path-empty",
+        OCI_FAIL_MKDIR => "mkdir-failed",
+        OCI_FAIL_OVERLAY_TMPFS => "overlay-tmpfs-mount-failed",
+        OCI_FAIL_OVERLAY_DIR => "overlay-dir-create-failed",
+        OCI_FAIL_OVERLAY_MOUNT => "overlay-mount-failed",
+        OCI_FAIL_SWITCH_ROOT_CHROOT => "switch-root-chroot-failed",
+        OCI_FAIL_SWITCH_ROOT_MOVE => "switch-root-move-failed",
+        OCI_FAIL_PIVOT_ROOT_EBUSY => "pivot-root-ebusy",
+        OCI_FAIL_PIVOT_ROOT_EPERM => "pivot-root-eperm",
+        OCI_FAIL_PIVOT_ROOT_ENOENT => "pivot-root-enoent",
+        OCI_FAIL_PIVOT_ROOT => "pivot-root-failed",
+        OCI_FAIL_MOUNT_SHARED => "mount-shared-failed",
+        OCI_FAIL_LOWER_MOUNT => "lower-mount-failed",
+        _ => "unknown",
+    }
+}
+
+fn oci_rootfs_requested() -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .map(|cmdline| {
+            cmdline.contains("voidbox.oci_rootfs_dev=") || cmdline.contains("voidbox.oci_rootfs=")
+        })
+        .unwrap_or(false)
+}
+
+fn trigger_oci_rootfs_setup_async() {
+    if !oci_rootfs_requested() {
+        return;
+    }
+    OCI_ROOTFS_SETUP_ONCE.call_once(|| {
+        kmsg("OCI setup: spawning async rootfs setup thread");
+        std::thread::spawn(|| {
+            kmsg("OCI setup: async rootfs setup thread started");
+            setup_oci_rootfs();
+            let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+            kmsg(&format!(
+                "OCI setup: async rootfs setup thread finished status={}",
+                status
+            ));
+        });
+    });
+}
+
+fn wait_for_oci_setup_ready(timeout: std::time::Duration) -> Result<(), String> {
+    if !oci_rootfs_requested() {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let code = OCI_SETUP_STATUS.load(Ordering::Acquire);
+        match code {
+            OCI_OK | OCI_OK_SWITCH_ROOT => return Ok(()),
+            OCI_NOT_RUN | OCI_STARTING => {
+                if start.elapsed() > timeout {
+                    return Err(format!(
+                        "OCI rootfs setup timeout (status={})",
+                        oci_status_str(code)
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                let detail = OCI_SETUP_ERROR_DETAIL
+                    .get()
+                    .map(|s| format!(" [{}]", s))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "OCI rootfs setup failed (status={}){}",
+                    oci_status_str(code),
+                    detail
+                ));
+            }
+        }
+    }
+}
+
+// Whether the current connection has been authenticated.
+// Each connection thread gets its own copy.
+thread_local! {
+    static AUTHENTICATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Resource limits applied to child processes via setrlimit.
+#[derive(Clone, serde::Deserialize)]
+pub(crate) struct ResourceLimits {
+    pub(crate) max_virtual_memory: u64,
+    pub(crate) max_open_files: u64,
+    pub(crate) max_processes: u64,
+    pub(crate) max_file_size: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_virtual_memory: 4 * 1024 * 1024 * 1024, // 4 GB — Bun/JSC needs ~640MB for startup, more for JIT at runtime
+            max_open_files: 1024,
+            max_processes: 512, // Bun worker threads count towards NPROC on Linux
+            max_file_size: 100 * 1024 * 1024, // 100 MB
+        }
+    }
+}
+
+/// Loaded resource limits (parsed from /etc/voidbox/resource_limits.json or defaults).
+pub(crate) static RESOURCE_LIMITS: std::sync::OnceLock<ResourceLimits> = std::sync::OnceLock::new();
+
+/// Loaded command allowlist (parsed from /etc/voidbox/allowed_commands.json or empty = allow all).
+static COMMAND_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn apply_network_deny_list() {
+    if NETWORK_DENY_LIST_APPLIED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let deny_list = match std::fs::read_to_string(NETWORK_DENY_LIST_PATH) {
+        Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+            Ok(deny_list) => deny_list,
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to parse network deny list {}: {}",
+                    NETWORK_DENY_LIST_PATH, e
+                ));
+                return;
+            }
+        },
+        Err(_) => {
+            return;
+        }
+    };
+
+    for cidr in deny_list {
+        match Command::new("ip")
+            .args(["route", "add", "blackhole", &cidr])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                kmsg(&format!("Installed deny-list blackhole route for {}", cidr));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                kmsg(&format!(
+                    "WARNING: Failed to install deny-list route for {}: {}",
+                    cidr,
+                    stderr.trim()
+                ));
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to run 'ip route add blackhole {}': {}",
+                    cidr, e
+                ));
+            }
+        }
+    }
+}
+
+/// CPU jiffies snapshot from /proc/stat
+struct CpuJiffies {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+}
+
+impl CpuJiffies {
+    fn total(&self) -> u64 {
+        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq
+    }
+
+    fn idle_total(&self) -> u64 {
+        self.idle + self.iowait
+    }
+}
+
+/// Writes a message to /dev/kmsg so it appears on the kernel serial console.
+///
+/// Must **not** also `eprintln!` — the stderr path goes through the guest
+/// kernel's n_tty line discipline, which blocks on `write_room` under
+/// sustained logging from a single thread and can wedge PID 1. Kernel
+/// printk already flushes `/dev/kmsg` writes to the serial console, so
+/// the stderr path adds no visibility, only load. See
+/// `docs/war-histories.md` — "The eprintln! tty-backpressure stall"
+/// for the full story.
+pub(crate) fn kmsg(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        use std::io::Write;
+        let _ = writeln!(f, "guest-agent: {}", msg);
+    }
+}
+
+/// Writes a message to /dev/kmsg at `KERN_EMERG` (priority `<0>`) so it
+/// bypasses the guest kernel's `loglevel=0` cmdline filter and lands on the
+/// serial console. Use only for failure-path diagnostics that must be visible
+/// to the host (e.g. PTY child execvp errno before `_exit(127)`). Normal
+/// progress/lifecycle logs should stick to [`kmsg`] so they do not flood
+/// production runs. See `src/vmm/config.rs::kernel_cmdline` for the loglevel
+/// pin.
+pub(crate) fn kmsg_emerg(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        use std::io::Write;
+        let _ = writeln!(f, "<0>guest-agent: {}", msg);
+    }
+}
+
+/// Constant-time equality check between a peer-supplied secret slice and the
+/// expected 32-byte session secret.
+///
+/// `subtle::ConstantTimeEq` does not branch on byte position, so a mismatch in
+/// the last byte takes the same time as a mismatch in the first byte; a
+/// short-circuit `memcmp` would not.
+fn session_secret_matches(peer_secret: &[u8], expected_secret: &[u8; 32]) -> bool {
+    peer_secret.ct_eq(&expected_secret[..]).into()
+}
+
+/// Parse the session secret from `/proc/cmdline` (`voidbox.secret=HEX`).
+fn parse_session_secret() -> Option<[u8; 32]> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    for param in cmdline.split_whitespace() {
+        if let Some(hex_str) = param.strip_prefix("voidbox.secret=") {
+            if hex_str.len() != 64 {
+                kmsg(&format!(
+                    "WARNING: voidbox.secret has wrong length: {} (expected 64 hex chars)",
+                    hex_str.len()
+                ));
+                return None;
+            }
+            let mut secret = [0u8; 32];
+            for i in 0..32 {
+                match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => secret[i] = b,
+                    Err(_) => {
+                        kmsg("WARNING: voidbox.secret contains invalid hex");
+                        return None;
+                    }
+                }
+            }
+            return Some(secret);
+        }
+    }
+    None
+}
+
+/// Set the guest system clock from the `voidbox.clock=<epoch_secs>` kernel
+/// cmdline parameter.  Without this the guest starts at 1970-01-01 and TLS
+/// certificate validation fails.
+fn sync_clock_from_cmdline() {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for param in cmdline.split_whitespace() {
+        if let Some(secs_str) = param.strip_prefix("voidbox.clock=") {
+            if let Ok(secs) = secs_str.parse::<i64>() {
+                let ts = libc::timespec {
+                    tv_sec: secs,
+                    tv_nsec: 0,
+                };
+                let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                if ret == 0 {
+                    kmsg(&format!("System clock set to epoch {}", secs));
+                } else {
+                    kmsg(&format!(
+                        "WARNING: clock_settime failed (errno={})",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Entry point for the guest agent (PID 1 inside the micro-VM). Called from the
+/// crate root's `main` on Linux.
+pub fn run() {
+    kmsg("void-box guest agent starting...");
+
+    // Initialize the system if we're PID 1
+    if std::process::id() == 1 {
+        init_system();
+    }
+
+    // Set the wall clock before anything that needs accurate time (e.g. TLS).
+    if std::process::id() == 1 {
+        sync_clock_from_cmdline();
+    }
+
+    // Load kernel modules needed for vsock (virtio_mmio + vsock transport)
+    // and virtio-net (for SLIRP networking). Must happen after init_system()
+    // so filesystems are mounted, but before network setup which needs the drivers.
+    load_kernel_modules();
+
+    // Mount shared directories (virtiofs or 9p) specified via kernel cmdline.
+    // Must happen after module loading (9p needs 9pnet_virtio.ko).
+    // In OCI rootfs mode, this is skipped — mounts are deferred to
+    // setup_oci_rootfs() which mounts directly inside the overlay newroot.
+    mount_shared_dirs();
+
+    // Set up networking after modules are loaded (virtio_net.ko creates eth0).
+    // Skip when host did not configure a net virtio-mmio device.
+    if std::process::id() == 1 {
+        if network_enabled_from_cmdline() {
+            setup_network();
+            // Allow unprivileged ICMP sockets for all GIDs so non-root
+            // processes (uid=1000 sandbox user) can call ping without
+            // CAP_NET_RAW.  Mirrors the default on most desktop Linux
+            // distributions (ping_group_range = 0 2147483647).
+            let _ = std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0\t2147483647\n");
+            // Install the host-provided network deny list *once* at boot,
+            // before any guest command can run. This closes the window
+            // between network bring-up and the first exec call, and avoids
+            // repeating the (idempotent) work on every exec.
+            apply_network_deny_list();
+        } else {
+            kmsg("Network disabled by host config; skipping setup_network()");
+        }
+    }
+
+    // Parse session secret from kernel cmdline for vsock authentication.
+    match parse_session_secret() {
+        Some(secret) => {
+            let _ = SESSION_SECRET.set(secret);
+            kmsg("Session secret loaded from kernel cmdline");
+        }
+        None => {
+            kmsg("WARNING: No session secret found in kernel cmdline -- all connections will be rejected");
+        }
+    }
+
+    // Load resource limits from config file (written by host during provisioning).
+    let limits = match std::fs::read_to_string("/etc/voidbox/resource_limits.json") {
+        Ok(content) => match serde_json::from_str::<ResourceLimits>(&content) {
+            Ok(limits) => {
+                kmsg(&format!(
+                    "Loaded resource limits: AS={}MB, NOFILE={}, NPROC={}, FSIZE={}MB",
+                    limits.max_virtual_memory / (1024 * 1024),
+                    limits.max_open_files,
+                    limits.max_processes,
+                    limits.max_file_size / (1024 * 1024),
+                ));
+                limits
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to parse resource_limits.json: {}, using defaults",
+                    e
+                ));
+                ResourceLimits::default()
+            }
+        },
+        Err(_) => {
+            kmsg("Using default resource limits (no /etc/voidbox/resource_limits.json)");
+            ResourceLimits::default()
+        }
+    };
+    let _ = RESOURCE_LIMITS.set(limits);
+
+    // Load command allowlist from config file (written by host during provisioning).
+    match std::fs::read_to_string("/etc/voidbox/allowed_commands.json") {
+        Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+            Ok(allowlist) => {
+                kmsg(&format!(
+                    "Loaded command allowlist: {} commands",
+                    allowlist.len()
+                ));
+                let _ = COMMAND_ALLOWLIST.set(allowlist);
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: Failed to parse allowed_commands.json: {}",
+                    e
+                ));
+            }
+        },
+        Err(_) => {
+            kmsg("No command allowlist loaded (no /etc/voidbox/allowed_commands.json)");
+        }
+    }
+
+    // Create vsock listener, retrying since module loading + device probe takes time
+    let listener_fd = {
+        let mut fd = -1i32;
+        for attempt in 0..30 {
+            fd = create_vsock_listener(LISTEN_PORT);
+            if fd >= 0 {
+                kmsg(&format!(
+                    "vsock listener created on attempt {}",
+                    attempt + 1
+                ));
+                break;
+            }
+            let errno = std::io::Error::last_os_error();
+            kmsg(&format!(
+                "vsock listener attempt {} failed: {} retrying in 200ms...",
+                attempt + 1,
+                errno
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        fd
+    };
+
+    if listener_fd < 0 {
+        kmsg("Failed to create vsock listener after retries, entering idle loop (PID 1 must not exit)");
+        // PID 1 must never exit or the kernel panics
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    kmsg(&format!("Listening on vsock port {}", LISTEN_PORT));
+
+    // Accept connections and handle requests (multi-threaded for concurrent telemetry + exec)
+    loop {
+        let client_fd =
+            unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if client_fd < 0 {
+            eprintln!("Accept failed");
+            continue;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("conn".into())
+            .spawn(move || {
+                if let Err(e) = handle_connection(client_fd) {
+                    eprintln!("Connection error: {}", e);
+                }
+                unsafe {
+                    libc::close(client_fd);
+                }
+            })
+        {
+            eprintln!("Failed to spawn connection thread: {}", e);
+        }
+    }
+}
+
+/// Initialize the system when running as init (PID 1)
+fn init_system() {
+    // Set PATH early - as PID 1, we inherit no environment
+    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin");
+    std::env::set_var("HOME", "/root");
+    std::env::set_var("TERM", "linux");
+
+    kmsg("Running as init, setting up system...");
+
+    // Mount proc filesystem
+    let _ = std::fs::create_dir_all("/proc");
+    let proc = std::ffi::CString::new("proc").unwrap();
+    let proc_path = std::ffi::CString::new("/proc").unwrap();
+    unsafe {
+        libc::mount(
+            proc.as_ptr(),
+            proc_path.as_ptr(),
+            proc.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    // Mount sys filesystem
+    let _ = std::fs::create_dir_all("/sys");
+    let sysfs = std::ffi::CString::new("sysfs").unwrap();
+    let sys_path = std::ffi::CString::new("/sys").unwrap();
+    unsafe {
+        libc::mount(
+            sysfs.as_ptr(),
+            sys_path.as_ptr(),
+            sysfs.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    // Mount devtmpfs
+    let _ = std::fs::create_dir_all("/dev");
+    let devtmpfs = std::ffi::CString::new("devtmpfs").unwrap();
+    let dev_path = std::ffi::CString::new("/dev").unwrap();
+    unsafe {
+        libc::mount(
+            devtmpfs.as_ptr(),
+            dev_path.as_ptr(),
+            devtmpfs.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    let _ = std::fs::create_dir_all("/dev/pts");
+    let devpts = std::ffi::CString::new("devpts").unwrap();
+    let pts_path = std::ffi::CString::new("/dev/pts").unwrap();
+    let pts_opts = std::ffi::CString::new("newinstance,ptmxmode=0666").unwrap();
+    unsafe {
+        libc::mount(
+            devpts.as_ptr(),
+            pts_path.as_ptr(),
+            devpts.as_ptr(),
+            0,
+            pts_opts.as_ptr() as *const _,
+        );
+    }
+
+    let ptmx_src = std::ffi::CString::new("/dev/pts/ptmx").unwrap();
+    let ptmx_dst = std::ffi::CString::new("/dev/ptmx").unwrap();
+    unsafe {
+        libc::remove(ptmx_dst.as_ptr());
+        libc::symlink(ptmx_src.as_ptr(), ptmx_dst.as_ptr());
+    }
+
+    // Mount tmpfs on /tmp so all users can write temp files
+    let _ = std::fs::create_dir_all("/tmp");
+    let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
+    let tmp_path = std::ffi::CString::new("/tmp").unwrap();
+    let tmp_opts = std::ffi::CString::new("mode=1777").unwrap();
+    unsafe {
+        libc::mount(
+            tmpfs.as_ptr(),
+            tmp_path.as_ptr(),
+            tmpfs.as_ptr(),
+            0,
+            tmp_opts.as_ptr() as *const _,
+        );
+    }
+
+    // Create /workspace for user projects and /home/sandbox for the sandbox user
+    let _ = std::fs::create_dir_all("/workspace");
+    let _ = std::fs::create_dir_all("/home/sandbox/.local/bin");
+    let _ = std::os::unix::fs::symlink(
+        "/usr/local/bin/claude-code",
+        "/home/sandbox/.local/bin/claude",
+    );
+    unsafe {
+        let workspace = std::ffi::CString::new("/workspace").unwrap();
+        libc::chown(workspace.as_ptr(), 1000, 1000);
+        let home = std::ffi::CString::new("/home/sandbox").unwrap();
+        libc::chown(home.as_ptr(), 1000, 1000);
+        let local = std::ffi::CString::new("/home/sandbox/.local").unwrap();
+        libc::chown(local.as_ptr(), 1000, 1000);
+        let local_bin = std::ffi::CString::new("/home/sandbox/.local/bin").unwrap();
+        libc::chown(local_bin.as_ptr(), 1000, 1000);
+    }
+
+    // Create /etc for resolv.conf
+    let _ = std::fs::create_dir_all("/etc");
+
+    // Configure YAMA ptrace scope to allow same-UID ptrace
+    // ptrace_scope=0: classic ptrace permissions (same UID can ptrace)
+    // This allows ripgrep and debuggers to work in the sandbox
+    match std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0\n") {
+        Ok(()) => kmsg("Configured YAMA ptrace_scope=0"),
+        Err(e) => {
+            // Non-fatal: kernel may not have YAMA compiled in
+            kmsg(&format!("Note: Could not configure YAMA: {}", e));
+        }
+    }
+
+    // Note: network setup is done after module loading in main(), not here,
+    // because virtio_net.ko creates eth0 and must be loaded first.
+
+    kmsg("System initialization complete");
+}
+
+/// Load kernel modules required for virtio-mmio and vsock.
+/// Modules are expected in /lib/modules/ as .ko.xz files.
+/// Uses the finit_module(2) syscall which handles compressed modules.
+fn load_kernel_modules() {
+    // Fast path: if `/lib/modules` is missing or empty, the kernel built every
+    // driver we need in-tree (=y). Walking 15 fallback paths + stat'ing
+    // /sys/module/<name> for each one costs nothing interesting, but it's
+    // visible in boot traces and unnecessary noise on slim-kernel guests.
+    let has_modules = std::fs::read_dir("/lib/modules")
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false);
+    if !has_modules {
+        kmsg("Modules loaded (all built-in, no /lib/modules entries)");
+        return;
+    }
+
+    let virtio_mmio_params = virtio_mmio_params_from_cmdline();
+
+    // Load order matters: dependencies must be loaded first.
+    // virtio_mmio needs explicit device= params since the cmdline params may not
+    // be forwarded when loading as a module.
+    let modules: Vec<(&str, String, bool)> = vec![
+        // virtio core modules (required when not built-in).
+        ("virtio.ko", String::new(), false),
+        ("virtio_ring.ko", String::new(), false),
+        ("virtio_mmio.ko", virtio_mmio_params, true),
+        // vsock modules
+        ("vsock.ko", String::new(), true),
+        ("vmw_vsock_virtio_transport_common.ko", String::new(), true),
+        ("vmw_vsock_virtio_transport.ko", String::new(), true),
+        // Network modules (for SLIRP networking — optional, missing on macOS)
+        ("failover.ko", String::new(), false),
+        ("net_failover.ko", String::new(), false),
+        ("virtio_net.ko", String::new(), false),
+        // virtiofs module (for macOS/VZ host directory sharing — OCI rootfs)
+        ("virtiofs.ko", String::new(), false),
+        // 9p filesystem modules (for host directory sharing — optional, missing on macOS).
+        // Load order matters: netfs → 9pnet → 9p → 9pnet_virtio (dependency chain).
+        ("netfs.ko", String::new(), false),
+        ("9pnet.ko", String::new(), false),
+        ("9p.ko", String::new(), false),
+        ("9pnet_virtio.ko", String::new(), false),
+        // overlayfs module (required for OCI rootfs writable overlay + pivot_root)
+        ("overlay.ko", String::new(), false),
+    ];
+
+    for (module_name, params, required) in modules {
+        let path = format!("/lib/modules/{}", module_name);
+        match load_module_file(&path, &params) {
+            Ok(()) => kmsg(&format!(
+                "Loaded module: {} (params='{}')",
+                module_name, params
+            )),
+            Err(e) if required => kmsg(&format!("WARNING: failed to load {}: {}", module_name, e)),
+            Err(e) => kmsg(&format!(
+                "Optional module {} not loaded: {}",
+                module_name, e
+            )),
+        }
+    }
+
+    // No blind sleep here: `finit_module(2)` is synchronous — by the time it
+    // returns, the module's init callback has run and the virtio device has
+    // been probed. Subsequent `socket(AF_VSOCK, ...)` will succeed
+    // immediately. A fixed sleep added ~1s to every cold boot for no gain.
+    kmsg("Modules loaded");
+}
+
+fn virtio_mmio_params_from_cmdline() -> String {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let mut params = Vec::new();
+    for token in cmdline.split_whitespace() {
+        if let Some(dev) = token.strip_prefix("virtio_mmio.device=") {
+            params.push(format!("device={}", dev));
+        }
+    }
+    if params.is_empty() {
+        // x86_64: fall back to the host's standard device windows in case
+        // the cmdline params were not forwarded to the module. On aarch64
+        // devices are declared in the DTB and the kernel probes them from
+        // there — module parameters would register bogus windows at
+        // addresses that don't exist on that layout.
+        #[cfg(target_arch = "x86_64")]
+        {
+            return "device=512@0xd0000000:10 device=512@0xd0800000:11 device=512@0xd1000000:12"
+                .to_string();
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return String::new();
+        }
+    }
+    params.join(" ")
+}
+
+/// Load a single kernel module using finit_module(2), with optional parameters.
+///
+/// Returns `Ok(())` if the module was loaded, is already loaded, or is built
+/// into the kernel (no .ko file on disk). This makes the function resilient
+/// to aarch64/VZ environments where virtio modules are compiled in (`=y`)
+/// and no .ko files exist.
+fn load_module_file(path: &str, params: &str) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    // If the .ko file doesn't exist, check if the module is already built
+    // into the kernel. Built-in modules appear in /sys/module/<name>.
+    if !std::path::Path::new(path).exists() {
+        let mod_name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // Kernel uses underscores internally even if the .ko has hyphens
+        let sys_name = mod_name.replace('-', "_");
+        let sys_path = format!("/sys/module/{}", sys_name);
+        if std::path::Path::new(&sys_path).exists() {
+            kmsg(&format!(
+                "Module {} built-in (found {})",
+                mod_name, sys_path
+            ));
+            return Ok(());
+        }
+        return Err(format!("file not found: {}", path));
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
+
+    let fd = file.as_raw_fd();
+    let params_c = CString::new(params).unwrap();
+
+    // finit_module(fd, params, flags)
+    let ret = unsafe { libc::syscall(libc::SYS_finit_module, fd, params_c.as_ptr(), 0i32) };
+
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        // EEXIST means module already loaded - that's fine
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        return Err(format!("finit_module: {}", err));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum ProbeResult {
+    Ok,
+    WriteFailed,
+    PrivilegeDropFailed,
+    ForkFailed,
+    WaitFailed,
+}
+
+/// Fork a child that drops to uid 1000 and probes create+rename+delete writability.
+fn write_probe_as_sandbox(guest_path: &str) -> ProbeResult {
+    // Collision-safe name: pid + monotonic nanos
+    let nanos = {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    };
+    let probe_name = format!(".voidbox_probe_{}_{}", std::process::id(), nanos);
+    let probe_dir = format!("{}/{}", guest_path, probe_name);
+    let probe_renamed = format!("{}/{}_ok", guest_path, probe_name);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return ProbeResult::ForkFailed;
+    }
+
+    if pid == 0 {
+        // Child: drop privileges to sandbox user
+        unsafe {
+            // Clear supplementary groups
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                libc::_exit(2);
+            }
+            if libc::setgid(1000) != 0 {
+                libc::_exit(2);
+            }
+            if libc::setuid(1000) != 0 {
+                libc::_exit(2);
+            }
+        }
+
+        let result = (|| -> Result<(), std::io::Error> {
+            std::fs::create_dir(&probe_dir)?;
+            std::fs::rename(&probe_dir, &probe_renamed)?;
+            std::fs::remove_dir(&probe_renamed)?;
+            std::result::Result::Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&probe_dir);
+            let _ = std::fs::remove_dir_all(&probe_renamed);
+        }
+
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 1 }) };
+    }
+
+    // Parent: wait for child (loop on EINTR)
+    let mut status: libc::c_int = 0;
+    loop {
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return ProbeResult::WaitFailed;
+        }
+    }
+
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        ProbeResult::Ok
+    } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 2 {
+        ProbeResult::PrivilegeDropFailed
+    } else {
+        ProbeResult::WriteFailed
+    }
+}
+
+fn log_probe_result(guest_path: &str, result: &ProbeResult) {
+    match result {
+        ProbeResult::Ok => kmsg(&format!(
+            "Write probe passed for {} (uid=1000 can create+rename+delete)",
+            guest_path
+        )),
+        ProbeResult::PrivilegeDropFailed => kmsg(&format!(
+            "WARNING: write probe could not drop to uid=1000 for {}",
+            guest_path
+        )),
+        ProbeResult::WriteFailed => kmsg(&format!(
+            "WARNING: write probe FAILED for {} — uid=1000 cannot write",
+            guest_path
+        )),
+        ProbeResult::ForkFailed => kmsg(&format!(
+            "WARNING: fork failed for write probe on {}",
+            guest_path
+        )),
+        ProbeResult::WaitFailed => kmsg(&format!(
+            "WARNING: waitpid failed for write probe on {}",
+            guest_path
+        )),
+    }
+}
+
+/// After mounting an rw shared directory, ensure uid 1000 can write to it.
+///
+/// Tries chown first, then runs a write probe as uid 1000. If the probe fails
+/// and this is a declared rw mount, falls back to chmod 0777 and re-probes.
+/// Check whether `path` is a mount point by comparing its device ID to its parent's.
+fn is_mount_point(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("/"));
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+    meta.dev() != parent_meta.dev()
+}
+
+fn ensure_mount_writable(guest_path: &str, is_rw_mount: bool) {
+    let c_path = match std::ffi::CString::new(guest_path) {
+        std::result::Result::Ok(p) => p,
+        Err(e) => {
+            kmsg(&format!(
+                "WARNING: invalid mount path '{}': {}",
+                guest_path, e
+            ));
+            return;
+        }
+    };
+
+    // Step 1: Try chown to sandbox user
+    let chown_ok = unsafe { libc::chown(c_path.as_ptr(), 1000, 1000) } == 0;
+    if chown_ok {
+        kmsg(&format!("chown {} to 1000:1000 succeeded", guest_path));
+    } else {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!(
+            "chown {} to 1000:1000 failed ({})",
+            guest_path, err
+        ));
+    }
+
+    // Step 2: Write probe as uid 1000
+    let result = write_probe_as_sandbox(guest_path);
+    log_probe_result(guest_path, &result);
+
+    if result == ProbeResult::Ok {
+        return;
+    }
+
+    // Only apply chmod fallback for actual write failures.
+    // Infra failures (fork/wait/privdrop) should not mutate permissions.
+    if result != ProbeResult::WriteFailed {
+        kmsg(&format!(
+            "WARNING: skipping chmod fallback for {} (probe error was {:?})",
+            guest_path, result
+        ));
+        return;
+    }
+
+    // Step 3: Fallback chmod 0777 — only for declared rw mounts from cmdline.
+    if !is_rw_mount {
+        kmsg(&format!(
+            "WARNING: {} is not a declared rw mount, skipping chmod fallback",
+            guest_path
+        ));
+        return;
+    }
+    let chmod_ok = unsafe { libc::chmod(c_path.as_ptr(), 0o777) } == 0;
+    if chmod_ok {
+        kmsg(&format!(
+            "Applied chmod 0777 fallback on {} (declared rw mount)",
+            guest_path
+        ));
+    } else {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!(
+            "WARNING: chmod 0777 {} failed: {} — mount may not be writable",
+            guest_path, err
+        ));
+        return;
+    }
+
+    // Step 4: Re-probe after chmod
+    let result = write_probe_as_sandbox(guest_path);
+    log_probe_result(guest_path, &result);
+}
+
+/// Dump diagnostic info when a post-pivot mount is missing.
+/// Logs /proc/filesystems, /proc/mounts, and virtio sysfs state.
+fn dump_mount_diagnostics(tag: &str, guest_path: &str) {
+    kmsg(&format!(
+        "=== mount diagnostics for tag='{}' path='{}' ===",
+        tag, guest_path
+    ));
+
+    // Check supported filesystem types
+    if let Ok(fs_types) = std::fs::read_to_string("/proc/filesystems") {
+        let relevant: Vec<&str> = fs_types
+            .lines()
+            .filter(|l| l.contains("9p") || l.contains("virtiofs"))
+            .collect();
+        if relevant.is_empty() {
+            kmsg("  /proc/filesystems: NO 9p or virtiofs support");
+        } else {
+            for line in &relevant {
+                kmsg(&format!("  /proc/filesystems: {}", line.trim()));
+            }
+        }
+    } else {
+        kmsg("  /proc/filesystems: unreadable");
+    }
+
+    // Show current mounts (look for 9p/virtiofs/overlay)
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let relevant: Vec<&str> = mounts
+            .lines()
+            .filter(|l| {
+                l.contains("9p")
+                    || l.contains("virtiofs")
+                    || l.contains(tag)
+                    || l.contains(guest_path)
+            })
+            .collect();
+        if relevant.is_empty() {
+            kmsg("  /proc/mounts: no 9p/virtiofs/tag matches");
+        } else {
+            for line in &relevant {
+                kmsg(&format!("  /proc/mounts: {}", line));
+            }
+        }
+    } else {
+        kmsg("  /proc/mounts: unreadable");
+    }
+
+    // Check virtio devices in sysfs
+    let sysfs_path = "/sys/bus/virtio/devices";
+    match std::fs::read_dir(sysfs_path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let dev = entry.path();
+                let dev_name = dev
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                // Read device type
+                let id_path = dev.join("device");
+                let dev_type = std::fs::read_to_string(&id_path)
+                    .unwrap_or_else(|_| "?".into())
+                    .trim()
+                    .to_string();
+                // For 9p devices (type 9), try to read the mount_tag
+                let tag_info = if dev_type.trim_start_matches("0x") == "9"
+                    || dev_type == "9"
+                    || dev_type == "0x0009"
+                {
+                    std::fs::read_to_string(dev.join("mount_tag"))
+                        .unwrap_or_else(|_| "?".into())
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                kmsg(&format!(
+                    "  sysfs: {} type={} {}",
+                    dev_name,
+                    dev_type,
+                    if tag_info.is_empty() {
+                        String::new()
+                    } else {
+                        format!("mount_tag={}", tag_info)
+                    }
+                ));
+            }
+        }
+        Err(e) => kmsg(&format!("  sysfs: {} unreadable: {}", sysfs_path, e)),
+    }
+
+    // Check if target path exists and its metadata
+    match std::fs::metadata(guest_path) {
+        Ok(meta) => {
+            kmsg(&format!(
+                "  target: {} exists, dev={}, ino={}",
+                guest_path,
+                meta.dev(),
+                meta.ino()
+            ));
+        }
+        Err(e) => kmsg(&format!("  target: {} — {}", guest_path, e)),
+    }
+    kmsg("=== end mount diagnostics ===");
+}
+
+/// Attempt to mount a shared directory via virtiofs or 9p.
+/// Returns Ok(()) on success, Err(diagnostic string) on failure.
+fn try_mount_9p_virtiofs(tag: &str, guest_path: &str, read_only: bool) -> Result<(), String> {
+    let tag_cstr = std::ffi::CString::new(tag).unwrap();
+    let path_cstr = std::ffi::CString::new(guest_path).unwrap();
+    let virtiofs_type = std::ffi::CString::new("virtiofs").unwrap();
+    let p9_type = std::ffi::CString::new("9p").unwrap();
+    let ro_flag: libc::c_ulong = if read_only {
+        libc::MS_RDONLY as libc::c_ulong
+    } else {
+        0
+    };
+
+    let mut errors = Vec::new();
+
+    // Try virtiofs first (macOS/VZ)
+    let ret = unsafe {
+        libc::mount(
+            tag_cstr.as_ptr(),
+            path_cstr.as_ptr(),
+            virtiofs_type.as_ptr(),
+            ro_flag,
+            std::ptr::null(),
+        )
+    };
+    if ret == 0 {
+        kmsg(&format!("Mounted virtiofs '{}' at {}", tag, guest_path));
+        return Ok(());
+    }
+    let virtiofs_err = std::io::Error::last_os_error();
+    errors.push(format!("virtiofs: {}", virtiofs_err));
+
+    // Try 9p with trans=virtio (Linux/KVM).
+    // RW mounts need access control that allows uid 1000; kernels vary in
+    // which access= modes are accepted, so try a compatibility chain.
+    let p9_candidates: Vec<String> = if read_only {
+        vec!["trans=virtio,version=9p2000.L,ro".to_string()]
+    } else {
+        vec![
+            "trans=virtio,version=9p2000.L,access=any".to_string(),
+            "trans=virtio,version=9p2000.L,access=1000".to_string(),
+            "trans=virtio,version=9p2000.L".to_string(),
+        ]
+    };
+
+    for opts in &p9_candidates {
+        let p9_opts = std::ffi::CString::new(opts.as_str()).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                tag_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                p9_type.as_ptr(),
+                ro_flag,
+                p9_opts.as_ptr() as *const libc::c_void,
+            )
+        };
+        if ret == 0 {
+            let mode = if read_only { "ro" } else { "rw" };
+            kmsg(&format!(
+                "Mounted 9p '{}' at {} ({}) with opts '{}'",
+                tag, guest_path, mode, opts
+            ));
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        errors.push(format!("9p({}): {}", opts, err));
+        kmsg(&format!(
+            "9p mount attempt failed for '{}' at {} with opts '{}': {}",
+            tag, guest_path, opts, err
+        ));
+    }
+
+    Err(errors.join("; "))
+}
+
+/// Parse shared mount entries from `/proc/cmdline`.
+fn parse_shared_mount_entries() -> Vec<(String, String, bool)> {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_shared_mount_entries_from(&cmdline)
+}
+
+/// Parse shared mount entries from a given kernel cmdline string.
+///
+/// Each `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>` parameter produces a
+/// `(tag, guest_path, read_only)` tuple. When the mode suffix is omitted the
+/// mount defaults to read-only.
+fn parse_shared_mount_entries_from(cmdline: &str) -> Vec<(String, String, bool)> {
+    let mut mounts: Vec<(String, String, bool)> = Vec::new();
+
+    for param in cmdline.split_whitespace() {
+        // Match voidbox.mount0=mount0:/workspace/output:rw
+        if let Some(rest) = param.strip_prefix("voidbox.mount") {
+            // rest = "0=mount0:/workspace/output:rw"
+            if let Some(eq_pos) = rest.find('=') {
+                let value = &rest[eq_pos + 1..];
+                let parts: Vec<&str> = value.splitn(3, ':').collect();
+                if parts.len() >= 2 {
+                    let tag = parts[0].to_string();
+                    let guest_path = parts[1].to_string();
+                    let read_only = parts.get(2).map(|&m| m != "rw").unwrap_or(true);
+                    mounts.push((tag, guest_path, read_only));
+                }
+            }
+        }
+    }
+
+    mounts
+}
+
+/// Mount shared directories specified via kernel cmdline parameters.
+///
+/// The host encodes mount config as `voidbox.mount<N>=<tag>:<guest_path>:<ro|rw>`.
+/// On macOS/VZ the filesystem type is `virtiofs`; on Linux/KVM it's `9p`.
+/// We try virtiofs first and fall back to 9p.
+///
+/// When OCI rootfs is configured, shared mounts are deferred to
+/// `setup_oci_rootfs()` which mounts them directly inside the overlay
+/// newroot before pivot_root.  Mounting here AND in setup_oci_rootfs
+/// would cause a double-mount on the same virtio device, which hangs
+/// on some kernels.
+fn mount_shared_dirs() {
+    if oci_rootfs_requested() {
+        kmsg("Skipping early shared mounts — OCI rootfs mode will mount inside overlay");
+        return;
+    }
+
+    let mounts = parse_shared_mount_entries();
+
+    if mounts.is_empty() {
+        return;
+    }
+
+    kmsg(&format!(
+        "Mounting {} shared director{}",
+        mounts.len(),
+        if mounts.len() == 1 { "y" } else { "ies" }
+    ));
+
+    for (tag, guest_path, read_only) in &mounts {
+        if let Err(e) = std::fs::create_dir_all(guest_path) {
+            kmsg(&format!(
+                "WARNING: failed to create mount point {}: {}",
+                guest_path, e
+            ));
+            continue;
+        }
+
+        if try_mount_9p_virtiofs(tag, guest_path, *read_only).is_ok() {
+            if !*read_only {
+                ensure_mount_writable(guest_path, true);
+            }
+        } else {
+            kmsg(&format!(
+                "WARNING: failed to mount '{}' at {} (tried virtiofs + 9p candidates)",
+                tag, guest_path
+            ));
+        }
+    }
+}
+
+/// Set up an OCI base image rootfs via overlayfs + pivot_root.
+///
+/// When the host sets `voidbox.oci_rootfs=<path>` on the kernel cmdline,
+/// the guest-agent will:
+/// 1. Mount a tmpfs for the overlay upper/work directories
+/// 2. Mount overlayfs (OCI rootfs as lower, tmpfs as upper) at a staging point
+/// 3. Move /proc, /sys, /dev into the new root
+/// 4. pivot_root to switch the root filesystem
+/// 5. Unmount the old root
+///
+/// This gives a writable root filesystem based on the OCI image.
+fn setup_oci_rootfs() {
+    OCI_SETUP_STATUS.store(OCI_STARTING, Ordering::Release);
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(_) => {
+            OCI_SETUP_STATUS.store(OCI_FAIL_CMDLINE_READ, Ordering::Release);
+            return;
+        }
+    };
+
+    let oci_rootfs_dev = cmdline
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("voidbox.oci_rootfs_dev="))
+        .map(String::from);
+    let oci_rootfs = cmdline
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("voidbox.oci_rootfs="))
+        .map(String::from);
+
+    let lowerdir = if let Some(dev) = oci_rootfs_dev {
+        match mount_oci_block_lowerdir(&dev) {
+            Ok(path) => path,
+            Err(e) => {
+                let msg = format!("WARNING: OCI rootfs device {} mount failed: {}", dev, e);
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_BLOCK_MOUNT, Ordering::Release);
+                return;
+            }
+        }
+    } else {
+        let Some(rootfs_path) = oci_rootfs else {
+            OCI_SETUP_STATUS.store(OCI_FAIL_NO_OCI_ROOTFS, Ordering::Release);
+            return;
+        };
+
+        // Legacy mount-based OCI path for virtiofs/9p backends.
+        //
+        // `mount_shared_dirs()` is skipped on boot when OCI rootfs is
+        // configured (to avoid a double-mount of the same virtio device
+        // during the later overlay setup).  Consequently the virtiofs/9p
+        // share that backs the rootfs has NOT been mounted yet — the host
+        // only declared it in the VMM config.  Mount it here so the
+        // subsequent `is_dir`/overlay `lowerdir` steps see real content.
+        //
+        // On macOS/VZ this is the only place the share gets mounted.  On
+        // Linux/KVM this branch is unreachable (the block-device plan is
+        // used instead).
+        let shared_mounts_for_bootstrap = parse_shared_mount_entries_from(&cmdline);
+        if let Some((tag, _, read_only)) = shared_mounts_for_bootstrap
+            .iter()
+            .find(|(_, guest_path, _)| guest_path == &rootfs_path)
+        {
+            if let Err(e) = std::fs::create_dir_all(&rootfs_path) {
+                let msg = format!(
+                    "WARNING: failed to create OCI rootfs mount point {}: {}",
+                    rootfs_path, e
+                );
+                kmsg(&msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_MKDIR, Ordering::Release);
+                return;
+            }
+            if let Err(e) = try_mount_9p_virtiofs(tag, &rootfs_path, *read_only) {
+                let msg = format!(
+                    "WARNING: failed to mount OCI rootfs share '{}' at {}: {}",
+                    tag, rootfs_path, e
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(msg);
+                OCI_SETUP_STATUS.store(OCI_FAIL_LOWER_MOUNT, Ordering::Release);
+                return;
+            }
+            kmsg(&format!(
+                "Mounted OCI rootfs share '{}' at {} (pre-overlay bootstrap)",
+                tag, rootfs_path
+            ));
+        } else {
+            kmsg(&format!(
+                "WARNING: no voidbox.mount* entry targets OCI rootfs path {}; \
+                 expecting host to have pre-populated the path",
+                rootfs_path
+            ));
+        }
+
+        if !std::path::Path::new(&rootfs_path).is_dir() {
+            kmsg(&format!(
+                "WARNING: OCI rootfs {} not found, skipping pivot_root",
+                rootfs_path
+            ));
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_MISSING, Ordering::Release);
+            return;
+        }
+        let has_content = std::fs::read_dir(&rootfs_path)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if !has_content {
+            kmsg(&format!(
+                "WARNING: OCI rootfs {} is empty (mount may have failed), skipping pivot_root",
+                rootfs_path
+            ));
+            OCI_SETUP_STATUS.store(OCI_FAIL_ROOTFS_EMPTY, Ordering::Release);
+            return;
+        }
+        rootfs_path
+    };
+    kmsg(&format!("Setting up OCI rootfs from {}", lowerdir));
+
+    // Preserve DNS config before pivot_root (network setup wrote resolv.conf;
+    // on VZ/DHCP it's 8.8.8.8, on KVM/SLIRP it's 10.0.2.3).
+    let resolv_contents = std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_else(|_| "nameserver 10.0.2.3\n".to_string());
+
+    let newroot = "/mnt/newroot";
+    // Overlay requires upperdir and workdir to be on the same filesystem.
+    // Use one tmpfs parent and create both subdirs inside it.
+    let overlay_base = "/mnt/overlay-tmp";
+    let upper = "/mnt/overlay-tmp/upper";
+    let work = "/mnt/overlay-tmp/work";
+
+    // Create staging directories
+    for dir in [newroot, overlay_base] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
+            OCI_SETUP_STATUS.store(OCI_FAIL_MKDIR, Ordering::Release);
+            return;
+        }
+    }
+
+    // Mount a single tmpfs that will hold both upper and work directories.
+    let tmpfs_type = std::ffi::CString::new("tmpfs").unwrap();
+    let overlay_base_c = std::ffi::CString::new(overlay_base).unwrap();
+    let ret = unsafe {
+        libc::mount(
+            tmpfs_type.as_ptr(),
+            overlay_base_c.as_ptr(),
+            tmpfs_type.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        kmsg(&format!(
+            "WARNING: failed to mount tmpfs at {}: {}",
+            overlay_base,
+            std::io::Error::last_os_error()
+        ));
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_TMPFS, Ordering::Release);
+        return;
+    }
+    for dir in [upper, work] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            kmsg(&format!("WARNING: failed to create {}: {}", dir, e));
+            OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_DIR, Ordering::Release);
+            return;
+        }
+    }
+
+    // Mount overlayfs: lower=OCI rootfs (read-only), upper=tmpfs (writable)
+    let overlay_type = std::ffi::CString::new("overlay").unwrap();
+    let newroot_c = std::ffi::CString::new(newroot).unwrap();
+    let overlay_opts = std::ffi::CString::new(format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lowerdir, upper, work
+    ))
+    .unwrap();
+
+    let ret = unsafe {
+        libc::mount(
+            overlay_type.as_ptr(),
+            newroot_c.as_ptr(),
+            overlay_type.as_ptr(),
+            0,
+            overlay_opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if ret != 0 {
+        let msg = format!(
+            "WARNING: overlayfs mount failed: {} (kernel may lack CONFIG_OVERLAY_FS)",
+            std::io::Error::last_os_error()
+        );
+        kmsg(&msg);
+        eprintln!("{}", msg);
+        OCI_SETUP_STATUS.store(OCI_FAIL_OVERLAY_MOUNT, Ordering::Release);
+        return;
+    }
+
+    kmsg("Overlayfs mounted, preparing pivot_root...");
+
+    // Create mount points in the new root
+    for dir in [
+        "/proc",
+        "/sys",
+        "/dev",
+        "/tmp",
+        "/workspace",
+        "/home/sandbox",
+        "/etc/voidbox",
+        "/usr/local/bin",
+        "/lib/modules",
+        "/mnt/oldroot",
+    ] {
+        let full = format!("{}{}", newroot, dir);
+        let _ = std::fs::create_dir_all(&full);
+    }
+
+    // Stage essential host-provided tools from initramfs into the new root.
+    // This keeps control-plane commands functional even for minimal OCI roots.
+    stage_bootstrap_tools_into_newroot(newroot);
+
+    // If the initramfs has claude-code, stage it into the OCI overlay root so
+    // agent-mode runs keep working after root switch.
+    stage_claude_into_newroot(newroot);
+
+    // Move existing mounts into the new root
+    for mount_point in ["/proc", "/sys", "/dev"] {
+        let src = std::ffi::CString::new(mount_point).unwrap();
+        let dst = std::ffi::CString::new(format!("{}{}", newroot, mount_point)).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            kmsg(&format!(
+                "WARNING: failed to move mount {} -> {}{}: {}",
+                mount_point,
+                newroot,
+                mount_point,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    // Mount shared (9p/virtiofs) dirs directly into the overlay newroot.
+    //
+    // mount_shared_dirs() skips early mounts when OCI rootfs is configured,
+    // so this is the FIRST (and only) mount of each tag.  Mounting directly
+    // at the destination avoids MS_MOVE (fails on overlay targets) and
+    // double-mount (hangs on some kernels when the virtio device is claimed
+    // twice).  After pivot_root the mount survives because it's a submount
+    // of the overlay.
+    //
+    // Parse from the local `cmdline` variable because /proc has already
+    // been MS_MOVEd above.
+    let shared_mounts = parse_shared_mount_entries_from(&cmdline);
+    kmsg(&format!(
+        "Mounting {} shared dir(s) into newroot",
+        shared_mounts.len()
+    ));
+    for (tag, guest_path, read_only) in &shared_mounts {
+        // The OCI rootfs share (legacy path-based mode) is already mounted
+        // at `lowerdir` pre-overlay and consumed by overlayfs.  Re-mounting
+        // the same virtio tag inside newroot would be a double-mount
+        // (hangs on some kernels) and the overlay absorbs its contents
+        // regardless, so skip it here.
+        if guest_path == &lowerdir {
+            kmsg(&format!(
+                "Skipping newroot re-mount of OCI rootfs share '{}' at {}",
+                tag, guest_path
+            ));
+            continue;
+        }
+        let dst_path = format!("{}{}", newroot, guest_path);
+        if let Err(e) = std::fs::create_dir_all(&dst_path) {
+            kmsg(&format!(
+                "WARNING: failed to create shared mount target {}: {}",
+                dst_path, e
+            ));
+            continue;
+        }
+
+        match try_mount_9p_virtiofs(tag, &dst_path, *read_only) {
+            Ok(()) => {
+                kmsg(&format!(
+                    "Mounted shared dir '{}' at {} (inside newroot)",
+                    tag, dst_path
+                ));
+            }
+            Err(ref e) => {
+                kmsg(&format!(
+                    "WARNING: failed to mount '{}' at {}: {} — \
+                     post-pivot verification will catch this",
+                    tag, dst_path, e
+                ));
+            }
+        }
+    }
+
+    // Switch to overlay root via pivot_root.
+    // pivot_root requires mount propagation to be private.
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            std::ffi::CString::new("/").unwrap().as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        );
+    }
+
+    let cwd_newroot = std::ffi::CString::new(newroot).unwrap();
+    unsafe {
+        libc::chdir(cwd_newroot.as_ptr());
+    }
+    let put_old_c = std::ffi::CString::new("mnt/oldroot").unwrap();
+    let dot_c = std::ffi::CString::new(".").unwrap();
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pivot_root as libc::c_long,
+            dot_c.as_ptr(),
+            put_old_c.as_ptr(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error().unwrap_or_default();
+        if code == libc::EINVAL {
+            // Initramfs rootfs cannot be pivot_root'ed. Fallback to switch-root.
+            let root_c = std::ffi::CString::new("/").unwrap();
+            let move_ret = unsafe {
+                libc::mount(
+                    dot_c.as_ptr(),
+                    root_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_MOVE as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            };
+            if move_ret == 0 {
+                let chroot_ret = unsafe { libc::chroot(dot_c.as_ptr()) };
+                if chroot_ret == 0 {
+                    unsafe {
+                        libc::chdir(root_c.as_ptr());
+                    }
+                    OCI_SETUP_STATUS.store(OCI_OK_SWITCH_ROOT, Ordering::Release);
+                } else {
+                    OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_CHROOT, Ordering::Release);
+                }
+            } else {
+                OCI_SETUP_STATUS.store(OCI_FAIL_SWITCH_ROOT_MOVE, Ordering::Release);
+            }
+            if OCI_SETUP_STATUS.load(Ordering::Acquire) == OCI_OK_SWITCH_ROOT {
+                kmsg("OCI rootfs switch-root fallback complete");
+                eprintln!("OCI rootfs switch-root fallback complete");
+                // Continue with post-switch setup.
+            } else {
+                let msg = format!(
+                    "WARNING: pivot_root EINVAL and switch-root fallback failed: {}",
+                    oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                return;
+            }
+        } else {
+            let msg = format!("WARNING: pivot_root failed (errno={}): {}", code, err);
+            kmsg(&msg);
+            eprintln!("{}", msg);
+            OCI_SETUP_STATUS.store(
+                match code {
+                    libc::EBUSY => OCI_FAIL_PIVOT_ROOT_EBUSY,
+                    libc::EPERM => OCI_FAIL_PIVOT_ROOT_EPERM,
+                    libc::ENOENT => OCI_FAIL_PIVOT_ROOT_ENOENT,
+                    _ => OCI_FAIL_PIVOT_ROOT,
+                },
+                Ordering::Release,
+            );
+            return;
+        }
+    }
+
+    let root = std::ffi::CString::new("/").unwrap();
+    unsafe {
+        libc::chdir(root.as_ptr());
+    }
+
+    // Detach old root so it is no longer reachable.
+    let oldroot_c = std::ffi::CString::new("/mnt/oldroot").unwrap();
+    unsafe {
+        libc::umount2(oldroot_c.as_ptr(), libc::MNT_DETACH);
+    }
+    let _ = std::fs::remove_dir_all("/mnt/oldroot");
+
+    // Mount tmpfs on /tmp in the new root.
+    let tmpfs_type = std::ffi::CString::new("tmpfs").unwrap();
+    let tmp_path = std::ffi::CString::new("/tmp").unwrap();
+    let tmp_opts = std::ffi::CString::new("mode=1777").unwrap();
+    unsafe {
+        libc::mount(
+            tmpfs_type.as_ptr(),
+            tmp_path.as_ptr(),
+            tmpfs_type.as_ptr(),
+            0,
+            tmp_opts.as_ptr() as *const libc::c_void,
+        );
+    }
+
+    // Recreate essential directories (may already exist from the OCI image)
+    let _ = std::fs::create_dir_all("/workspace");
+    let _ = std::fs::create_dir_all("/home/sandbox");
+    let _ = std::fs::create_dir_all("/etc/voidbox");
+
+    // Preserve DNS inside the new root (saved before pivot_root).
+    // Force a regular resolv.conf (not a dangling symlink from base image layers).
+    ensure_resolv_conf(&resolv_contents);
+
+    // Chown workspace and home to sandbox user (uid 1000)
+    unsafe {
+        let workspace = std::ffi::CString::new("/workspace").unwrap();
+        libc::chown(workspace.as_ptr(), 1000, 1000);
+        let home = std::ffi::CString::new("/home/sandbox").unwrap();
+        libc::chown(home.as_ptr(), 1000, 1000);
+    }
+
+    // Verify RW shared mounts are real mount points (not just overlay dirs).
+    // If a mount was lost during MS_MOVE / pivot_root, attempt a fresh
+    // 9p/virtiofs mount directly on the post-pivot overlay filesystem.
+    kmsg("Post-pivot: verifying shared mounts...");
+    for (tag, guest_path, read_only) in &shared_mounts {
+        if *read_only {
+            continue;
+        }
+        if !is_mount_point(guest_path) {
+            // Mount wasn't carried through pivot_root — try mounting fresh.
+            kmsg(&format!(
+                "Shared mount '{}' at {} is NOT a mount point after pivot_root, \
+                 attempting fresh 9p/virtiofs mount...",
+                tag, guest_path
+            ));
+
+            dump_mount_diagnostics(tag, guest_path);
+            let _ = std::fs::create_dir_all(guest_path);
+            let mount_result = try_mount_9p_virtiofs(tag, guest_path, *read_only);
+            if mount_result.is_err() || !is_mount_point(guest_path) {
+                let mount_err = mount_result.err().unwrap_or_default();
+                let msg = format!(
+                    "FATAL: rw mount '{}' at {} failed — {}. \
+                     Aborting to prevent silent data loss.",
+                    tag, guest_path, mount_err
+                );
+                kmsg(&msg);
+                eprintln!("{}", msg);
+                let _ = OCI_SETUP_ERROR_DETAIL.set(mount_err);
+                OCI_SETUP_STATUS.store(OCI_FAIL_MOUNT_SHARED, Ordering::Release);
+                return;
+            }
+        }
+        kmsg(&format!(
+            "Verified shared mount '{}' at {} is a real mount point",
+            tag, guest_path
+        ));
+        ensure_mount_writable(guest_path, true);
+    }
+
+    kmsg("OCI rootfs pivot_root complete — running on overlay filesystem");
+    eprintln!("OCI rootfs pivot_root complete");
+    OCI_SETUP_STATUS.store(OCI_OK, Ordering::Release);
+}
+
+fn stage_claude_into_newroot(newroot: &str) {
+    let src = "/usr/local/bin/claude-code";
+    if !std::path::Path::new(src).exists() {
+        return;
+    }
+
+    let dst = format!("{}/usr/local/bin/claude-code", newroot);
+    let dst_path = std::path::Path::new(&dst);
+    if !dst_path.exists() {
+        match std::fs::copy(src, dst_path) {
+            Ok(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dst_path, std::fs::Permissions::from_mode(0o755));
+                kmsg("Staged claude-code into OCI overlay root");
+            }
+            Err(e) => {
+                kmsg(&format!(
+                    "WARNING: failed to stage claude-code into OCI root: {}",
+                    e
+                ));
+                return;
+            }
+        }
+    }
+
+    // Keep the convenience alias.
+    let claude_link = format!("{}/usr/local/bin/claude", newroot);
+    let _ = std::fs::remove_file(&claude_link);
+    let _ = std::os::unix::fs::symlink("claude-code", &claude_link);
+}
+
+fn stage_bootstrap_tools_into_newroot(newroot: &str) {
+    let src_busybox = "/bin/busybox";
+    if !std::path::Path::new(src_busybox).exists() {
+        return;
+    }
+
+    let dst_busybox = format!("{}/bin/busybox", newroot);
+    let dst_busybox_path = std::path::Path::new(&dst_busybox);
+    if let Some(parent) = dst_busybox_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !dst_busybox_path.exists() {
+        if let Err(e) = std::fs::copy(src_busybox, dst_busybox_path) {
+            kmsg(&format!(
+                "WARNING: failed to stage busybox into OCI root: {}",
+                e
+            ));
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst_busybox_path, std::fs::Permissions::from_mode(0o755));
+        kmsg("Staged busybox into OCI overlay root");
+    }
+
+    // Provide the minimal applets used by tests and bootstrap commands.
+    for applet in ["sh", "cat", "touch", "test", "ls", "mkdir", "rm"] {
+        let link = format!("{}/bin/{}", newroot, applet);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::os::unix::fs::symlink("busybox", &link);
+    }
+}
+
+fn mount_oci_block_lowerdir(dev: &str) -> Result<String, String> {
+    let dev_path = std::path::Path::new(dev);
+    for _ in 0..40 {
+        if dev_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !dev_path.exists() {
+        return Err(format!("device not found: {}", dev));
+    }
+
+    let lowerdir = "/mnt/oci-lower";
+    std::fs::create_dir_all(lowerdir).map_err(|e| e.to_string())?;
+    let dev_c = std::ffi::CString::new(dev).unwrap();
+    let lower_c = std::ffi::CString::new(lowerdir).unwrap();
+    let ext4_c = std::ffi::CString::new("ext4").unwrap();
+    let ret = unsafe {
+        libc::mount(
+            dev_c.as_ptr(),
+            lower_c.as_ptr(),
+            ext4_c.as_ptr(),
+            libc::MS_RDONLY as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let has_content = std::fs::read_dir(lowerdir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !has_content {
+        return Err("mounted OCI block rootfs is empty".to_string());
+    }
+    Ok(lowerdir.to_string())
+}
+
+/// Set up network interface.
+///
+/// Tries DHCP first (for VZ NAT on macOS), falls back to static SLIRP
+/// addressing (for KVM/SLIRP on Linux).
+fn setup_network() {
+    kmsg("Setting up network...");
+
+    for i in 0..300 {
+        if std::path::Path::new("/sys/class/net/eth0").exists() {
+            kmsg(&format!("eth0 detected after {} attempts", i + 1));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    if !std::path::Path::new("/sys/class/net/eth0").exists() {
+        kmsg("Warning: eth0 not found, networking may not be available");
+        return;
+    }
+
+    let _ = run_cmd("ip", &["link", "set", "lo", "up"]);
+    let _ = run_cmd("ip", &["link", "set", "eth0", "up"]);
+
+    // Try DHCP first (works with VZ NAT on macOS), fall back to static below.
+    let dhcp_result = Command::new("udhcpc")
+        .args(["-i", "eth0", "-n", "-q", "-t", "3", "-T", "2"])
+        .output();
+
+    if let Err(e) = &dhcp_result {
+        kmsg(&format!("udhcpc failed to run: {}", e));
+    }
+
+    let dhcp_ok = dhcp_result.map(|o| o.status.success()).unwrap_or(false);
+
+    if dhcp_ok {
+        kmsg("Network configured via DHCP (VZ NAT)");
+        ensure_resolv_conf("nameserver 8.8.8.8\n");
+        return;
+    }
+
+    // Fallback: static SLIRP addressing (KVM)
+    kmsg("DHCP failed, falling back to static SLIRP addressing");
+    let mut routed = false;
+    for _ in 0..20 {
+        let _ = run_cmd("ip", &["link", "set", "eth0", "up"]);
+        let _ = run_cmd("ip", &["addr", "replace", "10.0.2.15/24", "dev", "eth0"]);
+        let _ = run_cmd("ip", &["route", "replace", "default", "via", "10.0.2.2"]);
+        if has_default_route() {
+            routed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    ensure_resolv_conf("nameserver 10.0.2.3\n");
+    if !routed {
+        kmsg("WARNING: default route not visible after static network setup");
+    }
+
+    kmsg("Network configured: 10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3");
+}
+
+fn network_enabled_from_cmdline() -> bool {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    for t in cmdline.split_whitespace() {
+        // KVM: virtio_mmio device 10 is the network device
+        if t == "virtio_mmio.device=512@0xd0000000:10" {
+            return true;
+        }
+        // VZ: explicit flag (VZ uses PCI, no virtio_mmio in cmdline)
+        if t == "voidbox.network=1" {
+            return true;
+        }
+    }
+    false
+}
+
+fn ensure_resolv_conf(contents: &str) {
+    let _ = std::fs::create_dir_all("/etc");
+    if let Ok(meta) = std::fs::symlink_metadata("/etc/resolv.conf") {
+        if meta.file_type().is_symlink() {
+            if let Err(e) = std::fs::remove_file("/etc/resolv.conf") {
+                kmsg(&format!("Failed to remove symlink /etc/resolv.conf: {}", e));
+            }
+        }
+    }
+
+    match std::fs::write("/etc/resolv.conf", contents) {
+        Ok(()) => kmsg("Wrote /etc/resolv.conf"),
+        Err(e) => kmsg(&format!("Failed to write /etc/resolv.conf: {}", e)),
+    }
+}
+
+/// Run a command and log the result
+fn run_cmd(program: &str, args: &[&str]) -> bool {
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!(
+                    "Warning: {} {:?} failed: {}",
+                    program,
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to run {} {:?}: {}", program, args, e);
+            false
+        }
+    }
+}
+
+fn has_default_route() -> bool {
+    let routes = match std::fs::read_to_string("/proc/net/route") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in routes.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() > 1 && cols[0] == "eth0" && cols[1] == "00000000" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Create a vsock listener socket
+fn create_vsock_listener(port: u32) -> RawFd {
+    let socket_fd =
+        unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+
+    if socket_fd < 0 {
+        return -1;
+    }
+
+    // Bind to the port
+    #[repr(C)]
+    struct SockaddrVm {
+        svm_family: libc::sa_family_t,
+        svm_reserved1: u16,
+        svm_port: u32,
+        svm_cid: u32,
+        svm_zero: [u8; 4],
+    }
+
+    let addr = SockaddrVm {
+        svm_family: libc::AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: 0xFFFFFFFF, // VMADDR_CID_ANY
+        svm_zero: [0; 4],
+    };
+
+    let ret = unsafe {
+        libc::bind(
+            socket_fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrVm>() as libc::socklen_t,
+        )
+    };
+
+    if ret < 0 {
+        unsafe {
+            libc::close(socket_fd);
+        }
+        return -1;
+    }
+
+    let ret = unsafe { libc::listen(socket_fd, 5) };
+    if ret < 0 {
+        unsafe {
+            libc::close(socket_fd);
+        }
+        return -1;
+    }
+
+    socket_fd
+}
+
+/// Handle a connection – process messages in a loop until the peer disconnects
+/// or a terminal message (Shutdown) is received.
+fn handle_connection(fd: RawFd) -> Result<(), String> {
+    loop {
+        // Read message header (4 bytes length + 1 byte type)
+        let mut header = [0u8; 5];
+        match read_exact(fd, &mut header) {
+            Ok(()) => {}
+            Err(_) => {
+                // Connection closed by peer (normal)
+                return Ok(());
+            }
+        }
+
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let msg_type = header[4];
+
+        // Reject oversized messages before allocating
+        if length > MAX_MESSAGE_SIZE {
+            eprintln!(
+                "Rejecting oversized message: {} bytes (max {})",
+                length, MAX_MESSAGE_SIZE
+            );
+            return Err(format!(
+                "Payload too large: {} bytes (max {})",
+                length, MAX_MESSAGE_SIZE
+            ));
+        }
+
+        // Read payload
+        let mut payload = vec![0u8; length];
+        if length > 0 {
+            read_exact(fd, &mut payload)?;
+        }
+
+        if msg_type != MessageType::Ping as u8 && !AUTHENTICATED.with(|a| a.get()) {
+            eprintln!("Rejecting unauthenticated message type {}", msg_type);
+            return Err(
+                "Connection not authenticated -- send Ping with session secret first".into(),
+            );
+        }
+
+        let Ok(message_type) = MessageType::try_from(msg_type) else {
+            eprintln!("Unknown message type: {}", msg_type);
+            continue;
+        };
+
+        // Ping is the pre-multiplex handshake: its payload is the session
+        // secret + version + flags with no request_id prefix. Everything
+        // else speaks the multiplex frame: payload = [request_id:4 LE][body].
+        let (request_id, body) = if message_type == MessageType::Ping {
+            (0u32, payload.as_slice())
+        } else if payload.len() < 4 {
+            return Err(format!(
+                "multiplex payload too short for {:?}: {} bytes",
+                message_type,
+                payload.len()
+            ));
+        } else {
+            let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            (id, &payload[4..])
+        };
+
+        match message_type {
+            MessageType::ExecRequest => {
+                let request: ExecRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse request: {}", e))?;
+
+                let response = execute_command(fd, request_id, &request);
+                send_mux_response(fd, MessageType::ExecResponse, request_id, &response)?;
+            }
+            MessageType::Ping => match SESSION_SECRET.get() {
+                Some(expected_secret) => {
+                    let Some((peer_secret, peer_version, peer_flags)) =
+                        void_box_protocol::parse_ping_payload(body)
+                    else {
+                        eprintln!("Authentication failed: Ping payload shorter than 32 bytes");
+                        return Err("Authentication failed: malformed Ping payload".into());
+                    };
+
+                    if !session_secret_matches(peer_secret, expected_secret) {
+                        eprintln!("Authentication failed: invalid secret");
+                        return Err("Authentication failed: invalid session secret".into());
+                    }
+
+                    AUTHENTICATED.with(|a| a.set(true));
+
+                    // Multiplex framing is required since protocol v2 — every
+                    // post-handshake frame carries a request_id prefix that
+                    // pre-multiplex peers cannot decode, so accepting a peer
+                    // without PROTO_FLAG_SUPPORTS_MULTIPLEX would corrupt every
+                    // subsequent frame. Reject at handshake.
+                    let peer_supports_multiplex =
+                        peer_flags & void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX != 0;
+                    if !peer_supports_multiplex {
+                        kmsg(&format!(
+                            "Protocol error: peer does not advertise PROTO_FLAG_SUPPORTS_MULTIPLEX (peer_version={peer_version}, peer_flags={peer_flags:#x}); minimum protocol version required is v2"
+                        ));
+                        return Err(format!(
+                            "Protocol error: peer does not advertise PROTO_FLAG_SUPPORTS_MULTIPLEX (peer_version={peer_version}, peer_flags={peer_flags:#x}); minimum protocol version required is v2"
+                        ));
+                    }
+
+                    let pong_payload = void_box_protocol::build_pong_payload(
+                        void_box_protocol::PROTO_FLAG_SUPPORTS_MULTIPLEX,
+                    );
+                    send_raw_message(fd, MessageType::Pong, &pong_payload)?;
+
+                    kmsg(&format!(
+                        "Authenticated (peer_version={}, our_version={}, peer_supports_multiplex={})",
+                        peer_version,
+                        void_box_protocol::PROTOCOL_VERSION,
+                        peer_supports_multiplex
+                    ));
+
+                    trigger_oci_rootfs_setup_async();
+                }
+                None => {
+                    eprintln!("Authentication failed: no secret configured");
+                    return Err("Authentication failed: no session secret configured".into());
+                }
+            },
+            MessageType::Shutdown => {
+                eprintln!("Shutdown requested");
+                unsafe {
+                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                }
+                return Ok(());
+            }
+            MessageType::SubscribeTelemetry => {
+                let opts: TelemetrySubscribeRequest = if body.is_empty() {
+                    TelemetrySubscribeRequest::default()
+                } else {
+                    serde_json::from_slice(body).unwrap_or_default()
+                };
+                kmsg(&format!(
+                    "Telemetry subscription started (interval={}ms, kernel_threads={})",
+                    opts.interval_ms, opts.include_kernel_threads
+                ));
+                // Telemetry runs for the lifetime of the connection.
+                // Running it inline would monopolize this handler thread
+                // and block every other RPC on the shared multiplex
+                // connection. Spawning it as a background thread lets the
+                // handler keep dispatching; [`CONN_WRITE_LOCK`] serializes
+                // writes between this thread and the handler.
+                let handler_fd = fd;
+                std::thread::Builder::new()
+                    .name("telemetry".into())
+                    .spawn(move || telemetry_stream_loop(handler_fd, request_id, &opts))
+                    .map_err(|e| format!("spawn telemetry thread: {e}"))?;
+            }
+            MessageType::WriteFile => {
+                let request: WriteFileRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse WriteFileRequest: {}", e))?;
+                let response = handle_write_file(&request);
+                send_mux_response(fd, MessageType::WriteFileResponse, request_id, &response)?;
+            }
+            MessageType::MkdirP => {
+                let request: MkdirPRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse MkdirPRequest: {}", e))?;
+                let response = handle_mkdir_p(&request);
+                send_mux_response(fd, MessageType::MkdirPResponse, request_id, &response)?;
+            }
+            MessageType::ReadFile => {
+                let request: ReadFileRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse ReadFileRequest: {}", e))?;
+                let response = handle_read_file(&request);
+                send_mux_response(fd, MessageType::ReadFileResponse, request_id, &response)?;
+            }
+            MessageType::FileStat => {
+                let request: FileStatRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse FileStatRequest: {}", e))?;
+                let response = handle_file_stat(&request);
+                send_mux_response(fd, MessageType::FileStatResponse, request_id, &response)?;
+            }
+            MessageType::SnapshotReady => {
+                send_mux_raw(fd, MessageType::SnapshotReady, request_id, &[])?;
+            }
+            MessageType::PtyOpen => {
+                let request: PtyOpenRequest = serde_json::from_slice(body)
+                    .map_err(|e| format!("Failed to parse PtyOpenRequest: {}", e))?;
+                pty::handle_pty_open(fd, request_id, &request, is_command_allowed)?;
+                return Ok(());
+            }
+            MessageType::PtyData | MessageType::PtyResize | MessageType::PtyClose => {
+                eprintln!("Unexpected PTY message outside session: {:?}", message_type);
+            }
+            MessageType::ExecResponse
+            | MessageType::Pong
+            | MessageType::FileTransfer
+            | MessageType::FileTransferResponse
+            | MessageType::TelemetryData
+            | MessageType::TelemetryAck
+            | MessageType::WriteFileResponse
+            | MessageType::MkdirPResponse
+            | MessageType::ExecOutputChunk
+            | MessageType::ExecOutputAck
+            | MessageType::ReadFileResponse
+            | MessageType::FileStatResponse
+            | MessageType::PtyOpened
+            | MessageType::PtyClosed => {
+                eprintln!("Unexpected response-type message: {:?}", message_type);
+            }
+        }
+    }
+}
+
+/// Checks whether a program is permitted by the command allowlist.
+pub(crate) fn is_command_allowed(program: &str) -> bool {
+    match COMMAND_ALLOWLIST.get() {
+        None => true, // No allowlist loaded = allow all
+        Some(list) if list.is_empty() => true,
+        Some(list) => {
+            // Match against basename of the program path
+            let basename = Path::new(program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(program);
+            list.iter().any(|allowed| allowed == basename)
+        }
+    }
+}
+
+/// Execute a command, streaming stdout/stderr chunks via ExecOutputChunk
+/// messages, then return the final ExecResponse with full accumulated output.
+///
+/// Every outgoing frame for this exec carries `request_id` so the host
+/// demultiplexer can route chunks back to the caller's stream receiver.
+fn execute_command(fd: RawFd, request_id: u32, request: &ExecRequest) -> ExecResponse {
+    let start = std::time::Instant::now();
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        kmsg(&format!(
+            "Exec start: program='{}' args={} oci_status={}",
+            request.program,
+            request.args.len(),
+            status
+        ));
+    }
+
+    // Ensure OCI rootfs setup is started and reaches a terminal state before
+    // executing guest commands. Bound the wait so host calls fail fast instead
+    // of hanging if root switch gets stuck.
+    trigger_oci_rootfs_setup_async();
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        let msg = format!("OCI rootfs not ready: {}", e);
+        kmsg(&msg);
+        return ExecResponse {
+            stdout: Vec::new(),
+            stderr: msg.clone().into_bytes(),
+            exit_code: -1,
+            error: Some(msg),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+    }
+    {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        kmsg(&format!("Exec gate passed: oci_status={}", status));
+    }
+
+    // Check command allowlist before spawning
+    if !is_command_allowed(&request.program) {
+        eprintln!("Command not allowed: {}", request.program);
+        kmsg(&format!("Command not allowed: {}", request.program));
+        return ExecResponse {
+            stdout: Vec::new(),
+            stderr: format!(
+                "Command '{}' is not in the allowed commands list",
+                request.program
+            )
+            .into_bytes(),
+            exit_code: -1,
+            error: Some(format!("Command '{}' is not allowed", request.program)),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+    }
+
+    let mut cmd = Command::new(&request.program);
+    cmd.args(&request.args);
+
+    // Ensure PATH includes common binary locations
+    let path =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/sbin".to_string());
+    if !path.contains("/usr/local/bin") {
+        cmd.env("PATH", format!("/usr/local/bin:{}", path));
+    } else {
+        cmd.env("PATH", &path);
+    }
+
+    // Child processes run as uid=1000 (sandbox user) but inherit HOME=/root
+    // from init. Since /root is not writable by uid=1000, set HOME to the
+    // sandbox user's home directory so tools like claude-code can write to
+    // $HOME/.claude/ for config and cache.
+    cmd.env("HOME", "/home/sandbox");
+
+    // Set environment variables from request (may override PATH and HOME above)
+    for (key, value) in &request.env {
+        cmd.env(key, value);
+    }
+
+    // Set working directory
+    if let Some(ref dir) = request.working_dir {
+        cmd.current_dir(dir);
+    }
+
+    // Set up stdin
+    if !request.stdin.is_empty() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Drop privileges to sandbox user (uid=1000, gid=1000) for child processes.
+    // This is required because claude-code refuses --dangerously-skip-permissions as root.
+    // The guest-agent (PID 1) stays root, but child commands run as sandbox user.
+    //
+    // Also apply resource limits (setrlimit) to prevent fork bombs, OOM, and disk filling.
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            // Always run child processes as sandbox user.
+            if libc::setgid(1000) != 0 || libc::setuid(1000) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // Create a new process group so the watchdog can killpg().
+            libc::setpgid(0, 0);
+
+            if let Some(limits) = RESOURCE_LIMITS.get() {
+                // RLIMIT_AS intentionally omitted: Bun (claude-code runtime)
+                // requires large virtual address space for mmap and will abort
+                // if constrained. The VM memory limit is the effective bound.
+
+                // RLIMIT_NOFILE: open file descriptors
+                let rlim_nofile = libc::rlimit {
+                    rlim_cur: limits.max_open_files,
+                    rlim_max: limits.max_open_files,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile);
+
+                // RLIMIT_NPROC: max processes (anti-fork-bomb)
+                let rlim_nproc = libc::rlimit {
+                    rlim_cur: limits.max_processes,
+                    rlim_max: limits.max_processes,
+                };
+                libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc);
+
+                // RLIMIT_FSIZE: max file size
+                let rlim_fsize = libc::rlimit {
+                    rlim_cur: limits.max_file_size,
+                    rlim_max: limits.max_file_size,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rlim_fsize);
+            }
+
+            Ok(())
+        });
+    }
+
+    // Spawn the process
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let path_env = std::env::var("PATH").unwrap_or_default();
+            let mut msg = format!("Failed to spawn process '{}': {}", request.program, e);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let mut checks: Vec<String> = Vec::new();
+                if request.program.contains('/') {
+                    let p = Path::new(&request.program);
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        use std::os::unix::fs::PermissionsExt;
+                        checks.push(format!(
+                            "{} exists mode={:o}",
+                            p.display(),
+                            meta.permissions().mode()
+                        ));
+                    }
+                } else {
+                    for dir in path_env.split(':') {
+                        if dir.is_empty() {
+                            continue;
+                        }
+                        let candidate = Path::new(dir).join(&request.program);
+                        if let Ok(meta) = std::fs::metadata(&candidate) {
+                            use std::os::unix::fs::PermissionsExt;
+                            checks.push(format!(
+                                "{} exists mode={:o}",
+                                candidate.display(),
+                                meta.permissions().mode()
+                            ));
+                        }
+                    }
+                }
+                if !checks.is_empty() {
+                    msg.push_str(&format!(
+                        "; found candidate binaries [{}] (ENOENT may indicate missing ELF interpreter or loader path)",
+                        checks.join(", ")
+                    ));
+                }
+            }
+            let diag_paths = [
+                "/bin/sh",
+                "/usr/bin/bash",
+                "/usr/bin/npm",
+                "/lib64/ld-linux-x86-64.so.2",
+            ];
+            let mut diag = Vec::new();
+            for p in diag_paths {
+                let exists = Path::new(p).exists();
+                diag.push(format!("{}={}", p, exists));
+            }
+            if let Ok(mounts) = std::fs::read_to_string("/proc/1/mounts") {
+                if let Some(root_line) = mounts.lines().find(|l| l.contains(" / ")) {
+                    diag.push(format!("root_mount={}", root_line));
+                }
+            }
+            diag.push(format!(
+                "oci_setup={}",
+                oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire))
+            ));
+            msg.push_str(&format!("; diag [{}]", diag.join(", ")));
+            kmsg(&format!(
+                "Failed to spawn '{}': {} (cwd={:?})",
+                request.program, e, request.working_dir
+            ));
+            return ExecResponse {
+                stdout: Vec::new(),
+                stderr: format!(
+                    "{} (cwd={:?}, agent_path={})",
+                    msg, request.working_dir, path_env
+                )
+                .as_bytes()
+                .to_vec(),
+                exit_code: -1,
+                error: Some(msg),
+                duration_ms: None,
+            };
+        }
+    };
+
+    // Write stdin if provided, then close
+    if !request.stdin.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&request.stdin);
+        }
+    }
+
+    // Spawn a watchdog thread that SIGKILLs the child's process group
+    // when `timeout_secs` elapses. The watchdog shares a condition
+    // variable with the main handler: when the child exits normally,
+    // the handler notifies the condvar so the watchdog wakes up early
+    // and we can `join` it. Without this the watchdog would sleep the
+    // full timeout and leak its OS thread until the VM shuts down.
+    let child_pid = child.id() as i32;
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog_wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let watchdog_handle = match request.timeout_secs {
+        None | Some(0) => None,
+        Some(timeout_secs) => {
+            let timed_out_flag = Arc::clone(&timed_out);
+            let wake = Arc::clone(&watchdog_wake);
+            std::thread::Builder::new()
+                .name("watchdog".into())
+                .spawn(move || {
+                    let (lock, cvar) = &*wake;
+                    let Ok(guard) = lock.lock() else {
+                        return;
+                    };
+                    let (guard, wait_result) = cvar
+                        .wait_timeout_while(
+                            guard,
+                            std::time::Duration::from_secs(timeout_secs),
+                            |done| !*done,
+                        )
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *guard {
+                        return;
+                    }
+                    if !wait_result.timed_out() {
+                        return;
+                    }
+                    eprintln!(
+                        "Watchdog: timeout ({}s) reached, sending SIGKILL to pid {}",
+                        timeout_secs, child_pid
+                    );
+                    timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    unsafe {
+                        libc::kill(-child_pid, libc::SIGKILL);
+                        libc::kill(child_pid, libc::SIGKILL);
+                    }
+                })
+                .ok()
+        }
+    };
+
+    // Take stdout/stderr pipes for streaming
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Wrap fd in a Mutex so both streaming threads can send chunks safely
+    // without interleaving wire-format messages.
+    let fd_mutex = Arc::new(Mutex::new(fd));
+
+    let fd_for_stdout = fd_mutex.clone();
+    let stdout_handle =
+        std::thread::spawn(move || stream_pipe(fd_for_stdout, request_id, stdout_pipe, "stdout"));
+
+    let fd_for_stderr = fd_mutex.clone();
+    let stderr_handle =
+        std::thread::spawn(move || stream_pipe(fd_for_stderr, request_id, stderr_pipe, "stderr"));
+
+    // Wait for process to exit
+    let exit_code = match child.wait() {
+        Ok(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    kmsg(&format!(
+                        "Process '{}' killed by signal {} (exit_status={:?})",
+                        request.program, sig, status,
+                    ));
+                }
+            }
+            status.code().unwrap_or(-1)
+        }
+        Err(e) => {
+            let stdout_bytes = stdout_handle.join().unwrap_or_default();
+            let stderr_bytes = stderr_handle.join().unwrap_or_default();
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return ExecResponse {
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+                exit_code: -1,
+                error: Some(format!("Failed to wait for process: {}", e)),
+                duration_ms: Some(duration_ms),
+            };
+        }
+    };
+
+    // Collect accumulated output from streaming threads
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let mut stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Wake the watchdog early so it exits without blocking for the full
+    // timeout, then join it so the OS thread is reaped. Under the
+    // persistent control channel this matters: leaked watchdog threads
+    // were accumulating on every exec and stalling the guest dispatch
+    // loop after ~20 sequential calls.
+    if let Some(handle) = watchdog_handle {
+        let (lock, cvar) = &*watchdog_wake;
+        if let Ok(mut done) = lock.lock() {
+            *done = true;
+            cvar.notify_all();
+        }
+        let _ = handle.join();
+    }
+
+    let was_timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
+
+    let error_msg = if was_timed_out {
+        Some(format!(
+            "Process killed after {}s timeout",
+            request.timeout_secs.unwrap_or(0)
+        ))
+    } else if exit_code == -1 {
+        Some("Process killed by signal (exit_code mapped to -1)".to_string())
+    } else {
+        None
+    };
+
+    // Surface OCI rootfs setup state on non-zero exits so host-side logs can
+    // distinguish command errors from root-switch/setup failures.
+    if exit_code != 0 {
+        let status = oci_status_str(OCI_SETUP_STATUS.load(Ordering::Acquire));
+        let mut suffix = format!("\n[voidbox] oci_setup_status={}\n", status).into_bytes();
+        stderr_bytes.append(&mut suffix);
+    }
+
+    ExecResponse {
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        exit_code,
+        error: error_msg,
+        duration_ms: Some(duration_ms),
+    }
+}
+
+/// Reads from a pipe and sends ExecOutputChunk messages as data arrives.
+///
+/// Returns the full accumulated output for the final ExecResponse so the
+/// host still gets a complete stdout/stderr summary even if a streaming
+/// send transiently fails.
+fn stream_pipe(
+    fd: Arc<Mutex<RawFd>>,
+    request_id: u32,
+    pipe: Option<impl Read>,
+    stream_name: &str,
+) -> Vec<u8> {
+    let mut accumulated = Vec::new();
+    let mut seq = 0u64;
+    let mut buf = [0u8; 4096];
+
+    if let Some(mut pipe) = pipe {
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    accumulated.extend_from_slice(&buf[..n]);
+                    let chunk = ExecOutputChunk {
+                        stream: stream_name.to_string(),
+                        data: buf[..n].to_vec(),
+                        seq,
+                    };
+                    if let Ok(locked_fd) = fd.lock() {
+                        let _ = send_mux_response(
+                            *locked_fd,
+                            MessageType::ExecOutputChunk,
+                            request_id,
+                            &chunk,
+                        );
+                    }
+                    seq += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    accumulated
+}
+
+/// Read exactly `buf.len()` bytes from the socket
+fn read_exact(fd: RawFd, buf: &mut [u8]) -> Result<(), String> {
+    let mut total_read = 0;
+    while total_read < buf.len() {
+        let n = unsafe {
+            libc::read(
+                fd,
+                buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - total_read,
+            )
+        };
+        if n <= 0 {
+            return Err("Read failed".into());
+        }
+        total_read += n as usize;
+    }
+    Ok(())
+}
+
+/// Sends a JSON-serialized response framed with a multiplex request_id prefix.
+///
+/// All post-handshake guest→host messages include the `request_id` the
+/// host allocated for the corresponding request, so the host-side
+/// demultiplexer can route the frame back to its caller.
+fn send_mux_response<T: Serialize>(
+    fd: RawFd,
+    msg_type: MessageType,
+    request_id: u32,
+    payload: &T,
+) -> Result<(), String> {
+    let payload_bytes =
+        serde_json::to_vec(payload).map_err(|e| format!("Failed to serialize response: {}", e))?;
+    send_mux_raw(fd, msg_type, request_id, &payload_bytes)
+}
+
+/// Sends a raw-payload response framed with a multiplex request_id prefix.
+///
+/// Prepends the little-endian request_id to the payload bytes so the
+/// host-side demultiplexer can match the response to its pending slot.
+fn send_mux_raw(
+    fd: RawFd,
+    msg_type: MessageType,
+    request_id: u32,
+    body: &[u8],
+) -> Result<(), String> {
+    let payload_len = (4 + body.len()) as u32;
+    let mut msg = Vec::with_capacity(5 + 4 + body.len());
+    msg.extend_from_slice(&payload_len.to_le_bytes());
+    msg.push(msg_type as u8);
+    msg.extend_from_slice(&request_id.to_le_bytes());
+    msg.extend_from_slice(body);
+
+    write_framed(fd, &msg)
+}
+
+/// Send a raw (non-JSON) message to the host over the vsock fd.
+///
+/// Unlike [`send_response`] which JSON-serializes a `T`, this writes the
+/// payload bytes verbatim. Used for the Pong reply that carries raw
+/// protocol-version bytes instead of JSON.
+fn send_raw_message(fd: RawFd, msg_type: MessageType, payload: &[u8]) -> Result<(), String> {
+    let length = payload.len() as u32;
+    let mut msg = Vec::with_capacity(5 + payload.len());
+    msg.extend_from_slice(&length.to_le_bytes());
+    msg.push(msg_type as u8);
+    msg.extend_from_slice(payload);
+
+    write_framed(fd, &msg)
+}
+
+/// Writes a fully framed message to the host vsock fd under
+/// [`CONN_WRITE_LOCK`].
+///
+/// # Errors
+///
+/// Returns [`String`] if the write lock is poisoned or if the
+/// underlying `libc::write` returns a non-positive value.
+fn write_framed(fd: RawFd, msg: &[u8]) -> Result<(), String> {
+    let _guard = CONN_WRITE_LOCK
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
+
+    let mut total_written = 0;
+    while total_written < msg.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                msg[total_written..].as_ptr() as *const libc::c_void,
+                msg.len() - total_written,
+            )
+        };
+        if n <= 0 {
+            return Err("Write failed".into());
+        }
+        total_written += n as usize;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Native file operations (no shell/base64 required)
+// ---------------------------------------------------------------------------
+
+/// Handle a WriteFile request: write content directly to the guest filesystem.
+/// Runs as root (no privilege drop) since this is host-initiated provisioning.
+/// After writing, the file and its parent directories are chowned to uid 1000
+/// so the sandbox user can read them (e.g., when claudio runs as uid 1000).
+///
+/// Path resolution is delegated to `fs_guard`, which uses `openat2` with
+/// `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` against a cached root fd. The
+/// resolved fd is used directly for the write — no path-string re-open
+/// after resolution, which is what would re-introduce a TOCTOU window.
+fn handle_write_file(request: &WriteFileRequest) -> WriteFileResponse {
+    // In OCI-rootfs mode the cached fs_guard root fds must be opened
+    // post-pivot, otherwise resolution targets orphaned initramfs
+    // inodes; mirrors the gate `handle_exec` already enforces.
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        return WriteFileResponse {
+            success: false,
+            error: Some(format!("OCI rootfs not ready: {}", e)),
+        };
+    }
+
+    let target = Path::new(&request.path);
+
+    if request.create_parents {
+        if let Some(parent) = target.parent() {
+            if let Err(e) = fs_guard::create_dirs_in_root(parent) {
+                return WriteFileResponse {
+                    success: false,
+                    error: Some(format!(
+                        "Refusing mkdir for parents of {}: {}",
+                        request.path, e
+                    )),
+                };
+            }
+            chown_recursive(parent);
+        }
+    }
+
+    let (parent_fd, basename) = match fs_guard::resolve_parent_for_write(target) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!(
+                    "Refusing write outside allowed roots {:?}: {} ({})",
+                    ALLOWED_WRITE_ROOTS, request.path, e
+                )),
+            };
+        }
+    };
+
+    // Open the leaf via the resolved parent fd with O_NOFOLLOW so a
+    // final-component symlink the agent plants (after the parent walk
+    // resolves) cannot redirect the write. The parent walk itself is
+    // protected by RESOLVE_NO_SYMLINKS; this closes the leaf-only race.
+    let basename_c = match std::ffi::CString::new(basename.as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!("invalid basename in path: {}", request.path)),
+            };
+        }
+    };
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            basename_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return WriteFileResponse {
+            success: false,
+            error: Some(format!("Failed to open {}: {}", request.path, err)),
+        };
+    }
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let mut written = 0usize;
+    while written < request.content.len() {
+        let n = unsafe {
+            libc::write(
+                owned.as_raw_fd(),
+                request.content[written..].as_ptr() as *const libc::c_void,
+                request.content.len() - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return WriteFileResponse {
+                success: false,
+                error: Some(format!("Failed to write {}: {}", request.path, err)),
+            };
+        }
+        if n == 0 {
+            break;
+        }
+        written += n as usize;
+    }
+
+    if unsafe { libc::fchown(owned.as_raw_fd(), 1000, 1000) } != 0 {
+        // Best-effort, matches the prior behaviour of the path-based chown.
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!("fchown({}) failed: {}", request.path, err));
+    }
+    if unsafe { libc::fchmod(owned.as_raw_fd(), 0o644) } != 0 {
+        let err = std::io::Error::last_os_error();
+        kmsg(&format!("fchmod({}) failed: {}", request.path, err));
+    }
+
+    kmsg(&format!(
+        "Wrote {} bytes to {}",
+        request.content.len(),
+        request.path
+    ));
+
+    // The proxy stages the guest `/etc/hosts` under an allowed write root; mirror
+    // it into `/etc/hosts` with the guest-agent's own (root) write, so the host
+    // never needs `fs_guard` access to `/etc`. The staged content is already the
+    // full hosts file (loopback + proxy aliases), so this is a plain overwrite.
+    // The mirror is the point of staging this path, so a mirror failure fails the
+    // RPC — otherwise the host reports success while the upstream name never
+    // resolves to the proxy and the credentialed call fails later, opaquely.
+    if request.path == PROXY_HOSTS_CONFIG_PATH {
+        if let Err(e) = std::fs::write("/etc/hosts", &request.content) {
+            let msg = format!("Failed to apply proxy hosts to /etc/hosts: {}", e);
+            kmsg(&msg);
+            return WriteFileResponse {
+                success: false,
+                error: Some(msg),
+            };
+        }
+        kmsg("Applied proxy hosts to /etc/hosts");
+    }
+
+    WriteFileResponse {
+        success: true,
+        error: None,
+    }
+}
+
+fn handle_read_file(request: &ReadFileRequest) -> ReadFileResponse {
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        return ReadFileResponse {
+            success: false,
+            content: Vec::new(),
+            error: Some(format!("OCI rootfs not ready: {}", e)),
+        };
+    }
+    fs_guard::init_read_roots(&ALLOWED_READ_ROOTS);
+
+    let target = Path::new(&request.path);
+    let fd = match fs_guard::resolve_for_read(target) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!(
+                    "Refusing read outside allowed roots {:?}: {} ({})",
+                    ALLOWED_READ_ROOTS, request.path, e
+                )),
+            };
+        }
+    };
+
+    // Upgrade the resolved O_PATH fd to a real read fd by re-opening
+    // through `/proc/self/fd/<n>`. This is the documented `O_PATH ->
+    // O_RDONLY` recipe; the kernel resolves the magic-link to the
+    // already-resolved inode without re-walking the user-supplied path.
+    use std::os::fd::AsRawFd as _;
+    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let c_path = match std::ffi::CString::new(proc_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!("invalid /proc fd path for {}", request.path)),
+            };
+        }
+    };
+    let read_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if read_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return ReadFileResponse {
+            success: false,
+            content: Vec::new(),
+            error: Some(format!("Failed to open {}: {}", request.path, err)),
+        };
+    }
+    use std::os::fd::FromRawFd as _;
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
+
+    let mut content = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = unsafe {
+            libc::read(
+                owned.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ReadFileResponse {
+                success: false,
+                content: Vec::new(),
+                error: Some(format!("Failed to read {}: {}", request.path, err)),
+            };
+        }
+        if n == 0 {
+            break;
+        }
+        content.extend_from_slice(&buf[..n as usize]);
+    }
+
+    ReadFileResponse {
+        success: true,
+        content,
+        error: None,
+    }
+}
+
+fn handle_file_stat(request: &FileStatRequest) -> FileStatResponse {
+    match std::fs::metadata(&request.path) {
+        Ok(meta) => FileStatResponse {
+            exists: true,
+            size: Some(meta.len()),
+            error: None,
+        },
+        Err(e) => {
+            let not_found = e.kind() == std::io::ErrorKind::NotFound;
+            FileStatResponse {
+                exists: false,
+                size: None,
+                error: if not_found { None } else { Some(e.to_string()) },
+            }
+        }
+    }
+}
+
+/// Recursively chown a path and its parents to uid 1000:1000.
+/// Only affects directories that are owned by root.
+///
+/// Uses `fs_guard` to obtain a kernel-resolved fd at each level, then
+/// `fchown`/`fchmod` against the fd. A planted symlink at any level
+/// fails the kernel walk via `RESOLVE_NO_SYMLINKS`; a directory whose
+/// `fstat.uid` is not 0 is skipped (mirrors the prior `lstat`-then-skip
+/// behaviour, but via fd so there's no second filesystem walk).
+fn chown_recursive(path: &std::path::Path) {
+    let ancestors = match fs_guard::ancestors_for_write(path) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    use std::os::fd::AsRawFd as _;
+    for fd in &ancestors {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            continue;
+        }
+        // Only chown root-owned directories — matches the prior
+        // chown_dir_if_root_owned semantics.
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            continue;
+        }
+        if st.st_uid != 0 {
+            continue;
+        }
+        unsafe {
+            libc::fchown(fd.as_raw_fd(), 1000, 1000);
+            libc::fchmod(fd.as_raw_fd(), 0o755);
+        }
+    }
+}
+
+/// Handle a MkdirP request: create directories recursively.
+/// Runs as root (no privilege drop) since this is host-initiated provisioning.
+/// After creating, directories are chowned to uid 1000 so the sandbox user
+/// can access them.
+///
+/// Path creation walks via `fs_guard::create_dirs_in_root`, which
+/// `mkdirat`s each component against the latest resolved fd and re-resolves
+/// with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS` between steps. A planted
+/// symlink at any level fails the resolve rather than redirecting the
+/// `mkdir`; the kernel never walks a path string we hand it.
+fn handle_mkdir_p(request: &MkdirPRequest) -> MkdirPResponse {
+    if let Err(e) = wait_for_oci_setup_ready(std::time::Duration::from_secs(30)) {
+        return MkdirPResponse {
+            success: false,
+            error: Some(format!("OCI rootfs not ready: {}", e)),
+        };
+    }
+
+    let target = Path::new(&request.path);
+    match fs_guard::create_dirs_in_root(target) {
+        Ok(_fd) => {
+            chown_recursive(target);
+            kmsg(&format!("Created directory {}", request.path));
+            MkdirPResponse {
+                success: true,
+                error: None,
+            }
+        }
+        Err(e) => MkdirPResponse {
+            success: false,
+            error: Some(format!(
+                "Refusing mkdir outside allowed roots {:?}: {} ({})",
+                ALLOWED_WRITE_ROOTS, request.path, e
+            )),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry: procfs parsing and streaming
+// ---------------------------------------------------------------------------
+
+/// Streams telemetry data to the host until the connection drops.
+///
+/// All outgoing `TelemetryData` frames carry `request_id` so the host
+/// demultiplexer routes them back to the subscriber's stream receiver.
+fn telemetry_stream_loop(fd: RawFd, request_id: u32, opts: &TelemetrySubscribeRequest) {
+    let interval = std::time::Duration::from_millis(opts.interval_ms.max(100)); // floor at 100ms
+    let mut seq: u64 = 0;
+    let mut prev_cpu = read_cpu_jiffies();
+
+    loop {
+        std::thread::sleep(interval);
+
+        let curr_cpu = read_cpu_jiffies();
+        let cpu_percent = compute_cpu_percent(&prev_cpu, &curr_cpu);
+        prev_cpu = curr_cpu;
+
+        let (memory_used_bytes, memory_total_bytes) = read_meminfo();
+        let (net_rx_bytes, net_tx_bytes) = read_netdev();
+        let procs_running = read_procs_running();
+        let open_fds = read_open_fds();
+        let processes = collect_process_metrics(opts.include_kernel_threads);
+
+        let batch = TelemetryBatch {
+            seq,
+            timestamp_ms: unix_millis(),
+            system: Some(SystemMetrics {
+                cpu_percent,
+                memory_used_bytes,
+                memory_total_bytes,
+                net_rx_bytes,
+                net_tx_bytes,
+                procs_running,
+                open_fds,
+            }),
+            processes,
+            trace_context: None,
+        };
+
+        if send_mux_response(fd, MessageType::TelemetryData, request_id, &batch).is_err() {
+            kmsg("Telemetry subscription ended (write error)");
+            return;
+        }
+
+        seq += 1;
+    }
+}
+
+/// Read aggregate CPU jiffies from the first line of /proc/stat.
+fn read_cpu_jiffies() -> CpuJiffies {
+    let default = CpuJiffies {
+        user: 0,
+        nice: 0,
+        system: 0,
+        idle: 0,
+        iowait: 0,
+        irq: 0,
+        softirq: 0,
+    };
+    let content = match std::fs::read_to_string("/proc/stat") {
+        Ok(c) => c,
+        Err(_) => return default,
+    };
+    // First line: "cpu  user nice system idle iowait irq softirq ..."
+    let line = match content.lines().next() {
+        Some(l) => l,
+        None => return default,
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 8 || fields[0] != "cpu" {
+        return default;
+    }
+    let parse = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    CpuJiffies {
+        user: parse(1),
+        nice: parse(2),
+        system: parse(3),
+        idle: parse(4),
+        iowait: parse(5),
+        irq: parse(6),
+        softirq: parse(7),
+    }
+}
+
+/// Compute CPU usage percentage from two jiffies snapshots.
+fn compute_cpu_percent(prev: &CpuJiffies, curr: &CpuJiffies) -> f64 {
+    let total_delta = curr.total().saturating_sub(prev.total());
+    if total_delta == 0 {
+        return 0.0;
+    }
+    let idle_delta = curr.idle_total().saturating_sub(prev.idle_total());
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+    (busy_delta as f64 / total_delta as f64) * 100.0
+}
+
+/// Read memory info from /proc/meminfo. Returns (used_bytes, total_bytes).
+fn read_meminfo() -> (u64, u64) {
+    let content = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(c) => c,
+        Err(_) => return (0, 0),
+    };
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_available_kb: u64 = 0;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            mem_total_kb = parse_meminfo_value(rest);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            mem_available_kb = parse_meminfo_value(rest);
+        }
+    }
+    let total = mem_total_kb * 1024;
+    let used = total.saturating_sub(mem_available_kb * 1024);
+    (used, total)
+}
+
+/// Parse a /proc/meminfo value line like "    12345 kB" -> 12345
+fn parse_meminfo_value(s: &str) -> u64 {
+    s.split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Read network device stats from /proc/net/dev for eth0. Returns (rx_bytes, tx_bytes).
+fn read_netdev() -> (u64, u64) {
+    let content = match std::fs::read_to_string("/proc/net/dev") {
+        Ok(c) => c,
+        Err(_) => return (0, 0),
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(after_colon) = trimmed.strip_prefix("eth0:") {
+            let fields: Vec<&str> = after_colon.split_whitespace().collect();
+            let rx = fields
+                .first()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            // tx_bytes is the 9th field (index 8) after the colon
+            let tx = fields
+                .get(8)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            return (rx, tx);
+        }
+    }
+    (0, 0)
+}
+
+/// Read number of running processes from /proc/stat.
+fn read_procs_running() -> u32 {
+    let content = match std::fs::read_to_string("/proc/stat") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    parse_procs_running(&content)
+}
+
+/// Read number of allocated file descriptors from /proc/sys/fs/file-nr.
+fn read_open_fds() -> u32 {
+    let content = match std::fs::read_to_string("/proc/sys/fs/file-nr") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    parse_open_fds(&content)
+}
+
+/// Collect per-process metrics by scanning /proc/[0-9]*/.
+///
+/// When `include_kernel_threads` is false, kernel threads are filtered out.
+/// Kernel threads have an empty `/proc/PID/cmdline` — this is the standard
+/// Linux way to distinguish them.
+fn collect_process_metrics(include_kernel_threads: bool) -> Vec<ProcessMetrics> {
+    let mut processes = Vec::new();
+    let page_size = page_size_bytes();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return processes,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only numeric directories (PIDs)
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let base = format!("/proc/{}", pid);
+
+        // Filter kernel threads: they have an empty /proc/PID/cmdline
+        if !include_kernel_threads {
+            let cmdline = std::fs::read(format!("{}/cmdline", base)).unwrap_or_default();
+            if cmdline.is_empty() {
+                continue;
+            }
+        }
+
+        // Read comm
+        let comm = std::fs::read_to_string(format!("{}/comm", base))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if comm.is_empty() {
+            continue;
+        }
+
+        // Read RSS from statm (second field, in pages)
+        let rss_bytes = std::fs::read_to_string(format!("{}/statm", base))
+            .ok()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            * page_size;
+
+        // Read state and cpu jiffies from stat
+        let (state, cpu_jiffies) = read_proc_stat_fields(&base);
+
+        processes.push(ProcessMetrics {
+            pid,
+            comm,
+            rss_bytes,
+            cpu_jiffies,
+            state,
+        });
+    }
+
+    processes
+}
+
+/// Read process state and CPU jiffies (utime + stime) from /proc/PID/stat.
+fn read_proc_stat_fields(base: &str) -> (char, u64) {
+    let content = match std::fs::read_to_string(format!("{}/stat", base)) {
+        Ok(c) => c,
+        Err(_) => return ('?', 0),
+    };
+    parse_proc_stat_fields_content(&content)
+}
+
+fn parse_proc_stat_fields_content(content: &str) -> (char, u64) {
+    // /proc/PID/stat format: pid (comm) state ... utime(14) stime(15) ...
+    // Find the closing ')' to skip the comm field (which may contain spaces/parens)
+    let after_comm = match content.rfind(')') {
+        Some(pos) => &content[pos + 1..],
+        None => return ('?', 0),
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // fields[0] = state, fields[11] = utime, fields[12] = stime
+    let state = fields.first().and_then(|s| s.chars().next()).unwrap_or('?');
+    let utime = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = fields
+        .get(12)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (state, utime + stime)
+}
+
+fn parse_procs_running(content: &str) -> u32 {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("procs_running ") {
+            return rest.trim().parse::<u32>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+fn parse_open_fds(content: &str) -> u32 {
+    // Format: "allocated_fds  free_fds  max_fds"
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn page_size_bytes() -> u64 {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        4096
+    } else {
+        page_size as u64
+    }
+}
+
+/// Get current time as Unix milliseconds.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_proc_stat_fields_content_ok() {
+        let line = "1234 (my(proc) name) S 1 2 3 4 5 6 7 8 9 10 100 200 0 0 0 0\n";
+        let (state, jiffies) = parse_proc_stat_fields_content(line);
+        assert_eq!(state, 'S');
+        assert_eq!(jiffies, 300);
+    }
+
+    #[test]
+    fn test_parse_proc_stat_fields_content_malformed() {
+        let (state, jiffies) = parse_proc_stat_fields_content("not-a-valid-stat-line");
+        assert_eq!(state, '?');
+        assert_eq!(jiffies, 0);
+    }
+
+    #[test]
+    fn test_parse_procs_running() {
+        let content = "cpu  1 2 3 4 5 6 7 8\nprocs_running 9\n";
+        assert_eq!(parse_procs_running(content), 9);
+        assert_eq!(parse_procs_running("cpu 1 2 3"), 0);
+    }
+
+    #[test]
+    fn test_parse_open_fds() {
+        assert_eq!(parse_open_fds("123 456 789\n"), 123);
+        assert_eq!(parse_open_fds("oops"), 0);
+    }
+
+    // Path-allowlist coverage lives in `fs_guard::tests`, not here.
+    // Privileged FS RPCs route every path through `fs_guard`'s
+    // `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)` against cached
+    // root fds; the symlink/`..`/outside-root negative cases sit
+    // alongside the helper they exercise.
+
+    #[test]
+    fn test_page_size_bytes_positive() {
+        assert!(page_size_bytes() > 0);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = {
+            let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+        };
+        std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos))
+    }
+
+    #[test]
+    fn test_write_probe_passes_on_writable_dir() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: requires root");
+            return;
+        }
+        let dir = unique_temp_dir("voidbox_test_probe_writable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chown(c_path.as_ptr(), 1000, 1000);
+        }
+        let result = write_probe_as_sandbox(dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, ProbeResult::Ok);
+    }
+
+    #[test]
+    fn test_write_probe_fails_on_readonly_dir() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: requires root");
+            return;
+        }
+        let dir = unique_temp_dir("voidbox_test_probe_readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            libc::chmod(c_path.as_ptr(), 0o555);
+        }
+        let result = write_probe_as_sandbox(dir.to_str().unwrap());
+        unsafe {
+            libc::chmod(c_path.as_ptr(), 0o755);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, ProbeResult::WriteFailed);
+    }
+
+    #[test]
+    fn test_probe_result_variants() {
+        assert_ne!(ProbeResult::Ok, ProbeResult::WriteFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::PrivilegeDropFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::ForkFailed);
+        assert_ne!(ProbeResult::Ok, ProbeResult::WaitFailed);
+        assert_ne!(ProbeResult::WriteFailed, ProbeResult::PrivilegeDropFailed);
+    }
+
+    #[test]
+    fn test_is_mount_point_detects_proc() {
+        // /proc is almost always a mount point on Linux
+        assert!(is_mount_point("/proc"));
+    }
+
+    #[test]
+    fn test_is_mount_point_regular_dir_is_not() {
+        let dir = unique_temp_dir("voidbox_test_mount_point");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_mount_point(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_multiple() {
+        let cmdline = "console=ttyS0 voidbox.mount0=mount0:/workspace/output:rw voidbox.mount1=mount1:/data:ro quiet";
+        let mounts = parse_shared_mount_entries_from(cmdline);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(
+            mounts[0],
+            ("mount0".into(), "/workspace/output".into(), false)
+        );
+        assert_eq!(mounts[1], ("mount1".into(), "/data".into(), true));
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_empty() {
+        let mounts = parse_shared_mount_entries_from("");
+        assert!(mounts.is_empty());
+
+        let mounts = parse_shared_mount_entries_from("console=ttyS0 quiet");
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_shared_mount_entries_default_readonly() {
+        // When no mode suffix is given, mount should default to read-only.
+        let cmdline = "voidbox.mount0=tag0:/mnt/share";
+        let mounts = parse_shared_mount_entries_from(cmdline);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0], ("tag0".into(), "/mnt/share".into(), true));
+    }
+
+    #[test]
+    fn test_try_mount_9p_virtiofs_returns_err_without_device() {
+        // Outside a VM, there's no virtio device — both virtiofs and 9p should
+        // fail gracefully and return Err (not panic or hang).
+        let dir = unique_temp_dir("voidbox_test_9p_mount");
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = try_mount_9p_virtiofs("mount0", dir.to_str().unwrap(), false);
+        assert!(result.is_err(), "mount should fail outside a VM");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dump_mount_diagnostics_does_not_panic() {
+        // Verify the diagnostic dump runs without panicking.
+        // On a dev machine it will log "unreadable" for most sysfs paths.
+        dump_mount_diagnostics("mount0", "/nonexistent/path");
+    }
+
+    #[test]
+    fn test_session_secret_matches_accepts_correct_secret() {
+        let expected = [0xABu8; 32];
+        assert!(session_secret_matches(&expected, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_wrong_secret() {
+        let expected = [0xABu8; 32];
+        let mut wrong = expected;
+        wrong[0] ^= 0xFF;
+        assert!(!session_secret_matches(&wrong, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_last_byte_mismatch() {
+        // Differ only in the final byte: a short-circuit memcmp would fall
+        // through 31 equal bytes before rejecting, which a constant-time
+        // compare must not. The functional assertion is rejection; the
+        // timing property is structural (delegated to subtle::ConstantTimeEq).
+        let expected = [0xABu8; 32];
+        let mut wrong = expected;
+        wrong[31] ^= 0x01;
+        assert!(!session_secret_matches(&wrong, &expected));
+    }
+
+    #[test]
+    fn test_session_secret_matches_rejects_wrong_length() {
+        let expected = [0xABu8; 32];
+        let too_short = [0xABu8; 31];
+        let too_long = [0xABu8; 33];
+        assert!(!session_secret_matches(&too_short, &expected));
+        assert!(!session_secret_matches(&too_long, &expected));
+    }
+}

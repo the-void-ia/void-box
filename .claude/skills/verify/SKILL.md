@@ -10,27 +10,12 @@ Run these checks in order. Stop and report at the first failure.
 cargo fmt --all -- --check
 ```
 
-**2. Clippy (platform-aware)**
-
-On macOS (excludes guest-agent, which is Linux-only):
-```
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-```
-
-On Linux:
+**2. Clippy** (guest-agent builds as a no-op stub on non-Linux, so the same command runs on macOS)
 ```
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-**3. Tests (platform-aware)**
-
-On macOS (excludes guest-agent, which is Linux-only):
-```
-cargo test --workspace --exclude guest-agent --all-features --verbose
-cargo test --doc --workspace --exclude guest-agent --all-features
-```
-
-On Linux:
+**3. Tests**
 ```
 cargo test --workspace --all-features --verbose
 cargo test --doc --workspace --all-features

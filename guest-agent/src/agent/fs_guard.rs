@@ -33,8 +33,8 @@
 //! fails, init `_exit`s rather than `panic!`s so PID 1 dies cleanly
 //! without unwinding through a partially-initialised init.
 //!
-//! [`ALLOWED_WRITE_ROOTS`]: crate::ALLOWED_WRITE_ROOTS
-//! [`ALLOWED_READ_ROOTS`]: crate::ALLOWED_READ_ROOTS
+//! [`ALLOWED_WRITE_ROOTS`]: super::ALLOWED_WRITE_ROOTS
+//! [`ALLOWED_READ_ROOTS`]: super::ALLOWED_READ_ROOTS
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -45,7 +45,7 @@ use nix::errno::Errno;
 use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
 
-use crate::{kmsg, kmsg_emerg, ALLOWED_WRITE_ROOTS};
+use super::{kmsg, kmsg_emerg, ALLOWED_WRITE_ROOTS};
 
 /// One allowlisted root and its cached `O_PATH` directory fd.
 #[derive(Debug)]

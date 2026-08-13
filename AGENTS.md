@@ -797,26 +797,15 @@ Static quality:
 cargo fmt --all -- --check
 ```
 
-Clippy (Linux):
+Clippy (guest-agent builds as a no-op stub on non-Linux, so the same commands run on macOS):
 ```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Clippy (macOS — excludes guest-agent, which is Linux-only):
-```bash
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-```
-
-Core tests (Linux):
+Core tests:
 ```bash
 cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
-```
-
-Core tests (macOS — excludes guest-agent):
-```bash
-cargo test --workspace --exclude guest-agent --all-features
-cargo test --doc --workspace --exclude guest-agent --all-features
 ```
 
 Ignored/VM suites (requires kernel/initramfs and usable KVM/vsock access):
@@ -911,18 +900,11 @@ all required gates are explicit.
 
 ### Standard validation sequence
 
-Linux:
+Same on Linux and macOS — guest-agent builds as a no-op stub on non-Linux, so no per-crate exclusion is needed:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-```
-
-macOS (excludes guest-agent, which is Linux-only):
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-cargo test --workspace --exclude guest-agent --all-features
 ```
 
 ### macOS dev setup

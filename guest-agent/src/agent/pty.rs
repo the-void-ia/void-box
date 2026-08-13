@@ -17,7 +17,7 @@ use void_box_protocol::{
     HEADER_SIZE, MAX_MESSAGE_SIZE,
 };
 
-use crate::{kmsg, kmsg_emerg, RESOURCE_LIMITS};
+use super::{kmsg, kmsg_emerg, RESOURCE_LIMITS};
 
 /// Tracks the number of active PTY sessions (max [`MAX_PTY_SESSIONS`]).
 static PTY_SESSION_COUNT: AtomicU32 = AtomicU32::new(0);

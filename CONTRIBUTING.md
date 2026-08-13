@@ -94,13 +94,10 @@ All agent-flavor scripts (`build_claude_rootfs.sh`, `build_codex_rootfs.sh`, `bu
 export TMPDIR=$PWD/target/tmp
 mkdir -p "$TMPDIR"
 
-# Fast local checks
+# Fast local checks (guest-agent builds as a no-op stub on non-Linux, so the
+# same commands work on macOS with no per-crate exclusion)
 cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
-
-# macOS parity with CI (guest-agent excluded in some jobs)
-cargo test --workspace --exclude guest-agent --all-features
-cargo test --doc --workspace --exclude guest-agent --all-features
 
 # Include ignored/VM tests (Linux or macOS with artifacts available)
 export VOID_BOX_KERNEL=/path/to/vmlinuz
@@ -136,17 +133,11 @@ Before submitting a PR, ensure your code passes all checks:
 # Check formatting
 cargo fmt --all -- --check
 
-# Run clippy (Linux / CI parity)
+# Run clippy
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run clippy (macOS / CI parity)
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-
 # Build documentation
-cargo doc --no-deps --all-features
-
-# Build docs on macOS with CI parity
-cargo doc --workspace --no-deps --all-features --exclude guest-agent
+cargo doc --workspace --no-deps --all-features
 ```
 
 ## Coding Standards
