@@ -76,14 +76,38 @@ pub fn artifacts() -> (PathBuf, PathBuf) {
     }
 }
 
-/// Unwrap a fallible VM op (backend start, a guest RPC), or panic. Capability is
-/// not probed and artifacts are provisioned, so an error here is a real failure
-/// on a machine asked to run VM tests — never a skip, on any platform.
+/// Unwrap a fallible VM op (a guest RPC on a booted VM, a host-side build
+/// step), or panic with the full error-source chain. Capability is not probed
+/// and artifacts are provisioned, so an error here is a real failure on a
+/// machine asked to run VM tests — never a skip, on any platform. Reserve this
+/// for ops after the test's first boot op has been gated through [`vm_start`]
+/// or [`vm_start_value`] (or for ops that cannot raise a capability absence).
 #[allow(dead_code)]
-pub fn expect_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+pub fn expect_vm<T, E: std::error::Error + 'static>(result: Result<T, E>, context: &str) -> T {
     result.unwrap_or_else(|err| {
-        panic!("{context}: VM operation failed on a capable machine (a real failure, not a skip): {err}")
+        panic!(
+            "{context}: VM operation failed on a capable machine (a real failure, not a skip): {}",
+            format_error_chain(&err)
+        )
     })
+}
+
+/// Format an error and its `source()` chain, one cause per line. `Display` on a
+/// thiserror-derived [`void_box::Error`] shows only the top message; the
+/// underlying I/O / vsock / serde context lives behind `source()`, and the
+/// real-failure panics need every layer to be diagnosable. The skip and
+/// `VOID_BOX_REQUIRE_VM` messages stay single-line with the top message only —
+/// `HypervisorUnavailable` carries no source, so nothing is lost.
+#[allow(dead_code)]
+pub fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str("\n    caused by: ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// The outcome of a VM backend `start()` attempt.
@@ -105,11 +129,34 @@ pub enum VmStart {
 /// asserted capable cannot launder a lost hypervisor into a skip.
 #[allow(dead_code)]
 pub fn vm_start(result: Result<(), void_box::Error>, context: &str) -> VmStart {
-    let Err(err) = result else {
-        return VmStart::Ready;
+    match vm_start_value(result, context) {
+        Some(()) => VmStart::Ready,
+        None => VmStart::SkipIncapable,
+    }
+}
+
+/// [`vm_start`] for boot ops that return a value: a constructor like
+/// `MicroVm::new`, or the first RPC on a lazily booted `Sandbox` / `VoidBox` /
+/// `Pipeline`, where `vm_start`'s `Result<(), _>` signature would discard the
+/// booted handle. Classification is identical: `Some(value)` proceeds, `None`
+/// means the host cannot virtualize and the caller must `return` (the test
+/// skips), and every other error panics as a real failure. Gate only the
+/// *first* boot op per test with this — once a VM booted, a later error can no
+/// longer be a capability absence, so subsequent ops belong on [`expect_vm`].
+#[allow(dead_code)]
+#[must_use = "None means the host cannot virtualize and the test must return early"]
+pub fn vm_start_value<T>(result: Result<T, void_box::Error>, context: &str) -> Option<T> {
+    let err = match result {
+        Ok(value) => return Some(value),
+        Err(err) => err,
     };
-    let require_vm = std::env::var("VOID_BOX_REQUIRE_VM").as_deref() == Ok("1");
     if is_capability_absence(&err) {
+        // Read the env var only on a capability absence: the real-failure path
+        // must not depend on process env, and keeping `getenv` off that path
+        // lets the honesty meta-tests exercise it concurrently with the test
+        // that mutates `VOID_BOX_REQUIRE_VM` (`setenv` racing a `getenv` on
+        // another thread is undefined behavior in glibc).
+        let require_vm = std::env::var("VOID_BOX_REQUIRE_VM").as_deref() == Ok("1");
         if require_vm {
             panic!("{context}: VOID_BOX_REQUIRE_VM=1 but the host cannot virtualize: {err}");
         }
@@ -117,11 +164,29 @@ pub fn vm_start(result: Result<(), void_box::Error>, context: &str) -> VmStart {
             "SKIP [{context}]: host cannot run VM tests (capability absent) — {err}. \
              Set VOID_BOX_REQUIRE_VM=1 to treat this as a failure."
         );
-        return VmStart::SkipIncapable;
+        return None;
     }
     panic!(
-        "{context}: VM operation failed on a capable machine (a real failure, not a skip): {err}"
+        "{context}: VM operation failed on a capable machine (a real failure, not a skip): {}",
+        format_error_chain(&err)
     );
+}
+
+/// Create a backend and start it, or `None` when the host genuinely cannot
+/// virtualize (the caller skips). A real boot failure on a capable host panics
+/// inside [`vm_start`], and `VOID_BOX_REQUIRE_VM=1` makes even a capability
+/// absence fail. Suites keep their own thin wrappers only to build the
+/// `BackendConfig` and name the context.
+#[allow(dead_code)]
+pub async fn start_backend(
+    config: void_box::backend::BackendConfig,
+    context: &str,
+) -> Option<Box<dyn void_box::backend::VmmBackend>> {
+    let mut backend = void_box::backend::create_backend();
+    match vm_start(backend.start(config).await, context) {
+        VmStart::Ready => Some(backend),
+        VmStart::SkipIncapable => None,
+    }
 }
 
 /// Whether a `start()` error is a genuine hardware incapability, matched on the

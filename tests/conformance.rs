@@ -79,13 +79,9 @@ async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
 }
 
 /// Start the backend, or `None` when the host genuinely cannot virtualize (the
-/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+/// caller skips) — the skip-or-fail contract lives on [`test_artifacts::start_backend`].
 async fn create_started_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
-    let mut backend = void_box::backend::create_backend();
-    match test_artifacts::vm_start(backend.start(config).await, "backend start (conformance)") {
-        test_artifacts::VmStart::Ready => Some(backend),
-        test_artifacts::VmStart::SkipIncapable => None,
-    }
+    test_artifacts::start_backend(config, "backend start (conformance)").await
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {

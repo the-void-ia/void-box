@@ -60,7 +60,13 @@ async fn test_agent_box_with_local_skill() {
 
     let ab = build_kvm_box("data_analyst", skills, "Analyze AAPL stock data");
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
+    // `run` boots the lazily started VM, so it is the op that can surface a
+    // genuine hypervisor absence — gate it as skip-or-fail.
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
+    };
 
     // Basic checks
     assert_eq!(result.box_name, "data_analyst");
@@ -106,7 +112,11 @@ async fn test_agent_box_with_multiple_skills() {
 
     let ab = build_kvm_box("multi_skill_box", skills, "Analyze and compute indicators");
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
+    };
 
     assert!(!result.agent_result.is_error);
 
@@ -149,7 +159,11 @@ async fn test_agent_box_with_mcp_skill() {
 
     let ab = build_kvm_box("mcp_box", skills, "Fetch market data");
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
+    };
 
     assert!(!result.agent_result.is_error);
 
@@ -198,7 +212,11 @@ async fn test_agent_box_mixed_skills() {
 
     let ab = build_kvm_box("mixed_box", skills, "Analyze with MCP data");
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "skill_pipeline run")
+    else {
+        return;
+    };
 
     assert!(!result.agent_result.is_error);
 
@@ -239,13 +257,15 @@ async fn test_pipeline_two_stages_kvm() {
     let box1 = build_kvm_box("data_stage", box1_skills, "Collect market data");
     let box2 = build_kvm_box("quant_stage", box2_skills, "Compute indicators");
 
-    let result = test_artifacts::expect_vm(
+    let Some(result) = test_artifacts::vm_start_value(
         Pipeline::named("two_stage_test", box1)
             .pipe(box2)
             .run()
             .await,
         "skill_pipeline pipeline run",
-    );
+    ) else {
+        return;
+    };
 
     // Verify pipeline structure
     assert_eq!(result.stages.len(), 2);
@@ -295,7 +315,11 @@ async fn test_agent_box_with_input_data_kvm() {
     let ab = build_kvm_box("input_box", skills, "Process the input data");
 
     let input = br#"{"symbols": ["AAPL", "NVDA"], "period": "30d"}"#;
-    let result = test_artifacts::expect_vm(ab.run(Some(input), None).await, "skill_pipeline run");
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(Some(input), None).await, "skill_pipeline run")
+    else {
+        return;
+    };
 
     assert_eq!(result.box_name, "input_box");
     assert!(!result.agent_result.is_error);

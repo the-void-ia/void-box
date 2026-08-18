@@ -66,16 +66,9 @@ const REAL_KEY: &str = "sk-ant-e2e-real-host-held-secret";
 type CapturedHeaders = Arc<Mutex<Option<HeaderMap>>>;
 
 /// Start the backend, or `None` when the host genuinely cannot virtualize (the
-/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+/// caller skips) — the skip-or-fail contract lives on [`test_artifacts::start_backend`].
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
-    let mut backend = void_box::backend::create_backend();
-    match test_artifacts::vm_start(
-        backend.start(backend_config()).await,
-        "backend start (credential_proxy)",
-    ) {
-        test_artifacts::VmStart::Ready => Some(backend),
-        test_artifacts::VmStart::SkipIncapable => None,
-    }
+    test_artifacts::start_backend(backend_config(), "backend start (credential_proxy)").await
 }
 
 fn backend_config() -> BackendConfig {

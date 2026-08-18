@@ -12,7 +12,14 @@ mod pty_tests {
     use void_box::sandbox::Sandbox;
     use void_box_protocol::PtyOpenRequest;
 
-    fn test_sandbox() -> std::sync::Arc<Sandbox> {
+    /// Build the sandbox and boot it with a gated first exec. `None` means the
+    /// host cannot virtualize and the test must return early (skip). Booting
+    /// here — rather than letting the first `attach_pty` do it — keeps every
+    /// PTY-op result meaningful: the tests assert on `attach_pty` outcomes
+    /// (`pty_command_not_allowed` even asserts on an expected `Err`'s
+    /// message), and a hypervisor absence surfacing through those calls would
+    /// fail the assertions confusingly instead of skipping.
+    async fn test_sandbox() -> Option<std::sync::Arc<Sandbox>> {
         let (kernel, initramfs) = test_artifacts::artifacts();
         let build = Sandbox::local()
             .kernel(&kernel)
@@ -20,13 +27,20 @@ mod pty_tests {
             .memory_mb(512)
             .network(false)
             .build();
-        test_artifacts::expect_vm(build, "sandbox build (e2e_pty)")
+        let sandbox = test_artifacts::expect_vm(build, "sandbox build (e2e_pty)");
+        test_artifacts::vm_start_value(
+            sandbox.exec("echo", &["boot"]).await,
+            "first boot exec (e2e_pty)",
+        )?;
+        Some(sandbox)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_open_and_immediate_exit() {
-        let sandbox = test_sandbox();
+        let Some(sandbox) = test_sandbox().await else {
+            return;
+        };
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -51,7 +65,9 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_command_not_allowed() {
-        let sandbox = test_sandbox();
+        let Some(sandbox) = test_sandbox().await else {
+            return;
+        };
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -76,7 +92,9 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_nonzero_exit_code() {
-        let sandbox = test_sandbox();
+        let Some(sandbox) = test_sandbox().await else {
+            return;
+        };
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -107,7 +125,9 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_exit_code_survives_session_close() {
-        let sandbox = test_sandbox();
+        let Some(sandbox) = test_sandbox().await else {
+            return;
+        };
 
         let request = PtyOpenRequest {
             cols: 80,

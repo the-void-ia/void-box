@@ -115,7 +115,14 @@ async fn real_claude_uses_void_mcp_tools() {
 
     eprintln!("running real Claude Code with void-mcp...");
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (agent_mcp)");
+    // `run` boots the VM, so it is the op that can surface a genuine
+    // hypervisor absence — gate it, stopping the sidecar on a skip.
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "guest run (agent_mcp)")
+    else {
+        handle.stop().await;
+        return;
+    };
 
     eprintln!("=== Claude Result ===");
     eprintln!("model: {}", result.agent_result.model);
@@ -243,7 +250,10 @@ async fn diagnostic_void_mcp_starts_in_guest() {
         "backend start (agent_mcp diagnostic)",
     ) {
         test_artifacts::VmStart::Ready => {}
-        test_artifacts::VmStart::SkipIncapable => return,
+        test_artifacts::VmStart::SkipIncapable => {
+            handle.stop().await;
+            return;
+        }
     }
 
     // Test 1: void-mcp binary exists

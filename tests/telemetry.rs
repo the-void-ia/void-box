@@ -596,9 +596,13 @@ async fn kvm_telemetry_end_to_end() {
 
     cfg.validate().expect("invalid VoidBoxConfig");
 
-    let mut vm = MicroVm::new(cfg)
-        .await
-        .expect("failed to create KVM-backed MicroVm");
+    // A genuine hypervisor absence skips; anything else fails.
+    let Some(mut vm) = test_artifacts::vm_start_value(
+        MicroVm::new(cfg).await,
+        "MicroVm::new (telemetry end-to-end)",
+    ) else {
+        return;
+    };
 
     // Verify the VM boots by running a trivial command first
     let output = test_artifacts::expect_vm(
@@ -690,9 +694,12 @@ async fn kvm_telemetry_with_kernel_threads() {
 
     cfg.validate().expect("invalid VoidBoxConfig");
 
-    let mut vm = MicroVm::new(cfg)
-        .await
-        .expect("failed to create KVM-backed MicroVm");
+    let Some(mut vm) = test_artifacts::vm_start_value(
+        MicroVm::new(cfg).await,
+        "MicroVm::new (telemetry kernel threads)",
+    ) else {
+        return;
+    };
 
     // Verify VM boots
     let output = test_artifacts::expect_vm(

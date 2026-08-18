@@ -34,7 +34,6 @@ use void_box::backend::MountConfig;
 use void_box::sandbox::Sandbox;
 use void_box::spec::load_spec;
 use void_box::spec::RunSpec;
-use void_box::Error;
 
 #[cfg(target_os = "macos")]
 use void_box::backend::GuestConsoleSink;
@@ -493,7 +492,7 @@ fn build_sandbox_with_oci_mount(oci_dir: &std::path::Path, _read_only: bool) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, String> {
+fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, std::io::Error> {
     fn dir_size_bytes(path: &std::path::Path) -> std::io::Result<u64> {
         fn walk(path: &std::path::Path, total: &mut u64) -> std::io::Result<()> {
             for entry in std::fs::read_dir(path)? {
@@ -531,9 +530,9 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, S
         .arg(disk_size.to_string())
         .arg(&disk_path)
         .status()
-        .map_err(|e| format!("failed to run truncate: {e}"))?;
+        .map_err(|e| std::io::Error::other(format!("failed to run truncate: {e}")))?;
     if !truncate_status.success() {
-        return Err("truncate failed".to_string());
+        return Err(std::io::Error::other("truncate failed"));
     }
 
     let mkfs_status = std::process::Command::new("mkfs.ext4")
@@ -543,9 +542,9 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, S
         .arg(rootfs_dir)
         .arg(&disk_path)
         .status()
-        .map_err(|e| format!("failed to run mkfs.ext4: {e}"))?;
+        .map_err(|e| std::io::Error::other(format!("failed to run mkfs.ext4: {e}")))?;
     if !mkfs_status.success() {
-        return Err("mkfs.ext4 failed".to_string());
+        return Err(std::io::Error::other("mkfs.ext4 failed"));
     }
 
     Ok(disk_path)
@@ -561,14 +560,14 @@ async fn vm_oci_rootfs_mount_visible() {
     let oci_dir = create_fake_oci_rootfs();
     let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
-    // After OCI setup, guest-agent pivots into the OCI rootfs.
-    let output = match sandbox.exec("/bin/cat", &["/oci-marker.txt"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => panic!("vm_oci_rootfs_mount_visible: VM not running"),
-        Err(Error::Guest(msg)) => {
-            panic!("vm_oci_rootfs_mount_visible: guest communication error: {msg}")
-        }
-        Err(e) => panic!("failed to exec cat in sandbox: {e}"),
+    // After OCI setup, guest-agent pivots into the OCI rootfs. This first exec
+    // boots the lazily started sandbox VM, so it is the op that can surface a
+    // genuine hypervisor absence — gate it as skip-or-fail.
+    let Some(output) = test_artifacts::vm_start_value(
+        sandbox.exec("/bin/cat", &["/oci-marker.txt"]).await,
+        "guest exec cat (oci mount visible)",
+    ) else {
+        return;
     };
 
     assert!(
@@ -590,13 +589,11 @@ async fn vm_oci_rootfs_readonly() {
     let oci_dir = create_fake_oci_rootfs();
     let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
-    let output = match sandbox.exec("/bin/touch", &["/should-write.txt"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => panic!("vm_oci_rootfs_readonly: VM not running"),
-        Err(Error::Guest(msg)) => {
-            panic!("vm_oci_rootfs_readonly: guest communication error: {msg}")
-        }
-        Err(e) => panic!("failed to exec touch in sandbox: {e}"),
+    let Some(output) = test_artifacts::vm_start_value(
+        sandbox.exec("/bin/touch", &["/should-write.txt"]).await,
+        "guest exec touch (oci readonly)",
+    ) else {
+        return;
     };
 
     assert!(
@@ -738,11 +735,12 @@ async fn vm_oci_alpine_os_release() {
     let sandbox = test_artifacts::expect_vm(builder.build(), "oci alpine sandbox build");
 
     // 3. Exec `cat /etc/os-release` — after pivot_root this is alpine's file.
-    let output = match sandbox.exec("/bin/cat", &["/etc/os-release"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => panic!("vm_oci_alpine_os_release: VM not running"),
-        Err(Error::Guest(msg)) => panic!("vm_oci_alpine_os_release: guest error: {msg}"),
-        Err(e) => panic!("exec failed: {e}"),
+    // This first exec boots the lazily started sandbox VM — gate it.
+    let Some(output) = test_artifacts::vm_start_value(
+        sandbox.exec("/bin/cat", &["/etc/os-release"]).await,
+        "guest exec cat (oci alpine os-release)",
+    ) else {
+        return;
     };
 
     eprintln!("--- /etc/os-release ---\n{}", output.stdout_str());

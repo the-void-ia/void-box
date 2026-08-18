@@ -62,18 +62,23 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Arc<Sandbox> {
     test_artifacts::expect_vm(builder.build(), "telemetry sandbox build")
 }
 
-/// Helper: run claudio in a sandbox with given scenario env vars, return parsed result.
+/// Helper: run claudio in a sandbox with given scenario env vars, return the
+/// parsed result. Each caller uses this as its *first* exec, which boots the
+/// lazily started sandbox VM, so the exec is gated: `None` means the host
+/// cannot virtualize and the test must return early (skip).
 async fn run_claudio(
     sandbox: &Sandbox,
     prompt: &str,
-) -> void_box::observe::claude::AgentExecResult {
-    let output = sandbox
-        .exec(
-            "claude-code",
-            &["-p", prompt, "--output-format", "stream-json"],
-        )
-        .await
-        .expect("exec failed");
+) -> Option<void_box::observe::claude::AgentExecResult> {
+    let output = test_artifacts::vm_start_value(
+        sandbox
+            .exec(
+                "claude-code",
+                &["-p", prompt, "--output-format", "stream-json"],
+            )
+            .await,
+        "claudio exec (e2e_telemetry)",
+    )?;
 
     assert!(
         output.success(),
@@ -82,7 +87,7 @@ async fn run_claudio(
         output.stderr_str(),
     );
 
-    parse_stream_json(&output.stdout)
+    Some(parse_stream_json(&output.stdout))
 }
 
 // ===========================================================================
@@ -99,7 +104,9 @@ async fn test_default_scenario() {
     let sandbox = build_test_sandbox();
 
     // --- A) Parse stream-json ---
-    let result = run_claudio(&sandbox, "hello world test").await;
+    let Some(result) = run_claudio(&sandbox, "hello world test").await else {
+        return;
+    };
 
     assert!(
         !result.session_id.is_empty(),
@@ -209,7 +216,12 @@ async fn test_traceparent_propagation() {
     let cfg = setup_test_vm();
 
     cfg.validate().expect("invalid config");
-    let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
+    let Some(mut vm) = test_artifacts::vm_start_value(
+        MicroVm::new(cfg).await,
+        "MicroVm::new (e2e_telemetry traceparent)",
+    ) else {
+        return;
+    };
 
     let trace_id = "aaaabbbbccccddddeeeeffff00001111";
     let span_id = "1234567890abcdef";
@@ -256,7 +268,12 @@ async fn test_telemetry_aggregator() {
     let cfg = setup_test_vm();
 
     cfg.validate().expect("invalid config");
-    let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
+    let Some(mut vm) = test_artifacts::vm_start_value(
+        MicroVm::new(cfg).await,
+        "MicroVm::new (e2e_telemetry aggregator)",
+    ) else {
+        return;
+    };
 
     // Warmup: ensure VM is ready
     test_artifacts::expect_vm(
@@ -327,13 +344,18 @@ async fn test_telemetry_aggregator() {
 async fn test_error_scenario() {
     let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "error")]);
 
-    let output = sandbox
-        .exec(
-            "claude-code",
-            &["-p", "trigger error", "--output-format", "stream-json"],
-        )
-        .await
-        .expect("exec failed");
+    // First exec boots the lazily started sandbox VM — gate it as skip-or-fail.
+    let Some(output) = test_artifacts::vm_start_value(
+        sandbox
+            .exec(
+                "claude-code",
+                &["-p", "trigger error", "--output-format", "stream-json"],
+            )
+            .await,
+        "claudio exec (e2e_telemetry error scenario)",
+    ) else {
+        return;
+    };
 
     let result = parse_stream_json(&output.stdout);
 
@@ -373,7 +395,9 @@ async fn test_error_scenario() {
 async fn test_heavy_scenario() {
     let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "heavy")]);
 
-    let result = run_claudio(&sandbox, "build a complex application").await;
+    let Some(result) = run_claudio(&sandbox, "build a complex application").await else {
+        return;
+    };
 
     assert!(!result.is_error, "heavy scenario should succeed");
     assert!(
@@ -414,7 +438,9 @@ async fn test_heavy_scenario() {
 async fn test_multi_tool_scenario() {
     let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "multi_tool")]);
 
-    let result = run_claudio(&sandbox, "refactor the code").await;
+    let Some(result) = run_claudio(&sandbox, "refactor the code").await else {
+        return;
+    };
 
     assert!(!result.is_error);
     assert_eq!(
@@ -451,13 +477,18 @@ async fn test_configurable_env_overrides() {
         ),
     ]);
 
-    let output = sandbox
-        .exec(
-            "claude-code",
-            &["-p", "combined test", "--output-format", "stream-json"],
-        )
-        .await
-        .expect("exec failed");
+    // First exec boots the lazily started sandbox VM — gate it as skip-or-fail.
+    let Some(output) = test_artifacts::vm_start_value(
+        sandbox
+            .exec(
+                "claude-code",
+                &["-p", "combined test", "--output-format", "stream-json"],
+            )
+            .await,
+        "claudio exec (e2e_telemetry env overrides)",
+    ) else {
+        return;
+    };
 
     let result = parse_stream_json(&output.stdout);
 

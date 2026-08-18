@@ -69,10 +69,13 @@ async fn kvm_real_vm_exec_uname() {
     // Validate early so we fail fast on misconfiguration.
     cfg.validate().expect("invalid VoidBoxConfig for KVM test");
 
-    // Start the micro-VM.
-    let mut vm = MicroVm::new(cfg)
-        .await
-        .expect("failed to create KVM-backed MicroVm");
+    // Start the micro-VM; a genuine hypervisor absence skips, anything else fails.
+    let Some(mut vm) = test_artifacts::vm_start_value(
+        MicroVm::new(cfg).await,
+        "MicroVm::new (kvm_integration uname)",
+    ) else {
+        return;
+    };
 
     // Run uname. On a capable machine a boot or guest-comms failure is a real
     // failure: dump serial output for VmNotRunning, then panic.
@@ -111,10 +114,14 @@ async fn kvm_real_vm_exec_uname() {
 async fn kvm_sandbox_echo_parity() {
     let sandbox = build_local_kvm_sandbox();
 
-    let output = test_artifacts::expect_vm(
+    // First exec boots the lazily started sandbox VM, so it is the op that can
+    // surface a genuine hypervisor absence — gate it as skip-or-fail.
+    let Some(output) = test_artifacts::vm_start_value(
         sandbox.exec("echo", &["hello", "world"]).await,
         "guest exec echo (kvm_integration)",
-    );
+    ) else {
+        return;
+    };
 
     assert!(
         output.success(),
@@ -133,10 +140,12 @@ async fn kvm_sandbox_stdin_pipe() {
     let sandbox = build_local_kvm_sandbox();
 
     let msg = b"hello from stdin over KVM";
-    let output = test_artifacts::expect_vm(
+    let Some(output) = test_artifacts::vm_start_value(
         sandbox.exec_with_stdin("cat", &[], msg).await,
         "guest exec cat (kvm_integration)",
-    );
+    ) else {
+        return;
+    };
 
     assert!(output.success());
     assert_eq!(output.stdout, msg);
@@ -160,13 +169,15 @@ async fn kvm_workflow_pipe_uppercase() {
         .pipe("step1", "step2")
         .build();
 
-    let observed = test_artifacts::expect_vm(
+    let Some(observed) = test_artifacts::vm_start_value(
         workflow
             .observe(ObserveConfig::test())
             .run_in(sandbox)
             .await,
         "workflow run (kvm_integration)",
-    );
+    ) else {
+        return;
+    };
 
     let steps: String = observed
         .result
@@ -219,13 +230,15 @@ async fn kvm_claude_workflow_plan_apply() {
         .output("apply")
         .build();
 
-    let observed = test_artifacts::expect_vm(
+    let Some(observed) = test_artifacts::vm_start_value(
         workflow
             .observe(ObserveConfig::test())
             .run_in(sandbox)
             .await,
         "claude workflow run (kvm_integration)",
-    );
+    ) else {
+        return;
+    };
 
     let steps: String = observed
         .result

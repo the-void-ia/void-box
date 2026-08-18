@@ -81,19 +81,15 @@ fn build_config_with_mount(host_dir: &Path, guest_path: &str, read_only: bool) -
 }
 
 /// Create and start a VM backend with a mount, or `None` when the host
-/// genuinely cannot virtualize (the caller skips). A real boot failure on a
-/// capable host panics inside `vm_start`.
+/// genuinely cannot virtualize (the caller skips) — the skip-or-fail contract
+/// lives on [`test_artifacts::start_backend`].
 async fn create_started_backend_with_mount(
     host_dir: &Path,
     guest_path: &str,
     read_only: bool,
 ) -> Option<Box<dyn VmmBackend>> {
     let config = build_config_with_mount(host_dir, guest_path, read_only);
-    let mut backend = void_box::backend::create_backend();
-    match test_artifacts::vm_start(backend.start(config).await, "backend start (mount)") {
-        test_artifacts::VmStart::Ready => Some(backend),
-        test_artifacts::VmStart::SkipIncapable => None,
-    }
+    test_artifacts::start_backend(config, "backend start (mount)").await
 }
 
 /// Execute a shell command inside the guest, returning the ExecOutput.

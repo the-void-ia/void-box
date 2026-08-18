@@ -83,13 +83,9 @@ async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Option<Box<dyn 
 }
 
 /// Start the backend, or `None` when the host genuinely cannot virtualize (the
-/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+/// caller skips) — the skip-or-fail contract lives on [`test_artifacts::start_backend`].
 async fn start_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
-    let mut backend = void_box::backend::create_backend();
-    match test_artifacts::vm_start(backend.start(config).await, "backend start (sidecar)") {
-        test_artifacts::VmStart::Ready => Some(backend),
-        test_artifacts::VmStart::SkipIncapable => None,
-    }
+    test_artifacts::start_backend(config, "backend start (sidecar)").await
 }
 
 async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
@@ -494,8 +490,15 @@ async fn claudio_discovers_injected_messaging_skill() {
         }
     };
 
-    // Run claudio — it scans skills dir and reports discoveries
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (sidecar)");
+    // Run claudio — it scans skills dir and reports discoveries. `run` boots
+    // the VM, so it is the op that can surface a genuine hypervisor absence —
+    // gate it, stopping the sidecar on a skip.
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "guest run (sidecar)")
+    else {
+        handle.stop().await;
+        return;
+    };
 
     eprintln!("claudio result_text: {}", result.agent_result.result_text);
 
@@ -645,7 +648,13 @@ async fn claudio_discovers_void_mcp_tools() {
         }
     };
 
-    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (sidecar)");
+    // `run` boots the VM — gate it, stopping the sidecar on a skip.
+    let Some(result) =
+        test_artifacts::vm_start_value(ab.run(None, None).await, "guest run (sidecar)")
+    else {
+        handle.stop().await;
+        return;
+    };
 
     eprintln!("claudio result: {}", result.agent_result.result_text);
 
