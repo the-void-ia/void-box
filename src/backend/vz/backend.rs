@@ -258,25 +258,17 @@ fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
     out
 }
 
-/// Whether a Virtualization.framework error means the host itself cannot
-/// virtualize — as opposed to a real configuration or runtime error.
+/// Whether a Virtualization.framework error means the host cannot virtualize at
+/// all, rather than a real config or runtime error.
 ///
-/// Apple surfaces "no hypervisor on this host" as a *configuration-validation*
-/// failure carrying the same `VZError` code as a genuine bad config
-/// (`VZErrorInvalidVirtualMachineConfiguration`), so the code cannot tell them
-/// apart — the message is the only signal. This is the one place that has to
-/// read Apple's message; the backend then raises the typed
-/// [`crate::Error::HypervisorUnavailable`], so callers (the test harness's
-/// capability gate) classify on the error type, never on a string. A real
-/// config bug does not name unavailable hardware, so it fails rather than skips.
+/// Apple reports "no hypervisor" as a config-validation failure with the same
+/// `VZError` code as a genuine bad config, so only the message distinguishes
+/// them. This is the one place that reads that message; the backend then raises
+/// the typed [`crate::Error::HypervisorUnavailable`] so callers classify on the
+/// type. A real config bug does not name unavailable hardware, so it fails.
 fn vz_error_is_hardware_unavailable(e: &objc2_foundation::NSError) -> bool {
-    // `to_string()` is the NSError's `localizedDescription` — the field Apple
-    // populates with this phrase for a hardware-unavailable failure at config
-    // validation (the string the pre-typed classifier already matched, verified
-    // on a virt-less runner). Read it directly, not the richer
-    // `format_vz_ns_error` (which also pulls `localizedFailureReason`), so a
-    // later refactor cannot silently shift which field the skip hinges on. A
-    // real config bug does not name unavailable hardware.
+    // `to_string()` is the localizedDescription, where Apple puts this phrase —
+    // read it directly, not the richer `format_vz_ns_error`.
     e.to_string()
         .contains("Virtualization is not available on this hardware")
 }

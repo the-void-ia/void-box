@@ -1,11 +1,7 @@
-//! Honesty meta-test for the VM-test capability gate.
-//!
-//! The gate must classify a genuine hardware incapability (no hypervisor) as a
-//! skip and every other error — a broken artifact, a boot timeout, a failed RPC
-//! — as a failure, so a real regression on a capable machine can never be
-//! laundered into a green skip. This test runs without a VM: it drives the
-//! `test_artifacts` classifier and `vm_start` directly, so it guards the
-//! invariant even where no VM can boot.
+//! Honesty meta-test for the VM-test capability gate: a genuine incapability
+//! classifies as a skip, every other error as a failure, so a real regression
+//! is never laundered into a green skip. Runs without a VM — it drives the
+//! `test_artifacts` classifier and `vm_start` directly.
 
 #[path = "common/test_artifacts.rs"]
 mod test_artifacts;
@@ -23,11 +19,9 @@ fn recognizes_genuine_hypervisor_absence() {
     )));
 }
 
-/// A real failure must never be read as a capability absence. Classification is
-/// on the error type, so every non-`HypervisorUnavailable` variant is a failure
-/// — a config bug, a boot timeout, a failed RPC, a device error — including any
-/// other `Error::Kvm` ioctl error, which cannot be constructed portably here but
-/// is excluded by construction (only `HypervisorUnavailable` matches).
+/// A real failure must never be read as a capability absence: every
+/// non-`HypervisorUnavailable` variant — a config bug, boot timeout, RPC
+/// failure, device error, or any other `Error::Kvm` — fails, not skips.
 #[test]
 fn real_failures_are_not_capability_absence() {
     let real: [Error; 4] = [

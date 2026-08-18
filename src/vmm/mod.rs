@@ -285,16 +285,11 @@ impl MicroVm {
         )?;
         debug!("Loaded kernel at entry point: {:#x}", entry_point);
 
-        // CID for vsock (must be > 2; 0-2 reserved).
-        //
-        // Mix the process id into the time seed: the CID (and the CID-derived
-        // userspace-vsock socket path) must be unique across VMs that boot
-        // concurrently, and a test runner such as nextest boots each test's VM
-        // in its own process. Time alone collides when two processes read the
-        // clock in the same nanosecond; xoring the pid (rotated into the high
-        // bits) makes distinct processes yield distinct CIDs, while within one
-        // process the nanosecond still differs. A collision would otherwise fail
-        // the vsock bind.
+        // CID for vsock (must be > 2; 0-2 reserved). The CID — and the derived
+        // userspace-vsock socket path — must be unique across VMs booting
+        // concurrently, and nextest boots each test's VM in its own process, so
+        // time alone collides when two read the clock in the same nanosecond.
+        // Xor the pid into the seed so distinct processes get distinct CIDs.
         let cid = config.cid.unwrap_or_else(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             let nanos = SystemTime::now()

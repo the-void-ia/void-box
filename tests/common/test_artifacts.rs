@@ -92,23 +92,17 @@ pub fn expect_vm<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -
 pub enum VmStart {
     /// The backend started; the test proceeds.
     Ready,
-    /// The host itself cannot virtualize (no nested virtualization, or no
-    /// accessible `/dev/kvm`). The caller must `return` — the test skips. Only
-    /// produced when `VOID_BOX_REQUIRE_VM=1` is unset.
+    /// The host cannot virtualize; the caller must `return` (the test skips).
+    /// Only produced when `VOID_BOX_REQUIRE_VM=1` is unset.
     SkipIncapable,
 }
 
-/// Classify a VM backend `start()` result, separating a host that genuinely
-/// cannot virtualize from a real boot failure on a capable host.
-///
-/// The classification is on the error *type*. A
-/// [`void_box::Error::HypervisorUnavailable`] — raised by the backends only
-/// where a hypervisor is genuinely absent — yields [`VmStart::SkipIncapable`],
-/// so the test skips with a loud reason instead of a silent green. Every other
-/// error (a boot timeout, a handshake failure, an RPC error) panics: those occur
-/// on a capable host and must fail. `VOID_BOX_REQUIRE_VM=1` turns even a
-/// capability absence into a failure, so a CI runner asserted capable cannot
-/// launder a lost hypervisor into a skip.
+/// Classify a VM backend `start()` result by error *type*. A
+/// [`void_box::Error::HypervisorUnavailable`] — raised only where a hypervisor
+/// is genuinely absent — yields [`VmStart::SkipIncapable`] (a loud skip); every
+/// other error panics, since those are real failures on a capable host.
+/// `VOID_BOX_REQUIRE_VM=1` makes even a capability absence fail, so a runner
+/// asserted capable cannot launder a lost hypervisor into a skip.
 #[allow(dead_code)]
 pub fn vm_start(result: Result<(), void_box::Error>, context: &str) -> VmStart {
     let Err(err) = result else {
@@ -130,17 +124,13 @@ pub fn vm_start(result: Result<(), void_box::Error>, context: &str) -> VmStart {
     );
 }
 
-/// Whether an error from a VM backend `start()` is a genuine hardware
-/// incapability — matched on the error *type*, not its message.
-///
-/// The backends raise [`void_box::Error::HypervisorUnavailable`] only where a
-/// hypervisor is genuinely absent: the KVM path at the `/dev/kvm` open and the
-/// required-extension check, and the VZ path at config validation when Apple
-/// reports the hardware unavailable. Every other error — a real boot, config, or
-/// RPC failure, including any other `Error::Kvm` ioctl error — is a different
-/// variant, so it fails rather than skips. Matching the variant, not a string,
-/// is what keeps a real aarch64 boot regression (`KVM_ARM_VCPU_INIT` ENOENT,
-/// rendered `KVM error: No such file or directory`) from being read as a skip.
+/// Whether a `start()` error is a genuine hardware incapability, matched on the
+/// error *type*, not its message. The backends raise
+/// [`void_box::Error::HypervisorUnavailable`] only where a hypervisor is absent
+/// (KVM's `/dev/kvm` probe; VZ's config validation on virt-less hardware). Any
+/// other error is a different variant and fails, not skips — matching the
+/// variant rather than a string is what stops a real `Error::Kvm` (e.g. an
+/// aarch64 `KVM_ARM_VCPU_INIT` ENOENT) from being laundered into a skip.
 #[allow(dead_code)]
 pub fn is_capability_absence(err: &void_box::Error) -> bool {
     matches!(err, void_box::Error::HypervisorUnavailable(_))
