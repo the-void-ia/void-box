@@ -9,9 +9,10 @@ mod test_artifacts;
 use test_artifacts::{is_capability_absence, vm_start, vm_start_value, VmStart};
 use void_box::Error;
 
-/// `Error::HypervisorUnavailable` — the variant the backends raise only where a
-/// hypervisor is genuinely absent (KVM's `/dev/kvm` probe, VZ's hardware-not-
-/// available at config validation) — is a capability absence.
+/// `Error::HypervisorUnavailable` — the variant the backends raise only where
+/// no hypervisor is available to the process (KVM's `/dev/kvm` probe on the
+/// absent-device and access-denied errnos, VZ's hardware-not-available at
+/// config validation) — is a capability absence.
 #[test]
 fn recognizes_genuine_hypervisor_absence() {
     assert!(is_capability_absence(&Error::HypervisorUnavailable(

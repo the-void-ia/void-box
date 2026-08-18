@@ -189,10 +189,11 @@ pub async fn start_backend(
     }
 }
 
-/// Whether a `start()` error is a genuine hardware incapability, matched on the
-/// error *type*, not its message. The backends raise
-/// [`void_box::Error::HypervisorUnavailable`] only where a hypervisor is absent
-/// (KVM's `/dev/kvm` probe; VZ's config validation on virt-less hardware). Any
+/// Whether a `start()` error is a genuine capability absence — no hypervisor
+/// available to this process — matched on the error *type*, not its message.
+/// The backends raise [`void_box::Error::HypervisorUnavailable`] only where
+/// that is true (KVM's `/dev/kvm` probe, on the absent-device and
+/// access-denied errnos only; VZ's config validation on virt-less hardware). Any
 /// other error is a different variant and fails, not skips — matching the
 /// variant rather than a string is what stops a real `Error::Kvm` (e.g. an
 /// aarch64 `KVM_ARM_VCPU_INIT` ENOENT) from being laundered into a skip.

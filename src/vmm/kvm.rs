@@ -11,6 +11,23 @@ use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemory
 use crate::vmm::arch::{Arch, CurrentArch};
 use crate::{Error, Result};
 
+/// Classify a failure to open `/dev/kvm`. The device being absent (`ENOENT`,
+/// `ENODEV`, `ENXIO`) or this user being denied access to it (`EACCES`,
+/// `EPERM`) means the host, as configured, cannot run KVM — the capability
+/// absence the VM-test gate is allowed to turn into a skip. Every other errno
+/// (fd exhaustion under concurrent boots, `ENOMEM`, a transient `EINTR`) can
+/// occur on a perfectly capable host, so it stays a regular [`Error::Kvm`] —
+/// classifying it as an absence would let a resource failure skip a test that
+/// must fail.
+fn classify_kvm_open_error(err: kvm_ioctls::Error) -> Error {
+    match err.errno() {
+        libc::ENOENT | libc::ENODEV | libc::ENXIO | libc::EACCES | libc::EPERM => {
+            Error::HypervisorUnavailable(format!("cannot open /dev/kvm: {err}"))
+        }
+        _ => Error::Kvm(err),
+    }
+}
+
 /// Represents a KVM virtual machine.
 pub struct Vm {
     /// KVM system handle
@@ -33,10 +50,9 @@ impl Vm {
     pub fn new(memory_mb: usize) -> Result<Self> {
         let memory_size = (memory_mb as u64) * 1024 * 1024;
 
-        // Open /dev/kvm. A failure here — absent, or not accessible to this
-        // user — is a hypervisor absence, not a boot failure.
-        let kvm = Kvm::new()
-            .map_err(|e| Error::HypervisorUnavailable(format!("cannot open /dev/kvm: {e}")))?;
+        // Open /dev/kvm, classifying the errno: only device-absent or
+        // access-denied means the host cannot virtualize.
+        let kvm = Kvm::new().map_err(classify_kvm_open_error)?;
         debug!("KVM API version: {}", kvm.get_api_version());
 
         // Check required extensions
@@ -254,5 +270,44 @@ mod tests {
         let layout = CurrentArch::memory_layout();
         // RAM start should be valid
         assert!(layout.ram_start < u64::MAX);
+    }
+
+    /// Absent-device and access-denied errnos at the `/dev/kvm` open mean the
+    /// host cannot virtualize — the one signal the VM-test gate may skip on.
+    #[test]
+    fn kvm_open_absence_errnos_classify_as_hypervisor_unavailable() {
+        for errno in [
+            libc::ENOENT,
+            libc::ENODEV,
+            libc::ENXIO,
+            libc::EACCES,
+            libc::EPERM,
+        ] {
+            let classified = classify_kvm_open_error(kvm_ioctls::Error::new(errno));
+            assert!(
+                matches!(classified, Error::HypervisorUnavailable(_)),
+                "errno {errno} must classify as a hypervisor absence, got: {classified}"
+            );
+        }
+    }
+
+    /// Resource and transient errnos at the same open occur on capable hosts
+    /// (e.g. fd exhaustion under concurrent test boots) and must stay real
+    /// failures — never a skip.
+    #[test]
+    fn kvm_open_resource_errnos_stay_real_failures() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EINTR,
+            libc::EIO,
+        ] {
+            let classified = classify_kvm_open_error(kvm_ioctls::Error::new(errno));
+            assert!(
+                matches!(classified, Error::Kvm(_)),
+                "errno {errno} must stay a real failure, not a skip, got: {classified}"
+            );
+        }
     }
 }
