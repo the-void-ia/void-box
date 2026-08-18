@@ -120,6 +120,10 @@ jobs:
           ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present"
 
       - name: Install system packages
+        # apt on a hosted runner can hang; cap this step so an infra stall fails
+        # fast instead of consuming the whole job budget and looking like a test
+        # cancellation.
+        timeout-minutes: 10
         run: |
           sudo apt-get update -qq
           # busybox-static: same reason as e2e.yml — `build_test_image.sh`

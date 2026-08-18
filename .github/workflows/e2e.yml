@@ -67,6 +67,10 @@ jobs:
 
       # ---- System dependencies ----
       - name: Install system packages
+        # apt on a hosted runner can hang; cap this step so an infra stall fails
+        # fast instead of consuming the whole job budget and looking like a test
+        # cancellation.
+        timeout-minutes: 10
         run: |
           sudo apt-get update -qq
           # busybox-static is REQUIRED — `scripts/build_test_image.sh`
