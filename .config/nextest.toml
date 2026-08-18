@@ -6,8 +6,8 @@
 # guest RAM), so how many can run at once is bounded by host RAM and CPU, not by
 # core count. The `vm` test group caps their concurrency; every other test runs
 # at full nextest parallelism. Raising `max-threads` trades wall-clock for peak
-# resource use — too high risks OOM or a failed boot (which now fails honestly,
-# it does not skip), so keep it conservative and tune per runner.
+# resource use — too high risks OOM or a failed boot, so keep it conservative
+# and tune per runner.
 
 [test-groups.vm]
 max-threads = 2
