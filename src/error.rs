@@ -181,10 +181,12 @@ pub enum Error {
     #[error("KVM error: {0}")]
     Kvm(#[from] kvm_ioctls::Error),
 
-    /// The host cannot run a hypervisor at all — a capability absence, not a
-    /// failure. Raised only where that is genuinely true: on Linux/KVM at the
-    /// cold-boot probes (opening `/dev/kvm`, the extension check), so it is
-    /// distinct from an `Error::Kvm` at any other ioctl; on macOS/VZ when
+    /// No hypervisor is available to this process — a capability absence, not
+    /// a failure. Raised only where that is genuinely true: on Linux/KVM when
+    /// opening `/dev/kvm` fails with an errno meaning the device is absent or
+    /// this user is denied access to it (a resource errno like `EMFILE` at the
+    /// same open stays `Error::Kvm`, as does any other ioctl failure), or when
+    /// a required KVM extension is missing; on macOS/VZ when
     /// Virtualization.framework reports the hardware cannot virtualize.
     #[error("hypervisor unavailable: {0}")]
     HypervisorUnavailable(String),
