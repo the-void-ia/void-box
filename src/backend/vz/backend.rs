@@ -258,6 +258,25 @@ fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
     out
 }
 
+/// Whether a Virtualization.framework error means the host itself cannot
+/// virtualize — as opposed to a real configuration or runtime error.
+///
+/// Apple surfaces "no hypervisor on this host" as a *configuration-validation*
+/// failure carrying the same `VZError` code as a genuine bad config
+/// (`VZErrorInvalidVirtualMachineConfiguration`), so the code cannot tell them
+/// apart — the message is the only signal. This is the one place that has to
+/// read Apple's message; the backend then raises the typed
+/// [`crate::Error::HypervisorUnavailable`], so callers (the test harness's
+/// capability gate) classify on the error type, never on a string. A real
+/// config bug does not name unavailable hardware, so it fails rather than skips.
+fn vz_error_is_hardware_unavailable(e: &objc2_foundation::NSError) -> bool {
+    // `to_string()` is the localized description Apple populates for the failure
+    // (verified to carry this phrase on a virt-less runner); a real config bug
+    // does not name unavailable hardware.
+    e.to_string()
+        .contains("Virtualization is not available on this hardware")
+}
+
 /// Reconcile a caller-supplied `BackendConfig` with the saved metadata so the
 /// reconstructed VZ configuration matches the save blob device-for-device.
 ///
@@ -631,10 +650,14 @@ impl VzBackend {
         // we always validate, since the whole operation depends on it.
         unsafe {
             vm_config.validateWithError().map_err(|e| {
-                crate::Error::Backend(format!(
-                    "VZ config validation: {}",
-                    enrich_vz_validation_error(&e.to_string())
-                ))
+                if vz_error_is_hardware_unavailable(&e) {
+                    crate::Error::HypervisorUnavailable(format!("Virtualization.framework: {e}"))
+                } else {
+                    crate::Error::Backend(format!(
+                        "VZ config validation: {}",
+                        enrich_vz_validation_error(&e.to_string())
+                    ))
+                }
             })?;
             if validate_save_restore {
                 vm_config

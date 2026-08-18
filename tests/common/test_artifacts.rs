@@ -101,53 +101,49 @@ pub enum VmStart {
 /// Classify a VM backend `start()` result, separating a host that genuinely
 /// cannot virtualize from a real boot failure on a capable host.
 ///
-/// A capability-absence signal — the hypervisor is unavailable, or `/dev/kvm`
-/// is missing or inaccessible — yields [`VmStart::SkipIncapable`], so
-/// the test skips with a loud reason instead of a silent green. Every other
+/// The classification is on the error *type*. A
+/// [`void_box::Error::HypervisorUnavailable`] — raised by the backends only
+/// where a hypervisor is genuinely absent — yields [`VmStart::SkipIncapable`],
+/// so the test skips with a loud reason instead of a silent green. Every other
 /// error (a boot timeout, a handshake failure, an RPC error) panics: those occur
 /// on a capable host and must fail. `VOID_BOX_REQUIRE_VM=1` turns even a
 /// capability absence into a failure, so a CI runner asserted capable cannot
 /// launder a lost hypervisor into a skip.
 #[allow(dead_code)]
-pub fn vm_start<E: std::fmt::Display>(result: Result<(), E>, context: &str) -> VmStart {
+pub fn vm_start(result: Result<(), void_box::Error>, context: &str) -> VmStart {
     let Err(err) = result else {
         return VmStart::Ready;
     };
-    let message = err.to_string();
     let require_vm = std::env::var("VOID_BOX_REQUIRE_VM").as_deref() == Ok("1");
-    if is_capability_absence(&message) {
+    if is_capability_absence(&err) {
         if require_vm {
-            panic!("{context}: VOID_BOX_REQUIRE_VM=1 but the host cannot virtualize: {message}");
+            panic!("{context}: VOID_BOX_REQUIRE_VM=1 but the host cannot virtualize: {err}");
         }
         eprintln!(
-            "SKIP [{context}]: host cannot run VM tests (capability absent) — {message}. \
+            "SKIP [{context}]: host cannot run VM tests (capability absent) — {err}. \
              Set VOID_BOX_REQUIRE_VM=1 to treat this as a failure."
         );
         return VmStart::SkipIncapable;
     }
     panic!(
-        "{context}: VM operation failed on a capable machine (a real failure, not a skip): {message}"
+        "{context}: VM operation failed on a capable machine (a real failure, not a skip): {err}"
     );
 }
 
-/// Signals that the host itself cannot virtualize — as opposed to a boot or RPC
-/// failure on a capable host. Both are typed capability-absence markers, not
-/// errno guesses: an errno string is unsafe because `Error::Kvm` is raised at
-/// every KVM ioctl, and on aarch64 the same errnos (e.g. ENOENT from
-/// `KVM_ARM_VCPU_INIT` on an unknown feature bit) arise from real boot
-/// regressions that must fail, not skip.
+/// Whether an error from a VM backend `start()` is a genuine hardware
+/// incapability — matched on the error *type*, not its message.
+///
+/// The backends raise [`void_box::Error::HypervisorUnavailable`] only where a
+/// hypervisor is genuinely absent: the KVM path at the `/dev/kvm` open and the
+/// required-extension check, and the VZ path at config validation when Apple
+/// reports the hardware unavailable. Every other error — a real boot, config, or
+/// RPC failure, including any other `Error::Kvm` ioctl error — is a different
+/// variant, so it fails rather than skips. Matching the variant, not a string,
+/// is what keeps a real aarch64 boot regression (`KVM_ARM_VCPU_INIT` ENOENT,
+/// rendered `KVM error: No such file or directory`) from being read as a skip.
 #[allow(dead_code)]
-pub fn is_capability_absence(message: &str) -> bool {
-    const SIGNALS: &[&str] = &[
-        // Linux KVM: `Error::HypervisorUnavailable`, raised only at the cold-boot
-        // probe sites (opening `/dev/kvm`, the extension check). A plain
-        // `KVM error: ...` from any other ioctl is a real failure, not matched.
-        "hypervisor unavailable",
-        // macOS VZ: Apple's hardware-availability message. Config errors take a
-        // different path (`VZ config validation: ...`) and are not matched.
-        "Virtualization is not available on this hardware",
-    ];
-    SIGNALS.iter().any(|signal| message.contains(signal))
+pub fn is_capability_absence(err: &void_box::Error) -> bool {
+    matches!(err, void_box::Error::HypervisorUnavailable(_))
 }
 
 /// Read `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` for the heavy suites that need a

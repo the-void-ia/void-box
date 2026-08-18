@@ -11,44 +11,35 @@
 mod test_artifacts;
 
 use test_artifacts::{is_capability_absence, vm_start, VmStart};
+use void_box::Error;
 
-/// The genuine capability-absence signals are recognized: the typed
-/// `HypervisorUnavailable` marker raised at the `/dev/kvm` probe, and Apple's
-/// hardware-availability message.
+/// `Error::HypervisorUnavailable` — the variant the backends raise only where a
+/// hypervisor is genuinely absent (KVM's `/dev/kvm` probe, VZ's hardware-not-
+/// available at config validation) — is a capability absence.
 #[test]
 fn recognizes_genuine_hypervisor_absence() {
-    // Build the KVM case from the real error type, not a literal, so a change to
-    // the variant's Display that is not mirrored in the classifier's signals
-    // breaks this test — the exact drift it exists to catch.
-    let kvm_absent =
-        void_box::Error::HypervisorUnavailable("cannot open /dev/kvm: Permission denied".into());
-    assert!(is_capability_absence(&kvm_absent.to_string()));
-    // VZ's message is Apple's, surfaced verbatim through `Error::Backend`.
-    assert!(is_capability_absence(
-        "Backend error: VZ config validation: Internal error. \
-         Virtualization is not available on this hardware."
-    ));
+    assert!(is_capability_absence(&Error::HypervisorUnavailable(
+        "cannot open /dev/kvm: Permission denied".into()
+    )));
 }
 
-/// A real failure must never be read as a capability absence. This is the core
-/// anti-laundering invariant: the classifier stays narrow, so a config, boot, or
-/// RPC regression on a capable host fails rather than skips. In particular the
-/// plain `KVM error:` errnos are excluded — on aarch64 `KVM_ARM_VCPU_INIT`
-/// raises ENOENT for an unknown feature bit, a real regression, not a missing
-/// device.
+/// A real failure must never be read as a capability absence. Classification is
+/// on the error type, so every non-`HypervisorUnavailable` variant is a failure
+/// — a config bug, a boot timeout, a failed RPC, a device error — including any
+/// other `Error::Kvm` ioctl error, which cannot be constructed portably here but
+/// is excluded by construction (only `HypervisorUnavailable` matches).
 #[test]
 fn real_failures_are_not_capability_absence() {
-    for message in [
-        "KVM error: Invalid argument (os error 22)",
-        "KVM error: No such file or directory (os error 2)",
-        "KVM error: No such device (os error 19)",
-        "control_channel: deadline reached (connect or handshake)",
-        "Guest communication error: exec timed out after 30s",
-        "Device error: vsock requested but virtio-vsock MMIO backend failed to initialize",
-    ] {
+    let real: [Error; 4] = [
+        Error::Backend("VZ config validation: invalid virtio device".into()),
+        Error::Boot("control channel: deadline reached (connect or handshake)".into()),
+        Error::Guest("exec timed out after 30s".into()),
+        Error::Device("vsock requested but virtio-vsock MMIO backend failed to initialize".into()),
+    ];
+    for err in &real {
         assert!(
-            !is_capability_absence(message),
-            "must be a failure, not a skip: {message}"
+            !is_capability_absence(err),
+            "must be a failure, not a skip: {err}"
         );
     }
 }
@@ -58,22 +49,26 @@ fn real_failures_are_not_capability_absence() {
 #[test]
 #[should_panic(expected = "not a skip")]
 fn real_failure_fails_never_skips() {
-    let result: Result<(), String> =
-        Err("control_channel: deadline reached (connect or handshake)".into());
-    let _ = vm_start(result, "meta");
+    let _ = vm_start(
+        Err(Error::Boot(
+            "control channel: deadline reached (connect or handshake)".into(),
+        )),
+        "meta",
+    );
 }
 
 /// `vm_start` on a genuine incapability skips when `VOID_BOX_REQUIRE_VM` is
-/// unset. Remove the var first so the test holds even if the environment set it;
-/// the failing direction (`REQUIRE_VM=1` fails even here) is exercised by the CI
-/// VM lane, which sets it.
+/// unset. Save and restore the var so the test never leaves the process env
+/// mutated; the failing direction (`REQUIRE_VM=1` fails even here) is exercised
+/// by the CI VM lane, which sets it.
 #[test]
 fn incapability_skips_when_not_required() {
-    // Save and restore the var so the test never leaves the process env mutated.
     let saved = std::env::var("VOID_BOX_REQUIRE_VM").ok();
     std::env::remove_var("VOID_BOX_REQUIRE_VM");
-    let result: Result<(), String> = Err("hypervisor unavailable: no /dev/kvm".into());
-    let outcome = vm_start(result, "meta");
+    let outcome = vm_start(
+        Err(Error::HypervisorUnavailable("no /dev/kvm".into())),
+        "meta",
+    );
     match saved {
         Some(value) => std::env::set_var("VOID_BOX_REQUIRE_VM", value),
         None => std::env::remove_var("VOID_BOX_REQUIRE_VM"),
