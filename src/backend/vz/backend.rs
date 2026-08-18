@@ -270,9 +270,13 @@ fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
 /// capability gate) classify on the error type, never on a string. A real
 /// config bug does not name unavailable hardware, so it fails rather than skips.
 fn vz_error_is_hardware_unavailable(e: &objc2_foundation::NSError) -> bool {
-    // `to_string()` is the localized description Apple populates for the failure
-    // (verified to carry this phrase on a virt-less runner); a real config bug
-    // does not name unavailable hardware.
+    // `to_string()` is the NSError's `localizedDescription` — the field Apple
+    // populates with this phrase for a hardware-unavailable failure at config
+    // validation (the string the pre-typed classifier already matched, verified
+    // on a virt-less runner). Read it directly, not the richer
+    // `format_vz_ns_error` (which also pulls `localizedFailureReason`), so a
+    // later refactor cannot silently shift which field the skip hinges on. A
+    // real config bug does not name unavailable hardware.
     e.to_string()
         .contains("Virtualization is not available on this hardware")
 }
