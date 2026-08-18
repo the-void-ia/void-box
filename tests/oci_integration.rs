@@ -460,7 +460,14 @@ fn create_fake_oci_rootfs() -> tempfile::TempDir {
 /// Build a sandbox that mounts `oci_dir` at `/mnt/oci-rootfs` and sets
 /// `oci_rootfs` in the sandbox config.  Works on both Linux (KVM) and
 /// macOS (VZ) — the `Sandbox::local()` builder picks the right backend.
-fn build_sandbox_with_oci_mount(oci_dir: &std::path::Path, _read_only: bool) -> Arc<Sandbox> {
+/// On Linux the returned guard owns the virtio-blk disk image; the caller
+/// binds it for the test's lifetime (a named `_disk_guard`, not `_`) so the
+/// image is removed on every exit path. On macOS there is no disk and the
+/// guard is `None`.
+fn build_sandbox_with_oci_mount(
+    oci_dir: &std::path::Path,
+    _read_only: bool,
+) -> (Arc<Sandbox>, Option<tempfile::TempDir>) {
     let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut builder = Sandbox::local()
@@ -470,29 +477,43 @@ fn build_sandbox_with_oci_mount(oci_dir: &std::path::Path, _read_only: bool) -> 
         .initramfs(&initramfs);
 
     #[cfg(target_os = "linux")]
-    {
-        let disk = test_artifacts::expect_vm(
+    let disk_guard: Option<tempfile::TempDir> = {
+        let (guard, disk) = test_artifacts::expect_vm(
             build_test_oci_rootfs_disk(oci_dir),
             "build the OCI rootfs disk",
         );
         builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
-    }
+        Some(guard)
+    };
 
     #[cfg(not(target_os = "linux"))]
-    {
+    let disk_guard: Option<tempfile::TempDir> = {
         let mount = MountConfig {
             host_path: oci_dir.to_string_lossy().into_owned(),
             guest_path: "/mnt/oci-rootfs".to_string(),
             read_only: _read_only,
         };
         builder = builder.mount(mount).oci_rootfs("/mnt/oci-rootfs");
-    }
+        None
+    };
 
-    test_artifacts::expect_vm(builder.build(), "oci sandbox build")
+    (
+        test_artifacts::expect_vm(builder.build(), "oci sandbox build"),
+        disk_guard,
+    )
 }
 
+/// Build an ext4 disk image from `rootfs_dir` for the virtio-blk OCI path.
+/// The image lives inside the returned [`tempfile::TempDir`]; the caller holds
+/// that guard for the test's lifetime, so dropping it removes the ≥512 MB
+/// image on every exit path — success, capability skip, and panic unwind
+/// alike — instead of accumulating one per run in `$TMPDIR`. Unlinking is
+/// safe while the VM still holds the backing file open: the inode lives until
+/// the fd closes.
 #[cfg(target_os = "linux")]
-fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, std::io::Error> {
+fn build_test_oci_rootfs_disk(
+    rootfs_dir: &std::path::Path,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
     fn dir_size_bytes(path: &std::path::Path) -> std::io::Result<u64> {
         fn walk(path: &std::path::Path, total: &mut u64) -> std::io::Result<()> {
             for entry in std::fs::read_dir(path)? {
@@ -511,16 +532,12 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, s
         Ok(total)
     }
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let base_tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let disk_path = PathBuf::from(base_tmp).join(format!(
-        "voidbox-oci-test-{}-{}.img",
-        std::process::id(),
-        ts
-    ));
+    // The prefix keeps the artifact recognizable in $TMPDIR listings; the
+    // TempDir's random suffix provides uniqueness across concurrent tests.
+    let disk_dir = tempfile::Builder::new()
+        .prefix("voidbox-oci-test-")
+        .tempdir()?;
+    let disk_path = disk_dir.path().join("oci-rootfs.img");
     let content_size = dir_size_bytes(rootfs_dir).unwrap_or(64 * 1024 * 1024);
     let disk_size = (content_size.saturating_mul(2)).saturating_add(256 * 1024 * 1024);
     let disk_size = disk_size.max(512 * 1024 * 1024);
@@ -547,7 +564,7 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, s
         return Err(std::io::Error::other("mkfs.ext4 failed"));
     }
 
-    Ok(disk_path)
+    Ok((disk_dir, disk_path))
 }
 
 /// Mount a host directory as OCI rootfs and verify the guest can read its files.
@@ -558,7 +575,7 @@ fn build_test_oci_rootfs_disk(rootfs_dir: &std::path::Path) -> Result<PathBuf, s
 #[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
 async fn vm_oci_rootfs_mount_visible() {
     let oci_dir = create_fake_oci_rootfs();
-    let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
+    let (sandbox, _disk_guard) = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
     // After OCI setup, guest-agent pivots into the OCI rootfs. This first exec
     // boots the lazily started sandbox VM, so it is the op that can surface a
@@ -587,7 +604,7 @@ async fn vm_oci_rootfs_mount_visible() {
 #[ignore = "requires VM backend + kernel/initramfs + OCI rootfs"]
 async fn vm_oci_rootfs_readonly() {
     let oci_dir = create_fake_oci_rootfs();
-    let sandbox = build_sandbox_with_oci_mount(oci_dir.path(), true);
+    let (sandbox, _disk_guard) = build_sandbox_with_oci_mount(oci_dir.path(), true);
 
     let Some(output) = test_artifacts::vm_start_value(
         sandbox.exec("/bin/touch", &["/should-write.txt"]).await,
@@ -714,14 +731,17 @@ async fn vm_oci_alpine_os_release() {
         .vcpus(1)
         .kernel(&kernel)
         .initramfs(&initramfs);
+    // The named guard keeps the disk image alive until the test ends (a bare
+    // `_` would drop — and delete — it immediately).
     #[cfg(target_os = "linux")]
-    {
-        let disk = test_artifacts::expect_vm(
+    let _disk_guard = {
+        let (guard, disk) = test_artifacts::expect_vm(
             build_test_oci_rootfs_disk(&rootfs_path),
             "build the OCI rootfs disk for the alpine rootfs",
         );
         builder = builder.oci_rootfs_dev("/dev/vda").oci_rootfs_disk(disk);
-    }
+        guard
+    };
     #[cfg(not(target_os = "linux"))]
     {
         let mount = MountConfig {
