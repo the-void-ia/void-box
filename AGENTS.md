@@ -830,6 +830,8 @@ cargo nextest run --run-ignored only --no-fail-fast \
 
 The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs. It covers every deterministic suite that runs on Linux — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration`. `snapshot_vz_integration` is macOS-only and has no CI lane at all (#158). `e2e_service_mode` and `e2e_agent_mcp` stay out of it: no pull-request runner holds an Anthropic credential, so there they would pass without starting an agent. Run them on your own machine and record the result in the pull request's Local validation block. `.github/workflows/e2e-agent.yml` runs the same pair under `VOID_BOX_REQUIRE_AGENT_CREDS=1`, but by manual dispatch only — every run spends Anthropic API credit, so nothing triggers it automatically.
 
+`skill_pipeline`'s two `--ignored` tests are off the gate for a different reason: they fetch a skill document from a third-party GitHub repository, so they would fail when that repository changes rather than when this one does. `.github/workflows/e2e-external.yml` runs them weekly and on demand. A red result there means the outside world moved.
+
 The explicit-artifact form (env override; still one suite at a time):
 
 ```bash
