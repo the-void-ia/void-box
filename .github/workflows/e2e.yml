@@ -85,13 +85,20 @@ jobs:
           #     → snapshot suite asserts fail, pty `sh -c "exit 42"`
           #     hits the execvp(127) child path.
           # All three failures share this single missing dep.
-          # e2fsprogs + coreutils back the OCI block-rootfs path: the
-          # oci_integration suite shells out to `truncate` and `mkfs.ext4` to
-          # build the ext4 image it attaches as /dev/vda. Both are preinstalled
-          # on the hosted image; listed here so a slimmer runner cannot drop
-          # them silently.
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static \
-            e2fsprogs coreutils
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
+          # `truncate` and `mkfs.ext4` back the OCI block-rootfs path: the
+          # oci_integration suite shells out to both to build the ext4 image it
+          # attaches as /dev/vda. Assert rather than install. Their packages
+          # (coreutils, e2fsprogs) are preinstalled, so installing buys nothing —
+          # and naming coreutils is actively harmful: it is an Essential package,
+          # and any apt plan touching one demands an interactive
+          # "Yes, do as I say!" that -y does not satisfy, so the step hangs
+          # silently under -qq until its timeout. A presence check gives the same
+          # protection against a slimmer runner with no apt involvement.
+          for tool in truncate mkfs.ext4; do
+            command -v "$tool" >/dev/null \
+              || { echo "::error::$tool is missing; oci_integration cannot build its ext4 rootfs"; exit 1; }
+          done
           # Ensure kernel modules are available for the running kernel
           sudo apt-get install -y -qq linux-modules-$(uname -r) || true
           # Resolve the installed busybox path and export it so the build
