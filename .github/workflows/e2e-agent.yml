@@ -98,19 +98,38 @@ jobs:
         with:
           shared-key: e2e-agent
 
-      # `setup_pinned_kernel_modules` bundles the modules of the *pinned*
-      # kernel whenever GITHUB_ACTIONS is set, so the image must boot on that
-      # kernel and not on the runner's own — mismatched vermagic means the vsock
-      # chain never loads and the control channel times out.
+      # This job boots the pinned kernel, not the runner's own, and that is
+      # forced by how the production image is built: `build_claude_rootfs.sh`
+      # calls `setup_pinned_kernel_modules`, which sets VOID_BOX_KMOD_VERSION
+      # whenever GITHUB_ACTIONS is set, so the image bundles modules downloaded
+      # for the version in `scripts/lib/kernel_pin.sh`. Booting those against the
+      # runner's own kernel is a vermagic mismatch: the vsock module chain never
+      # loads and the only symptom is a control-channel timeout much later.
+      #
+      # (The pull-request lane is consistent in the other direction —
+      # `build_test_image.sh` never sets that variable, so its image carries the
+      # host's modules and pairs with the host's kernel.)
       - name: Download the pinned guest kernel
         run: |
-          # `download_kernel.sh` treats an existing OUT_FILE as a cache hit. The
-          # cargo cache restores `target/`, so a kernel left there from before a
-          # `kernel_pin.sh` bump would be paired with modules built for the new
-          # pin — a vermagic mismatch whose only symptom is an opaque control
-          # channel timeout 20 minutes later.
+          # Remove any cached kernel first. `download_kernel.sh` exits early when
+          # its output file already exists, and the cargo cache restores
+          # `target/`, so a kernel from before a `kernel_pin.sh` bump would
+          # otherwise be paired with modules built for the new pin. The download
+          # is small and SHA-256 verified against the pin, so paying it on every
+          # dispatch costs far less than debugging that mismatch once.
           rm -f target/vmlinuz-* target/vmlinux-*
           scripts/download_kernel.sh
+
+          # Export the file the script produced rather than naming one here: it
+          # derives the filename from the host architecture, so a hardcoded name
+          # would silently point at the wrong kernel if this job ever runs
+          # somewhere else.
+          shopt -s nullglob
+          found=(target/vmlinuz-* target/vmlinux-*)
+          shopt -u nullglob
+          [ "${#found[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly one kernel in target/, found ${#found[@]}"; exit 1; }
+          echo "VOID_BOX_KERNEL=$PWD/${found[0]}" >> "$GITHUB_ENV"
 
       - name: Build the production Claude initramfs
         # Hash-pinned claude-code download (scripts/agents/manifest.toml); a
@@ -126,7 +145,6 @@ jobs:
       - name: Run e2e_service_mode
         timeout-minutes: 25
         env:
-          VOID_BOX_KERNEL: target/vmlinuz-amd64
           VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
           VOID_BOX_REQUIRE_VM: "1"
           VOID_BOX_REQUIRE_AGENT_CREDS: "1"
@@ -136,7 +154,6 @@ jobs:
       - name: Run e2e_agent_mcp
         timeout-minutes: 25
         env:
-          VOID_BOX_KERNEL: target/vmlinuz-amd64
           VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
           VOID_BOX_REQUIRE_VM: "1"
           VOID_BOX_REQUIRE_AGENT_CREDS: "1"
