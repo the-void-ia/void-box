@@ -54,6 +54,19 @@ pub struct SplitVirtqueue {
     pub call_fd: RawFd,
 }
 
+/// A guest ring address plus an offset into it, or `None` when the sum leaves
+/// the 64-bit address space.
+///
+/// The base comes from an MMIO register the guest writes with no validation, so
+/// a base near `u64::MAX` is reachable. Plain `+` panics there under
+/// `overflow-checks`, which turns a guest register write into a host VMM crash;
+/// wrapping instead would fold a wild address back onto memory that is mapped.
+/// Rejecting the operation leaves the guest with an unserviced queue, which is
+/// the consequence of the address it programmed.
+fn ring_addr(base: u64, offset: u64) -> Option<GuestAddress> {
+    base.checked_add(offset).map(GuestAddress)
+}
+
 /// A chain of descriptors popped from the available ring.
 pub struct DescriptorChain {
     /// Index of the head descriptor (needed for push_used).
@@ -84,21 +97,43 @@ impl SplitVirtqueue {
         }
     }
 
+    /// Whether the guest has configured this queue with a usable size.
+    ///
+    /// `num` is whatever the guest last wrote to the `QueueNum` MMIO register,
+    /// and a device activates a queue as soon as `QueueReady` is set — neither
+    /// step validates the value. Zero is therefore reachable from the guest, and
+    /// every ring index here is computed modulo `num`, so the ring math must not
+    /// run until this holds.
+    fn is_configured(&self) -> bool {
+        self.num != 0
+    }
+
     /// Check if there are available descriptors to process.
     pub fn has_avail(&self, mem: &GuestMemoryMmap) -> bool {
+        if !self.is_configured() {
+            return false;
+        }
         // avail->idx is at avail_ring_addr + 2
-        let avail_idx: u16 = mem
-            .read_obj(GuestAddress(self.avail_ring_addr + 2))
-            .unwrap_or(self.last_avail_idx);
+        let Some(idx_addr) = ring_addr(self.avail_ring_addr, 2) else {
+            return false;
+        };
+        let avail_idx: u16 = mem.read_obj(idx_addr).unwrap_or(self.last_avail_idx);
         avail_idx != self.last_avail_idx
     }
 
     /// Pop the next available descriptor chain from the queue.
     ///
-    /// Returns `None` if no descriptors are available.
+    /// Returns `None` if no descriptors are available, if the guest has not
+    /// configured a queue size, or if the ring addresses it programmed do not
+    /// address readable memory.
     pub fn pop_avail(&mut self, mem: &GuestMemoryMmap) -> Option<DescriptorChain> {
+        if !self.is_configured() {
+            warn!("virtqueue: pop on a queue whose size the guest left at 0");
+            return None;
+        }
+
         // Read avail->idx (u16 at offset 2 in the available ring)
-        let avail_idx: u16 = mem.read_obj(GuestAddress(self.avail_ring_addr + 2)).ok()?;
+        let avail_idx: u16 = mem.read_obj(ring_addr(self.avail_ring_addr, 2)?).ok()?;
 
         if avail_idx == self.last_avail_idx {
             return None;
@@ -107,7 +142,7 @@ impl SplitVirtqueue {
         // Read the descriptor index from avail->ring[last_avail_idx % num]
         let ring_offset = 4 + (self.last_avail_idx % self.num) as u64 * 2;
         let head_index: u16 = mem
-            .read_obj(GuestAddress(self.avail_ring_addr + ring_offset))
+            .read_obj(ring_addr(self.avail_ring_addr, ring_offset)?)
             .ok()?;
 
         // Walk the descriptor chain
@@ -120,12 +155,23 @@ impl SplitVirtqueue {
                 warn!("virtqueue: descriptor chain too long (loop?)");
                 break;
             }
+            // A descriptor index at or past the queue size is outside the table
+            // the guest allocated. Reading there would interpret whatever
+            // happens to follow it as a descriptor.
+            if idx >= self.num {
+                warn!(
+                    "virtqueue: descriptor index {idx} is outside the {}-entry table",
+                    self.num
+                );
+                break;
+            }
 
-            let desc_addr = self.desc_table_addr + idx as u64 * 16;
-            let addr: u64 = mem.read_obj(GuestAddress(desc_addr)).ok()?;
-            let len: u32 = mem.read_obj(GuestAddress(desc_addr + 8)).ok()?;
-            let flags: u16 = mem.read_obj(GuestAddress(desc_addr + 12)).ok()?;
-            let next: u16 = mem.read_obj(GuestAddress(desc_addr + 14)).ok()?;
+            // `idx as u64 * 16` cannot overflow: a u16 index times 16 fits u64.
+            let desc_base = self.desc_table_addr.checked_add(idx as u64 * 16)?;
+            let addr: u64 = mem.read_obj(ring_addr(desc_base, 0)?).ok()?;
+            let len: u32 = mem.read_obj(ring_addr(desc_base, 8)?).ok()?;
+            let flags: u16 = mem.read_obj(ring_addr(desc_base, 12)?).ok()?;
+            let next: u16 = mem.read_obj(ring_addr(desc_base, 14)?).ok()?;
 
             descriptors.push(VirtqDesc {
                 addr,
@@ -153,19 +199,38 @@ impl SplitVirtqueue {
     ///
     /// `head_index` is the descriptor chain head from `pop_avail`.
     /// `len` is the number of bytes written to the descriptor chain.
+    ///
+    /// A queue the guest left unconfigured, or a used-ring address that does not
+    /// address writable memory, drops the completion: the guest gets no used
+    /// entry for a request it made with a ring it never set up.
     pub fn push_used(&mut self, mem: &GuestMemoryMmap, head_index: u16, len: u32) {
+        if !self.is_configured() {
+            warn!("virtqueue: used-ring push on a queue whose size the guest left at 0");
+            return;
+        }
+
         // used->ring[last_used_idx % num] = { id: head_index, len }
         let ring_offset = 4 + (self.last_used_idx % self.num) as u64 * 8;
-        let used_elem_addr = self.used_ring_addr + ring_offset;
+        let (Some(used_elem_addr), Some(used_len_addr), Some(used_idx_addr)) = (
+            ring_addr(self.used_ring_addr, ring_offset),
+            ring_addr(self.used_ring_addr, ring_offset + 4),
+            ring_addr(self.used_ring_addr, 2),
+        ) else {
+            warn!(
+                "virtqueue: used ring at {:#x} overflows the address space",
+                self.used_ring_addr
+            );
+            return;
+        };
 
         // Write used element (id: u32, len: u32)
-        let _ = mem.write_obj(head_index as u32, GuestAddress(used_elem_addr));
-        let _ = mem.write_obj(len, GuestAddress(used_elem_addr + 4));
+        let _ = mem.write_obj(head_index as u32, used_elem_addr);
+        let _ = mem.write_obj(len, used_len_addr);
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         // Update used->idx
-        let _ = mem.write_obj(self.last_used_idx, GuestAddress(self.used_ring_addr + 2));
+        let _ = mem.write_obj(self.last_used_idx, used_idx_addr);
 
         trace!(
             "virtqueue: pushed used head={} len={} used_idx={}",
@@ -277,6 +342,67 @@ mod tests {
         let len: u32 = mem.read_obj(GuestAddress(used_ring + 8)).unwrap();
         assert_eq!(id, 5);
         assert_eq!(len, 128);
+    }
+
+    /// A guest that sets `QueueReady` without ever writing `QueueNum` leaves
+    /// `num` at 0. Every ring index is computed modulo `num`, so this used to
+    /// panic the VMM process on the first kick.
+    #[test]
+    fn zero_queue_size_is_inert_rather_than_fatal() {
+        let mem = setup_test_memory();
+        let avail_ring = 0x2000u64;
+        // A non-zero avail->idx, so the "nothing available" early return cannot
+        // be what saves us.
+        mem.write_obj(1u16, GuestAddress(avail_ring + 2)).unwrap();
+
+        let mut vq = SplitVirtqueue::new(0, 0x1000, avail_ring, 0x3000, -1, -1);
+        assert!(!vq.has_avail(&mem));
+        assert!(vq.pop_avail(&mem).is_none());
+        vq.push_used(&mem, 0, 0);
+        assert_eq!(
+            vq.last_used_idx, 0,
+            "no used entry for an unconfigured queue"
+        );
+    }
+
+    /// Ring addresses come from unvalidated MMIO writes, so a base near the top
+    /// of the address space is reachable. The offset arithmetic must reject it
+    /// rather than overflow.
+    #[test]
+    fn ring_addresses_near_the_top_of_memory_do_not_overflow() {
+        let mem = setup_test_memory();
+        let mut vq = SplitVirtqueue::new(256, u64::MAX, u64::MAX, u64::MAX, -1, -1);
+        assert!(!vq.has_avail(&mem));
+        assert!(vq.pop_avail(&mem).is_none());
+        vq.push_used(&mem, 0, 0);
+        assert_eq!(vq.last_used_idx, 0);
+    }
+
+    /// A descriptor index at or past the queue size points outside the table the
+    /// guest allocated; following it would read whatever happens to sit there.
+    #[test]
+    fn descriptor_index_past_the_queue_size_ends_the_walk() {
+        let mem = setup_test_memory();
+        let desc_table = 0x1000u64;
+        let avail_ring = 0x2000u64;
+
+        // Descriptor 0 chains (NEXT) to descriptor 9, one past a 2-entry queue.
+        mem.write_obj(0x4000u64, GuestAddress(desc_table)).unwrap();
+        mem.write_obj(64u32, GuestAddress(desc_table + 8)).unwrap();
+        mem.write_obj(VRING_DESC_F_NEXT, GuestAddress(desc_table + 12))
+            .unwrap();
+        mem.write_obj(9u16, GuestAddress(desc_table + 14)).unwrap();
+
+        mem.write_obj(1u16, GuestAddress(avail_ring + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(avail_ring + 4)).unwrap();
+
+        let mut vq = SplitVirtqueue::new(2, desc_table, avail_ring, 0x3000, -1, -1);
+        let chain = vq.pop_avail(&mem).expect("head descriptor is in range");
+        assert_eq!(
+            chain.descriptors.len(),
+            1,
+            "the out-of-range NEXT must not be followed"
+        );
     }
 
     #[test]
