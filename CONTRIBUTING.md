@@ -19,7 +19,7 @@ Thank you for your interest in contributing to void-box! This document provides 
 
 ### Prerequisites
 
-- Rust 1.83 or later
+- Rust 1.88 or later (the `rust-version` pinned in `Cargo.toml`; CI's MSRV jobs build with exactly that toolchain)
 - `cpio` and `gzip` for initramfs creation
 
 Linux (KVM/E2E):
@@ -99,21 +99,25 @@ mkdir -p "$TMPDIR"
 cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
 
-# Include ignored/VM tests (Linux or macOS with artifacts available)
-export VOID_BOX_KERNEL=/path/to/vmlinuz
-export VOID_BOX_INITRAMFS=/path/to/rootfs.cpio.gz
-cargo test --workspace --all-targets -- --include-ignored
+# VM suites (`--ignored`) auto-provision the pinned kernel and test initramfs
+# into target/ on first run — no env vars needed. An explicit VOID_BOX_KERNEL /
+# VOID_BOX_INITRAMFS override still wins. On a machine you believe can
+# virtualize, set VOID_BOX_REQUIRE_VM=1 so a capability skip becomes a failure
+# instead of hiding.
 
-# Targeted VM suites (generic guest image)
-cargo test --test conformance -- --ignored --test-threads=1
-cargo test --test oci_integration -- --ignored --test-threads=1
+# Targeted VM suites, one at a time:
+VOID_BOX_REQUIRE_VM=1 cargo test --test conformance -- --ignored --test-threads=1
+VOID_BOX_REQUIRE_VM=1 cargo test --test oci_integration -- --ignored --test-threads=1
+VOID_BOX_REQUIRE_VM=1 cargo test --test e2e_telemetry -- --ignored --test-threads=1
+VOID_BOX_REQUIRE_VM=1 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
-# Claudio-based deterministic E2E suites (requires test initramfs)
-./scripts/build_test_image.sh
-export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
-cargo test --test e2e_telemetry -- --ignored --test-threads=1
-cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+# Every VM suite with bounded parallelism (two concurrent boots — the `vm`
+# test group in .config/nextest.toml):
+VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
+  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
+
+The heavy agent suites (`e2e_agent_mcp`, `e2e_service_mode`) are the exception: they need a staged production image via `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` and skip when it is absent — see `AGENTS.md#testing`.
 
 Note: `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`).
 
@@ -211,8 +215,10 @@ Create a new area label only when a third open issue would use it; until then, a
    - How does it work?
    - Are there any breaking changes?
 5. **Link related issues** in the PR description
-6. **Run relevant ignored suites** when touching VM/OCI/runtime behavior, and mention results in the PR
+6. **Run relevant ignored suites** when touching VM/OCI/runtime behavior, and record what you validated in the template's `Local validation` block (host, VM suites booted or the skip reason, bench delta, review outcomes) — the approver reads that block and checks CI separately
 7. **Respond to review feedback** promptly
+
+A branch ruleset enforces the required status checks on `main`: the CI matrix (format, lint, tests, build, docs, and MSRV across the supported platforms), the security audit, the CodeQL analyses, and the E2E lanes must be green before a PR can merge. The authoritative check list lives in the repo's branch rulesets (Settings → Rules), not in the repo tree. If you rename a CI job, that list must be updated in the same change, or the renaming PR blocks itself waiting for the old check name.
 
 ## AI Agent Skills
 

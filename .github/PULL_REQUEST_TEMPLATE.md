@@ -46,6 +46,17 @@ Related to #
 
 ```
 
+## Local validation
+
+<!-- What you validated on your own machine — the approver checks CI separately.
+     Fill each line; keep the alternative that applies. -->
+
+- Host: <os/arch>
+- VM suites: booted (<suites>) | skipped (<no KVM | no Mac>)
+- Perf bench: <cold/warm p50 delta vs base> on <machine> | not run (<reason>)
+- Security review: <agent/model; …> — <findings, each fixed | dismissed (reason)> | none (<reason>)
+- Perf review: <agent/model; …> — <findings, each fixed | dismissed (reason)> | none (<reason>)
+
 ## Documentation
 
 - [ ] Updated inline code documentation
