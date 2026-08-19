@@ -1,0 +1,129 @@
+name: E2E Agent (credentialed)
+
+# The two RFC-0004 M1 suites a pull-request runner cannot run. Both need a real
+# agent credential on top of a VM: `e2e_service_mode` drives a Claude agent
+# through the daemon's service lifecycle, and `e2e_agent_mcp` checks that Claude
+# Code discovers the void-mcp tools and emits intents the sidecar receives. A
+# fork PR never sees a repository secret, so on the PR lane both would print a
+# skip line and report green without starting an agent. They run here instead,
+# under VOID_BOX_REQUIRE_AGENT_CREDS=1, so a missing or rotated key fails this
+# job rather than passing it.
+#
+# Manual dispatch only, and not a required status check. Every run boots a 3 GB
+# guest and spends Anthropic API credit, so nothing here fires on a schedule or
+# on a push — a maintainer triggers it before a release, or after a change to
+# service mode, the sidecar, or void-mcp. Day to day these suites run on a
+# contributor's machine and the result goes in the pull request's Local
+# validation block.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Read-only token: this workflow only runs tests.
+permissions:
+  contents: read
+
+# One run at a time. A queued duplicate would spend API credit for nothing.
+concurrency:
+  group: e2e-agent
+  cancel-in-progress: false
+
+jobs:
+  e2e-agent:
+    name: E2E Agent (Ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The production image is ~100 MB compressed and stages a far larger
+      # rootfs; the hosted image's default free space does not hold it
+      # alongside the cargo target dir. Same reclaim the PR lane uses.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
+      # Fail before the ~20-minute image build rather than after it: an absent
+      # secret is a configuration error, and VOID_BOX_REQUIRE_AGENT_CREDS=1
+      # would only surface it once the suites already booted a VM.
+      - name: Require the Anthropic credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set for this repository. Add it under Settings → Secrets and variables → Actions, or run these suites locally per AGENTS.md."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is present (${#ANTHROPIC_API_KEY} chars)."
+
+      - name: Enable KVM access
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sudo modprobe vhost_vsock || true
+          sudo chmod a+rw /dev/vhost-vsock 2>/dev/null || true
+          ls -la /dev/kvm
+          ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present (may be built-in)"
+
+      - name: Install system packages
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
+          BUSYBOX_PATH="$(command -v busybox)"
+          test -n "$BUSYBOX_PATH" \
+            || { echo "::error::busybox not on PATH after busybox-static install"; exit 1; }
+          echo "BUSYBOX=$BUSYBOX_PATH" >> "$GITHUB_ENV"
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: e2e-agent
+
+      # `setup_pinned_kernel_modules` bundles the modules of the *pinned*
+      # kernel whenever GITHUB_ACTIONS is set, so the image must boot on that
+      # kernel and not on the runner's own — mismatched vermagic means the vsock
+      # chain never loads and the control channel times out.
+      - name: Download the pinned guest kernel
+        run: scripts/download_kernel.sh
+
+      - name: Build the production Claude initramfs
+        # Hash-pinned claude-code download (scripts/agents/manifest.toml); a
+        # digest mismatch fails the build.
+        run: scripts/build_claude_rootfs.sh
+
+      - name: Run e2e_service_mode
+        timeout-minutes: 25
+        env:
+          VOID_BOX_KERNEL: target/vmlinuz-amd64
+          VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
+          VOID_BOX_REQUIRE_VM: "1"
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test e2e_service_mode -- --ignored --test-threads=1 --nocapture
+
+      - name: Run e2e_agent_mcp
+        timeout-minutes: 25
+        env:
+          VOID_BOX_KERNEL: target/vmlinuz-amd64
+          VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
+          VOID_BOX_REQUIRE_VM: "1"
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture

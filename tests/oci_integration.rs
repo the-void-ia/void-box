@@ -689,11 +689,14 @@ fn example_spec_oci_skills() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Group 4: Real OCI image E2E (pull alpine:3.20, pivot_root, exec in guest)
 //
-// These tests pull a real OCI image from Docker Hub, mount it as rootfs in a
-// KVM/VZ micro-VM, and verify that `pivot_root` works — the guest's `/` is
-// the OCI image, not the initramfs.
+// These tests pull a real OCI image from Docker Hub. `vm_oci_alpine_os_release`
+// mounts it as rootfs in a KVM/VZ micro-VM and verifies that `pivot_root` works
+// — the guest's `/` is the OCI image, not the initramfs.
+// `oci_client_resolves_alpine_rootfs_into_cache` covers the host-side pull and
+// extract on its own, with no VM.
 //
-// Requirements: VM backend + kernel/initramfs + **network** (image pull).
+// Requirements: **network** (image pull), plus a VM backend and
+// kernel/initramfs for the boot tests.
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Pull alpine:3.20, boot a VM with pivot_root, and exec `cat /etc/os-release`.
@@ -778,20 +781,20 @@ async fn vm_oci_alpine_os_release() {
     );
 }
 
-/// YAML spec with `sandbox.image` resolves the OCI image via `run_file()`.
+/// A `kind: workflow` spec carrying `sandbox.image` runs end to end in mock mode.
 ///
-/// This verifies the YAML → runtime path that `voidbox run --file spec.yaml`
-/// uses: spec parsing → `resolve_oci_base_image()` → extracted rootfs exists
-/// on disk. The workflow runs in mock mode to avoid the vsock timing
-/// sensitivity of OCI pivot_root boots (the real VM path is covered by
-/// `vm_oci_alpine_os_release` above).
+/// Mock mode deliberately skips OCI resolution: `run_workflow` gates the whole
+/// `resolve_oci_base_image` → `resolve_oci_rootfs_plan` chain on
+/// `uses_mock_sandbox`, so a mock run never pulls an image it has no guest to
+/// mount it in. What this pins is that `sandbox.image` on a mock spec is
+/// accepted rather than rejected, and that the steps still run. The resolution
+/// path itself is covered by `oci_client_resolves_alpine_rootfs_into_cache`
+/// (host side, no VM) and `vm_oci_alpine_os_release` (full boot).
+///
+/// No network and no VM: mock mode resolves neither the guest image nor the
+/// OCI image, so this runs in a plain `cargo test`.
 #[tokio::test]
-#[ignore = "requires network (pulls alpine:3.20)"]
-async fn runtime_run_file_resolves_oci_image() {
-    // Write a workflow YAML that references an OCI image but uses mock mode.
-    // run_file will call resolve_oci_base_image("alpine:3.20") which pulls
-    // and extracts the image, then build_shared_sandbox creates a mock sandbox
-    // (mock mode ignores OCI mounts but the resolution still happens).
+async fn runtime_run_file_accepts_oci_image_in_mock_mode() {
     let yaml = r#"
 api_version: v1
 kind: workflow
@@ -813,14 +816,12 @@ workflow:
     std::fs::write(&spec_path, yaml).unwrap();
 
     // Mock mode: no VM is booted, so there is no capability to gate on and any
-    // error is a real regression in the spec → OCI-resolution path.
+    // error is a real regression in the spec → runtime path.
     let report = void_box::runtime::run_file(&spec_path, None, None, None, None, None, None)
         .await
         .expect("run_file");
 
     // The mock sandbox's echo returns "resolved-ok\n".
-    // The important part is that run_file succeeded, which means
-    // resolve_oci_base_image("alpine:3.20") completed without error.
     assert!(
         report.success,
         "workflow should succeed: output={:?}",
@@ -831,15 +832,50 @@ workflow:
         "expected probe output, got: {}",
         report.output
     );
+}
 
-    // Verify the OCI rootfs was actually extracted to the cache.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let cache_dir = PathBuf::from(home).join(".voidbox/oci");
+/// Pull and extract `alpine:3.20` into a cache directory this test owns, then
+/// resolve it again and get the same path back.
+///
+/// The cache lives in a `tempfile::TempDir`, so the first call is always a cold
+/// pull and the second is always a warm hit — the assertions hold on a machine
+/// that has never seen the image and on one that ran the suite a hundred times.
+/// A test that reads the shared `~/.voidbox/oci` cache instead would pass or
+/// fail on leftover state from an earlier run.
+#[tokio::test]
+#[ignore = "requires network (pulls alpine:3.20)"]
+async fn oci_client_resolves_alpine_rootfs_into_cache() {
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let client = voidbox_oci::OciClient::new(cache_dir.path().to_path_buf());
+
+    // A pull/extract failure is a real regression in the OCI path, not a reason
+    // to skip: this test is `--ignored`, so it only runs where network is
+    // expected.
+    let rootfs = client
+        .resolve_rootfs("alpine:3.20")
+        .await
+        .expect("pull and extract alpine:3.20");
+
     assert!(
-        cache_dir.exists(),
-        "OCI cache dir should exist at {}",
-        cache_dir.display()
+        rootfs.starts_with(cache_dir.path()),
+        "extracted rootfs {} should live under the cache dir {}",
+        rootfs.display(),
+        cache_dir.path().display()
     );
+
+    let os_release = std::fs::read_to_string(rootfs.join("etc/os-release"))
+        .expect("extracted rootfs should contain etc/os-release");
+    assert!(
+        os_release.contains("Alpine"),
+        "expected Alpine in the extracted /etc/os-release, got: {os_release}"
+    );
+
+    // Second resolve: served from the cache, same path, no re-extract.
+    let cached = client
+        .resolve_rootfs("alpine:3.20")
+        .await
+        .expect("cached resolve should succeed");
+    assert_eq!(rootfs, cached);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

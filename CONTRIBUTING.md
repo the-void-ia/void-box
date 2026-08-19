@@ -117,7 +117,7 @@ VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
   -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
 
-The heavy agent suites (`e2e_agent_mcp`, `e2e_service_mode`) are the exception: they need a staged production image via `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` and skip when it is absent — see `AGENTS.md#testing`.
+The heavy agent suites (`e2e_agent_mcp`, `e2e_service_mode`) are the exception: they need a staged production image via `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` and a real Anthropic credential, and skip when either is absent — see `AGENTS.md#testing`. Set `VOID_BOX_REQUIRE_AGENT_CREDS=1` once you have staged a key so the credential skip fails instead. They are the only VM suites CI's pull-request lane does not run, because no pull-request runner holds a credential — run them yourself and record the result in the `Local validation` block. `.github/workflows/e2e-agent.yml` runs the same pair, by manual dispatch only, since every run spends Anthropic API credit.
 
 Note: `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`).
 

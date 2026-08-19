@@ -812,6 +812,8 @@ cargo test --doc --workspace --all-features
 
 Ignored/VM suites. The deterministic suites auto-provision the pinned kernel and test initramfs into `target/` on first run, so `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` need not be set — an explicit override still wins (ADR-0011). The heavy agent suites `e2e_agent_mcp` and `e2e_service_mode` are the exception: they need a staged production image via those env vars and skip when it is absent. On a machine that genuinely cannot virtualize the suites skip loudly, but the reason prints only with `--nocapture`; on a machine you believe is capable, set `VOID_BOX_REQUIRE_VM=1` so a skip becomes a failure and nothing hides. A real boot or RPC failure always fails.
 
+The two agent suites skip a second way: they also need a real Anthropic credential, and without one they print a skip and pass. Set `VOID_BOX_REQUIRE_AGENT_CREDS=1` when you have staged a key, and that skip becomes a failure too. The variable is separate from `VOID_BOX_REQUIRE_VM=1` because the Linux CI lane asserts VM capability while holding no credential — it must keep skipping the agent suites without laundering a lost key into a pass.
+
 To run the VM suites with bounded parallelism instead of one at a time, use nextest — each VM-booting binary joins the `vm` test group in `.config/nextest.toml`, capped at two concurrent boots. This runs every VM suite locally on a capable machine:
 
 ```bash
@@ -819,7 +821,7 @@ VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
   -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
 
-The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs.
+The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs. It covers every deterministic suite — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration`. `e2e_service_mode` and `e2e_agent_mcp` stay out of it: no pull-request runner holds an Anthropic credential, so there they would pass without starting an agent. Run them on your own machine and record the result in the pull request's Local validation block. `.github/workflows/e2e-agent.yml` runs the same pair under `VOID_BOX_REQUIRE_AGENT_CREDS=1`, but by manual dispatch only — every run spends Anthropic API credit, so nothing triggers it automatically.
 
 The explicit-artifact form (env override; still one suite at a time):
 
@@ -841,10 +843,13 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
-
-# Service mode + sidecar + MCP e2e suites:
-cargo test --test e2e_service_mode -- --ignored --test-threads=1
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
+
+# Agent suites — production image plus a real credential:
+scripts/build_claude_rootfs.sh
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
+export VOID_BOX_REQUIRE_AGENT_CREDS=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_service_mode -- --ignored --test-threads=1
 ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
@@ -968,9 +973,17 @@ cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
 
-# Service mode + sidecar + MCP e2e suites (Linux-only):
-cargo test --test e2e_service_mode -- --ignored --test-threads=1
+# Sidecar (Linux-only, deterministic — runs in CI):
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
+
+# Agent suites (Linux-only). These need the production image and a real
+# credential, and no CI pull-request runner has one, so run them here.
+# VOID_BOX_REQUIRE_AGENT_CREDS=1 turns a missing credential into a failure
+# instead of a green skip.
+scripts/build_claude_rootfs.sh
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
+export VOID_BOX_REQUIRE_AGENT_CREDS=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_service_mode -- --ignored --test-threads=1
 ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
@@ -1237,6 +1250,10 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 
 - `conformance`: command execution, lifecycle, streaming, filesystem primitives.
 - `oci_integration`: image pull/extract, rootfs mounting, readonly invariants.
+- `kvm_integration`: direct `MicroVm` and `Sandbox::local()` boots over the real
+  vsock + guest-agent path, without the backend abstraction in between.
+- `telemetry`: `TelemetryBatch` wire format, host-side `TelemetryAggregator`,
+  and a subscribed telemetry stream from a booted guest.
 - `snapshot_integration`: cold snapshot capture, vCPU state persistence
   (including XCR0/xsave), restore pipeline, exec on restored VM, VM stop
   after restore. **Must pass** for any changes to snapshot, restore, vCPU,
@@ -1252,16 +1269,24 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
   pre-existing content, empty dirs.
 - `e2e_service_mode`: service lifecycle — output publication while running,
   graceful stop, exit status mapping. **Must pass** for changes to service mode,
-  daemon service lifecycle, or `ServiceStageHandle`.
+  daemon service lifecycle, or `ServiceStageHandle`. Needs the production image
+  and a real credential, so it runs locally — or by manual dispatch of
+  `e2e-agent.yml` — never on the pull-request lane.
 - `e2e_sidecar`: sidecar intent flow — submit, inbox polling, context identity,
   idempotency. **Must pass** for changes to sidecar state, types, or server.
 - `e2e_agent_mcp`: end-to-end agent (currently Claude Code) with void-mcp
   tools inside a real VM. void-mcp itself is agent-agnostic; the test
   uses Claude as the consumer because it's the only LlmProvider wired to
   consume MCP today. Requires `ANTHROPIC_API_KEY`. **Must pass** for
-  changes to void-mcp tools or MCP provisioning.
+  changes to void-mcp tools or MCP provisioning. Same placement as
+  `e2e_service_mode`: local, or a manual dispatch of `e2e-agent.yml`.
 
-If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
+Only a genuine hypervisor absence skips a VM suite — the typed
+`Error::HypervisorUnavailable` from the `/dev/kvm` probe, or VZ reporting
+virt-less hardware (ADR-0011). Everything else fails, including an absent
+network: `oci_integration` pulls `alpine:3.20` and the published guest image, so
+on a machine with no outbound network those tests fail rather than skip. Run
+them where the network is.
 
 ## Guest image build scripts
 
@@ -1300,8 +1325,8 @@ Which image for which test suite:
 |---|---|
 | `cargo test --workspace` (unit tests) | None (no VM) |
 | `conformance`, `oci_integration` | `build_guest_image.sh` → `/tmp/void-box-rootfs.cpio.gz` |
-| `snapshot_integration`, `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_mount`, `e2e_service_mode`, `e2e_sidecar` | `build_test_image.sh` → `/tmp/void-box-test-rootfs.cpio.gz` |
-| `e2e_agent_mcp` (real Claude + MCP) | `build_claude_rootfs.sh` → `target/void-box-claude.cpio.gz` |
+| `snapshot_integration`, `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_mount`, `e2e_sidecar` | `build_test_image.sh` → `/tmp/void-box-test-rootfs.cpio.gz` |
+| `e2e_service_mode`, `e2e_agent_mcp` (real Claude + MCP) | `build_claude_rootfs.sh` → `target/void-box-claude.cpio.gz` |
 | Codex e2e (manual gate) | `build_codex_rootfs.sh` → `target/void-box-codex.cpio.gz` |
 
 ## VM memory sizing

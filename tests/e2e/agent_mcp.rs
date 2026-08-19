@@ -9,16 +9,21 @@
 //!    so the sidecar receives zero intents and the test's
 //!    `assert!(!drained.is_empty())` always fails). Build the right
 //!    initramfs with `scripts/build_claude_rootfs.sh` (writes to
-//!    `target/void-box-rootfs.cpio.gz`).
+//!    `target/void-box-claude.cpio.gz`).
 //! 2. ANTHROPIC_API_KEY environment variable set
 //! 3. Network access to api.anthropic.com from the host
 //!
 //! Run with:
 //!   scripts/build_claude_rootfs.sh
 //!   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!   VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz \
+//!   VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz \
 //!   ANTHROPIC_API_KEY=sk-... \
 //!   cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
+//!
+//! A run without the key skips. Set `VOID_BOX_REQUIRE_AGENT_CREDS=1` — as the
+//! dispatch-only `e2e-agent.yml` workflow does — to turn that skip into a
+//! failure, so a run staged with a key cannot report green without ever
+//! calling the agent.
 
 #[path = "../common/test_artifacts.rs"]
 mod test_artifacts;
@@ -45,7 +50,7 @@ async fn real_claude_uses_void_mcp_tools() {
         return;
     };
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
-        eprintln!("skipping: set ANTHROPIC_API_KEY");
+        test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
         return;
     }
 
