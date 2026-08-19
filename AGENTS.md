@@ -817,8 +817,15 @@ The two agent suites skip a second way: they also need a real Anthropic credenti
 To run the VM suites with bounded parallelism instead of one at a time, use nextest — each VM-booting binary joins the `vm` test group in `.config/nextest.toml`, capped at two concurrent boots. This runs every VM suite locally on a capable machine:
 
 ```bash
-VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
-  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
+# VOIDBOX_TEST_GUEST_IMAGE makes guest_image_pull_and_extract run instead of
+# skipping — the CI lane sets it, so without it a local run cannot reproduce
+# the gate. The two agent suites are excluded because they need a staged
+# production image and a credential: `e2e_.+` would sweep them in, and under
+# VOID_BOX_REQUIRE_VM=1 their artifact check fails rather than skips.
+VOID_BOX_REQUIRE_VM=1 \
+VOIDBOX_TEST_GUEST_IMAGE=ghcr.io/the-void-ia/voidbox-guest:v0.2.0 \
+cargo nextest run --run-ignored only --no-fail-fast \
+  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/) & not binary(/^(e2e_agent_mcp|e2e_service_mode)$/)'
 ```
 
 The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs. It covers every deterministic suite that runs on Linux — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration`. `snapshot_vz_integration` is macOS-only and has no CI lane at all (#158). `e2e_service_mode` and `e2e_agent_mcp` stay out of it: no pull-request runner holds an Anthropic credential, so there they would pass without starting an agent. Run them on your own machine and record the result in the pull request's Local validation block. `.github/workflows/e2e-agent.yml` runs the same pair under `VOID_BOX_REQUIRE_AGENT_CREDS=1`, but by manual dispatch only — every run spends Anthropic API credit, so nothing triggers it automatically.
@@ -1342,8 +1349,7 @@ Which image for which test suite:
 | Test suite | Image needed |
 |---|---|
 | `cargo test --workspace` (unit tests) | None (no VM) |
-| `conformance`, `oci_integration`, `kvm_integration`, `telemetry` | auto-provisioned (ADR-0011) → `target/void-box-test-rootfs.cpio.gz`; `build_guest_image.sh` also works |
-| `snapshot_integration`, `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_mount`, `e2e_sidecar` | `build_test_image.sh` → `/tmp/void-box-test-rootfs.cpio.gz` |
+| Every suite on the CI VM lane — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration` | auto-provisioned (ADR-0011) → `target/void-box-test-rootfs.cpio.gz` |
 | `e2e_service_mode`, `e2e_agent_mcp` (real Claude + MCP) | `build_claude_rootfs.sh` → `target/void-box-claude.cpio.gz` |
 | Codex e2e (manual gate) | `build_codex_rootfs.sh` → `target/void-box-codex.cpio.gz` |
 

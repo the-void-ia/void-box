@@ -46,11 +46,11 @@ async fn injects_real_key_and_real_anthropic_accepts_it() {
     let real_key = match std::env::var("ANTHROPIC_API_KEY") {
         Ok(key) if !key.trim().is_empty() => key,
         Ok(_) => {
-            test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is empty");
+            let _skip = test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is empty");
             return;
         }
         Err(_) => {
-            test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
+            let _skip = test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
             return;
         }
     };

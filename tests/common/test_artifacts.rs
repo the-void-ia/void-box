@@ -253,13 +253,22 @@ pub fn env_artifacts_or_skip() -> Option<(PathBuf, PathBuf)> {
 /// still not run these suites. A job that does stage a credential sets
 /// `VOID_BOX_REQUIRE_AGENT_CREDS=1`, and a lost or mistyped secret then fails
 /// that job instead of passing it green without ever calling the agent.
+///
+/// The returned value is `#[must_use]`, matching [`vm_start_value`]: a caller
+/// that drops it has recorded a skip and then run the test anyway, which is the
+/// exact laundering this module exists to prevent.
 #[allow(dead_code)]
-pub fn skip_without_agent_creds(reason: &str) {
+#[must_use = "SkipAgentCreds means the test must return early"]
+pub struct SkipAgentCreds;
+
+#[allow(dead_code)]
+pub fn skip_without_agent_creds(reason: &str) -> SkipAgentCreds {
     assert!(
         std::env::var("VOID_BOX_REQUIRE_AGENT_CREDS").as_deref() != Ok("1"),
         "VOID_BOX_REQUIRE_AGENT_CREDS=1 but {reason}"
     );
     eprintln!("skipping: {reason}");
+    SkipAgentCreds
 }
 
 fn resolve_artifacts() -> Result<(PathBuf, PathBuf), String> {

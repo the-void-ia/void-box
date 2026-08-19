@@ -50,7 +50,7 @@ async fn real_claude_uses_void_mcp_tools() {
         return;
     };
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
-        test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
+        let _skip = test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
         return;
     }
 

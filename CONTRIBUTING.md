@@ -113,8 +113,15 @@ VOID_BOX_REQUIRE_VM=1 cargo test --test e2e_skill_pipeline -- --ignored --test-t
 
 # Every VM suite with bounded parallelism (two concurrent boots — the `vm`
 # test group in .config/nextest.toml):
-VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
-  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
+# VOIDBOX_TEST_GUEST_IMAGE makes guest_image_pull_and_extract run instead of
+# skipping — the CI lane sets it, so without it a local run cannot reproduce
+# the gate. The two agent suites are excluded because they need a staged
+# production image and a credential: `e2e_.+` would sweep them in, and under
+# VOID_BOX_REQUIRE_VM=1 their artifact check fails rather than skips.
+VOID_BOX_REQUIRE_VM=1 \
+VOIDBOX_TEST_GUEST_IMAGE=ghcr.io/the-void-ia/voidbox-guest:v0.2.0 \
+cargo nextest run --run-ignored only --no-fail-fast \
+  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/) & not binary(/^(e2e_agent_mcp|e2e_service_mode)$/)'
 ```
 
 The heavy agent suites (`e2e_agent_mcp`, `e2e_service_mode`) are the exception: they need a staged production image via `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` and a real Anthropic credential, and skip when either is absent — see `AGENTS.md#testing`. Set `VOID_BOX_REQUIRE_AGENT_CREDS=1` once you have staged a key so the credential skip fails instead. They are the only VM suites CI's pull-request lane does not run, because no pull-request runner holds a credential — run them yourself and record the result in the `Local validation` block. `.github/workflows/e2e-agent.yml` runs the same pair, by manual dispatch only, since every run spends Anthropic API credit.

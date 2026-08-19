@@ -130,17 +130,25 @@ jobs:
         with:
           shared-key: e2e-${{ matrix.musl-target }}
 
-      # The required lane pulls alpine:3.20 from Docker Hub and the guest image
-      # from ghcr. Both are anonymous, and Docker Hub rate-limits per source IP,
-      # which hosted runners share — with `retries = 2` in nextest one 429
-      # becomes three. Caching the shared OCI dir drops the steady state to a
-      # single Docker Hub pull per job: `oci_client_resolves_alpine_rootfs_into_cache`
-      # uses a fresh TempDir by design and always pulls cold.
+      # The required lane makes three anonymous registry pulls: alpine:3.20 twice
+      # from Docker Hub and the guest image once from ghcr. Docker Hub rate-limits
+      # per source IP, which hosted runners share, and `retries = 2` in nextest
+      # turns one 429 into three requests.
+      #
+      # This cache covers exactly one of the three. Only `vm_oci_alpine_os_release`
+      # resolves through the shared `~/.voidbox/oci`; the other two
+      # (`oci_client_resolves_alpine_rootfs_into_cache` and
+      # `guest_image_pull_and_extract`) each build a client on a fresh TempDir by
+      # design, so their pulls stay cold on every run and the ~115 MB ghcr pull is
+      # not mitigated at all. `restore-keys` lets a bumped image tag start from
+      # the previous entry instead of cold.
       - name: Cache extracted OCI images
         uses: actions/cache@v4
         with:
           path: ~/.voidbox/oci
-          key: oci-alpine3.20-guest0.2.0-${{ runner.os }}-${{ runner.arch }}
+          key: oci-${{ runner.os }}-${{ runner.arch }}-alpine3.20-${{ github.run_id }}
+          restore-keys: |
+            oci-${{ runner.os }}-${{ runner.arch }}-alpine3.20-
 
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
@@ -181,6 +189,12 @@ jobs:
           # registry outage or rate limit fails the lane for reasons unrelated
           # to the change under review.
           VOIDBOX_TEST_GUEST_IMAGE: ghcr.io/the-void-ia/voidbox-guest:v0.2.0
+          # #149: multiplex establishment intermittently exceeds the 30 s default
+          # on this runner class, and doubling the suites doubles the draws. The
+          # knob only ever lengthens the deadline (never shortens it), so a
+          # healthy boot is unaffected and a slow one stops reading as a step
+          # cancellation.
+          VOID_BOX_CONNECT_DEADLINE_SECS: "120"
         run: |
           # Do not exit green when /dev/vhost-vsock is missing: VOID_BOX_REQUIRE_VM=1
           # asserts this runner is capable, so a lost device must fail the suites

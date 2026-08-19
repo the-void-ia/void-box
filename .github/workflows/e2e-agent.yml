@@ -66,7 +66,7 @@ jobs:
             echo "::error::ANTHROPIC_API_KEY is not set for this repository. Add it under Settings → Secrets and variables → Actions, or run these suites locally per AGENTS.md."
             exit 1
           fi
-          echo "ANTHROPIC_API_KEY is present (${#ANTHROPIC_API_KEY} chars)."
+          echo "ANTHROPIC_API_KEY is present."
 
       - name: Enable KVM access
         run: |
@@ -101,7 +101,14 @@ jobs:
       # kernel and not on the runner's own — mismatched vermagic means the vsock
       # chain never loads and the control channel times out.
       - name: Download the pinned guest kernel
-        run: scripts/download_kernel.sh
+        run: |
+          # `download_kernel.sh` treats an existing OUT_FILE as a cache hit. The
+          # cargo cache restores `target/`, so a kernel left there from before a
+          # `kernel_pin.sh` bump would be paired with modules built for the new
+          # pin — a vermagic mismatch whose only symptom is an opaque control
+          # channel timeout 20 minutes later.
+          rm -f target/vmlinuz-* target/vmlinux-*
+          scripts/download_kernel.sh
 
       - name: Build the production Claude initramfs
         # Hash-pinned claude-code download (scripts/agents/manifest.toml); a
