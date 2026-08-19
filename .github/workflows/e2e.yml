@@ -225,26 +225,27 @@ jobs:
           ls -la "$VOID_BOX_KERNEL"
           ls -la "$VOID_BOX_INITRAMFS"
 
-          # One nextest run for every deterministic VM suite. The `vm` test
-          # group (.config/nextest.toml) caps how many VMs boot at once, so the
-          # suites run with bounded cross-suite parallelism instead of strictly
-          # serially; --no-fail-fast collects every result rather than stopping
-          # at the first failure. snapshot_integration is included here (it was a
-          # separate step). pty_command_not_allowed stays excluded: it asserts
-          # the guest rejects a non-allowlisted program, but the allowlist loads
-          # at guest boot from a file only the agent-box provisioning path
-          # writes, which this direct attach_pty path never stages — so the guest
-          # allows all commands (#99).
+          # One nextest run for every deterministic VM suite: the backend
+          # contract, direct MicroVm/Sandbox boots, the OCI root switch and its
+          # read-only invariant, host-directory mounts, the guest→host telemetry
+          # stream and sidecar gateway, the PTY and credential-proxy paths, the
+          # persistent control channel, and snapshot/restore. The `vm` test group
+          # (.config/nextest.toml) caps how many VMs boot at once, so the suites
+          # run with bounded cross-suite parallelism rather than serially, and
+          # --no-fail-fast collects every result instead of stopping at the first
+          # failure.
           #
-          # conformance, telemetry, kvm_integration, oci_integration and
-          # e2e_sidecar joined the lane in RFC-0004 M1, covering the backend
-          # contract, the guest→host telemetry stream, direct MicroVm/Sandbox
-          # boots, the OCI root switch and its read-only invariant, and the
-          # guest→host sidecar gateway. e2e_service_mode and e2e_agent_mcp are
-          # the two M1 suites that stay out: both need real agent credentials,
-          # which no pull-request runner holds, so here they would report green
-          # without ever starting an agent. They are contributor-run, and the
-          # dispatch-only `e2e-agent.yml` runs the same pair under
-          # VOID_BOX_REQUIRE_AGENT_CREDS=1.
+          # Two exclusions, both deliberate:
+          #
+          # pty_command_not_allowed asserts the guest rejects a non-allowlisted
+          # program, but the allowlist loads at guest boot from a file only the
+          # agent-box provisioning path writes, which this direct attach_pty path
+          # never stages — so the guest allows all commands (#99).
+          #
+          # The agent suites (e2e_service_mode, e2e_agent_mcp) need a real agent
+          # credential, which no pull-request runner holds, so here they would
+          # detect its absence and report green without starting an agent. They
+          # run in `e2e-agent.yml` instead, under VOID_BOX_REQUIRE_AGENT_CREDS=1,
+          # and on contributors' machines.
           cargo nextest run --run-ignored only --no-fail-fast -E \
             'binary(/^(conformance|telemetry|kvm_integration|oci_integration|e2e_sidecar|e2e_telemetry|e2e_mount|persistent_channel|e2e_skill_pipeline|e2e_pty|e2e_credential_proxy|snapshot_integration)$/) & not test(pty_command_not_allowed)'

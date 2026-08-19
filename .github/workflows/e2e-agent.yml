@@ -1,20 +1,21 @@
 name: E2E Agent (credentialed)
 
-# The two RFC-0004 M1 suites a pull-request runner cannot run. Both need a real
-# agent credential on top of a VM: `e2e_service_mode` drives a Claude agent
-# through the daemon's service lifecycle, and `e2e_agent_mcp` checks that Claude
-# Code discovers the void-mcp tools and emits intents the sidecar receives. A
-# fork PR never sees a repository secret, so on the PR lane both would print a
-# skip line and report green without starting an agent. They run here instead,
-# under VOID_BOX_REQUIRE_AGENT_CREDS=1, so a missing or rotated key fails this
-# job rather than passing it.
+# Test suites that need a real agent credential, which the pull-request lane
+# cannot supply: a workflow run triggered by a fork's pull request never receives
+# a repository secret. Run there, each of these suites detects the missing
+# credential and skips — reporting success without ever starting an agent. Here
+# they run with VOID_BOX_REQUIRE_AGENT_CREDS=1, which turns that skip into a
+# failure, so a missing or rotated key fails this job instead of passing it.
 #
-# Manual dispatch only, and not a required status check. Every run boots a 3 GB
-# guest and spends Anthropic API credit, so nothing here fires on a schedule or
-# on a push — a maintainer triggers it before a release, or after a change to
-# service mode, the sidecar, or void-mcp. Day to day these suites run on a
-# contributor's machine and the result goes in the pull request's Local
-# validation block.
+# Manual dispatch only, and not a required status check: a run boots a
+# multi-gigabyte guest and spends Anthropic API credit. Trigger it before a
+# release, or after changing service mode, the sidecar, void-mcp, or the
+# credential proxy. Day to day these suites run on a contributor's machine, and
+# the result goes in the pull request's `Local validation` block.
+#
+# To add a suite: compile it in the "Build the agent test binaries" step, so
+# compilation stays outside the per-suite timeouts, then give it a step of its
+# own with VOID_BOX_REQUIRE_AGENT_CREDS=1 in the environment.
 
 on:
   workflow_dispatch:
@@ -41,9 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The production image is ~100 MB compressed and stages a far larger
-      # rootfs; the hosted image's default free space does not hold it
-      # alongside the cargo target dir. Same reclaim the PR lane uses.
+      # The production image and the rootfs it stages do not fit alongside the
+      # cargo target directory in the hosted runner's default free space. Same
+      # reclaim `e2e.yml` performs, for the same reason.
       - name: Free runner disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
         with:
@@ -55,9 +56,10 @@ jobs:
           swap-storage: true
           tool-cache: false
 
-      # Fail before the ~20-minute image build rather than after it: an absent
+      # Check the secret before the image build rather than after it. An absent
       # secret is a configuration error, and VOID_BOX_REQUIRE_AGENT_CREDS=1
-      # would only surface it once the suites already booted a VM.
+      # would not surface it until the suites had already built an image and
+      # booted a VM.
       - name: Require the Anthropic credential
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -141,10 +143,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
 
-      # No VM, but the same credential gate: this is the only test that drives
-      # the credential-injection proxy against real api.anthropic.com. Its
-      # mock-upstream twin (`e2e_credential_proxy`) is on the pull-request lane;
-      # without this step the real-upstream half is never exercised anywhere.
+      # No VM, but the same credential gate: this drives the credential-injection
+      # proxy against the real api.anthropic.com endpoint. The mock-upstream half
+      # of that path (`e2e_credential_proxy`) runs on the pull-request lane; this
+      # step covers the live half.
       - name: Run proxy_real_upstream
         timeout-minutes: 10
         env:

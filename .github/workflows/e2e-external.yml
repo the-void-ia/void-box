@@ -51,7 +51,7 @@ jobs:
         with:
           shared-key: e2e-external
 
-      # `--ignored` runs only the two network tests; the rest of the binary
+      # `--ignored` selects the network-dependent tests; the rest of the binary
       # already runs on every pull request through `cargo test --workspace`.
       - name: Fetch remote skills over the network
         run: cargo test --test skill_pipeline -- --ignored --test-threads=1 --nocapture
