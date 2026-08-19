@@ -821,7 +821,7 @@ VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
   -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
 
-The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs. It covers every deterministic suite — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration`. `e2e_service_mode` and `e2e_agent_mcp` stay out of it: no pull-request runner holds an Anthropic credential, so there they would pass without starting an agent. Run them on your own machine and record the result in the pull request's Local validation block. `.github/workflows/e2e-agent.yml` runs the same pair under `VOID_BOX_REQUIRE_AGENT_CREDS=1`, but by manual dispatch only — every run spends Anthropic API credit, so nothing triggers it automatically.
+The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs. It covers every deterministic suite that runs on Linux — `conformance`, `telemetry`, `kvm_integration`, `oci_integration`, `e2e_sidecar`, `e2e_telemetry`, `e2e_mount`, `e2e_skill_pipeline`, `e2e_pty`, `e2e_credential_proxy`, `persistent_channel`, `snapshot_integration`. `snapshot_vz_integration` is macOS-only and has no CI lane at all (#158). `e2e_service_mode` and `e2e_agent_mcp` stay out of it: no pull-request runner holds an Anthropic credential, so there they would pass without starting an agent. Run them on your own machine and record the result in the pull request's Local validation block. `.github/workflows/e2e-agent.yml` runs the same pair under `VOID_BOX_REQUIRE_AGENT_CREDS=1`, but by manual dispatch only — every run spends Anthropic API credit, so nothing triggers it automatically.
 
 The explicit-artifact form (env override; still one suite at a time):
 
@@ -973,7 +973,7 @@ cargo test --test e2e_telemetry -- --ignored --test-threads=1
 cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
 
-# Sidecar (Linux-only, deterministic — runs in CI):
+# Sidecar (deterministic — runs in CI; also builds on macOS/VZ):
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
 
 # Agent suites. These need the production image and a real credential, and no
@@ -996,6 +996,8 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz
 cargo test --test conformance -- --ignored --test-threads=1
 cargo test --test oci_integration -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
+# The VZ guest→host gateway runs nowhere else — CI has no VZ VM lane (#158).
+cargo test --test e2e_sidecar -- --ignored --test-threads=1
 
 # VZ snapshot round-trip (requires test initramfs):
 scripts/build_test_image.sh
@@ -1003,11 +1005,14 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
 ```
 
-`e2e_telemetry`, `e2e_skill_pipeline`, and `e2e_sidecar` are Linux-only
-(`cfg(target_os = "linux")`) and are not expected to run on macOS.
-`e2e_service_mode` compiles on both (`cfg(any(linux, macos))`) and `e2e_agent_mcp`
-carries no platform guard at all, so both can be validated on a Mac given the
-production image and a credential.
+`e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`)
+and are not expected to run on macOS. Three others carry no such guard and do
+build on a Mac: `e2e_sidecar`, `e2e_agent_mcp`, and `e2e_service_mode`
+(`cfg(any(linux, macos))`). CI runs no VZ VM suites at all (#158), so a
+contributor's Mac is the only place `e2e_sidecar` ever exercises the VZ
+guest→host gateway — worth running there when touching sidecar or backend
+gateway code. The two agent suites additionally need the production image and a
+credential.
 
 ### Interactive PTY / shell validation
 
@@ -1286,18 +1291,20 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
 Once a suite starts booting, only a genuine hypervisor absence skips it — the
 typed `Error::HypervisorUnavailable` from the `/dev/kvm` probe, or VZ reporting
 virt-less hardware (ADR-0011). Every other boot or RPC error fails, and so does
-an absent network: `oci_integration` pulls `alpine:3.20` and the published guest
-image, so on a machine with no outbound network those tests fail rather than
-skip. Run them where the network is.
+an absent network: `oci_integration` pulls `alpine:3.20`, so on a machine with
+no outbound network those tests fail rather than skip. Run them where the
+network is.
 
-Three deliberate skips sit *before* that gate, and a green local run does not
-prove they ran. The agent suites skip without a staged production image
+Deliberate skips sit *before* that gate, and a green local run does not prove
+they ran. The agent suites skip without a staged production image
 (`env_artifacts_or_skip`) or without an agent credential
-(`skip_without_agent_creds`); `guest_image_pull_and_extract` skips when
+(`skip_without_agent_creds`); `proxy_real_upstream` skips without a credential
+too, and needs no VM at all; `guest_image_pull_and_extract` skips when
 `VOIDBOX_TEST_GUEST_IMAGE` is unset and its default `localhost:5555` registry is
 absent. `VOID_BOX_REQUIRE_VM=1` and `VOID_BOX_REQUIRE_AGENT_CREDS=1` convert the
-first two into failures; the CI lane sets `VOIDBOX_TEST_GUEST_IMAGE` for the
-third. Run with `--nocapture` to see which of them fired.
+credential and artifact skips into failures; the CI lane sets
+`VOIDBOX_TEST_GUEST_IMAGE` for the last. Run with `--nocapture` to see which
+fired.
 
 ## Guest image build scripts
 
@@ -1335,7 +1342,7 @@ Which image for which test suite:
 | Test suite | Image needed |
 |---|---|
 | `cargo test --workspace` (unit tests) | None (no VM) |
-| `conformance`, `oci_integration` | `build_guest_image.sh` → `/tmp/void-box-rootfs.cpio.gz` |
+| `conformance`, `oci_integration`, `kvm_integration`, `telemetry` | auto-provisioned (ADR-0011) → `target/void-box-test-rootfs.cpio.gz`; `build_guest_image.sh` also works |
 | `snapshot_integration`, `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_mount`, `e2e_sidecar` | `build_test_image.sh` → `/tmp/void-box-test-rootfs.cpio.gz` |
 | `e2e_service_mode`, `e2e_agent_mcp` (real Claude + MCP) | `build_claude_rootfs.sh` → `target/void-box-claude.cpio.gz` |
 | Codex e2e (manual gate) | `build_codex_rootfs.sh` → `target/void-box-codex.cpio.gz` |

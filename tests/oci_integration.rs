@@ -970,8 +970,20 @@ async fn guest_image_pull_and_extract() {
         initramfs_size
     );
 
-    // Second call: should use cache (no network).
+    // Second call: served from the cache, not re-pulled. The returned paths are
+    // content-addressed, so comparing them shows nothing — an implementation
+    // that re-downloaded and re-extracted every time returns the same pair.
+    // `resolve_guest_files` removes the extraction directory before re-running,
+    // so a marker written into it survives a cache hit and cannot survive a
+    // re-extract.
     eprintln!("=== Second call (cache hit) ===");
+    let marker = guest
+        .kernel
+        .parent()
+        .expect("extracted guest files live in a directory")
+        .join(".voidbox-cache-hit-marker");
+    std::fs::write(&marker, b"cache-hit").expect("write the cache marker");
+
     let guest2 = client
         .resolve_guest_files(&image_ref)
         .await
@@ -979,4 +991,8 @@ async fn guest_image_pull_and_extract() {
 
     assert_eq!(guest.kernel, guest2.kernel);
     assert_eq!(guest.initramfs, guest2.initramfs);
+    assert!(
+        marker.exists(),
+        "the second resolve re-extracted the guest image instead of serving it from the cache"
+    );
 }

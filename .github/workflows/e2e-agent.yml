@@ -108,6 +108,12 @@ jobs:
         # digest mismatch fails the build.
         run: scripts/build_claude_rootfs.sh
 
+      # Compile once, outside the per-suite budgets. Otherwise a cold first
+      # dispatch has to fit a full workspace test build, a 3 GB VM boot, and the
+      # suite's own ~4-minute poll budget inside 25 minutes.
+      - name: Build the agent test binaries
+        run: cargo test --test e2e_service_mode --test e2e_agent_mcp --test proxy_real_upstream --no-run
+
       - name: Run e2e_service_mode
         timeout-minutes: 25
         env:
@@ -127,3 +133,14 @@ jobs:
           VOID_BOX_REQUIRE_AGENT_CREDS: "1"
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
+
+      # No VM, but the same credential gate: this is the only test that drives
+      # the credential-injection proxy against real api.anthropic.com. Its
+      # mock-upstream twin (`e2e_credential_proxy`) is on the pull-request lane;
+      # without this step the real-upstream half is never exercised anywhere.
+      - name: Run proxy_real_upstream
+        timeout-minutes: 10
+        env:
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test proxy_real_upstream -- --ignored --test-threads=1 --nocapture

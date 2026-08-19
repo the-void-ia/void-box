@@ -16,6 +16,9 @@
 //!   cargo test --test proxy_real_upstream -- --ignored --nocapture
 //! ```
 
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -40,14 +43,17 @@ const BODY: &str = r#"{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a funded ANTHROPIC_API_KEY; hits real api.anthropic.com"]
 async fn injects_real_key_and_real_anthropic_accepts_it() {
-    let Ok(real_key) = std::env::var("ANTHROPIC_API_KEY") else {
-        eprintln!("SKIP: ANTHROPIC_API_KEY not set");
-        return;
+    let real_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        Ok(_) => {
+            test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is empty");
+            return;
+        }
+        Err(_) => {
+            test_artifacts::skip_without_agent_creds("ANTHROPIC_API_KEY is unset");
+            return;
+        }
     };
-    if real_key.trim().is_empty() {
-        eprintln!("SKIP: ANTHROPIC_API_KEY is empty");
-        return;
-    }
 
     // Production upstream client: real TLS validation to Anthropic, SSRF guard on
     // resolution, no env proxy, no redirect-following. This is the exact wiring the

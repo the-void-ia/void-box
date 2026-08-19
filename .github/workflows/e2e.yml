@@ -130,6 +130,18 @@ jobs:
         with:
           shared-key: e2e-${{ matrix.musl-target }}
 
+      # The required lane pulls alpine:3.20 from Docker Hub and the guest image
+      # from ghcr. Both are anonymous, and Docker Hub rate-limits per source IP,
+      # which hosted runners share — with `retries = 2` in nextest one 429
+      # becomes three. Caching the shared OCI dir drops the steady state to a
+      # single Docker Hub pull per job: `oci_client_resolves_alpine_rootfs_into_cache`
+      # uses a fresh TempDir by design and always pulls cold.
+      - name: Cache extracted OCI images
+        uses: actions/cache@v4
+        with:
+          path: ~/.voidbox/oci
+          key: oci-alpine3.20-guest0.2.0-${{ runner.os }}-${{ runner.arch }}
+
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
         # `install_busybox` (scripts/lib/guest_common.sh) requires the
@@ -161,7 +173,7 @@ jobs:
           # localhost:5555 registry and skips when none is running, which is
           # every machine. Pointing it at the published guest image turns that
           # skip into real coverage of resolve_guest_files (pull, extract
-          # vmlinux + rootfs.cpio.gz, second-call cache hit). A version tag
+          # vmlinuz + rootfs.cpio.gz, second-call cache hit). A version tag
           # rather than `latest` so the lane does not follow every publish, but
           # a tag is mutable — repointing v0.2.0 changes what this pulls. Pin by
           # digest if that becomes a problem. This and the alpine:3.20 pull in
