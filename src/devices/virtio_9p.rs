@@ -2329,6 +2329,97 @@ mod tests {
         );
     }
 
+    /// A descriptor's `dlen` sizes the buffer `process_queue` reads into, and it
+    /// comes from guest-written memory. The negotiated `msize` bounds the
+    /// request, so a descriptor claiming more must not size the read.
+    ///
+    /// The fuzz corpus cannot pin this, which was measured rather than assumed:
+    /// a 4 GiB `vec![0u8; n]` is `alloc_zeroed`, so Linux maps it lazily and
+    /// never faults, and replaying the same input with the cap reverted stays
+    /// green. An allocation-size regression needs an oracle, not a crash.
+    #[test]
+    fn process_queue_caps_descriptor_reads_at_msize() {
+        let (mut device, _dir) = make_rw_device();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 64 * 1024)]).unwrap();
+
+        const DESC: u64 = 0x40;
+        const AVAIL: u64 = 0x80;
+        const USED: u64 = 0xC0;
+        // A readable descriptor claiming the whole 32-bit length space.
+        mem.write_obj(0x20u64, GuestAddress(DESC)).unwrap();
+        mem.write_obj(u32::MAX, GuestAddress(DESC + 8)).unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 12)).unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 14)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL)).unwrap();
+        mem.write_obj(1u16, GuestAddress(AVAIL + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+
+        program_queue(&mut device, &mem, 8, DESC, AVAIL, USED);
+        device.mmio_write(mmio::QUEUE_NOTIFY, &0u32.to_le_bytes(), Some(&mem));
+
+        // The device answers, and what it wrote back is bounded — it did not try
+        // to assemble a 4 GiB request out of one descriptor.
+        let used_len: u32 = mem.read_obj(GuestAddress(USED + 8)).unwrap();
+        assert!(
+            used_len > 0 && used_len <= MAX_MSIZE,
+            "reply length {used_len} is not a bounded reply"
+        );
+    }
+
+    /// A descriptor index at or past the queue size points outside the table the
+    /// guest allocated, so the walk must stop rather than read what follows it.
+    ///
+    /// The corpus cannot pin this either: an out-of-table read lands in zeroed
+    /// guest memory and ends the walk indistinguishably from the bound doing it.
+    #[test]
+    fn process_queue_stops_at_an_out_of_table_descriptor_index() {
+        let (mut device, _dir) = make_rw_device();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 64 * 1024)]).unwrap();
+
+        const DESC: u64 = 0x40;
+        const AVAIL: u64 = 0x80;
+        const USED: u64 = 0xC0;
+        // Descriptor 0 is a complete, valid Tversion, chained (NEXT) to index 9 —
+        // outside a 4-entry queue.
+        let mut version = 8192u32.to_le_bytes().to_vec();
+        version.extend_from_slice(&(8u16).to_le_bytes());
+        version.extend_from_slice(b"9P2000.L");
+        let request = build_request(T_VERSION, 0, &version);
+        mem.write_slice(&request, GuestAddress(0x200)).unwrap();
+
+        mem.write_obj(0x200u64, GuestAddress(DESC)).unwrap();
+        mem.write_obj(request.len() as u32, GuestAddress(DESC + 8))
+            .unwrap();
+        mem.write_obj(VIRTQ_DESC_F_NEXT, GuestAddress(DESC + 12))
+            .unwrap();
+        mem.write_obj(9u16, GuestAddress(DESC + 14)).unwrap();
+        // Descriptor 9 would append trailing bytes if the walk followed it,
+        // making the assembled request disagree with its own declared size.
+        mem.write_obj(0x300u64, GuestAddress(DESC + 9 * 16))
+            .unwrap();
+        mem.write_obj(16u32, GuestAddress(DESC + 9 * 16 + 8))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 9 * 16 + 12))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 9 * 16 + 14))
+            .unwrap();
+
+        mem.write_obj(0u16, GuestAddress(AVAIL)).unwrap();
+        mem.write_obj(1u16, GuestAddress(AVAIL + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+
+        program_queue(&mut device, &mem, 4, DESC, AVAIL, USED);
+        device.mmio_write(mmio::QUEUE_NOTIFY, &0u32.to_le_bytes(), Some(&mem));
+
+        // Stopping at the bound leaves exactly the Tversion, which negotiates.
+        // Following the out-of-table NEXT would append 16 bytes, the declared
+        // size would no longer match, and the device would answer Rerror.
+        assert_eq!(
+            device.msize, 8192,
+            "the walk followed a descriptor index outside the table, corrupting the request"
+        );
+    }
+
     /// `Tlcreate` and `Tmkdir` build their target as `parent.join(name)`, so a
     /// name that is a path — absolute, or containing `..` — escapes the shared
     /// directory even though the parent fid is inside it.
@@ -2503,6 +2594,27 @@ mod tests {
     }
 
     /// Create an rw device rooted at a tempdir and return (device, tempdir_path).
+    /// Program a queue through the MMIO registers, the way a guest driver does.
+    fn program_queue(
+        device: &mut Virtio9pDevice,
+        mem: &GuestMemoryMmap,
+        num: u32,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) {
+        for (register, value) in [
+            (mmio::QUEUE_SEL, 0u32),
+            (mmio::QUEUE_NUM, num),
+            (mmio::QUEUE_DESC_LOW, desc as u32),
+            (mmio::QUEUE_DRIVER_LOW, avail as u32),
+            (mmio::QUEUE_DEVICE_LOW, used as u32),
+            (mmio::QUEUE_READY, 1),
+        ] {
+            device.mmio_write(register, &value.to_le_bytes(), Some(mem));
+        }
+    }
+
     fn make_rw_device() -> (Virtio9pDevice, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Virtio9pDevice::new(tmp.path(), "test", false);
