@@ -246,6 +246,10 @@ path = "tests/observe_codex.rs"
 name = "network_baseline"
 path = "tests/network_baseline.rs"
 
+[[test]]
+name = "fuzz_corpus"
+path = "tests/fuzz_corpus.rs"
+
 [[bench]]
 name = "startup"
 path = "benches/startup.rs"
@@ -270,6 +274,11 @@ path = "src/bin/voidbox-network-bench/main.rs"
 
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]
+# `fuzz/` is a cargo-fuzz crate with its own workspace: its libFuzzer targets
+# need a nightly toolchain and sanitizer instrumentation, which must stay off the
+# path of an ordinary `cargo build --workspace`. Excluded explicitly so the
+# separation does not rest on that crate keeping its own `[workspace]` table.
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 # Wrapper types for in-memory secrets: compile-enforced `.expose_secret()`

@@ -1,0 +1,98 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the guest-facing parsers (RFC-0004 M1).
+#
+# Not a required status check, and deliberately not run on pull requests. A
+# fuzzer that finds a new bug on an unrelated change blocks that change, which
+# trains people to route around the gate; and libFuzzer needs a nightly
+# toolchain, which breaks on its own schedule and has no business on the path
+# that gates a merge. The pull-request gate instead replays every committed
+# corpus input and crash artifact through the same harnesses on stable, inside
+# `cargo test` (`tests/fuzz_corpus.rs`) — so anything found here is checked on
+# every change once its input is committed.
+#
+# When a run fails, download the `fuzz-artifacts` bundle, commit the crashing
+# input under `fuzz/artifacts/<target>/` together with the parser fix, and the
+# replay test keeps it fixed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'Seconds to fuzz each target'
+        required: false
+        default: '300'
+  schedule:
+    # Sundays 04:00 UTC. Fuzzing costs only runner minutes, so unlike the
+    # credentialed agent lane this one can run unattended; a weekly cadence is
+    # enough for a parser surface that changes rarely.
+    - cron: '0 4 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per target so a crash in one still leaves the others' results
+        # readable, and so each gets the full budget rather than a share of it.
+        target: [vsock_frame, vsock_packet, virtqueue, nine_p]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer's `fuzz_target!` and the sanitizer instrumentation
+      # `cargo fuzz` passes are nightly-only. This is why fuzzing lives here and
+      # not in the stable lanes.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1  # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: |
+            .
+            fuzz
+          shared-key: fuzz-${{ matrix.target }}
+
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          # -rss_limit_mb bounds the harness's own footprint: an allocation
+          # sized from a guest-supplied length is exactly the class of bug this
+          # is looking for, so it must report rather than OOM the runner.
+          # -max_len keeps inputs in the range the parsers actually see on the
+          # wire, so the budget goes into structure rather than length.
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || '300' }} \
+            -rss_limit_mb=2048 \
+            -max_len=65536 \
+            -print_final_stats=1
+
+      # `if: failure()` on purpose: a crash is the only case with an artifact to
+      # collect, and it is the case where the reproducer must not be lost.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

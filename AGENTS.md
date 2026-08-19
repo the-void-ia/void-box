@@ -848,6 +848,27 @@ cargo test --test e2e_sidecar -- --ignored --test-threads=1
 ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
+### Fuzzing the guest-facing parsers
+
+Three host-side parsers read bytes a guest chooses: the control-channel frame decoder (`void-box-protocol` framing plus the multiplex request-id prefix), the split-virtqueue reader that walks descriptor chains out of guest memory, and the 9P server. Their harnesses live in `src/fuzz.rs`, and two callers drive the same bodies.
+
+The merge gate replays them. `tests/fuzz_corpus.rs` runs every file under `fuzz/corpus/<target>/` and `fuzz/artifacts/<target>/` through its harness on stable, as part of a plain `cargo test`. It is deterministic and costs milliseconds, so it needs no special invocation.
+
+Discovery is out of band. `cargo fuzz` needs a nightly toolchain, and a search that finds a new bug on an unrelated change would block that change, so it runs weekly and on demand in `.github/workflows/fuzz.yml` — never on a pull request (ADR-0012). To run it locally:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cargo +nightly fuzz run vsock_frame -- -max_total_time=60 -rss_limit_mb=2048
+# targets: vsock_frame, vsock_packet, virtqueue, nine_p
+```
+
+When a run crashes, `cargo fuzz` writes the input under `fuzz/artifacts/<target>/`. Commit that file **together with the parser fix** — the replay test then keeps the bug fixed for everyone. Never commit a crashing input ahead of its fix: it reds the gate for every unrelated change.
+
+Adding a target means adding a `[[bin]]` to `fuzz/Cargo.toml`, a harness body in `src/fuzz.rs`, an arm in `tests/fuzz_corpus.rs`, and at least one seed under `fuzz/corpus/<target>/`. `every_fuzz_target_is_replayed` fails if any of the last three is missing, so a target cannot end up fuzzed but unguarded.
+
+A harness parameterizes itself from the raw input through a hand-rolled byte reader rather than the `arbitrary` crate. The committed corpus is tied to the exact byte-consumption order, and a crate upgrade that reorders its reads would silently repoint every seed at a different scenario.
+
 ### Test initramfs and BusyBox
 
 `scripts/build_test_image.sh` builds a minimal initramfs with `guest-agent`

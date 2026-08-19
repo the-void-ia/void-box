@@ -30,3 +30,4 @@ An ADR is distinct from an RFC. An RFC (in [`../rfc/`](../rfc/README.md)) is a p
 | 0009 | Separate capability from failure in the VM test gate | Superseded by ADR-0011 | 2026-08-07 | [0009-vm-test-capability-vs-failure.md](0009-vm-test-capability-vs-failure.md) |
 | 0010 | Review security and performance with advisory local AI agents | Accepted | 2026-08-07 | [0010-advisory-local-reviews.md](0010-advisory-local-reviews.md) |
 | 0011 | Honest VM tests by auto-provisioning and classifying failure at the boot boundary | Accepted | 2026-08-13 | [0011-honest-vm-tests-auto-provision-and-classify.md](0011-honest-vm-tests-auto-provision-and-classify.md) |
+| 0012 | Fuzz out of band, replay the corpus in the merge gate | Accepted | 2026-08-19 | [0012-fuzz-discovery-out-of-band-corpus-replay-in-gate.md](0012-fuzz-discovery-out-of-band-corpus-replay-in-gate.md) |

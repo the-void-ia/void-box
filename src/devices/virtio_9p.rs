@@ -555,7 +555,7 @@ impl Virtio9pDevice {
 
     /// Dispatch an incoming 9P request and return the full response message
     /// (including the 4-byte size header).
-    fn handle_9p_request(&mut self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn handle_9p_request(&mut self, data: &[u8]) -> Vec<u8> {
         // Minimum 9P header: size(4) + type(1) + tag(2) = 7 bytes
         if data.len() < 7 {
             warn!("virtio-9p: request too short ({} bytes)", data.len());

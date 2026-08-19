@@ -1,0 +1,58 @@
+# cargo-fuzz targets for the guest-facing parsers (RFC-0004 M1).
+#
+# Its own workspace on purpose: libFuzzer needs a nightly toolchain and
+# `-Cpasses=sancov-module` instrumentation, and folding that into the main
+# workspace would put both on the path of every ordinary `cargo build`. The
+# harness bodies live in `void_box::fuzz` so `tests/fuzz_corpus.rs` can replay
+# the same code on stable without this crate.
+[package]
+name = "void-box-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+void-box = { path = ".." }
+
+# Fuzzing wants optimized code with the checks left in: `debug-assertions` keeps
+# arithmetic-overflow panics, which for a parser reading guest-chosen addresses
+# and lengths are findings rather than noise.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "vsock_frame"
+path = "fuzz_targets/vsock_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vsock_packet"
+path = "fuzz_targets/vsock_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtqueue"
+path = "fuzz_targets/virtqueue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nine_p"
+path = "fuzz_targets/nine_p.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

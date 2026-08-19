@@ -72,6 +72,11 @@ pub mod backend;
 #[cfg(target_os = "linux")]
 pub mod devices;
 pub mod error;
+// Fuzz harnesses for the guest-facing parsers. Public so `fuzz/` (its own
+// cargo-fuzz workspace) can drive them, hidden from the docs because nothing
+// outside the fuzzing setup should call them.
+#[doc(hidden)]
+pub mod fuzz;
 pub mod guest;
 #[cfg(target_os = "linux")]
 pub mod network;

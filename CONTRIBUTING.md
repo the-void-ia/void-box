@@ -121,6 +121,8 @@ The heavy agent suites (`e2e_agent_mcp`, `e2e_service_mode`) are the exception: 
 
 Note: `e2e_telemetry` and `e2e_skill_pipeline` are Linux-only (`cfg(target_os = "linux")`).
 
+The fuzz corpus replays as part of `cargo test` — `tests/fuzz_corpus.rs` runs every committed input through the parser harnesses in `src/fuzz.rs`, so you need no extra command. Running the fuzzer itself needs a nightly toolchain and is out of band; see `AGENTS.md#fuzzing-the-guest-facing-parsers` and ADR-0012.
+
 If an ignored VM suite reports `Kvm(Error(13))` (or `Permission denied`) it usually means KVM ioctls are blocked in the current execution context; run the same command in a host shell/session with usable `/dev/kvm` and `/dev/vhost-vsock`.
 
 For runtime setup examples and platform-specific details, see:
