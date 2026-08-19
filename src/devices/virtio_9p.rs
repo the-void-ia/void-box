@@ -1352,6 +1352,7 @@ impl Virtio9pDevice {
         let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let offset = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         let count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+        let msize_read_budget = self.msize.saturating_sub(REPLY_OVERHEAD);
 
         let state = match self.fids.get(&fid) {
             Some(s) => s,
@@ -1403,7 +1404,15 @@ impl Virtio9pDevice {
         // Build dirent stream starting from the given offset
         // Dirent format: qid(13) + offset(8) + type(1) + name_len(2) + name(n)
         let mut dirent_data = Vec::new();
-        let max_bytes = count as usize;
+        // `count` is guest-chosen and bounds nothing on its own: entries come
+        // from the host directory, which a guest with a read-write mount fills
+        // itself, so a large `count` lets it drive how much the host buffers
+        // here. It also has to fit the reply inside `msize` — `process_queue`
+        // writes only as far as the guest's descriptors reach and then reports a
+        // short length, while the reply's own size field still declares the
+        // full one, so an oversized reply desynchronizes the 9P stream for every
+        // later request on the mount.
+        let max_bytes = count.min(msize_read_budget) as usize;
 
         for (idx, (name, metadata)) in all_entries.iter().enumerate() {
             let entry_offset = idx as u64;
@@ -2181,6 +2190,46 @@ mod tests {
         );
         let returned = u32::from_le_bytes(response[7..11].try_into().unwrap());
         assert_eq!(returned, 5, "the whole file should come back");
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "reply of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+    }
+
+    /// `Treaddir`'s `count` bounds nothing by itself — the entries come from the
+    /// host directory — so the reply must be bounded by the negotiated `msize`,
+    /// or `process_queue` truncates it against the guest's descriptors while its
+    /// size field still declares the full length.
+    #[test]
+    fn treaddir_reply_cannot_exceed_the_negotiated_msize() {
+        let (mut device, dir) = make_rw_device();
+        // Enough entries that the dirent stream would outgrow a small msize.
+        for i in 0..200 {
+            fs::write(dir.path().join(format!("entry-{i:04}-padding-name")), b"x").unwrap();
+        }
+
+        let mut version_payload = 512u32.to_le_bytes().to_vec();
+        version_payload.extend_from_slice(&(8u16).to_le_bytes());
+        version_payload.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version_payload));
+        assert_eq!(device.msize, 512);
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        // Ask for 4 GiB worth of directory entries.
+        let mut readdir_payload = 0u32.to_le_bytes().to_vec();
+        readdir_payload.extend_from_slice(&0u64.to_le_bytes());
+        readdir_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_READDIR, 2, &readdir_payload));
+
+        assert_eq!(response[4], R_READDIR, "expected Rreaddir");
         assert!(
             (response.len() as u32) <= device.msize,
             "reply of {} bytes exceeds the negotiated msize {}",
