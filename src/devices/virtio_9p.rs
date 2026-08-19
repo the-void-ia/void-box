@@ -2345,11 +2345,22 @@ mod tests {
         const DESC: u64 = 0x40;
         const AVAIL: u64 = 0x80;
         const USED: u64 = 0xC0;
-        // A readable descriptor claiming the whole 32-bit length space.
-        mem.write_obj(0x20u64, GuestAddress(DESC)).unwrap();
+        // Descriptor 0: readable, claiming the whole 32-bit length space, and
+        // chained to a writable descriptor so the device has somewhere to put
+        // its reply — without one the used ring records zero bytes and the
+        // assertion below could not tell a capped read from no read at all.
+        mem.write_obj(0x200u64, GuestAddress(DESC)).unwrap();
         mem.write_obj(u32::MAX, GuestAddress(DESC + 8)).unwrap();
-        mem.write_obj(0u16, GuestAddress(DESC + 12)).unwrap();
-        mem.write_obj(0u16, GuestAddress(DESC + 14)).unwrap();
+        mem.write_obj(VIRTQ_DESC_F_NEXT, GuestAddress(DESC + 12))
+            .unwrap();
+        mem.write_obj(1u16, GuestAddress(DESC + 14)).unwrap();
+        // Descriptor 1: device-writable reply buffer.
+        mem.write_obj(0x2000u64, GuestAddress(DESC + 16)).unwrap();
+        mem.write_obj(4096u32, GuestAddress(DESC + 16 + 8)).unwrap();
+        mem.write_obj(VIRTQ_DESC_F_WRITE, GuestAddress(DESC + 16 + 12))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 16 + 14)).unwrap();
+
         mem.write_obj(0u16, GuestAddress(AVAIL)).unwrap();
         mem.write_obj(1u16, GuestAddress(AVAIL + 2)).unwrap();
         mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
@@ -2522,16 +2533,20 @@ mod tests {
     #[test]
     fn treaddir_reply_cannot_exceed_the_negotiated_msize() {
         let (mut device, dir) = make_rw_device();
-        // Enough entries that the dirent stream would outgrow a small msize.
-        for i in 0..200 {
+        // Enough entries that the dirent stream outgrows the negotiated msize.
+        // Each is ~24 bytes of dirent header plus a 24-byte name, so 600 entries
+        // is roughly 28 KB against an 8 KB budget.
+        for i in 0..600 {
             fs::write(dir.path().join(format!("entry-{i:04}-padding-name")), b"x").unwrap();
         }
 
-        let mut version_payload = 512u32.to_le_bytes().to_vec();
+        // Above MIN_MSIZE: negotiating below the floor would clamp, and the
+        // point here is the reply bound, not the floor.
+        let mut version_payload = 8192u32.to_le_bytes().to_vec();
         version_payload.extend_from_slice(&(8u16).to_le_bytes());
         version_payload.extend_from_slice(b"9P2000.L");
         device.handle_9p_request(&build_request(T_VERSION, 0, &version_payload));
-        assert_eq!(device.msize, 512);
+        assert_eq!(device.msize, 8192);
 
         let mut attach_payload = 0u32.to_le_bytes().to_vec();
         attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
