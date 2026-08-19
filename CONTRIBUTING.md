@@ -220,8 +220,6 @@ Create a new area label only when a third open issue would use it; until then, a
 
 A branch ruleset enforces the required status checks on `main`: the CI matrix (format, lint, tests, build, docs, and MSRV across the supported platforms), the security audit, the CodeQL analyses, and the E2E lanes must be green before a PR can merge. The authoritative check list lives in the repo's branch rulesets (Settings → Rules), not in the repo tree. If you rename a CI job, that list must be updated in the same change, or the renaming PR blocks itself waiting for the old check name.
 
-For emergencies, organization owners can bypass the required checks when merging a pull request (GitHub shows a bypass option in the merge box and records the bypass in the ruleset's audit history). The bypass applies only to pull-request merges — a PR, signed commits, and linear history remain mandatory. Reserve it for urgent fixes where waiting for CI is worse than merging unverified, and say so in the PR.
-
 ## AI Agent Skills
 
 The repo ships agent skills for common development tasks in `.claude/skills/`. Each skill is a plain markdown file (`SKILL.md`) with self-contained instructions — readable and executable by any AI coding agent.
