@@ -72,7 +72,25 @@ jobs:
         # cancellation.
         timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
+          # apt on a hosted runner can block indefinitely and silently: the
+          # periodic unattended-upgrades job holds the dpkg lock, and apt
+          # without DPkg::Lock::Timeout waits on it forever, printing nothing —
+          # the step then dies at its cap with an empty log. Bound the lock
+          # wait, cap each call, and retry, so one stall costs seconds instead
+          # of the whole budget. Observed failing 3 runs in 5 without this.
+          apt_get() {
+            for attempt in 1 2 3; do
+              if sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 "$@"; then
+                return 0
+              fi
+              echo "::warning::apt-get $1 attempt $attempt stalled or failed; retrying"
+              sleep 5
+            done
+            echo "::error::apt-get $1 failed after 3 attempts"
+            return 1
+          }
+
+          apt_get update -qq
           # busybox-static is REQUIRED — `scripts/build_test_image.sh`
           # silently builds an initramfs with no `/bin/sh` when BUSYBOX
           # is unset (see `scripts/lib/guest_common.sh::install_busybox`).
@@ -85,7 +103,7 @@ jobs:
           #     → snapshot suite asserts fail, pty `sh -c "exit 42"`
           #     hits the execvp(127) child path.
           # All three failures share this single missing dep.
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
+          apt_get install -y -qq cpio gzip zstd musl-tools busybox-static
           # `truncate` and `mkfs.ext4` back the OCI block-rootfs path: the
           # oci_integration suite shells out to both to build the ext4 image it
           # attaches as /dev/vda. Assert rather than install. Their packages
@@ -100,7 +118,7 @@ jobs:
               || { echo "::error::$tool is missing; oci_integration cannot build its ext4 rootfs"; exit 1; }
           done
           # Ensure kernel modules are available for the running kernel
-          sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          apt_get install -y -qq linux-modules-$(uname -r) || true
           # Resolve the installed busybox path and export it so the build
           # step (and any future step) gets `BUSYBOX=<actual path>` from
           # the workflow env. Avoids mutating system paths via symlinks

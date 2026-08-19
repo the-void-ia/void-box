@@ -81,8 +81,26 @@ jobs:
       - name: Install system packages
         timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
+          # apt on a hosted runner can block indefinitely and silently: the
+          # periodic unattended-upgrades job holds the dpkg lock, and apt
+          # without DPkg::Lock::Timeout waits on it forever, printing nothing —
+          # the step then dies at its cap with an empty log. Bound the lock
+          # wait, cap each call, and retry, so one stall costs seconds instead
+          # of the whole budget. Observed failing 3 runs in 5 without this.
+          apt_get() {
+            for attempt in 1 2 3; do
+              if sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 "$@"; then
+                return 0
+              fi
+              echo "::warning::apt-get $1 attempt $attempt stalled or failed; retrying"
+              sleep 5
+            done
+            echo "::error::apt-get $1 failed after 3 attempts"
+            return 1
+          }
+
+          apt_get update -qq
+          apt_get install -y -qq cpio gzip zstd musl-tools busybox-static
           BUSYBOX_PATH="$(command -v busybox)"
           test -n "$BUSYBOX_PATH" \
             || { echo "::error::busybox not on PATH after busybox-static install"; exit 1; }
