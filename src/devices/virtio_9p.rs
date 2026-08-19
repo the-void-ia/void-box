@@ -22,9 +22,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use tracing::{debug, trace, warn};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::devices::virtio_net::mmio;
+use crate::devices::virtqueue::ring_addr;
 
 // ---------------------------------------------------------------------------
 // Virtio constants
@@ -469,26 +470,33 @@ impl Virtio9pDevice {
             return Ok(());
         }
 
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
         let queue_size = q.num as usize;
+        // Every address below is a base the guest wrote to an MMIO register plus
+        // an offset. `vm_memory`'s `unchecked_add` is a plain `+`, so a base near
+        // `u64::MAX` panics under `overflow-checks` and wraps onto low mapped
+        // memory otherwise; `ring_addr` rejects the address instead.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
+        let Some(avail_idx_addr) = ring_addr(avail_base, 2) else {
+            warn!("virtio-9p: available ring at {avail_base:#x} overflows the address space");
+            return Ok(());
+        };
 
         // Read current available index from the driver ring
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read(&mut idx_buf, avail_idx_addr)
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
         while self.avail_idx != avail_idx {
             // Read head descriptor index from available ring
             let ring_offset = 4 + ((self.avail_idx as usize) % queue_size) * 2;
+            let Some(ring_entry_addr) = ring_addr(avail_base, ring_offset as u64) else {
+                warn!("virtio-9p: available ring entry overflows the address space");
+                return Ok(());
+            };
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            mem.read(&mut desc_id_buf, ring_entry_addr)
+                .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             // Walk the descriptor chain: collect request bytes and find the
@@ -496,12 +504,28 @@ impl Virtio9pDevice {
             let mut request_data = Vec::new();
             let mut response_descs: Vec<(u64, u32)> = Vec::new(); // (guest addr, len)
             let mut next = head_idx;
+            let mut walked = 0usize;
 
             loop {
                 if next >= queue_size {
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
+                // A chain cannot be longer than the table it indexes into. A
+                // descriptor whose NEXT points back into the chain — at itself,
+                // or around a cycle — would otherwise spin here forever while
+                // `response_descs` grows without bound.
+                if walked >= queue_size {
+                    warn!("virtio-9p: descriptor chain longer than the {queue_size}-entry table (cycle?)");
+                    break;
+                }
+                walked += 1;
+
+                let Some(desc_off) = ring_addr(desc_base, (next * 16) as u64) else {
+                    warn!(
+                        "virtio-9p: descriptor table at {desc_base:#x} overflows the address space"
+                    );
+                    return Ok(());
+                };
                 let mut desc = [0u8; 16];
                 mem.read(&mut desc, desc_off)
                     .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -515,9 +539,16 @@ impl Virtio9pDevice {
                     // Device-writable: response buffer
                     response_descs.push((addr, dlen));
                 } else {
-                    // Device-readable: request data
-                    if dlen > 0 && addr != 0 {
-                        let mut buf = vec![0u8; dlen as usize];
+                    // Device-readable: request data. `dlen` is a guest-written
+                    // descriptor length, so it sizes this buffer directly — one
+                    // descriptor could ask for 4 GiB, and a chain could repeat
+                    // it. The request is a 9P message, which by definition fits
+                    // in the negotiated `msize`, so anything past that budget is
+                    // bytes the device would refuse to parse anyway.
+                    let budget = (self.msize as usize).saturating_sub(request_data.len());
+                    let readable = (dlen as usize).min(budget);
+                    if readable > 0 && addr != 0 {
+                        let mut buf = vec![0u8; readable];
                         mem.read(&mut buf, GuestAddress(addr))
                             .map_err(|e| crate::Error::Memory(e.to_string()))?;
                         request_data.extend_from_slice(&buf);
@@ -549,20 +580,28 @@ impl Virtio9pDevice {
 
             // Update used ring
             let used_ring_off = 4 + ((self.used_idx as usize) % queue_size) * 8;
+            let Some(used_elem_addr) = ring_addr(used_base, used_ring_off as u64) else {
+                warn!("virtio-9p: used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_elem = [
                 (head_idx as u32).to_le_bytes(),
                 (written as u32).to_le_bytes(),
             ]
             .concat();
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.used_idx = self.used_idx.wrapping_add(1);
             self.avail_idx = self.avail_idx.wrapping_add(1);
 
             // Update used.idx so guest sees progress
+            let Some(used_idx_addr) = ring_addr(used_base, 2) else {
+                warn!("virtio-9p: used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_idx_bytes = self.used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write(&used_idx_bytes, used_idx_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 

@@ -859,9 +859,13 @@ Discovery is out of band. `cargo fuzz` needs a nightly toolchain, and a search t
 ```bash
 rustup toolchain install nightly
 cargo install cargo-fuzz
+# libfuzzer-sys builds the libFuzzer runtime with cc, so a C++ compiler must be
+# on PATH as `c++` (Fedora: gcc-c++; Debian/Ubuntu: g++).
 cargo +nightly fuzz run vsock_frame -- -max_total_time=60 -rss_limit_mb=2048
-# targets: vsock_frame, vsock_packet, virtqueue, nine_p
+# targets: vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport
 ```
+
+`nine_p` drives the 9P message parser directly; `nine_p_transport` drives the device through its MMIO registers and guest memory, covering the queue programming and descriptor walk beneath it. The split matters: the transport parses guest data of its own — descriptor lengths size host allocations and `next` indices steer the walk — and a harness aimed at the message parser never reaches it.
 
 When a run crashes, `cargo fuzz` writes the input under `fuzz/artifacts/<target>/`. Commit that file **together with the parser fix** — the replay test then keeps the bug fixed for everyone. Never commit a crashing input ahead of its fix: it reds the gate for every unrelated change.
 

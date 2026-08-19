@@ -57,13 +57,18 @@ pub struct SplitVirtqueue {
 /// A guest ring address plus an offset into it, or `None` when the sum leaves
 /// the 64-bit address space.
 ///
+/// Shared with the 9P device, which walks its own queue: `vm_memory`'s
+/// `unchecked_add` is a plain `+`, so it panics under `overflow-checks` rather
+/// than wrapping, and both walkers take their base from the same kind of
+/// unvalidated guest register.
+///
 /// The base comes from an MMIO register the guest writes with no validation, so
 /// a base near `u64::MAX` is reachable. Plain `+` panics there under
 /// `overflow-checks`, which turns a guest register write into a host VMM crash;
 /// wrapping instead would fold a wild address back onto memory that is mapped.
 /// Rejecting the operation leaves the guest with an unserviced queue, which is
 /// the consequence of the address it programmed.
-fn ring_addr(base: u64, offset: u64) -> Option<GuestAddress> {
+pub(crate) fn ring_addr(base: u64, offset: u64) -> Option<GuestAddress> {
     base.checked_add(offset).map(GuestAddress)
 }
 

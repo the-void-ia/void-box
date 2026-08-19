@@ -38,10 +38,12 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 #[cfg(target_os = "linux")]
 use crate::devices::virtio_9p::Virtio9pDevice;
 #[cfg(target_os = "linux")]
+use crate::devices::virtio_net::mmio;
+#[cfg(target_os = "linux")]
 use crate::devices::virtqueue::SplitVirtqueue;
 #[cfg(target_os = "linux")]
 use crate::devices::vsock_connection::{
-    ConnState, VsockConnection, VsockConnectionMap, VsockHeader,
+    ConnState, VsockConnection, VsockConnectionMap, VsockHeader, VSOCK_HEADER_SIZE,
 };
 
 /// Guest memory the virtqueue harness maps. Large enough to hold a descriptor
@@ -65,6 +67,11 @@ const FUZZ_MAX_VSOCK_BODY: usize = 8 * 1024;
 /// single iteration can do against the caller's root directory.
 #[cfg(target_os = "linux")]
 const FUZZ_MAX_9P_REQUESTS: usize = 64;
+
+/// MMIO writes driven per transport iteration. Enough to program a queue and
+/// kick it several times; bounded so one input cannot loop indefinitely.
+#[cfg(target_os = "linux")]
+const FUZZ_MAX_MMIO_WRITES: usize = 48;
 
 /// A cursor that turns a fuzzer's byte slice into harness parameters.
 ///
@@ -176,37 +183,30 @@ pub fn vsock_frame(data: &[u8]) {
 /// Drive the userspace vsock connection map with guest TX packets.
 ///
 /// The map is the host-side state machine behind `virtio_vsock_userspace`: it
-/// reads a 44-byte header out of a guest descriptor and routes the packet by
-/// its op, ports, and credit fields. The harness runs it twice over — once
-/// parsing a header straight from the input, then over synthesized headers, so
-/// the mutator can steer op and credit fields without spending 44 bytes per
-/// packet. One established connection is seeded over a `socketpair`, because
-/// the paths worth reaching — credit accounting, short-write buffering, the
-/// buffer caps — are only reachable on a connection in `Connected` state.
+/// reads a 44-byte header out of a guest descriptor and routes the packet by its
+/// op, ports, and credit fields. One established connection is seeded over a
+/// `socketpair`, because the paths worth reaching — credit accounting,
+/// short-write buffering — are only reachable on a connection in `Connected`
+/// state.
+///
+/// An input that opens with a full 44-byte header drives the state machine with
+/// exactly that header, so a wire-format seed exercises the op it encodes. Once
+/// those bytes are consumed the harness switches to a compact per-packet
+/// encoding, which lets the mutator steer op and credit fields without spending
+/// 44 bytes on every packet.
 #[cfg(target_os = "linux")]
 pub fn vsock_packet(data: &[u8]) {
     const GUEST_CID: u64 = 3;
     const GUEST_PORT: u32 = 1234;
     const HOST_PORT: u32 = 50000;
 
-    // Header parse straight off the wire bytes, plus the round-trip that pins
-    // field offsets: a shifted offset would silently reinterpret every field.
-    if let Some(header) = VsockHeader::from_bytes(data) {
-        let reparsed = VsockHeader::from_bytes(&header.to_bytes())
-            .expect("a serialized header must parse back");
-        assert_eq!(header.src_port, reparsed.src_port);
-        assert_eq!(header.dst_port, reparsed.dst_port);
-        assert_eq!(header.len, reparsed.len);
-        assert_eq!(header.op, reparsed.op);
-        assert_eq!(header.buf_alloc, reparsed.buf_alloc);
-        assert_eq!(header.fwd_cnt, reparsed.fwd_cnt);
-    }
-
     let mut map = VsockConnectionMap::new_without_listener(GUEST_CID);
 
-    // The peer end stays bound for the whole call and is never read. Its socket
-    // buffer therefore fills, which is what pushes `write_to_host` onto the
-    // short-write and backpressure paths rather than always completing.
+    // The peer end stays bound for the whole call and is never read, so its
+    // socket buffer fills and `write_to_host` takes the short-write path instead
+    // of always completing. The 256 KiB per-connection cap above that is out of
+    // reach here — one input is at most 64 KiB — so this covers partial writes
+    // and the cursor arithmetic, not the cap itself.
     let peer = match UnixStream::pair() {
         Ok((host_side, peer)) => {
             let mut conn = VsockConnection::new(GUEST_PORT, HOST_PORT, host_side);
@@ -218,6 +218,27 @@ pub fn vsock_packet(data: &[u8]) {
     };
 
     let mut bytes = Input::new(data);
+
+    // A leading wire-format header is parsed and fed to the state machine as
+    // itself, so a seed written in the on-wire layout drives the op it encodes.
+    // The round-trip through `to_bytes` pins the field offsets on the way: a
+    // shifted offset would silently reinterpret every field.
+    if let Some(header) = VsockHeader::from_bytes(bytes.take(VSOCK_HEADER_SIZE)) {
+        let reparsed = VsockHeader::from_bytes(&header.to_bytes())
+            .expect("a serialized header must parse back");
+        assert_eq!(header.src_port, reparsed.src_port);
+        assert_eq!(header.dst_port, reparsed.dst_port);
+        assert_eq!(header.len, reparsed.len);
+        assert_eq!(header.op, reparsed.op);
+        assert_eq!(header.buf_alloc, reparsed.buf_alloc);
+        assert_eq!(header.fwd_cnt, reparsed.fwd_cnt);
+
+        let body_len = (header.len as usize).min(FUZZ_MAX_VSOCK_BODY);
+        let body = bytes.take(body_len);
+        map.process_guest_tx(&header, body);
+        let _ = map.drain_rx();
+    }
+
     while !bytes.is_empty() {
         let header = VsockHeader {
             src_cid: GUEST_CID,
@@ -379,5 +400,66 @@ pub fn nine_p(root: &Path, data: &[u8]) {
             "9P reply declares {declared} bytes but is {} long",
             response.len()
         );
+    }
+}
+
+/// Drive the 9P device through its MMIO registers and guest memory, the way a
+/// guest driver does.
+///
+/// [`nine_p`] hands requests straight to the message parser, which skips
+/// everything between the guest and it: the queue registers the guest programs,
+/// the descriptor chain the device walks, and the reply write-back. That layer
+/// parses guest data too — descriptor lengths size host allocations, `next`
+/// indices steer the walk, and the ring base addresses come from unvalidated
+/// register writes — so it needs its own harness rather than sharing one with
+/// the parser above it.
+///
+/// The input supplies both halves at once: a sequence of register writes, and
+/// the guest memory those registers point into. `root` must be a directory the
+/// caller is willing to see modified.
+#[cfg(target_os = "linux")]
+pub fn nine_p_transport(root: &Path, data: &[u8]) {
+    /// Registers a driver programs to bring a queue up, plus the notify that
+    /// kicks it. Offsets come from the shared virtio-mmio layout.
+    const REGISTERS: &[u64] = &[
+        mmio::STATUS,
+        mmio::QUEUE_SEL,
+        mmio::QUEUE_NUM,
+        mmio::QUEUE_DESC_LOW,
+        mmio::QUEUE_DESC_HIGH,
+        mmio::QUEUE_DRIVER_LOW,
+        mmio::QUEUE_DRIVER_HIGH,
+        mmio::QUEUE_DEVICE_LOW,
+        mmio::QUEUE_DEVICE_HIGH,
+        mmio::QUEUE_READY,
+        mmio::QUEUE_NOTIFY,
+        mmio::DRIVER_FEATURES,
+        mmio::DRIVER_FEATURES_SEL,
+    ];
+
+    let mut input = Input::new(data);
+    let read_only = input.u8() & 1 == 0;
+    let mut device = Virtio9pDevice::new(root, "fuzz", read_only);
+
+    let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), FUZZ_GUEST_MEM_BYTES as usize)])
+        .expect("mapping fuzz guest memory");
+
+    // Seed guest memory before any register write, so a kick has a descriptor
+    // table, rings, and request buffers to find.
+    let write_offset = input.u16() as u64 % FUZZ_GUEST_MEM_BYTES;
+    let contents = input.take((FUZZ_GUEST_MEM_BYTES - write_offset) as usize);
+    let _ = memory.write_slice(contents, GuestAddress(write_offset));
+
+    for _ in 0..FUZZ_MAX_MMIO_WRITES {
+        if input.is_empty() {
+            break;
+        }
+        let register = REGISTERS[usize::from(input.u8()) % REGISTERS.len()];
+        let value = input.u32();
+        device.mmio_write(register, &value.to_le_bytes(), Some(&memory));
+
+        // Reads share the register decode and the config-space path.
+        let mut scratch = [0u8; 4];
+        device.mmio_read(u64::from(input.u8()) * 4, &mut scratch);
     }
 }

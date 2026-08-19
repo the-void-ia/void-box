@@ -20,7 +20,13 @@ use std::path::{Path, PathBuf};
 
 /// Corpus directories are per target; `nine_p` additionally needs a writable
 /// root, so the dispatch is by name rather than by a function pointer table.
-const TARGETS: &[&str] = &["vsock_frame", "vsock_packet", "virtqueue", "nine_p"];
+const TARGETS: &[&str] = &[
+    "vsock_frame",
+    "vsock_packet",
+    "virtqueue",
+    "nine_p",
+    "nine_p_transport",
+];
 
 /// Run one corpus input through the harness that owns it.
 ///
@@ -36,10 +42,12 @@ fn replay(target: &str, data: &[u8], root: &Path) {
         "virtqueue" => void_box::fuzz::virtqueue(data),
         #[cfg(target_os = "linux")]
         "nine_p" => void_box::fuzz::nine_p(root, data),
+        #[cfg(target_os = "linux")]
+        "nine_p_transport" => void_box::fuzz::nine_p_transport(root, data),
         // The device harnesses are Linux-only because `void_box::devices` is.
         // Their corpus still travels with the repo and still replays on Linux.
         #[cfg(not(target_os = "linux"))]
-        "vsock_packet" | "virtqueue" | "nine_p" => {
+        "vsock_packet" | "virtqueue" | "nine_p" | "nine_p_transport" => {
             let _ = (data, root);
         }
         other => panic!("no harness registered for fuzz target {other}"),
@@ -105,9 +113,14 @@ fn every_fuzz_target_is_replayed() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
     let manifest = fs::read_to_string(base.join("Cargo.toml")).expect("read fuzz/Cargo.toml");
 
+    // Not a TOML parser: match `name` followed by `=` with any spacing, so a
+    // target declared as `name="x"` is not silently skipped — that would leave
+    // the very gap this test exists to close.
     let declared: Vec<String> = manifest
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("name = "))
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("name"))
+        .filter_map(|rest| rest.trim_start().strip_prefix('='))
         .map(|value| value.trim().trim_matches('"').to_string())
         // The `[package]` name shares the key; the targets are the rest.
         .filter(|name| name != "void-box-fuzz")

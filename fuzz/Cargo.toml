@@ -55,4 +55,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "nine_p_transport"
+path = "fuzz_targets/nine_p_transport.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
