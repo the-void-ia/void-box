@@ -2431,6 +2431,57 @@ mod tests {
         );
     }
 
+    /// `Twalk`'s `nwname` is a guest u16 and each component costs a 13-byte QID
+    /// in the reply, so an unbounded walk builds an `Rwalk` several times the
+    /// negotiated `msize` — the same desync the read and readdir caps prevent.
+    ///
+    /// A `"."` component is the cheapest: 3 payload bytes for a 13-byte QID, so
+    /// one `msize`-sized request buys a reply roughly four times `msize`.
+    #[test]
+    fn twalk_reply_cannot_exceed_the_negotiated_msize() {
+        let (mut device, _dir) = make_rw_device();
+
+        let mut version = MIN_MSIZE.to_le_bytes().to_vec();
+        version.extend_from_slice(&(8u16).to_le_bytes());
+        version.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version));
+        assert_eq!(device.msize, MIN_MSIZE);
+
+        let mut attach = 0u32.to_le_bytes().to_vec();
+        attach.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach.extend_from_slice(&0u16.to_le_bytes());
+        attach.extend_from_slice(&0u16.to_le_bytes());
+        attach.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach));
+
+        // More components than the reply budget holds QIDs for.
+        let components = (MIN_MSIZE as usize / QID_SIZE) + 32;
+        let mut walk = 0u32.to_le_bytes().to_vec();
+        walk.extend_from_slice(&1u32.to_le_bytes());
+        walk.extend_from_slice(&(components as u16).to_le_bytes());
+        for _ in 0..components {
+            walk.extend_from_slice(&(1u16).to_le_bytes());
+            walk.push(b'.');
+        }
+        let response = device.handle_9p_request(&build_request(T_WALK, 2, &walk));
+
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "Rwalk of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+
+        // A walk that fits is still served.
+        let mut short = 0u32.to_le_bytes().to_vec();
+        short.extend_from_slice(&2u32.to_le_bytes());
+        short.extend_from_slice(&1u16.to_le_bytes());
+        short.extend_from_slice(&(1u16).to_le_bytes());
+        short.push(b'.');
+        let response = device.handle_9p_request(&build_request(T_WALK, 3, &short));
+        assert_eq!(response[4], R_WALK, "a walk within budget must succeed");
+    }
+
     /// `Tlcreate` and `Tmkdir` build their target as `parent.join(name)`, so a
     /// name that is a path — absolute, or containing `..` — escapes the shared
     /// directory even though the parent fid is inside it.
