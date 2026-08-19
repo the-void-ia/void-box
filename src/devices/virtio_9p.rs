@@ -57,6 +57,16 @@ const MAX_SYMLINK_FOLLOWS: usize = 20;
 // 9P2000.L message types
 // ---------------------------------------------------------------------------
 
+/// Largest 9P message the device will agree to in `Tversion`, and therefore the
+/// largest reply it will ever build. A guest may ask for more; the negotiated
+/// value is the minimum of its request and this.
+const MAX_MSIZE: u32 = 64 * 1024;
+
+/// Bytes a reply spends before its data: the 9P header (size, type, tag) plus
+/// the `count` field that `Rread` and `Rreaddir` carry. Data must fit in
+/// `msize` minus this.
+const REPLY_OVERHEAD: u32 = 7 + 4;
+
 const T_VERSION: u8 = 100;
 const R_VERSION: u8 = 101;
 const T_ATTACH: u8 = 104;
@@ -160,6 +170,15 @@ pub struct Virtio9pDevice {
     /// open(O_CREAT) / mkdir against any path that has been re-validated
     /// since the chown round-trip. See issue #52.
     mapped_uid_gid: Option<(u32, u32)>,
+    /// Largest message either side may send, as agreed in `Tversion`.
+    ///
+    /// `Tread` carries a guest-chosen `count` that sizes the reply buffer, and
+    /// a reply may not exceed `msize`. Holding the negotiated value is what lets
+    /// the read path bound that allocation; without it the guest's `count` — up
+    /// to 4 GiB — reaches the allocator directly. Starts at [`MAX_MSIZE`], the
+    /// ceiling negotiation can never exceed, so a request that arrives before
+    /// `Tversion` is bounded on the same terms.
+    msize: u32,
     // internal virtqueue tracking
     avail_idx: u16,
     used_idx: u16,
@@ -216,6 +235,7 @@ impl Virtio9pDevice {
             read_only,
             fids: HashMap::new(),
             mapped_uid_gid: None,
+            msize: MAX_MSIZE,
             avail_idx: 0,
             used_idx: 0,
         }
@@ -651,7 +671,8 @@ impl Virtio9pDevice {
 
         let client_msize = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         // We use the minimum of client and a reasonable max
-        let msize = client_msize.min(64 * 1024);
+        let msize = client_msize.min(MAX_MSIZE);
+        self.msize = msize;
 
         // Clear all fids on version negotiation (as per spec)
         self.fids.clear();
@@ -1085,6 +1106,7 @@ impl Virtio9pDevice {
         let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let offset = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         let count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+        let msize_read_budget = self.msize.saturating_sub(REPLY_OVERHEAD);
 
         let state = match self.fids.get_mut(&fid) {
             Some(s) => s,
@@ -1101,7 +1123,13 @@ impl Virtio9pDevice {
             return Self::build_error(tag, io_error_to_errno(&e));
         }
 
-        let mut buf = vec![0u8; count as usize];
+        // `count` is whatever the guest asked for, up to 4 GiB, and it sizes
+        // this buffer. A reply may not exceed the negotiated `msize`, so
+        // anything past that budget could not be returned anyway — allocating
+        // it would only let the guest drive host memory with a single request.
+        // A guest that respects its own negotiated msize sees no change.
+        let capacity = count.min(msize_read_budget) as usize;
+        let mut buf = vec![0u8; capacity];
         let nread = match file.read(&mut buf) {
             Ok(n) => n,
             Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
@@ -2104,6 +2132,69 @@ mod tests {
         // Should be EROFS
         let ecode = u32::from_le_bytes(response[7..11].try_into().unwrap());
         assert_eq!(ecode, libc::EROFS as u32);
+    }
+
+    /// `Tread`'s `count` sizes the reply buffer and comes straight from the
+    /// guest, so a single request could ask the host to allocate 4 GiB. The
+    /// negotiated `msize` bounds it.
+    #[test]
+    fn tread_count_cannot_allocate_past_the_negotiated_msize() {
+        let (mut device, dir) = make_rw_device();
+        fs::write(dir.path().join("data.txt"), b"hello").unwrap();
+
+        // Negotiate a small msize, then attach and open the file.
+        let mut version_payload = 4096u32.to_le_bytes().to_vec();
+        version_payload.extend_from_slice(&(8u16).to_le_bytes());
+        version_payload.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version_payload));
+        assert_eq!(device.msize, 4096);
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        let mut walk_payload = 0u32.to_le_bytes().to_vec();
+        walk_payload.extend_from_slice(&1u32.to_le_bytes());
+        walk_payload.extend_from_slice(&1u16.to_le_bytes());
+        walk_payload.extend_from_slice(&(8u16).to_le_bytes());
+        walk_payload.extend_from_slice(b"data.txt");
+        device.handle_9p_request(&build_request(T_WALK, 2, &walk_payload));
+
+        let mut open_payload = 1u32.to_le_bytes().to_vec();
+        open_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_LOPEN, 3, &open_payload));
+
+        // Ask for 4 GiB. The reply carries the file's 5 bytes and nothing
+        // near the requested size was ever allocated.
+        let mut read_payload = 1u32.to_le_bytes().to_vec();
+        read_payload.extend_from_slice(&0u64.to_le_bytes());
+        read_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_READ, 4, &read_payload));
+
+        assert_eq!(
+            response[4], R_READ,
+            "expected Rread, got type {}",
+            response[4]
+        );
+        let returned = u32::from_le_bytes(response[7..11].try_into().unwrap());
+        assert_eq!(returned, 5, "the whole file should come back");
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "reply of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+    }
+
+    /// A request that arrives before `Tversion` is bounded by the ceiling
+    /// negotiation could never exceed, not by an unset value.
+    #[test]
+    fn msize_defaults_to_the_negotiation_ceiling() {
+        let (device, _dir) = make_rw_device();
+        assert_eq!(device.msize, MAX_MSIZE);
     }
 
     #[test]

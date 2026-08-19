@@ -9,6 +9,12 @@
 //! would not run anyway; the enclosing temp directory is the OS's to reclaim.
 #![no_main]
 
+// `void_box::devices` is Linux-only, so this parser does not exist elsewhere.
+// Failing the build with a reason beats either a confusing type error or a
+// target that silently fuzzes nothing.
+#[cfg(not(target_os = "linux"))]
+compile_error!("this parser is Linux-only; fuzz it on Linux");
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
