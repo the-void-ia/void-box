@@ -21,7 +21,8 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::devices::virtio_net::mmio;
 use crate::devices::virtio_vsock_mmio::VIRTIO_VSOCK_DEVICE_TYPE;
-use crate::devices::virtqueue::{SplitVirtqueue, VirtqueueSnapshot, VRING_DESC_F_WRITE};
+use crate::devices::virtqueue::{ring_addr, SplitVirtqueue, VirtqueueSnapshot, VRING_DESC_F_WRITE};
+
 use crate::devices::vsock_backend::VsockMmioDevice;
 use crate::devices::vsock_connection::{VsockConnectionMap, VsockHeader, VSOCK_HEADER_SIZE};
 use crate::vmm::snapshot::{QueueSnapshotState, VsockSnapshotState};
@@ -33,6 +34,13 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 /// Interval of the worker's periodic sweep: the epoll wait bound in the
 /// normal path, and the sleep between sweeps in the degraded (no-epoll)
 /// path.
+/// Largest guest→host packet payload the device will assemble from one
+/// descriptor chain. A virtio-vsock packet is bounded by the credit the
+/// device advertises (`HOST_TO_GUEST_BUFFER_CAP` in `vsock_connection`), so a
+/// chain describing more than this is describing bytes the connection map
+/// would drop; reading them only lets a guest size a host allocation.
+const VSOCK_MAX_PACKET_BYTES: usize = 256 * 1024;
+
 const WORKER_TICK: Duration = Duration::from_millis(50);
 
 /// Deadline for joining the worker thread during device teardown. The
@@ -301,11 +309,23 @@ impl VirtioVsockUserspace {
             }
 
             if let Some(hdr) = VsockHeader::from_bytes(&hdr_buf) {
+                // Every length below is a guest-written descriptor length, and
+                // each one sizes a host allocation. The packet the guest is
+                // describing is at most `hdr.len` bytes, so that — bounded by the
+                // credit the device advertised — is the whole budget; reading
+                // past it would buffer bytes the truncation below discards
+                // anyway, at up to 4 GiB per descriptor across the chain.
+                let budget = (hdr.len as usize).min(VSOCK_MAX_PACKET_BYTES);
+
                 // Read data payload from subsequent descriptors
-                let mut data = Vec::new();
+                let mut data: Vec<u8> = Vec::new();
                 for desc in chain.descriptors.iter().skip(1) {
                     if desc.flags & VRING_DESC_F_WRITE == 0 {
-                        let mut buf = vec![0u8; desc.len as usize];
+                        let readable = (desc.len as usize).min(budget.saturating_sub(data.len()));
+                        if readable == 0 {
+                            continue;
+                        }
+                        let mut buf = vec![0u8; readable];
                         let _ = mem.read(&mut buf, GuestAddress(desc.addr));
                         data.extend_from_slice(&buf);
                     }
@@ -313,14 +333,20 @@ impl VirtioVsockUserspace {
                 // Also check if the first descriptor has data after the header
                 if let Some(desc) = chain.descriptors.first() {
                     if desc.len > VSOCK_HEADER_SIZE as u32 {
-                        let extra = desc.len as usize - VSOCK_HEADER_SIZE;
-                        let mut buf = vec![0u8; extra];
-                        let _ =
-                            mem.read(&mut buf, GuestAddress(desc.addr + VSOCK_HEADER_SIZE as u64));
-                        // Prepend to data since it comes from the first descriptor
-                        let mut combined = buf;
-                        combined.extend_from_slice(&data);
-                        data = combined;
+                        let extra = (desc.len as usize - VSOCK_HEADER_SIZE).min(budget);
+                        // The header sits at `desc.addr`; the payload follows it.
+                        // `desc.addr` is guest-written, so a base within 44 of
+                        // the top of the address space would overflow a plain
+                        // `+` under overflow-checks.
+                        if let Some(payload_addr) = ring_addr(desc.addr, VSOCK_HEADER_SIZE as u64) {
+                            let mut buf = vec![0u8; extra];
+                            let _ = mem.read(&mut buf, payload_addr);
+                            // Prepend to data since it comes from the first descriptor
+                            let mut combined = buf;
+                            combined.extend_from_slice(&data);
+                            combined.truncate(budget);
+                            data = combined;
+                        }
                     }
                 }
 
@@ -690,7 +716,12 @@ impl VsockMmioDevice for VirtioVsockUserspace {
             mmio::DRIVER_FEATURES_SEL => self.features_sel = value,
             mmio::QUEUE_SEL => self.queue_sel = value,
             mmio::QUEUE_NUM => {
-                self.current_queue_cfg_mut().num = value as u16;
+                // Clamp to the size the device advertises in `QueueNumMax`: the
+                // virtio spec forbids exceeding it, and `SplitVirtqueue` derives
+                // its descriptor-walk bound from this value, so an unclamped
+                // write would let the guest choose its own bound.
+                let num_max = self.current_queue_cfg().num_max;
+                self.current_queue_cfg_mut().num = (value as u16).min(num_max);
             }
             mmio::QUEUE_READY => {
                 let idx = self.queue_sel;

@@ -33,22 +33,38 @@ const TARGETS: &[&str] = &[
 /// `root` is a scratch directory the 9P harness may modify. Each input gets its
 /// own, so a replay failure names one file rather than one file plus whatever
 /// the previous input left behind.
-fn replay(target: &str, data: &[u8], root: &Path) {
+fn replay(target: &str, data: &[u8], root: &Path) -> bool {
     match target {
-        "vsock_frame" => void_box::fuzz::vsock_frame(data),
+        "vsock_frame" => {
+            void_box::fuzz::vsock_frame(data);
+            true
+        }
         #[cfg(target_os = "linux")]
-        "vsock_packet" => void_box::fuzz::vsock_packet(data),
+        "vsock_packet" => {
+            void_box::fuzz::vsock_packet(data);
+            true
+        }
         #[cfg(target_os = "linux")]
-        "virtqueue" => void_box::fuzz::virtqueue(data),
+        "virtqueue" => {
+            void_box::fuzz::virtqueue(data);
+            true
+        }
         #[cfg(target_os = "linux")]
-        "nine_p" => void_box::fuzz::nine_p(root, data),
+        "nine_p" => {
+            void_box::fuzz::nine_p(root, data);
+            true
+        }
         #[cfg(target_os = "linux")]
-        "nine_p_transport" => void_box::fuzz::nine_p_transport(root, data),
+        "nine_p_transport" => {
+            void_box::fuzz::nine_p_transport(root, data);
+            true
+        }
         // The device harnesses are Linux-only because `void_box::devices` is.
         // Their corpus still travels with the repo and still replays on Linux.
         #[cfg(not(target_os = "linux"))]
         "vsock_packet" | "virtqueue" | "nine_p" | "nine_p_transport" => {
             let _ = (data, root);
+            false
         }
         other => panic!("no harness registered for fuzz target {other}"),
     }
@@ -81,7 +97,9 @@ fn fuzz_corpus_replays_clean() {
     let scratch = tempfile::tempdir().expect("scratch dir for the 9P corpus");
     let mut replayed = 0usize;
 
+    let mut skipped: Vec<&str> = Vec::new();
     for target in TARGETS {
+        let mut ran_any = false;
         for path in inputs_for(target) {
             let data = fs::read(&path)
                 .unwrap_or_else(|err| panic!("read corpus input {}: {err}", path.display()));
@@ -90,14 +108,36 @@ fn fuzz_corpus_replays_clean() {
             // A panic here prints the harness's own assertion; name the input
             // too, since the whole point is to hand back a reproducer.
             eprintln!("replaying {}", path.display());
-            replay(target, &data, &root);
-            replayed += 1;
+            if replay(target, &data, &root) {
+                replayed += 1;
+                ran_any = true;
+            }
+        }
+        if !ran_any {
+            skipped.push(target);
         }
     }
 
+    // Count harnesses actually executed, not files read. Four of the five
+    // targets compile out on non-Linux, and a count of files would report a
+    // healthy number there while exercising one parser — the "covering nothing"
+    // guard would never fire on the platform where it matters most.
+    if !skipped.is_empty() {
+        eprintln!(
+            "SKIP: {} not replayed on this platform (void_box::devices is Linux-only): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
     assert!(
         replayed > 0,
-        "no fuzz corpus inputs found under fuzz/corpus — the replay gate is covering nothing"
+        "no fuzz harness ran — the replay gate is covering nothing"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        skipped.is_empty(),
+        "every target must replay on Linux, but these did not: {}",
+        skipped.join(", ")
     );
 }
 

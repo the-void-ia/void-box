@@ -290,14 +290,17 @@ pub fn virtqueue(data: &[u8]) {
     let mut bytes = Input::new(data);
 
     let num = bytes.u16();
-    // One input in eight keeps the raw 64-bit ring address, which is what a
-    // guest writing a wild value into the queue registers produces. The rest are
-    // folded into the mapped region so the reader gets past its first `read_obj`
-    // and actually walks a chain.
-    let unmapped_addrs = bytes.u8().is_multiple_of(8);
+    // Each ring address decides separately whether to keep its raw 64-bit value —
+    // what a guest writing a wild value into the queue registers produces — or to
+    // fold into the mapped region so the reader gets past its first `read_obj`
+    // and actually walks a chain. Deciding once for all three would make the
+    // mixed cases unreachable, and those are the interesting ones: a mapped
+    // available ring with a wild used ring is the only way to reach `push_used`'s
+    // overflow branch at all.
     let ring_addr = |input: &mut Input<'_>| {
+        let unmapped = input.u8().is_multiple_of(4);
         let raw = input.u64();
-        if unmapped_addrs {
+        if unmapped {
             raw
         } else {
             raw % FUZZ_GUEST_MEM_BYTES
@@ -446,8 +449,16 @@ pub fn nine_p_transport(root: &Path, data: &[u8]) {
 
     // Seed guest memory before any register write, so a kick has a descriptor
     // table, rings, and request buffers to find.
+    //
+    // The image length is its own field rather than "everything remaining":
+    // guest memory is 64 KiB and an input is at most that, so taking the rest of
+    // the slice would swallow the whole input and leave the register loop below
+    // nothing to run — the harness would construct a device and stop, never
+    // reaching `process_queue`. Splitting explicitly puts the boundary under the
+    // mutator's control and keeps a register program reachable from every input.
     let write_offset = input.u16() as u64 % FUZZ_GUEST_MEM_BYTES;
-    let contents = input.take((FUZZ_GUEST_MEM_BYTES - write_offset) as usize);
+    let image_len = usize::from(input.u16()).min((FUZZ_GUEST_MEM_BYTES - write_offset) as usize);
+    let contents = input.take(image_len);
     let _ = memory.write_slice(contents, GuestAddress(write_offset));
 
     for _ in 0..FUZZ_MAX_MMIO_WRITES {

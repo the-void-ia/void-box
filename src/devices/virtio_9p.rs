@@ -63,6 +63,12 @@ const MAX_SYMLINK_FOLLOWS: usize = 20;
 /// value is the minimum of its request and this.
 const MAX_MSIZE: u32 = 64 * 1024;
 
+/// Smallest `msize` the device will agree to. A 9P header plus the largest
+/// fixed reply must fit, and a guest that negotiates below this would starve the
+/// request-assembly budget in `process_queue` — including for the `Tversion`
+/// that would renegotiate.
+const MIN_MSIZE: u32 = 4 * 1024;
+
 /// Bytes a reply spends before its data: the 9P header (size, type, tag) plus
 /// the `count` field that `Rread` and `Rreaddir` carry. Data must fit in
 /// `msize` minus this.
@@ -186,6 +192,28 @@ pub struct Virtio9pDevice {
 }
 
 impl Virtio9pDevice {
+    /// A single directory-entry name, as `Tlcreate` / `Tmkdir` require, or
+    /// `None` when the guest sent something that is a path instead.
+    ///
+    /// These handlers build their target as `parent.join(name)`, and validating
+    /// only the parent does not constrain the result: `Path::join` with an
+    /// absolute name discards the base outright, and `..` is resolved by the
+    /// kernel at `create_dir`/`open` time. Either escapes the shared directory.
+    /// The sibling handlers that take a whole path go through
+    /// [`Self::normalize_under_root`]; these two take a name, so the tighter
+    /// check applies — a 9P name is one entry, with no separator in it.
+    fn entry_name(name: &str) -> Option<&std::ffi::OsStr> {
+        let mut components = std::path::Path::new(name).components();
+        let first = components.next()?;
+        if components.next().is_some() {
+            return None;
+        }
+        match first {
+            std::path::Component::Normal(component) => Some(component),
+            _ => None,
+        }
+    }
+
     fn normalize_under_root(root: &PathBuf, path: &std::path::Path) -> Option<PathBuf> {
         let mut out = root.clone();
         for comp in path.components() {
@@ -368,7 +396,11 @@ impl Virtio9pDevice {
                 self.queue_sel = value;
             }
             mmio::QUEUE_NUM => {
-                self.queue.num = value as u16;
+                // The guest may not exceed the size the device advertises in
+                // `QueueNumMax`; the virtio spec forbids it, and the descriptor
+                // walk's bound is derived from this value, so an unclamped write
+                // would let the guest set its own bound.
+                self.queue.num = (value as u16).min(self.queue.num_max);
             }
             mmio::QUEUE_READY => {
                 self.queue.ready = value != 0;
@@ -457,6 +489,10 @@ impl Virtio9pDevice {
             ..Default::default()
         };
         self.fids.clear();
+        // Negotiated per connection, so a reset must return it to the ceiling
+        // with everything else. Leaving the previous driver's value would apply
+        // a stale, smaller request cap to the next driver's first requests.
+        self.msize = MAX_MSIZE;
         self.avail_idx = 0;
         self.used_idx = 0;
     }
@@ -621,7 +657,20 @@ impl Virtio9pDevice {
             return Self::build_error(0, libc::EIO as u32);
         }
 
-        let _msg_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let msg_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        // The header declares the whole message. A mismatch means either a guest
+        // that lied or a request `process_queue` truncated at the `msize` budget;
+        // either way the handlers below would parse a payload that is not the one
+        // the header describes. Rejecting here makes that explicit instead of
+        // leaving each handler's own length check to surface it as some other
+        // errno.
+        if msg_size as usize != data.len() {
+            warn!(
+                "virtio-9p: request declares {msg_size} bytes but carries {}",
+                data.len()
+            );
+            return Self::build_error(0, libc::EIO as u32);
+        }
         let msg_type = data[4];
         let tag = u16::from_le_bytes(data[5..7].try_into().unwrap());
         let payload = &data[7..];
@@ -710,7 +759,11 @@ impl Virtio9pDevice {
 
         let client_msize = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         // We use the minimum of client and a reasonable max
-        let msize = client_msize.min(MAX_MSIZE);
+        // A floor as well as a ceiling: `process_queue` derives its
+        // request-assembly budget from `msize`, so accepting 0 would make every
+        // later request assemble to an empty buffer — including the `Tversion`
+        // that would renegotiate, leaving the mount unrecoverable.
+        let msize = client_msize.clamp(MIN_MSIZE, MAX_MSIZE);
         self.msize = msize;
 
         // Clear all fids on version negotiation (as per spec)
@@ -809,8 +862,19 @@ impl Virtio9pDevice {
             Err(_) => return Self::build_error(tag, libc::EIO as u32),
         };
 
+        // `nwname` is a guest u16 and each walked component costs a 13-byte QID in
+        // the reply, so an unbounded walk builds an `Rwalk` several times the
+        // negotiated `msize` — the same size-field-versus-delivered-bytes desync
+        // the read and readdir caps prevent. A conforming client never walks
+        // more components than fit.
+        let max_qids = (self.msize.saturating_sub(REPLY_OVERHEAD) as usize) / QID_SIZE;
+
         let mut walked_names: Vec<String> = Vec::new();
         for _ in 0..nwname {
+            if qids.len() >= max_qids {
+                warn!("virtio-9p: Twalk of {nwname} components exceeds the msize reply budget");
+                return Self::build_error(tag, libc::EINVAL as u32);
+            }
             if off + 2 > payload.len() {
                 return Self::build_error(tag, libc::EINVAL as u32);
             }
@@ -1031,7 +1095,11 @@ impl Virtio9pDevice {
             None => return Self::build_error(tag, libc::EBADF as u32),
         };
 
-        let new_path = parent_path.join(&name);
+        let Some(entry) = Self::entry_name(&name) else {
+            warn!("virtio-9p: Tlcreate name {name:?} is not a single entry name");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        };
+        let new_path = parent_path.join(entry);
 
         // Security check
         if let Ok(root) = self.root_dir.canonicalize() {
@@ -1391,7 +1459,22 @@ impl Virtio9pDevice {
         let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let offset = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         let count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
-        let msize_read_budget = self.msize.saturating_sub(REPLY_OVERHEAD);
+
+        // `count` is guest-chosen and bounds nothing on its own: the entries
+        // come from a host directory that a guest with a read-write mount fills
+        // itself. The reply also has to fit inside the negotiated `msize` —
+        // `process_queue` writes only as far as the guest's descriptors reach
+        // and then reports a short length, while the reply's own size field
+        // still declares the full one, so an oversized reply desynchronizes the
+        // 9P stream for every later request on the mount.
+        let max_bytes = count.min(self.msize.saturating_sub(REPLY_OVERHEAD)) as usize;
+        // The smallest an entry can be on the wire is a one-character name, so
+        // this many is the most the reply can possibly carry. Collecting past it
+        // would buffer a `String` and a `stat` result per entry — hundreds of
+        // megabytes on a directory the guest grew — and pay a `metadata()`
+        // syscall each, for entries that were never going to be sent.
+        const MIN_DIRENT_BYTES: usize = QID_SIZE + 8 + 1 + 2 + 1;
+        let max_entries = max_bytes / MIN_DIRENT_BYTES + 1;
 
         let state = match self.fids.get(&fid) {
             Some(s) => s,
@@ -1405,64 +1488,69 @@ impl Virtio9pDevice {
             Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
         };
 
-        // Collect all entries, including "." and ".."
-        let mut all_entries: Vec<(String, fs::Metadata)> = Vec::new();
+        // Entries carry their absolute position in the dirent stream, because
+        // the client pages through a directory by offset. Positions below
+        // `offset` advance the counter without being stat'd or stored, so a
+        // later page does not re-walk every earlier entry.
+        let mut collected: Vec<(u64, String, fs::Metadata)> = Vec::new();
+        let mut position = 0u64;
 
-        // Add "." entry
-        if let Ok(m) = fs::metadata(&dir_path) {
-            all_entries.push((".".to_string(), m));
-        }
-        // Add ".." entry
-        if let Some(parent) = dir_path.parent() {
-            // Ensure ".." doesn't escape root
-            let root_canon = self.root_dir.canonicalize().unwrap_or_default();
-            let parent_path = if dir_path == root_canon {
-                // At root, ".." points to root itself
-                dir_path.clone()
-            } else {
-                parent.to_path_buf()
-            };
-            if let Ok(m) = fs::metadata(&parent_path) {
-                all_entries.push(("..".to_string(), m));
+        // "." entry
+        if position >= offset && collected.len() < max_entries {
+            if let Ok(m) = fs::metadata(&dir_path) {
+                collected.push((position, ".".to_string(), m));
             }
         }
+        position += 1;
 
-        // Add regular entries
+        // ".." entry
+        if let Some(parent) = dir_path.parent() {
+            if position >= offset && collected.len() < max_entries {
+                // Ensure ".." doesn't escape root
+                let root_canon = self.root_dir.canonicalize().unwrap_or_default();
+                let parent_path = if dir_path == root_canon {
+                    // At root, ".." points to root itself
+                    dir_path.clone()
+                } else {
+                    parent.to_path_buf()
+                };
+                if let Ok(m) = fs::metadata(&parent_path) {
+                    collected.push((position, "..".to_string(), m));
+                }
+            }
+            position += 1;
+        }
+
+        // Regular entries
         for entry in entries {
+            if collected.len() >= max_entries {
+                break;
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            let at = position;
+            position += 1;
+            if at < offset {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             match entry.metadata() {
-                Ok(m) => all_entries.push((name, m)),
+                Ok(m) => collected.push((at, name, m)),
                 Err(_) => continue,
             }
         }
 
-        // Build dirent stream starting from the given offset
+        // Build dirent stream.
         // Dirent format: qid(13) + offset(8) + type(1) + name_len(2) + name(n)
         let mut dirent_data = Vec::new();
-        // `count` is guest-chosen and bounds nothing on its own: entries come
-        // from the host directory, which a guest with a read-write mount fills
-        // itself, so a large `count` lets it drive how much the host buffers
-        // here. It also has to fit the reply inside `msize` — `process_queue`
-        // writes only as far as the guest's descriptors reach and then reports a
-        // short length, while the reply's own size field still declares the
-        // full one, so an oversized reply desynchronizes the 9P stream for every
-        // later request on the mount.
-        let max_bytes = count.min(msize_read_budget) as usize;
 
-        for (idx, (name, metadata)) in all_entries.iter().enumerate() {
-            let entry_offset = idx as u64;
-            if entry_offset < offset {
-                continue;
-            }
-
+        for (at, name, metadata) in &collected {
             let qid = Self::build_qid(metadata);
             let dtype: u8 = if metadata.is_dir() {
                 4 // DT_DIR
-            } else if metadata.is_symlink() {
+            } else if metadata.file_type().is_symlink() {
                 10 // DT_LNK
             } else {
                 8 // DT_REG
@@ -1477,7 +1565,7 @@ impl Virtio9pDevice {
 
             dirent_data.extend_from_slice(&qid);
             // offset points to the *next* entry (so consumer can resume)
-            dirent_data.extend_from_slice(&(entry_offset + 1).to_le_bytes());
+            dirent_data.extend_from_slice(&(at + 1).to_le_bytes());
             dirent_data.push(dtype);
             dirent_data.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
             dirent_data.extend_from_slice(name_bytes);
@@ -1523,7 +1611,11 @@ impl Virtio9pDevice {
             None => return Self::build_error(tag, libc::EBADF as u32),
         };
 
-        let new_dir = parent_path.join(&name);
+        let Some(entry) = Self::entry_name(&name) else {
+            warn!("virtio-9p: Tmkdir name {name:?} is not a single entry name");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        };
+        let new_dir = parent_path.join(entry);
 
         // Security check
         if let Ok(root) = self.root_dir.canonicalize() {
@@ -2235,6 +2327,101 @@ mod tests {
             response.len(),
             device.msize
         );
+    }
+
+    /// `Tlcreate` and `Tmkdir` build their target as `parent.join(name)`, so a
+    /// name that is a path — absolute, or containing `..` — escapes the shared
+    /// directory even though the parent fid is inside it.
+    #[test]
+    fn lcreate_and_mkdir_reject_names_that_are_paths() {
+        let outside = tempfile::tempdir().expect("tempdir outside the share");
+        let (mut device, dir) = make_rw_device();
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        let escape_target = outside.path().join("escaped");
+        let absolute = escape_target.to_str().expect("utf-8 temp path").to_string();
+        for name in [absolute.as_str(), "../escaped", "..", "sub/escaped"] {
+            let mut create = 0u32.to_le_bytes().to_vec();
+            create.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            create.extend_from_slice(name.as_bytes());
+            create.extend_from_slice(&(0o102u32).to_le_bytes());
+            create.extend_from_slice(&(0o644u32).to_le_bytes());
+            create.extend_from_slice(&0u32.to_le_bytes());
+            let response = device.handle_9p_request(&build_request(T_LCREATE, 2, &create));
+            assert_eq!(response[4], R_ERROR, "Tlcreate({name:?}) should be refused");
+
+            let mut mkdir = 0u32.to_le_bytes().to_vec();
+            mkdir.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            mkdir.extend_from_slice(name.as_bytes());
+            mkdir.extend_from_slice(&(0o755u32).to_le_bytes());
+            mkdir.extend_from_slice(&0u32.to_le_bytes());
+            let response = device.handle_9p_request(&build_request(T_MKDIR, 3, &mkdir));
+            assert_eq!(response[4], R_ERROR, "Tmkdir({name:?}) should be refused");
+        }
+
+        assert!(
+            !escape_target.exists(),
+            "a guest name escaped the share to {}",
+            escape_target.display()
+        );
+        assert!(
+            !dir.path().parent().unwrap().join("escaped").exists(),
+            "a guest name escaped the share via .."
+        );
+        // A plain name still works.
+        let mut ok = 0u32.to_le_bytes().to_vec();
+        ok.extend_from_slice(&(7u16).to_le_bytes());
+        ok.extend_from_slice(b"allowed");
+        ok.extend_from_slice(&(0o755u32).to_le_bytes());
+        ok.extend_from_slice(&0u32.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_MKDIR, 4, &ok));
+        assert_eq!(response[4], R_MKDIR, "a single-component name must succeed");
+        assert!(dir.path().join("allowed").is_dir());
+    }
+
+    /// `msize` is negotiated per connection, so a reset must return it to the
+    /// ceiling, and a guest must not be able to negotiate a value so small that
+    /// the request-assembly budget starves the `Tversion` that would recover.
+    #[test]
+    fn msize_has_a_floor_and_is_restored_on_reset() {
+        let (mut device, _dir) = make_rw_device();
+
+        let mut tiny = 0u32.to_le_bytes().to_vec();
+        tiny.extend_from_slice(&(8u16).to_le_bytes());
+        tiny.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &tiny));
+        assert_eq!(device.msize, MIN_MSIZE, "msize=0 must clamp to the floor");
+
+        let mut small = 8192u32.to_le_bytes().to_vec();
+        small.extend_from_slice(&(8u16).to_le_bytes());
+        small.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &small));
+        assert_eq!(device.msize, 8192);
+
+        device.reset();
+        assert_eq!(
+            device.msize, MAX_MSIZE,
+            "reset must restore msize with the other negotiated state"
+        );
+    }
+
+    /// A request whose header disagrees with the bytes that arrived is rejected
+    /// at the entry point rather than parsed as if the header were right.
+    #[test]
+    fn request_with_mismatched_declared_size_is_rejected() {
+        let (mut device, _dir) = make_rw_device();
+        let mut request = build_request(T_VERSION, 0, &[0u8; 8]);
+        // Claim four more bytes than the buffer carries.
+        let declared = u32::from_le_bytes(request[0..4].try_into().unwrap()) + 4;
+        request[0..4].copy_from_slice(&declared.to_le_bytes());
+        let response = device.handle_9p_request(&request);
+        assert_eq!(response[4], R_ERROR);
     }
 
     /// `Treaddir`'s `count` bounds nothing by itself — the entries come from the

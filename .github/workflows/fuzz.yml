@@ -50,7 +50,7 @@ jobs:
       matrix:
         # One job per target so a crash in one still leaves the others' results
         # readable, and so each gets the full budget rather than a share of it.
-        target: [vsock_frame, vsock_packet, virtqueue, nine_p]
+        target: [vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport]
 
     steps:
       - uses: actions/checkout@v4
