@@ -976,8 +976,8 @@ cargo test --test e2e_mount -- --ignored --test-threads=1
 # Sidecar (Linux-only, deterministic — runs in CI):
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
 
-# Agent suites (Linux-only). These need the production image and a real
-# credential, and no CI pull-request runner has one, so run them here.
+# Agent suites. These need the production image and a real credential, and no
+# CI pull-request runner has one, so run them here.
 # VOID_BOX_REQUIRE_AGENT_CREDS=1 turns a missing credential into a failure
 # instead of a green skip.
 scripts/build_claude_rootfs.sh
@@ -1003,9 +1003,11 @@ export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
 cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=1
 ```
 
-`e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
-`e2e_agent_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
-to run on macOS.
+`e2e_telemetry`, `e2e_skill_pipeline`, and `e2e_sidecar` are Linux-only
+(`cfg(target_os = "linux")`) and are not expected to run on macOS.
+`e2e_service_mode` compiles on both (`cfg(any(linux, macos))`) and `e2e_agent_mcp`
+carries no platform guard at all, so both can be validated on a Mac given the
+production image and a credential.
 
 ### Interactive PTY / shell validation
 
@@ -1281,12 +1283,21 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
   changes to void-mcp tools or MCP provisioning. Same placement as
   `e2e_service_mode`: local, or a manual dispatch of `e2e-agent.yml`.
 
-Only a genuine hypervisor absence skips a VM suite — the typed
-`Error::HypervisorUnavailable` from the `/dev/kvm` probe, or VZ reporting
-virt-less hardware (ADR-0011). Everything else fails, including an absent
-network: `oci_integration` pulls `alpine:3.20` and the published guest image, so
-on a machine with no outbound network those tests fail rather than skip. Run
-them where the network is.
+Once a suite starts booting, only a genuine hypervisor absence skips it — the
+typed `Error::HypervisorUnavailable` from the `/dev/kvm` probe, or VZ reporting
+virt-less hardware (ADR-0011). Every other boot or RPC error fails, and so does
+an absent network: `oci_integration` pulls `alpine:3.20` and the published guest
+image, so on a machine with no outbound network those tests fail rather than
+skip. Run them where the network is.
+
+Three deliberate skips sit *before* that gate, and a green local run does not
+prove they ran. The agent suites skip without a staged production image
+(`env_artifacts_or_skip`) or without an agent credential
+(`skip_without_agent_creds`); `guest_image_pull_and_extract` skips when
+`VOIDBOX_TEST_GUEST_IMAGE` is unset and its default `localhost:5555` registry is
+absent. `VOID_BOX_REQUIRE_VM=1` and `VOID_BOX_REQUIRE_AGENT_CREDS=1` convert the
+first two into failures; the CI lane sets `VOIDBOX_TEST_GUEST_IMAGE` for the
+third. Run with `--nocapture` to see which of them fired.
 
 ## Guest image build scripts
 

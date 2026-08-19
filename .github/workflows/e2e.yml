@@ -161,9 +161,13 @@ jobs:
           # localhost:5555 registry and skips when none is running, which is
           # every machine. Pointing it at the published guest image turns that
           # skip into real coverage of resolve_guest_files (pull, extract
-          # vmlinux + rootfs.cpio.gz, second-call cache hit). Pinned rather than
-          # `latest` so a bad publish cannot red an unrelated pull request; bump
-          # it when the guest image layout changes.
+          # vmlinux + rootfs.cpio.gz, second-call cache hit). A version tag
+          # rather than `latest` so the lane does not follow every publish, but
+          # a tag is mutable — repointing v0.2.0 changes what this pulls. Pin by
+          # digest if that becomes a problem. This and the alpine:3.20 pull in
+          # the same suite put a registry dependency on the required gate: a
+          # registry outage or rate limit fails the lane for reasons unrelated
+          # to the change under review.
           VOIDBOX_TEST_GUEST_IMAGE: ghcr.io/the-void-ia/voidbox-guest:v0.2.0
         run: |
           # Do not exit green when /dev/vhost-vsock is missing: VOID_BOX_REQUIRE_VM=1

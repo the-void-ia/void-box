@@ -870,12 +870,23 @@ async fn oci_client_resolves_alpine_rootfs_into_cache() {
         "expected Alpine in the extracted /etc/os-release, got: {os_release}"
     );
 
-    // Second resolve: served from the cache, same path, no re-extract.
+    // Second resolve: served from the cache, not re-pulled. Comparing the two
+    // returned paths would not show that — the path is content-addressed, so an
+    // implementation that re-downloaded and re-extracted on every call returns
+    // the same one. A marker written into the extracted tree survives a cache
+    // hit and is destroyed by a re-extract, so its presence is the evidence.
+    let marker = rootfs.join(".voidbox-cache-hit-marker");
+    std::fs::write(&marker, b"cache-hit").expect("write the cache marker");
+
     let cached = client
         .resolve_rootfs("alpine:3.20")
         .await
         .expect("cached resolve should succeed");
     assert_eq!(rootfs, cached);
+    assert!(
+        marker.exists(),
+        "the second resolve re-extracted the image instead of serving it from the cache"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
