@@ -1,0 +1,190 @@
+name: E2E Agent (credentialed)
+
+# Test suites that need a real agent credential, which the pull-request lane
+# cannot supply: a workflow run triggered by a fork's pull request never receives
+# a repository secret. Run there, each of these suites detects the missing
+# credential and skips — reporting success without ever starting an agent. Here
+# they run with VOID_BOX_REQUIRE_AGENT_CREDS=1, which turns that skip into a
+# failure, so a missing or rotated key fails this job instead of passing it.
+#
+# Manual dispatch only, and not a required status check: a run boots a
+# multi-gigabyte guest and spends Anthropic API credit. Trigger it before a
+# release, or after changing service mode, the sidecar, void-mcp, or the
+# credential proxy. Day to day these suites run on a contributor's machine, and
+# the result goes in the pull request's `Local validation` block.
+#
+# To add a suite: compile it in the "Build the agent test binaries" step, so
+# compilation stays outside the per-suite timeouts, then give it a step of its
+# own with VOID_BOX_REQUIRE_AGENT_CREDS=1 in the environment.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Read-only token: this workflow only runs tests.
+permissions:
+  contents: read
+
+# One run at a time. A queued duplicate would spend API credit for nothing.
+concurrency:
+  group: e2e-agent
+  cancel-in-progress: false
+
+jobs:
+  e2e-agent:
+    name: E2E Agent (Ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The production image and the rootfs it stages do not fit alongside the
+      # cargo target directory in the hosted runner's default free space. Same
+      # reclaim `e2e.yml` performs, for the same reason.
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+          tool-cache: false
+
+      # Check the secret before the image build rather than after it. An absent
+      # secret is a configuration error, and VOID_BOX_REQUIRE_AGENT_CREDS=1
+      # would not surface it until the suites had already built an image and
+      # booted a VM.
+      - name: Require the Anthropic credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set for this repository. Add it under Settings → Secrets and variables → Actions, or run these suites locally per AGENTS.md."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is present."
+
+      - name: Enable KVM access
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sudo modprobe vhost_vsock || true
+          sudo chmod a+rw /dev/vhost-vsock 2>/dev/null || true
+          ls -la /dev/kvm
+          ls -la /dev/vhost-vsock 2>/dev/null || echo "/dev/vhost-vsock not present (may be built-in)"
+
+      - name: Install system packages
+        timeout-minutes: 10
+        run: |
+          # apt on a hosted runner can block indefinitely and silently: the
+          # periodic unattended-upgrades job holds the dpkg lock, and apt
+          # without DPkg::Lock::Timeout waits on it forever, printing nothing —
+          # the step then dies at its cap with an empty log. Bound the lock
+          # wait, cap each call, and retry, so one stall costs seconds instead
+          # of the whole budget. Observed failing 3 runs in 5 without this.
+          apt_get() {
+            for attempt in 1 2 3; do
+              if sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 "$@"; then
+                return 0
+              fi
+              echo "::warning::apt-get $1 attempt $attempt stalled or failed; retrying"
+              sleep 5
+            done
+            echo "::error::apt-get $1 failed after 3 attempts"
+            return 1
+          }
+
+          apt_get update -qq
+          apt_get install -y -qq cpio gzip zstd musl-tools busybox-static
+          BUSYBOX_PATH="$(command -v busybox)"
+          test -n "$BUSYBOX_PATH" \
+            || { echo "::error::busybox not on PATH after busybox-static install"; exit 1; }
+          echo "BUSYBOX=$BUSYBOX_PATH" >> "$GITHUB_ENV"
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: e2e-agent
+
+      # This job boots the pinned kernel, not the runner's own, and that is
+      # forced by how the production image is built: `build_claude_rootfs.sh`
+      # calls `setup_pinned_kernel_modules`, which sets VOID_BOX_KMOD_VERSION
+      # whenever GITHUB_ACTIONS is set, so the image bundles modules downloaded
+      # for the version in `scripts/lib/kernel_pin.sh`. Booting those against the
+      # runner's own kernel is a vermagic mismatch: the vsock module chain never
+      # loads and the only symptom is a control-channel timeout much later.
+      #
+      # (The pull-request lane is consistent in the other direction —
+      # `build_test_image.sh` never sets that variable, so its image carries the
+      # host's modules and pairs with the host's kernel.)
+      - name: Download the pinned guest kernel
+        run: |
+          # Remove any cached kernel first. `download_kernel.sh` exits early when
+          # its output file already exists, and the cargo cache restores
+          # `target/`, so a kernel from before a `kernel_pin.sh` bump would
+          # otherwise be paired with modules built for the new pin. The download
+          # is small and SHA-256 verified against the pin, so paying it on every
+          # dispatch costs far less than debugging that mismatch once.
+          rm -f target/vmlinuz-* target/vmlinux-*
+          scripts/download_kernel.sh
+
+          # Export the file the script produced rather than naming one here: it
+          # derives the filename from the host architecture, so a hardcoded name
+          # would silently point at the wrong kernel if this job ever runs
+          # somewhere else.
+          shopt -s nullglob
+          found=(target/vmlinuz-* target/vmlinux-*)
+          shopt -u nullglob
+          [ "${#found[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly one kernel in target/, found ${#found[@]}"; exit 1; }
+          echo "VOID_BOX_KERNEL=$PWD/${found[0]}" >> "$GITHUB_ENV"
+
+      - name: Build the production Claude initramfs
+        # Hash-pinned claude-code download (scripts/agents/manifest.toml); a
+        # digest mismatch fails the build.
+        run: scripts/build_claude_rootfs.sh
+
+      # Compile once, outside the per-suite budgets. Otherwise a cold first
+      # dispatch has to fit a full workspace test build, a 3 GB VM boot, and the
+      # suite's own ~4-minute poll budget inside 25 minutes.
+      - name: Build the agent test binaries
+        run: cargo test --test e2e_service_mode --test e2e_agent_mcp --test proxy_real_upstream --no-run
+
+      - name: Run e2e_service_mode
+        timeout-minutes: 25
+        env:
+          VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
+          VOID_BOX_REQUIRE_VM: "1"
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test e2e_service_mode -- --ignored --test-threads=1 --nocapture
+
+      - name: Run e2e_agent_mcp
+        timeout-minutes: 25
+        env:
+          VOID_BOX_INITRAMFS: target/void-box-claude.cpio.gz
+          VOID_BOX_REQUIRE_VM: "1"
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
+
+      # No VM, but the same credential gate: this drives the credential-injection
+      # proxy against the real api.anthropic.com endpoint. The mock-upstream half
+      # of that path (`e2e_credential_proxy`) runs on the pull-request lane; this
+      # step covers the live half.
+      - name: Run proxy_real_upstream
+        timeout-minutes: 10
+        env:
+          VOID_BOX_REQUIRE_AGENT_CREDS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test --test proxy_real_upstream -- --ignored --test-threads=1 --nocapture

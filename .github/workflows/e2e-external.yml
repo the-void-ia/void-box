@@ -1,0 +1,57 @@
+name: E2E External Dependencies
+
+# Tests that reach a third party over the network, kept off the pull-request
+# gate on purpose.
+#
+# `skill_pipeline`'s two `--ignored` tests fetch a skill document from the
+# `obra/superpowers` GitHub repository. That is real coverage — it is the only
+# place `Skill::fetch_remote_content` runs against a live server — but a
+# required check must fail for the change under review, and this one would also
+# fail when a third party renames a file, deletes a repository, or when
+# raw.githubusercontent.com has a bad day. So it runs here instead: weekly, so
+# breakage surfaces within days rather than whenever someone next tries a remote
+# skill, and on demand before a release.
+#
+# No secret and no VM. If this job goes red, read it as "the outside world
+# moved", and fix the reference or the test rather than the change that happened
+# to be merging.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Thursdays 06:00 UTC — away from the Monday agent-version bump, so a
+    # failure here is not competing for attention with that PR.
+    - cron: '0 6 * * 4'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-external
+  cancel-in-progress: false
+
+jobs:
+  remote-skills:
+    name: Remote skill fetching
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: e2e-external
+
+      # `--ignored` selects the network-dependent tests; the rest of the binary
+      # already runs on every pull request through `cargo test --workspace`.
+      - name: Fetch remote skills over the network
+        run: cargo test --test skill_pipeline -- --ignored --test-threads=1 --nocapture
