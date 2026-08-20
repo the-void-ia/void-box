@@ -1259,7 +1259,7 @@ impl SlirpBackend {
         if self.pending_dns.is_empty() {
             return;
         }
-        let queries: Vec<PendingDnsQuery> = self.pending_dns.drain(..).collect();
+        let queries: Vec<PendingDnsQuery> = std::mem::take(&mut self.pending_dns);
         for pending in queries {
             if let Some(response) = self.forward_dns_query(&pending.query) {
                 let frame = self.build_udp_response(
