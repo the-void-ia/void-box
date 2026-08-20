@@ -253,7 +253,7 @@ jobs:
           # --no-fail-fast collects every result instead of stopping at the first
           # failure.
           #
-          # Two exclusions, both deliberate:
+          # The exclusions, each deliberate:
           #
           # pty_command_not_allowed asserts the guest rejects a non-allowlisted
           # program, but the allowlist loads at guest boot from a file only the

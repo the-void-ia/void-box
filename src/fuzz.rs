@@ -1,14 +1,16 @@
 //! Fuzz harnesses for the host-side parsers that read guest-controlled bytes.
 //!
-//! Three surfaces sit between a guest and the host VMM's address space, and
-//! each one parses bytes the guest chose: the control-channel frame decoder
+//! Several surfaces sit between a guest and the host VMM's address space, and
+//! each parses bytes the guest chose: the control-channel frame decoder
 //! (`void-box-protocol` framing plus the multiplex request-id prefix), the
+//! userspace vsock connection state machine that routes guest packets, the
 //! split-virtqueue reader that walks descriptor chains out of guest memory, and
-//! the 9P server that answers file operations against a host directory. A panic
-//! in any of them takes down the VMM process for every sandbox it hosts, and an
-//! allocation sized from a guest-supplied length is a host memory exhaustion the
-//! guest triggers at will. Nothing else in the tree drives these with bytes the
-//! guest is free to choose.
+//! the 9P server that answers file operations against a host directory —
+//! together with the transport beneath it, which parses guest data of its own. A
+//! panic in any of them takes down the VMM process for every sandbox it hosts,
+//! and an allocation sized from a guest-supplied length is a host memory
+//! exhaustion the guest triggers at will. Nothing else in the tree drives these
+//! with bytes the guest is free to choose.
 //!
 //! Each entry point takes a raw byte slice, so one harness serves both callers:
 //! `cargo fuzz` mutates the slice under libFuzzer, and `tests/fuzz_corpus.rs`
@@ -150,7 +152,7 @@ impl<'a> Input<'a> {
 /// Decode `data` as control-channel frames the way the host reads them off a
 /// guest stream.
 ///
-/// Covers three layers in the order the reader thread applies them: the
+/// Covers the layers in the order the reader thread applies them: the
 /// length-prefixed `Message` header, the multiplex `[request_id][body]` payload
 /// prefix, and the handshake payload parsers. The streaming decoder gets its own
 /// pass because it and the whole-slice decoder size their allocation from the
