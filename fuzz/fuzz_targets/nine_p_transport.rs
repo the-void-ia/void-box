@@ -17,5 +17,6 @@ fuzz_target!(|data: &[u8]| {
         .prefix("void-box-fuzz-9pt-")
         .tempdir()
         .expect("create the 9P transport fuzz root");
-    void_box::fuzz::nine_p_transport(root.path(), data);
+    // The work count is for the replay gate; here any input is valid.
+    let _ = void_box::fuzz::nine_p_transport(root.path(), data);
 });

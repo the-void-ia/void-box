@@ -869,7 +869,9 @@ cargo +nightly fuzz run vsock_frame -- -max_total_time=60 -rss_limit_mb=2048
 
 When a run crashes, `cargo fuzz` writes the input under `fuzz/artifacts/<target>/`. Commit that file **together with the parser fix** — the replay test then keeps the bug fixed for everyone. Never commit a crashing input ahead of its fix: it reds the gate for every unrelated change.
 
-Adding a target means adding a `[[bin]]` to `fuzz/Cargo.toml`, a harness body in `src/fuzz.rs`, an arm in `tests/fuzz_corpus.rs`, and at least one seed under `fuzz/corpus/<target>/`. `every_fuzz_target_is_replayed` fails if any of the last three is missing, so a target cannot end up fuzzed but unguarded.
+Adding a target means adding a `[[bin]]` to `fuzz/Cargo.toml`, a harness body in `src/fuzz.rs`, an arm in `tests/fuzz_corpus.rs`, at least one seed under `fuzz/corpus/<target>/`, and a work floor in `work_floor`. `every_fuzz_target_is_replayed` fails if any of the middle three is missing, so a target cannot end up fuzzed but unguarded.
+
+A harness returns the units of work it performed — frames decoded, packets routed, chains popped, requests dispatched, registers written — and the replay test holds every seed to that target's floor. Panic-freedom alone does not show a harness still reaches its parser: one that reaches nothing returns cleanly and replays green, so the count is what makes an inert target visible. Set the floor from what the seeds actually do, with enough margin that trimming a seed does not trip it. The floor applies to seeds only; a crash artifact may reach its bug before doing any countable work. Assert nothing about the count inside a harness body — under `cargo fuzz` an input that does no work is an ordinary outcome, and an assertion there would be reported as a crash.
 
 A harness parameterizes itself from the raw input through a hand-rolled byte reader rather than the `arbitrary` crate. The committed corpus is tied to the exact byte-consumption order, and a crate upgrade that reorders its reads would silently repoint every seed at a different scenario.
 

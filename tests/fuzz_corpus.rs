@@ -28,61 +28,78 @@ const TARGETS: &[&str] = &[
     "nine_p_transport",
 ];
 
-/// Run one corpus input through the harness that owns it.
+/// Run one corpus input through the harness that owns it, returning the units of
+/// work the harness reported — or `None` when the target compiles out on this
+/// platform.
 ///
 /// `root` is a scratch directory the 9P harness may modify. Each input gets its
 /// own, so a replay failure names one file rather than one file plus whatever
 /// the previous input left behind.
-fn replay(target: &str, data: &[u8], root: &Path) -> bool {
+fn replay(target: &str, data: &[u8], root: &Path) -> Option<usize> {
     match target {
-        "vsock_frame" => {
-            void_box::fuzz::vsock_frame(data);
-            true
-        }
+        "vsock_frame" => Some(void_box::fuzz::vsock_frame(data)),
         #[cfg(target_os = "linux")]
-        "vsock_packet" => {
-            void_box::fuzz::vsock_packet(data);
-            true
-        }
+        "vsock_packet" => Some(void_box::fuzz::vsock_packet(data)),
         #[cfg(target_os = "linux")]
-        "virtqueue" => {
-            void_box::fuzz::virtqueue(data);
-            true
-        }
+        "virtqueue" => Some(void_box::fuzz::virtqueue(data)),
         #[cfg(target_os = "linux")]
-        "nine_p" => {
-            void_box::fuzz::nine_p(root, data);
-            true
-        }
+        "nine_p" => Some(void_box::fuzz::nine_p(root, data)),
         #[cfg(target_os = "linux")]
-        "nine_p_transport" => {
-            void_box::fuzz::nine_p_transport(root, data);
-            true
-        }
+        "nine_p_transport" => Some(void_box::fuzz::nine_p_transport(root, data)),
         // The device harnesses are Linux-only because `void_box::devices` is.
         // Their corpus still travels with the repo and still replays on Linux.
         #[cfg(not(target_os = "linux"))]
         "vsock_packet" | "virtqueue" | "nine_p" | "nine_p_transport" => {
             let _ = (data, root);
-            false
+            None
         }
         other => panic!("no harness registered for fuzz target {other}"),
     }
 }
 
+/// Units of work a seed must produce to count as reaching its parser.
+///
+/// A harness that reaches nothing returns cleanly, so panic-freedom alone lets a
+/// target go inert without the gate noticing — the seed still replays, it simply
+/// stops exercising the code it is named for. Holding each seed to a floor is
+/// what makes that visible.
+///
+/// `nine_p_transport` carries the high floor because reaching the queue walker
+/// takes a whole bring-up sequence: queue size, three ring addresses, ready, and
+/// notify. Its seeds each carry ten register writes, so eight leaves margin for
+/// a seed to be trimmed while still failing an input that programs nothing.
+fn work_floor(target: &str) -> usize {
+    match target {
+        "nine_p_transport" => 8,
+        _ => 1,
+    }
+}
+
+/// Where a replayed input came from. Seeds are written to cover a shape and are
+/// held to [`work_floor`]; artifacts are inputs a fuzz run crashed on, and one
+/// legitimately does almost nothing before reaching the bug it captures.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InputKind {
+    Seed,
+    Artifact,
+}
+
 /// Every input file under `fuzz/corpus/<target>/` and `fuzz/artifacts/<target>/`.
-fn inputs_for(target: &str) -> Vec<PathBuf> {
+fn inputs_for(target: &str) -> Vec<(InputKind, PathBuf)> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
     let mut files = Vec::new();
-    for kind in ["corpus", "artifacts"] {
-        let dir = base.join(kind).join(target);
+    for (kind, dir_name) in [
+        (InputKind::Seed, "corpus"),
+        (InputKind::Artifact, "artifacts"),
+    ] {
+        let dir = base.join(dir_name).join(target);
         let Ok(entries) = fs::read_dir(&dir) else {
             // `artifacts/` exists only once a target has crashed at least once.
             continue;
         };
         for entry in entries.flatten() {
             if entry.path().is_file() {
-                files.push(entry.path());
+                files.push((kind, entry.path()));
             }
         }
     }
@@ -98,9 +115,11 @@ fn fuzz_corpus_replays_clean() {
     let mut replayed = 0usize;
 
     let mut skipped: Vec<&str> = Vec::new();
+    let mut inert: Vec<String> = Vec::new();
     for target in TARGETS {
         let mut ran_any = false;
-        for path in inputs_for(target) {
+        let floor = work_floor(target);
+        for (kind, path) in inputs_for(target) {
             let data = fs::read(&path)
                 .unwrap_or_else(|err| panic!("read corpus input {}: {err}", path.display()));
             let root = scratch.path().join(format!("{target}-{replayed}"));
@@ -108,9 +127,18 @@ fn fuzz_corpus_replays_clean() {
             // A panic here prints the harness's own assertion; name the input
             // too, since the whole point is to hand back a reproducer.
             eprintln!("replaying {}", path.display());
-            if replay(target, &data, &root) {
-                replayed += 1;
-                ran_any = true;
+            let Some(work) = replay(target, &data, &root) else {
+                continue;
+            };
+            replayed += 1;
+            ran_any = true;
+            // Only seeds. A crash artifact earns its place by reaching a bug,
+            // which it may do before performing any countable work.
+            if kind == InputKind::Seed && work < floor {
+                inert.push(format!(
+                    "{} did {work} units of work, below the {floor} its target requires",
+                    path.display()
+                ));
             }
         }
         if !ran_any {
@@ -132,6 +160,14 @@ fn fuzz_corpus_replays_clean() {
     assert!(
         replayed > 0,
         "no fuzz harness ran — the replay gate is covering nothing"
+    );
+    // A seed below the floor means its harness no longer reaches the parser the
+    // seed was written for. The input still replays and still panics on nothing,
+    // so this is the only signal that the target has gone inert.
+    assert!(
+        inert.is_empty(),
+        "these seeds no longer reach their parser:\n  {}",
+        inert.join("\n  ")
     );
     #[cfg(target_os = "linux")]
     assert!(
@@ -176,7 +212,9 @@ fn every_fuzz_target_is_replayed() {
             "fuzz target {name} is declared in fuzz/Cargo.toml but not replayed by this test"
         );
         assert!(
-            !inputs_for(name).is_empty(),
+            inputs_for(name)
+                .iter()
+                .any(|(kind, _)| *kind == InputKind::Seed),
             "fuzz target {name} has no seed corpus under fuzz/corpus/{name}"
         );
     }

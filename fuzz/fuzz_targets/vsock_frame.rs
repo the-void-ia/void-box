@@ -5,5 +5,6 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    void_box::fuzz::vsock_frame(data);
+    // The work count is for the replay gate; here any input is valid.
+    let _ = void_box::fuzz::vsock_frame(data);
 });

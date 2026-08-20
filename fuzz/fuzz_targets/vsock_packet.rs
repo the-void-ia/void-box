@@ -11,5 +11,6 @@ compile_error!("this parser is Linux-only; fuzz it on Linux");
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    void_box::fuzz::vsock_packet(data);
+    // The work count is for the replay gate; here any input is valid.
+    let _ = void_box::fuzz::vsock_packet(data);
 });

@@ -17,6 +17,15 @@
 //! for every input — it must never assume the bytes are well-formed, because
 //! rejecting malformed input cleanly is the behavior under test.
 //!
+//! Every harness returns the number of units of work it performed: frames
+//! decoded, packets routed, chains popped, requests dispatched, registers
+//! written. A harness that reaches none of its parser still returns without
+//! panicking, so the replay gate would pass while covering nothing; the count is
+//! what lets that gate hold each committed seed to a floor and fail when a
+//! harness stops reaching the code it names. The count is reported, never
+//! asserted here: under `cargo fuzz` an input that does no work is an ordinary
+//! outcome, and an assertion would turn it into a reported crash.
+//!
 //! The module is `#[doc(hidden)]` rather than feature-gated: a harness behind an
 //! off-by-default feature is a harness the corpus replay silently stops
 //! covering the day someone drops `--all-features` from a command.
@@ -146,7 +155,9 @@ impl<'a> Input<'a> {
 /// prefix, and the handshake payload parsers. The streaming decoder gets its own
 /// pass because it and the whole-slice decoder size their allocation from the
 /// same guest-supplied length field but recover from a short buffer differently.
-pub fn vsock_frame(data: &[u8]) {
+///
+/// Returns the number of frames the streaming decoder produced.
+pub fn vsock_frame(data: &[u8]) -> usize {
     // Whole-slice decode: the length field is guest-chosen and indexes into a
     // buffer the guest also sized.
     let _ = Message::deserialize(data);
@@ -157,7 +168,9 @@ pub fn vsock_frame(data: &[u8]) {
     // reader thread's real workload is back-to-back frames, not one in
     // isolation.
     let mut cursor = Cursor::new(data);
+    let mut frames = 0;
     while let Ok(message) = Message::read_from_sync(&mut cursor) {
+        frames += 1;
         let Some((request_id, body)) = decode_payload(&message.payload) else {
             continue;
         };
@@ -178,6 +191,8 @@ pub fn vsock_frame(data: &[u8]) {
     // guest-chosen bytes before the session secret is ever compared.
     let _ = parse_ping_payload(data);
     let _ = parse_pong_payload(data);
+
+    frames
 }
 
 /// Drive the userspace vsock connection map with guest TX packets.
@@ -194,8 +209,10 @@ pub fn vsock_frame(data: &[u8]) {
 /// those bytes are consumed the harness switches to a compact per-packet
 /// encoding, which lets the mutator steer op and credit fields without spending
 /// 44 bytes on every packet.
+///
+/// Returns the number of packets routed through the state machine.
 #[cfg(target_os = "linux")]
-pub fn vsock_packet(data: &[u8]) {
+pub fn vsock_packet(data: &[u8]) -> usize {
     const GUEST_CID: u64 = 3;
     const GUEST_PORT: u32 = 1234;
     const HOST_PORT: u32 = 50000;
@@ -218,6 +235,7 @@ pub fn vsock_packet(data: &[u8]) {
     };
 
     let mut bytes = Input::new(data);
+    let mut packets = 0;
 
     // A leading wire-format header is parsed and fed to the state machine as
     // itself, so a seed written in the on-wire layout drives the op it encodes.
@@ -236,6 +254,7 @@ pub fn vsock_packet(data: &[u8]) {
         let body_len = (header.len as usize).min(FUZZ_MAX_VSOCK_BODY);
         let body = bytes.take(body_len);
         map.process_guest_tx(&header, body);
+        packets += 1;
         let _ = map.drain_rx();
     }
 
@@ -266,6 +285,7 @@ pub fn vsock_packet(data: &[u8]) {
         let body = bytes.take(body_len);
 
         map.process_guest_tx(&header, body);
+        packets += 1;
 
         // The map queues guest-bound packets with no consumer here; draining
         // keeps one input from growing `rx_queue` without bound and stands in
@@ -275,6 +295,8 @@ pub fn vsock_packet(data: &[u8]) {
     }
 
     drop(peer);
+
+    packets
 }
 
 /// Walk descriptor chains out of guest memory the way a userspace virtio device
@@ -285,8 +307,10 @@ pub fn vsock_packet(data: &[u8]) {
 /// in memory the guest owns. So both the parameters and the parsed bytes are
 /// guest-controlled, and the harness fuzzes them together: geometry from the
 /// front of the input, guest memory from the rest.
+///
+/// Returns the number of descriptor chains the reader walked.
 #[cfg(target_os = "linux")]
-pub fn virtqueue(data: &[u8]) {
+pub fn virtqueue(data: &[u8]) -> usize {
     let mut bytes = Input::new(data);
 
     let num = bytes.u16();
@@ -333,11 +357,13 @@ pub fn virtqueue(data: &[u8]) {
         -1,
     );
 
+    let mut chains = 0;
     for _ in 0..FUZZ_VIRTQUEUE_POPS {
         let _ = queue.has_avail(&memory);
         let Some(chain) = queue.pop_avail(&memory) else {
             break;
         };
+        chains += 1;
         // A chain must never be longer than the queue: the reader bounds its
         // walk by `num` precisely so a descriptor loop cannot spin forever.
         assert!(
@@ -351,6 +377,8 @@ pub fn virtqueue(data: &[u8]) {
             .fold(0u32, |total, desc| total.saturating_add(desc.len));
         queue.push_used(&memory, chain.head_index, written);
     }
+
+    chains
 }
 
 /// Answer 9P requests against `root`, a directory the caller owns.
@@ -365,13 +393,16 @@ pub fn virtqueue(data: &[u8]) {
 /// `root` must be a directory the caller is willing to see modified: the
 /// read-write pass creates, renames, and unlinks inside it. Give it a fresh
 /// temporary directory per run.
+///
+/// Returns the number of requests dispatched to the parser.
 #[cfg(target_os = "linux")]
-pub fn nine_p(root: &Path, data: &[u8]) {
+pub fn nine_p(root: &Path, data: &[u8]) -> usize {
     let mut bytes = Input::new(data);
     // Both modes matter: read-only exercises the rejection path every mutating
     // handler starts with, read-write exercises the handlers themselves.
     let read_only = bytes.u8() & 1 == 0;
     let mut device = Virtio9pDevice::new(root, "fuzz", read_only);
+    let mut requests = 0;
 
     for _ in 0..FUZZ_MAX_9P_REQUESTS {
         if bytes.is_empty() {
@@ -387,6 +418,7 @@ pub fn nine_p(root: &Path, data: &[u8]) {
         }
 
         let response = device.handle_9p_request(request);
+        requests += 1;
 
         // Every reply the guest kernel reads starts with its own total length.
         // A reply whose size field disagrees with its length desynchronizes the
@@ -404,6 +436,8 @@ pub fn nine_p(root: &Path, data: &[u8]) {
             response.len()
         );
     }
+
+    requests
 }
 
 /// Drive the 9P device through its MMIO registers and guest memory, the way a
@@ -420,8 +454,13 @@ pub fn nine_p(root: &Path, data: &[u8]) {
 /// The input supplies both halves at once: a sequence of register writes, and
 /// the guest memory those registers point into. `root` must be a directory the
 /// caller is willing to see modified.
+///
+/// Returns the number of MMIO register writes executed. Reaching the queue
+/// walker takes a whole bring-up sequence — size, three ring addresses, ready,
+/// notify — so a count near zero means the input never programmed a queue and
+/// the layer below went untouched, however cleanly the call returned.
 #[cfg(target_os = "linux")]
-pub fn nine_p_transport(root: &Path, data: &[u8]) {
+pub fn nine_p_transport(root: &Path, data: &[u8]) -> usize {
     /// Registers a driver programs to bring a queue up, plus the notify that
     /// kicks it. Offsets come from the shared virtio-mmio layout.
     const REGISTERS: &[u64] = &[
@@ -461,6 +500,7 @@ pub fn nine_p_transport(root: &Path, data: &[u8]) {
     let contents = input.take(image_len);
     let _ = memory.write_slice(contents, GuestAddress(write_offset));
 
+    let mut writes = 0;
     for _ in 0..FUZZ_MAX_MMIO_WRITES {
         if input.is_empty() {
             break;
@@ -468,9 +508,12 @@ pub fn nine_p_transport(root: &Path, data: &[u8]) {
         let register = REGISTERS[usize::from(input.u8()) % REGISTERS.len()];
         let value = input.u32();
         device.mmio_write(register, &value.to_le_bytes(), Some(&memory));
+        writes += 1;
 
         // Reads share the register decode and the config-space path.
         let mut scratch = [0u8; 4];
         device.mmio_read(u64::from(input.u8()) * 4, &mut scratch);
     }
+
+    writes
 }
