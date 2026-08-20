@@ -861,9 +861,16 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 # libfuzzer-sys builds the libFuzzer runtime with cc, so a C++ compiler must be
 # on PATH as `c++` (Fedora: gcc-c++; Debian/Ubuntu: g++).
-cargo +nightly fuzz run vsock_frame -- -max_total_time=60 -rss_limit_mb=2048
+# libFuzzer writes what it discovers to the first corpus directory and reads the
+# rest without modifying them, so runs go to `fuzz/corpus-run/` (gitignored) and
+# `fuzz/corpus/` stays the curated seed set.
+mkdir -p fuzz/corpus-run/vsock_frame
+cargo +nightly fuzz run vsock_frame fuzz/corpus-run/vsock_frame fuzz/corpus/vsock_frame \
+  -- -max_total_time=60 -rss_limit_mb=2048
 # targets: vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport
 ```
+
+Do not commit what a run accumulates in `fuzz/corpus-run/`. libFuzzer keeps an input because it reached new coverage, which is not the property the replay gate checks, so those inputs would be judged against a work floor written for curated seeds. Promote one deliberately when it covers a shape worth keeping: move it into `fuzz/corpus/<target>/` and give it a name that says what it covers.
 
 `nine_p` drives the 9P message parser directly; `nine_p_transport` drives the device through its MMIO registers and guest memory, covering the queue programming and descriptor walk beneath it. The split matters: the transport parses guest data of its own — descriptor lengths size host allocations and `next` indices steer the walk — and a harness aimed at the message parser never reaches it.
 

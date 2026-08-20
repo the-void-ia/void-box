@@ -81,7 +81,13 @@ jobs:
           # is looking for, so it must report rather than OOM the runner.
           # -max_len keeps inputs in the range the parsers actually see on the
           # wire, so the budget goes into structure rather than length.
-          cargo fuzz run ${{ matrix.target }} -- \
+          # Two corpus directories: libFuzzer writes what it discovers to the
+          # first and reads the second without modifying it, so the committed
+          # seed set stays exactly what `tests/fuzz_corpus.rs` polices.
+          mkdir -p fuzz/corpus-run/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus-run/${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} -- \
             -max_total_time=${{ github.event.inputs.max_total_time || '300' }} \
             -rss_limit_mb=2048 \
             -max_len=65536 \

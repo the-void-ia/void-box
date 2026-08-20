@@ -1,9 +1,15 @@
 /target
 # cargo-fuzz build output. `fuzz/corpus/` and `fuzz/artifacts/` are tracked on
-# purpose: the corpus is the seed set and the artifacts are crash regressions
-# that `tests/fuzz_corpus.rs` replays on every run.
+# purpose: the corpus is the curated seed set and the artifacts are crash
+# regressions that `tests/fuzz_corpus.rs` replays on every run.
 /fuzz/target
 /fuzz/coverage
+# Where a fuzz run accumulates what it discovers. libFuzzer writes new units to
+# the first corpus directory it is given, so runs are pointed here and
+# `fuzz/corpus/` stays exactly the seed set the replay gate polices — a
+# discovered input is kept for reaching new coverage, which is not the same
+# property the gate's work floor checks.
+/fuzz/corpus-run
 /artifacts
 /tmp
 package-lock.json
