@@ -758,12 +758,26 @@ impl Virtio9pDevice {
         }
 
         let client_msize = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-        // We use the minimum of client and a reasonable max
-        // A floor as well as a ceiling: `process_queue` derives its
-        // request-assembly budget from `msize`, so accepting 0 would make every
-        // later request assemble to an empty buffer — including the `Tversion`
-        // that would renegotiate, leaving the mount unrecoverable.
-        let msize = client_msize.clamp(MIN_MSIZE, MAX_MSIZE);
+
+        // A request below the floor is refused rather than raised. `process_queue`
+        // derives its request-assembly budget from `msize`, and a budget near zero
+        // starves every later request — including the `Tversion` that would
+        // renegotiate — so the device will not serve one. Answering with a larger
+        // value instead would break the negotiation the other way: the reply is a
+        // commitment not to exceed what the client can receive, and a client that
+        // asked for 1024 has not agreed to read 4096. Refusing leaves the client
+        // free to retry with a size both sides can serve.
+        //
+        // The error is `EINVAL` on the size, not the `Rversion` "unknown" reply
+        // reserved for a version string the server cannot speak: `9P2000.L` is
+        // spoken here, and it is the size that cannot be served.
+        if client_msize < MIN_MSIZE {
+            warn!("virtio-9p: Tversion msize={client_msize} is below the {MIN_MSIZE} minimum");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        // Lowering is in contract, so the ceiling clamps rather than refuses.
+        let msize = client_msize.min(MAX_MSIZE);
         self.msize = msize;
 
         // Clear all fids on version negotiation (as per spec)
@@ -867,6 +881,13 @@ impl Virtio9pDevice {
         // negotiated `msize` — the same size-field-versus-delivered-bytes desync
         // the read and readdir caps prevent. A conforming client never walks
         // more components than fit.
+        //
+        // Over budget answers `EINVAL` rather than 9P's short `Rwalk` with
+        // `nwqid < nwname`. A short reply means "the walk stopped here because
+        // this component does not exist", which would be a lie about the
+        // filesystem: the components may all exist and the request is simply one
+        // the negotiated size cannot answer. That is a malformed request, and an
+        // error says so without inventing a filesystem result.
         let max_qids = (self.msize.saturating_sub(REPLY_OVERHEAD) as usize) / QID_SIZE;
 
         let mut walked_names: Vec<String> = Vec::new();
@@ -2541,6 +2562,11 @@ mod tests {
     /// `msize` is negotiated per connection, so a reset must return it to the
     /// ceiling, and a guest must not be able to negotiate a value so small that
     /// the request-assembly budget starves the `Tversion` that would recover.
+    ///
+    /// A below-floor request is refused rather than raised: the reply commits the
+    /// server to a size the client agreed to receive, so answering 4096 to a
+    /// client that asked for 1024 would break the negotiation in the other
+    /// direction.
     #[test]
     fn msize_has_a_floor_and_is_restored_on_reset() {
         let (mut device, _dir) = make_rw_device();
@@ -2548,8 +2574,12 @@ mod tests {
         let mut tiny = 0u32.to_le_bytes().to_vec();
         tiny.extend_from_slice(&(8u16).to_le_bytes());
         tiny.extend_from_slice(b"9P2000.L");
-        device.handle_9p_request(&build_request(T_VERSION, 0, &tiny));
-        assert_eq!(device.msize, MIN_MSIZE, "msize=0 must clamp to the floor");
+        let response = device.handle_9p_request(&build_request(T_VERSION, 0, &tiny));
+        assert_eq!(response[4], R_ERROR, "a below-floor msize must be refused");
+        assert_eq!(
+            device.msize, MAX_MSIZE,
+            "a refused negotiation must not move msize"
+        );
 
         let mut small = 8192u32.to_le_bytes().to_vec();
         small.extend_from_slice(&(8u16).to_le_bytes());

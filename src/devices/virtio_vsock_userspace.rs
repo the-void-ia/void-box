@@ -34,14 +34,14 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 /// Interval of the worker's periodic sweep: the epoll wait bound in the
 /// normal path, and the sleep between sweeps in the degraded (no-epoll)
 /// path.
+const WORKER_TICK: Duration = Duration::from_millis(50);
+
 /// Largest guest→host packet payload the device will assemble from one
 /// descriptor chain. A virtio-vsock packet is bounded by the credit the
 /// device advertises (`HOST_TO_GUEST_BUFFER_CAP` in `vsock_connection`), so a
 /// chain describing more than this is describing bytes the connection map
 /// would drop; reading them only lets a guest size a host allocation.
 const VSOCK_MAX_PACKET_BYTES: usize = 256 * 1024;
-
-const WORKER_TICK: Duration = Duration::from_millis(50);
 
 /// Deadline for joining the worker thread during device teardown. The
 /// worker re-checks its lifecycle flag every [`WORKER_TICK`]; hitting
