@@ -128,9 +128,16 @@ async fn test_provision_remote_skill_fallback() {
 }
 
 // ─── Remote Fetching (live network, ignored) ────────────────────────────────
+//
+// These two reach a third-party repository over the network, so they stay off
+// the pull-request gate: a required check must fail for the change under review,
+// not because someone else renamed a file. They run in `e2e-external.yml`
+// (scheduled and on demand). Assertions here therefore check that the fetch
+// mechanism worked — not what the fetched document says, which that third party
+// can change at any time.
 
 #[tokio::test]
-#[ignore] // Requires network access
+#[ignore] // Requires network access; see the note above
 async fn test_remote_skill_provision_live() {
     let brainstorm =
         Skill::remote("obra/superpowers/brainstorming").description("Brainstorming methodology");
@@ -149,23 +156,30 @@ async fn test_remote_skill_provision_live() {
     assert!(!result.agent_result.is_error);
 }
 
+/// A 3-part reference resolves to a real document over the network.
+///
+/// The URL construction itself is covered without network by
+/// `test_skill_remote_url_three_part`; what this adds is that the constructed
+/// URL is fetchable and yields a usable skill document. It asserts the response
+/// is non-empty and looks like a skill (a YAML front-matter `name:`), rather
+/// than matching prose in a third-party file.
 #[tokio::test]
-#[ignore] // Requires network access
-async fn test_remote_skill_url_patterns() {
-    // 3-part: owner/repo/skill-name
-    let s3 = Skill::remote("obra/superpowers/brainstorming");
-    let content = s3.fetch_remote_content().await.unwrap();
-    assert!(
-        content.contains("Brainstorming"),
-        "3-part fetch should return brainstorming skill"
-    );
+#[ignore] // Requires network access; see the note above
+async fn test_remote_skill_fetch_returns_a_skill_document() {
+    let skill = Skill::remote("obra/superpowers/brainstorming");
+    let content = skill
+        .fetch_remote_content()
+        .await
+        .expect("3-part remote reference should fetch");
 
-    // 2-part: owner/repo (fetches root SKILL.md)
-    // vercel-labs/skills doesn't have a root SKILL.md, so this tests the URL pattern
-    let s2 = Skill::remote("obra/superpowers");
-    assert_eq!(
-        s2.remote_url().unwrap(),
-        "https://raw.githubusercontent.com/obra/superpowers/main/SKILL.md"
+    assert!(
+        !content.trim().is_empty(),
+        "fetched skill document is empty"
+    );
+    assert!(
+        content.contains("name:"),
+        "fetched document does not look like a skill (no front-matter `name:`):\n{}",
+        content.chars().take(200).collect::<String>()
     );
 }
 

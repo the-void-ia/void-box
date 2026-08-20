@@ -138,7 +138,9 @@ async fn e2e_service_mode_output_publication() {
         return;
     };
     let Some(provider_block) = service_provider_block() else {
-        eprintln!("skipping: neither ANTHROPIC_API_KEY nor claude-personal auth is available");
+        let _skip = test_artifacts::skip_without_agent_creds(
+            "neither ANTHROPIC_API_KEY nor claude-personal auth is available",
+        );
         return;
     };
 

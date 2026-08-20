@@ -72,7 +72,25 @@ jobs:
         # cancellation.
         timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
+          # apt on a hosted runner can block indefinitely and silently: the
+          # periodic unattended-upgrades job holds the dpkg lock, and apt
+          # without DPkg::Lock::Timeout waits on it forever, printing nothing —
+          # the step then dies at its cap with an empty log. Bound the lock
+          # wait, cap each call, and retry, so one stall costs seconds instead
+          # of the whole budget. Observed failing 3 runs in 5 without this.
+          apt_get() {
+            for attempt in 1 2 3; do
+              if sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 "$@"; then
+                return 0
+              fi
+              echo "::warning::apt-get $1 attempt $attempt stalled or failed; retrying"
+              sleep 5
+            done
+            echo "::error::apt-get $1 failed after 3 attempts"
+            return 1
+          }
+
+          apt_get update -qq
           # busybox-static is REQUIRED — `scripts/build_test_image.sh`
           # silently builds an initramfs with no `/bin/sh` when BUSYBOX
           # is unset (see `scripts/lib/guest_common.sh::install_busybox`).
@@ -85,9 +103,22 @@ jobs:
           #     → snapshot suite asserts fail, pty `sh -c "exit 42"`
           #     hits the execvp(127) child path.
           # All three failures share this single missing dep.
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
+          apt_get install -y -qq cpio gzip zstd musl-tools busybox-static
+          # `truncate` and `mkfs.ext4` back the OCI block-rootfs path: the
+          # oci_integration suite shells out to both to build the ext4 image it
+          # attaches as /dev/vda. Assert rather than install. Their packages
+          # (coreutils, e2fsprogs) are preinstalled, so installing buys nothing —
+          # and naming coreutils is actively harmful: it is an Essential package,
+          # and any apt plan touching one demands an interactive
+          # "Yes, do as I say!" that -y does not satisfy, so the step hangs
+          # silently under -qq until its timeout. A presence check gives the same
+          # protection against a slimmer runner with no apt involvement.
+          for tool in truncate mkfs.ext4; do
+            command -v "$tool" >/dev/null \
+              || { echo "::error::$tool is missing; oci_integration cannot build its ext4 rootfs"; exit 1; }
+          done
           # Ensure kernel modules are available for the running kernel
-          sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          apt_get install -y -qq linux-modules-$(uname -r) || true
           # Resolve the installed busybox path and export it so the build
           # step (and any future step) gets `BUSYBOX=<actual path>` from
           # the workflow env. Avoids mutating system paths via symlinks
@@ -124,6 +155,26 @@ jobs:
         with:
           shared-key: e2e-${{ matrix.musl-target }}
 
+      # The required lane makes three anonymous registry pulls: alpine:3.20 twice
+      # from Docker Hub and the guest image once from ghcr. Docker Hub rate-limits
+      # per source IP, which hosted runners share, and `retries = 2` in nextest
+      # turns one 429 into three requests.
+      #
+      # This cache covers exactly one of the three. Only `vm_oci_alpine_os_release`
+      # resolves through the shared `~/.voidbox/oci`; the other two
+      # (`oci_client_resolves_alpine_rootfs_into_cache` and
+      # `guest_image_pull_and_extract`) each build a client on a fresh TempDir by
+      # design, so their pulls stay cold on every run and the ~115 MB ghcr pull is
+      # not mitigated at all. `restore-keys` lets a bumped image tag start from
+      # the previous entry instead of cold.
+      - name: Cache extracted OCI images
+        uses: actions/cache@v4
+        with:
+          path: ~/.voidbox/oci
+          key: oci-${{ runner.os }}-${{ runner.arch }}-alpine3.20-${{ github.run_id }}
+          restore-keys: |
+            oci-${{ runner.os }}-${{ runner.arch }}-alpine3.20-
+
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
         # `install_busybox` (scripts/lib/guest_common.sh) requires the
@@ -151,6 +202,24 @@ jobs:
           # This runner is meant to boot VMs: past the vsock early-bail below,
           # an incapable machine must fail, not skip silently.
           VOID_BOX_REQUIRE_VM: "1"
+          # oci_integration's guest_image_pull_and_extract defaults to a
+          # localhost:5555 registry and skips when none is running, which is
+          # every machine. Pointing it at the published guest image turns that
+          # skip into real coverage of resolve_guest_files (pull, extract
+          # vmlinuz + rootfs.cpio.gz, second-call cache hit). A version tag
+          # rather than `latest` so the lane does not follow every publish, but
+          # a tag is mutable — repointing v0.2.0 changes what this pulls. Pin by
+          # digest if that becomes a problem. This and the alpine:3.20 pull in
+          # the same suite put a registry dependency on the required gate: a
+          # registry outage or rate limit fails the lane for reasons unrelated
+          # to the change under review.
+          VOIDBOX_TEST_GUEST_IMAGE: ghcr.io/the-void-ia/voidbox-guest:v0.2.0
+          # #149: multiplex establishment intermittently exceeds the 30 s default
+          # on this runner class, and doubling the suites doubles the draws. The
+          # knob only ever lengthens the deadline (never shortens it), so a
+          # healthy boot is unaffected and a slow one stops reading as a step
+          # cancellation.
+          VOID_BOX_CONNECT_DEADLINE_SECS: "120"
         run: |
           # Do not exit green when /dev/vhost-vsock is missing: VOID_BOX_REQUIRE_VM=1
           # asserts this runner is capable, so a lost device must fail the suites
@@ -174,15 +243,27 @@ jobs:
           ls -la "$VOID_BOX_KERNEL"
           ls -la "$VOID_BOX_INITRAMFS"
 
-          # One nextest run for every deterministic VM suite. The `vm` test
-          # group (.config/nextest.toml) caps how many VMs boot at once, so the
-          # suites run with bounded cross-suite parallelism instead of strictly
-          # serially; --no-fail-fast collects every result rather than stopping
-          # at the first failure. snapshot_integration is included here (it was a
-          # separate step). pty_command_not_allowed stays excluded: it asserts
-          # the guest rejects a non-allowlisted program, but the allowlist loads
-          # at guest boot from a file only the agent-box provisioning path
-          # writes, which this direct attach_pty path never stages — so the guest
-          # allows all commands (#99).
+          # One nextest run for every deterministic VM suite: the backend
+          # contract, direct MicroVm/Sandbox boots, the OCI root switch and its
+          # read-only invariant, host-directory mounts, the guest→host telemetry
+          # stream and sidecar gateway, the PTY and credential-proxy paths, the
+          # persistent control channel, and snapshot/restore. The `vm` test group
+          # (.config/nextest.toml) caps how many VMs boot at once, so the suites
+          # run with bounded cross-suite parallelism rather than serially, and
+          # --no-fail-fast collects every result instead of stopping at the first
+          # failure.
+          #
+          # Two exclusions, both deliberate:
+          #
+          # pty_command_not_allowed asserts the guest rejects a non-allowlisted
+          # program, but the allowlist loads at guest boot from a file only the
+          # agent-box provisioning path writes, which this direct attach_pty path
+          # never stages — so the guest allows all commands (#99).
+          #
+          # The agent suites (e2e_service_mode, e2e_agent_mcp) need a real agent
+          # credential, which no pull-request runner holds, so here they would
+          # detect its absence and report green without starting an agent. They
+          # run in `e2e-agent.yml` instead, under VOID_BOX_REQUIRE_AGENT_CREDS=1,
+          # and on contributors' machines.
           cargo nextest run --run-ignored only --no-fail-fast -E \
-            'binary(/^(e2e_telemetry|e2e_mount|persistent_channel|e2e_skill_pipeline|e2e_pty|e2e_credential_proxy|snapshot_integration)$/) & not test(pty_command_not_allowed)'
+            'binary(/^(conformance|telemetry|kvm_integration|oci_integration|e2e_sidecar|e2e_telemetry|e2e_mount|persistent_channel|e2e_skill_pipeline|e2e_pty|e2e_credential_proxy|snapshot_integration)$/) & not test(pty_command_not_allowed)'

@@ -726,20 +726,7 @@ mod otel_sdk_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// T6: KVM integration tests (ignored by default)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod kvm_otel_tests {
-    #[tokio::test]
-    #[ignore = "requires KVM + kernel + initramfs"]
-    async fn test_kvm_exec_with_traceparent() {
-        // This test would:
-        // 1. Boot a VM
-        // 2. Set a span context
-        // 3. Exec "env" in the guest
-        // 4. Verify TRACEPARENT appears in the output
-        // Placeholder for when running with real KVM
-    }
-}
+// TRACEPARENT propagation into a booted guest is covered by
+// `e2e_telemetry::test_traceparent_propagation`, which sets a known span context
+// on a real `MicroVm` and asserts the formatted traceparent reaches the guest's
+// exec environment. That suite is on the CI VM lane.
