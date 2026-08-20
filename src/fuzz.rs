@@ -177,9 +177,9 @@ pub fn vsock_frame(data: &[u8]) -> usize {
             continue;
         };
         // Reframing a decoded frame must reproduce the payload byte for byte.
-        // The two helpers are the only places the request-id prefix layout is
-        // written down, and a disagreement between them corrupts every RPC
-        // after the first.
+        // `build_frame` and `decode_payload` each encode the request-id prefix
+        // layout independently, and a disagreement between them corrupts every
+        // RPC after the first.
         let reframed = build_frame(message.msg_type, request_id, body);
         let reframed_payload = &reframed[void_box_protocol::HEADER_SIZE..];
         assert_eq!(

@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Coverage-guided fuzzing of the guest-facing parsers (RFC-0004 M1).
+# Coverage-guided fuzzing of the parsers that read guest-controlled bytes.
 #
 # Not a required status check, and deliberately not run on pull requests. A
 # fuzzer that finds a new bug on an unrelated change blocks that change, which
