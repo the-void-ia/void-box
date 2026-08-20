@@ -787,7 +787,7 @@ impl VsockConnectionMap {
             if conn.state != ConnState::Connected || conn.tx_buf.is_empty() {
                 return;
             }
-            conn.tx_buf.drain(..).collect::<Vec<_>>()
+            std::mem::take(&mut conn.tx_buf)
         } else {
             return;
         };
@@ -895,7 +895,7 @@ impl VsockConnectionMap {
             match conn.read_from_host() {
                 HostReadOutcome::Data(_) => {
                     if conn.state == ConnState::Connected {
-                        let data = conn.tx_buf.drain(..).collect::<Vec<_>>();
+                        let data = std::mem::take(&mut conn.tx_buf);
                         forwards.push((*guest_port, *host_port, data));
                     }
                 }
