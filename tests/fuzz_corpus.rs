@@ -61,17 +61,33 @@ fn replay(target: &str, data: &[u8], root: &Path) -> Option<usize> {
 ///
 /// A harness that reaches nothing returns cleanly, so panic-freedom alone lets a
 /// target go inert without the gate noticing — the seed still replays, it simply
-/// stops exercising the code it is named for. Holding each seed to a floor is
-/// what makes that visible.
+/// stops exercising the code it is named for. A floor makes that visible.
 ///
-/// `nine_p_transport` carries the high floor because reaching the queue walker
-/// takes a whole bring-up sequence: queue size, three ring addresses, ready, and
-/// notify. Its seeds each carry ten register writes, so eight leaves margin for
-/// a seed to be trimmed while still failing an input that programs nothing.
+/// It can only make it visible where the harness drives its parser from a loop
+/// over [`Input`], because that is what a consumption bug upstream can starve.
+/// The other two harnesses hand the raw slice straight to the parser, so they
+/// cannot be starved and a floor would assert nothing about them. Worse, it
+/// would be actively wrong: their most valuable seeds are the ones proving the
+/// parser *rejects* an input — a length field declaring 64 MB with no payload, a
+/// queue the guest never sized — and a rejection is zero units of successful
+/// work by construction. Counting invocations instead of successes would make
+/// those seeds pass, but the count would then be unconditional and the floor
+/// vacuous either way.
 fn work_floor(target: &str) -> usize {
     match target {
+        // Reaching the queue walker takes a full bring-up: queue size, three
+        // ring addresses, ready, notify. The seeds carry ten register writes, so
+        // eight leaves margin for one to be trimmed while still failing an input
+        // that programs nothing. This is the target whose harness was found
+        // starved, and the floor is measured against that failure.
         "nine_p_transport" => 8,
-        _ => 1,
+        // Both dispatch to their parser from a loop over `Input`, so both can be
+        // starved to zero the same way.
+        "nine_p" | "vsock_packet" => 1,
+        // `vsock_frame` and `virtqueue` invoke their parser with the raw input
+        // regardless of its contents, so there is nothing here for a floor to
+        // catch.
+        _ => 0,
     }
 }
 
@@ -134,7 +150,7 @@ fn fuzz_corpus_replays_clean() {
             ran_any = true;
             // Only seeds. A crash artifact earns its place by reaching a bug,
             // which it may do before performing any countable work.
-            if kind == InputKind::Seed && work < floor {
+            if kind == InputKind::Seed && floor > 0 && work < floor {
                 inert.push(format!(
                     "{} did {work} units of work, below the {floor} its target requires",
                     path.display()
