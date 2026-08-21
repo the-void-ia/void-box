@@ -506,7 +506,11 @@ impl VirtioVsockMmio {
             mmio::DRIVER_FEATURES_SEL => self.features_sel = value,
             mmio::QUEUE_SEL => self.queue_sel = value,
             mmio::QUEUE_NUM => {
-                self.current_queue_mut().num = value as u16;
+                // Held to the size the device advertises in `QueueNumMax`, as in
+                // every other virtio device here; the virtio spec forbids the
+                // driver exceeding it.
+                let queue = self.current_queue_mut();
+                queue.num = (value as u16).min(queue.num_max);
             }
             mmio::QUEUE_READY => {
                 let idx = self.queue_sel;

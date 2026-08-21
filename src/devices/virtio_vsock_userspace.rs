@@ -514,8 +514,10 @@ impl VirtioVsockUserspace {
         // Restore queue configurations
         fn restore_queue_cfg(snap: &QueueSnapshotState) -> QueueConfig {
             QueueConfig {
+                // A snapshot is a file, so its queue size is held to the
+                // advertised maximum the same way an MMIO write is.
                 num_max: snap.num_max,
-                num: snap.num,
+                num: snap.num.min(snap.num_max),
                 ready: snap.ready,
                 desc_addr: snap.desc_addr,
                 driver_addr: snap.driver_addr,
