@@ -732,25 +732,71 @@ mod tests {
         assert_eq!(got, contents[..want as usize]);
     }
 
-    /// A chain whose descriptors point in a cycle never ends on its own, so the
-    /// length bound is the only thing that stops the walk. A regression does not
-    /// fail here — it hangs until the harness timeout. The bound's placement,
-    /// before the push rather than after, is not observable and is not what this
-    /// pins.
+    /// A chain longer than the device accepts, but otherwise a request it would
+    /// serve: header, data descriptors, status. Without the bound the walk runs
+    /// to the end and the request succeeds, so the status byte the device writes
+    /// is what separates the two — the walk aborts before it ever identifies the
+    /// status descriptor, leaving the byte as the test set it.
     #[test]
-    fn a_cyclic_chain_is_refused_rather_than_walked_forever() {
+    fn a_chain_longer_than_the_device_accepts_is_refused() {
         let (mut device, _dir) = test_device();
         let mem = test_memory();
 
-        // Every descriptor points at the next, so the chain never ends on its own.
-        for index in 0..16u64 {
+        let total = MAX_CHAIN_DESCS + 8;
+        let last = (total - 1) as u64;
+        write_desc(
+            &mem,
+            0,
+            REQ_HEADER,
+            BLK_HEADER_BYTES as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        for index in 1..last {
+            write_desc(
+                &mem,
+                index,
+                DATA_BUFFER + index * 64,
+                64,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                (index + 1) as u16,
+            );
+        }
+        write_desc(&mem, last, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+
+        post_read_request(&mut device, &mem, 0);
+        device.queue.num = (total + 8) as u16;
+        // Neither status the device can write, so the assertion cannot pass on an
+        // untouched byte — and cannot pass on a served request either.
+        mem.write_obj(0xFFu8, GuestAddress(STATUS_BYTE)).unwrap();
+
+        device.process_queue(&mem).expect("the request completes");
+
+        assert_eq!(
+            status_of(&mem),
+            0xFF,
+            "the walk stops before the status descriptor, so the request is never served"
+        );
+        assert_eq!(device.used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// A chain whose descriptors point in a cycle never ends on its own, so the
+    /// length bound is what stops the walk. This one cannot fail cleanly: without
+    /// a bound there is no second outcome to assert, only a hang until the
+    /// harness timeout.
+    #[test]
+    fn a_cyclic_chain_terminates() {
+        let (mut device, _dir) = test_device();
+        let mem = test_memory();
+
+        for index in 0..8u64 {
             write_desc(
                 &mem,
                 index,
                 REQ_HEADER,
                 BLK_HEADER_BYTES as u32,
                 VIRTQ_DESC_F_NEXT,
-                ((index + 1) % 16) as u16,
+                ((index + 1) % 8) as u16,
             );
         }
         post_read_request(&mut device, &mem, 0);
