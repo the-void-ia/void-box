@@ -42,15 +42,29 @@ pub mod features {
     pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 }
 
-/// Largest guest→host frame the device assembles from one descriptor chain:
-/// the largest IP packet, its Ethernet framing, and the virtio-net header.
+/// Largest guest→host frame the device assembles from one descriptor chain.
 ///
-/// Every descriptor in a chain carries a guest-written `len` that sizes a host
-/// allocation, so without a ceiling one frame can ask for as much memory as the
-/// guest cares to name, repeated across the chain. The device negotiates no
-/// segmentation offload, so a frame a driver actually sends is MTU-sized and far
-/// below this.
-const MAX_TX_FRAME_BYTES: usize = 65535 + 14 + VirtioNetHeader::SIZE;
+/// Every descriptor carries a guest-written `len` that sizes a host allocation,
+/// so without a ceiling one chain can ask for as much memory as the guest cares
+/// to name. This bounds the allocation; whether the assembled bytes are the frame
+/// the chain described is a separate check after the walk.
+///
+/// The sum is the largest IP packet, its Ethernet framing, room for two VLAN
+/// tags, and the virtio-net header. A Linux guest offered no `VIRTIO_NET_F_MTU`
+/// sets `max_mtu` to 65535, so that is the largest frame a driver can hand over;
+/// the tags are counted so a frame at that MTU cannot land above the ceiling for
+/// carrying them.
+const MAX_TX_FRAME_BYTES: usize =
+    MAX_IP_PACKET_BYTES + ETHERNET_HEADER_BYTES + VLAN_TAG_BYTES * 2 + VirtioNetHeader::SIZE;
+
+/// Largest IP packet, from the 16-bit total-length field.
+const MAX_IP_PACKET_BYTES: usize = 65535;
+
+/// Destination, source, and EtherType.
+const ETHERNET_HEADER_BYTES: usize = 14;
+
+/// One 802.1Q tag.
+const VLAN_TAG_BYTES: usize = 4;
 
 /// Largest queue the device advertises in `QueueNumMax`, and the ceiling every
 /// queue size is held to however it is set — an MMIO write or a restored
