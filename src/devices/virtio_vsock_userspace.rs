@@ -43,6 +43,12 @@ const WORKER_TICK: Duration = Duration::from_millis(50);
 /// would drop; reading them only lets a guest size a host allocation.
 const VSOCK_MAX_PACKET_BYTES: usize = 256 * 1024;
 
+/// Largest queue this device advertises in `QueueNumMax`, and the ceiling every
+/// queue size is held to however it is set — an MMIO write or a restored
+/// snapshot. `SplitVirtqueue` derives its descriptor-walk bound from the queue
+/// size, so this is what keeps that bound the one the device published.
+const QUEUE_MAX_SIZE: u16 = 256;
+
 /// Deadline for joining the worker thread during device teardown. The
 /// worker re-checks its lifecycle flag every [`WORKER_TICK`]; hitting
 /// this means it is wedged, and teardown detaches it with a warning.
@@ -186,15 +192,15 @@ impl VirtioVsockUserspace {
             interrupt_status: 0,
             config_generation: 0,
             rx_queue_cfg: QueueConfig {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             tx_queue_cfg: QueueConfig {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             event_queue_cfg: QueueConfig {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             mmio_base: 0,
@@ -514,10 +520,12 @@ impl VirtioVsockUserspace {
         // Restore queue configurations
         fn restore_queue_cfg(snap: &QueueSnapshotState) -> QueueConfig {
             QueueConfig {
-                // A snapshot is a file, so its queue size is held to the
-                // advertised maximum the same way an MMIO write is.
-                num_max: snap.num_max,
-                num: snap.num.min(snap.num_max),
+                // A snapshot is a file, so both fields are held to the ceiling
+                // this device advertises rather than to each other — clamping a
+                // restored `num` against a restored `num_max` checks one
+                // untrusted value against another from the same file.
+                num_max: snap.num_max.min(QUEUE_MAX_SIZE),
+                num: snap.num.min(snap.num_max).min(QUEUE_MAX_SIZE),
                 ready: snap.ready,
                 desc_addr: snap.desc_addr,
                 driver_addr: snap.driver_addr,
@@ -612,15 +620,15 @@ impl VirtioVsockUserspace {
         self.interrupt_status = 0;
         self.driver_features = 0;
         self.rx_queue_cfg = QueueConfig {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.tx_queue_cfg = QueueConfig {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.event_queue_cfg = QueueConfig {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.rx_queue = None;

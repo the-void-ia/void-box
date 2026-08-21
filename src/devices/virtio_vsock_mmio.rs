@@ -22,6 +22,13 @@ pub const VIRTIO_VSOCK_DEVICE_TYPE: u32 = 19;
 /// VIRTIO_F_VERSION_1 - required for virtio-mmio v2 devices
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
+/// Largest queue this device advertises in `QueueNumMax`, and the ceiling every
+/// queue size is held to however it is set — an MMIO write or a restored
+/// snapshot. The size feeds `set_vring_num` into vhost, which validates it
+/// in-kernel; holding it here keeps the device's own state consistent with what
+/// it published.
+const QUEUE_MAX_SIZE: u16 = 256;
+
 /// vhost ioctl constants (Linux include/uapi/linux/vhost.h).
 /// On x86_64: _IO = 0x0000, _IOW = 0x4000, _IOR = 0x8000, _IOWR = 0xC000 (in upper 16 bits).
 /// Format: direction(2) | size(14) | type(8) | nr(8)
@@ -128,15 +135,15 @@ impl VirtioVsockMmio {
             interrupt_status: 0,
             config_generation: 0,
             rx_queue: QueueState {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             tx_queue: QueueState {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             event_queue: QueueState {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             mmio_base: 0,
@@ -607,15 +614,15 @@ impl VirtioVsockMmio {
         self.interrupt_status = 0;
         self.driver_features = 0;
         self.rx_queue = QueueState {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.tx_queue = QueueState {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.event_queue = QueueState {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
     }
@@ -689,8 +696,10 @@ impl VirtioVsockMmio {
         // Restore queue software state from snapshot.
         fn restore_queue(snap: &QueueSnapshotState) -> QueueState {
             QueueState {
-                num_max: snap.num_max,
-                num: snap.num,
+                // A snapshot is a file, so both fields are held to the ceiling
+                // this device advertises rather than to each other.
+                num_max: snap.num_max.min(QUEUE_MAX_SIZE),
+                num: snap.num.min(snap.num_max).min(QUEUE_MAX_SIZE),
                 ready: snap.ready,
                 desc_addr: snap.desc_addr,
                 driver_addr: snap.driver_addr,
