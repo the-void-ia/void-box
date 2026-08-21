@@ -602,6 +602,17 @@ impl VirtioNetDevice {
                 warn!("virtio-net: TX used ring at {used_base:#x} overflows the address space");
                 break;
             };
+            // `ring_addr` settles only whether the address fits in 64 bits. An
+            // ordinary address that is simply unmapped passes that and fails the
+            // write, which would leave the descriptor unretired after the frame
+            // had already gone to the backend — every later kick resending it.
+            if !mem.check_range(used_elem_addr, USED_ELEM_BYTES) {
+                warn!(
+                    "virtio-net: TX used entry at {:#x} is not writable; deferring the batch",
+                    used_elem_addr.0
+                );
+                break;
+            }
             let mut desc_id_buf = [0u8; 2];
             mem.read_slice(&mut desc_id_buf, ring_entry_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -684,20 +695,7 @@ impl VirtioNetDevice {
             if malformed {
                 malformed_chains += 1;
             } else if !packet.is_empty() {
-                // The completion must be writable before the frame leaves for the
-                // backend. `ring_addr` settles only whether the address fits in 64
-                // bits; an ordinary address that happens to be unmapped would let
-                // the frame go out and then fail the write below, leaving the
-                // descriptor unretired so every later kick resends it.
-                if mem.check_range(used_elem_addr, USED_ELEM_BYTES) {
-                    self.process_tx_frame(&packet)?;
-                } else {
-                    warn!(
-                        "virtio-net: TX used entry at {:#x} is not writable; dropping the frame",
-                        used_elem_addr.0
-                    );
-                    malformed_chains += 1;
-                }
+                self.process_tx_frame(&packet)?;
             }
 
             // Used-ring entry: 8 bytes (head_idx as u32, 0 as u32).
@@ -878,6 +876,15 @@ impl VirtioNetDevice {
                 aborted = true;
                 break;
             };
+            if !mem.check_range(used_elem_addr, USED_ELEM_BYTES) {
+                warn!(
+                    "virtio-net: RX used entry at {:#x} is not writable; deferring the batch",
+                    used_elem_addr.0
+                );
+                self.buffer_rx_frame(frame);
+                aborted = true;
+                break;
+            }
 
             let mut next = head_idx;
             let mut walked = 0usize;
@@ -1342,6 +1349,34 @@ mod tests {
             "a chain that cannot be walked to its end is not a frame"
         );
         assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// A used-ring address can be an ordinary `u64` and simply unmapped, which
+    /// checked arithmetic cannot see. Transmitting first and discovering the
+    /// completion is unwritable afterwards leaves the descriptor unretired, so
+    /// every later kick resends the same frame.
+    #[test]
+    fn a_frame_is_not_transmitted_when_its_completion_is_unwritable() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        let payload_len = 512u32;
+        write_desc(&mem, 0, DATA_BUFFER, payload_len, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+        // Well past the mapped region, but nowhere near overflowing.
+        device.tx_queue.device_addr = (TEST_MEM_BYTES as u64) * 4;
+
+        device
+            .process_tx_queue(&mem)
+            .expect("the batch is deferred");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing goes out when the completion cannot be written"
+        );
+        assert_eq!(device.tx_used_idx, 0, "no completion is claimed");
+        assert_eq!(device.tx_avail_idx, 0, "the entry stays for a later kick");
     }
 
     /// A descriptor pointing at guest address 0 describes bytes and contributes
