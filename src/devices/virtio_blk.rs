@@ -41,6 +41,15 @@ const DESC_BYTES: usize = 16;
 /// Bytes in a virtio-blk request header: type, reserved, and sector.
 const BLK_HEADER_BYTES: usize = 16;
 
+/// One entry of a guest descriptor table, as the device reads it.
+#[derive(Clone, Copy)]
+struct Desc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -338,14 +347,6 @@ impl VirtioBlkDevice {
         queue_size: usize,
         head: usize,
     ) -> crate::Result<(u8, usize)> {
-        #[derive(Clone, Copy)]
-        struct Desc {
-            addr: u64,
-            len: u32,
-            flags: u16,
-            next: u16,
-        }
-
         let mut descs = Vec::new();
         let mut idx = head;
         loop {
@@ -382,22 +383,31 @@ impl VirtioBlkDevice {
             return Ok((VIRTIO_BLK_S_IOERR, 0));
         }
 
-        // Header must be readable by device
-        if (descs[0].flags & VIRTQ_DESC_F_WRITE) != 0 || descs[0].len < 16 {
-            return Ok((VIRTIO_BLK_S_IOERR, 0));
-        }
-
-        let mut hdr = [0u8; BLK_HEADER_BYTES];
-        mem.read_slice(&mut hdr, GuestAddress(descs[0].addr))
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
-        let req_type = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-        let sector = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let offset = sector.saturating_mul(SECTOR_SIZE);
-
+        // The status descriptor is settled first, because it is where every
+        // failure below is reported. Validating the header first meant a bad
+        // header returned with that byte untouched, and the guest read whatever
+        // it held — for a fresh buffer, zero, which is success.
         let status_desc = *descs.last().unwrap();
         if (status_desc.flags & VIRTQ_DESC_F_WRITE) == 0 || status_desc.len < 1 {
             return Ok((VIRTIO_BLK_S_IOERR, 0));
         }
+
+        // Header must be readable by device
+        if (descs[0].flags & VIRTQ_DESC_F_WRITE) != 0 || (descs[0].len as usize) < BLK_HEADER_BYTES
+        {
+            return Ok((Self::report(mem, &status_desc, VIRTIO_BLK_S_IOERR)?, 1));
+        }
+
+        let mut hdr = [0u8; BLK_HEADER_BYTES];
+        if mem
+            .read_slice(&mut hdr, GuestAddress(descs[0].addr))
+            .is_err()
+        {
+            return Ok((Self::report(mem, &status_desc, VIRTIO_BLK_S_IOERR)?, 1));
+        }
+        let req_type = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let sector = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let offset = sector.saturating_mul(SECTOR_SIZE);
 
         let data_descs = &descs[1..descs.len() - 1];
         let mut total_written = 0usize;
@@ -486,11 +496,22 @@ impl VirtioBlkDevice {
             _ => VIRTIO_BLK_S_UNSUPP,
         };
 
-        mem.write_slice(&[status], GuestAddress(status_desc.addr))
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+        Self::report(mem, &status_desc, status)?;
         total_written += 1;
 
         Ok((status, total_written))
+    }
+
+    /// Write a request's status into the guest's status descriptor.
+    ///
+    /// Returns the status it wrote, so a caller can report and return in one
+    /// step. Every failure a request can reach after the status descriptor is
+    /// settled goes through here: the byte lives in guest memory, and a request
+    /// that completes without it leaves the guest reading whatever was there.
+    fn report(mem: &GuestMemoryMmap, status_desc: &Desc, status: u8) -> crate::Result<u8> {
+        mem.write_slice(&[status], GuestAddress(status_desc.addr))
+            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+        Ok(status)
     }
 }
 
@@ -711,10 +732,13 @@ mod tests {
         assert_eq!(got, contents[..want as usize]);
     }
 
-    /// A chain longer than the device accepts is refused, and refused before it
-    /// reads the descriptors past the limit.
+    /// A chain whose descriptors point in a cycle never ends on its own, so the
+    /// length bound is the only thing that stops the walk. A regression does not
+    /// fail here — it hangs until the harness timeout. The bound's placement,
+    /// before the push rather than after, is not observable and is not what this
+    /// pins.
     #[test]
-    fn a_chain_longer_than_the_limit_is_refused() {
+    fn a_cyclic_chain_is_refused_rather_than_walked_forever() {
         let (mut device, _dir) = test_device();
         let mem = test_memory();
 
@@ -737,6 +761,36 @@ mod tests {
             device.used_idx, 1,
             "the request is completed, not looped on"
         );
+    }
+
+    /// A request whose header the device rejects still has a status descriptor,
+    /// so the guest has to learn the request failed. Reporting only to the caller
+    /// leaves that byte at whatever it held — zero on a fresh buffer, which reads
+    /// as success.
+    #[test]
+    fn a_rejected_header_is_reported_to_the_guest() {
+        let (mut device, _dir) = test_device();
+        let mem = test_memory();
+
+        // Marked device-writable, which a request header may not be.
+        write_desc(
+            &mem,
+            0,
+            REQ_HEADER,
+            BLK_HEADER_BYTES as u32,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            1,
+        );
+        write_desc(&mem, 1, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+        post_read_request(&mut device, &mem, 0);
+        // Pre-set to a value that is neither of the two the device can write, so
+        // the assertion cannot pass on an untouched byte.
+        mem.write_obj(0xFFu8, GuestAddress(STATUS_BYTE)).unwrap();
+
+        device.process_queue(&mem).expect("the request completes");
+
+        assert_eq!(status_of(&mem), VIRTIO_BLK_S_IOERR);
+        assert_eq!(device.used_idx, 1, "the descriptor is still returned");
     }
 
     /// Ring addresses come from unvalidated MMIO writes, so a base near the top
