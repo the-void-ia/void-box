@@ -1444,6 +1444,36 @@ mod tests {
         assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
     }
 
+    /// The ceiling bounds the allocation inside the walk, which the
+    /// described-vs-assembled check cannot: that check runs after the buffer has
+    /// already grown. Pinning it needs a chain whose descriptors are backed by
+    /// real memory, so that removing the ceiling lets the reads succeed and the
+    /// oversized frame go out — against a small region the reads fail instead and
+    /// the chain is rejected for the wrong reason.
+    #[test]
+    fn a_chain_over_the_ceiling_is_dropped_even_when_its_memory_is_backed() {
+        let (mut device, sent) = recording_device();
+        // Room for two full-ceiling segments plus the rings.
+        let mem_bytes = MAX_TX_FRAME_BYTES * 2 + 0x2_0000;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_bytes)]).unwrap();
+
+        let segment = MAX_TX_FRAME_BYTES;
+        let first = 0x1_0000u64;
+        let second = first + segment as u64;
+        write_desc(&mem, 0, first, segment as u32, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(&mem, 1, second, segment as u32, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a chain describing twice the ceiling must not be assembled and sent"
+        );
+        assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
     /// The shape a Linux driver emits whenever it cannot push the header into
     /// the first buffer: a header descriptor chained to a payload descriptor.
     /// Every other multi-descriptor test here is a chain that must be rejected,
