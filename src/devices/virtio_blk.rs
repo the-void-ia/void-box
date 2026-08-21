@@ -8,9 +8,10 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use tracing::{debug, trace, warn};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::devices::virtio_net::mmio;
+use crate::devices::virtqueue::ring_addr;
 
 pub const VIRTIO_BLK_DEVICE_TYPE: u32 = 2;
 
@@ -179,7 +180,13 @@ impl VirtioBlkDevice {
             }
             mmio::DRIVER_FEATURES_SEL => self.driver_features_sel = value,
             mmio::QUEUE_SEL => self.queue_sel = value,
-            mmio::QUEUE_NUM => self.queue.num = value as u16,
+            mmio::QUEUE_NUM => {
+                // The guest may not exceed the size the device advertises in
+                // `QueueNumMax`; the virtio spec forbids it, and the descriptor
+                // walk derives its index bound from this value, so an unclamped
+                // write would let the guest choose its own bound.
+                self.queue.num = (value as u16).min(self.queue.num_max);
+            }
             mmio::QUEUE_READY => self.queue.ready = value != 0,
             mmio::QUEUE_NOTIFY => {
                 if let Some(mem) = guest_mem {
@@ -250,34 +257,52 @@ impl VirtioBlkDevice {
             return Ok(());
         }
 
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
+        // Every address below is a base the guest wrote to an MMIO register plus
+        // an offset. `vm_memory`'s `unchecked_add` is a plain `+`: it panics under
+        // `overflow-checks` and wraps otherwise, so a base near `u64::MAX` either
+        // ends the VMM process or folds the access onto unrelated mapped memory.
+        // `ring_addr` rejects the address instead.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
         let queue_size = q.num as usize;
 
+        let Some(avail_idx_addr) = ring_addr(avail_base, 2) else {
+            warn!("virtio-blk: available ring at {avail_base:#x} overflows the address space");
+            return Ok(());
+        };
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read(&mut idx_buf, avail_idx_addr)
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
         while self.avail_idx != avail_idx {
             let ring_offset = 4 + ((self.avail_idx as usize) % queue_size) * 2;
+            let Some(ring_entry_addr) = ring_addr(avail_base, ring_offset as u64) else {
+                warn!("virtio-blk: available ring entry overflows the address space");
+                return Ok(());
+            };
             let mut head_buf = [0u8; 2];
-            mem.read(&mut head_buf, avail_addr.unchecked_add(ring_offset as u64))
+            mem.read(&mut head_buf, ring_entry_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head = u16::from_le_bytes(head_buf) as usize;
 
-            let (status, written) = self.handle_request(mem, desc_addr, queue_size, head)?;
+            let (status, written) = self.handle_request(mem, desc_base, queue_size, head)?;
 
             let used_ring_off = 4 + ((self.used_idx as usize) % queue_size) * 8;
+            let (Some(used_elem_addr), Some(used_idx_addr)) = (
+                ring_addr(used_base, used_ring_off as u64),
+                ring_addr(used_base, 2),
+            ) else {
+                warn!("virtio-blk: used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_elem = [(head as u32).to_le_bytes(), (written as u32).to_le_bytes()].concat();
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
             self.used_idx = self.used_idx.wrapping_add(1);
             self.avail_idx = self.avail_idx.wrapping_add(1);
 
             let used_idx_bytes = self.used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write(&used_idx_bytes, used_idx_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             if status != VIRTIO_BLK_S_OK {
@@ -292,7 +317,7 @@ impl VirtioBlkDevice {
     fn handle_request(
         &mut self,
         mem: &GuestMemoryMmap,
-        desc_base: GuestAddress,
+        desc_base: u64,
         queue_size: usize,
         head: usize,
     ) -> crate::Result<(u8, usize)> {
@@ -310,7 +335,10 @@ impl VirtioBlkDevice {
             if idx >= queue_size {
                 return Ok((VIRTIO_BLK_S_IOERR, 0));
             }
-            let off = desc_base.unchecked_add((idx * 16) as u64);
+            let Some(off) = ring_addr(desc_base, (idx * 16) as u64) else {
+                warn!("virtio-blk: descriptor table at {desc_base:#x} overflows the address space");
+                return Ok((VIRTIO_BLK_S_IOERR, 0));
+            };
             let mut raw = [0u8; 16];
             mem.read(&mut raw, off)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -407,5 +435,49 @@ impl VirtioBlkDevice {
         total_written += 1;
 
         Ok((status, total_written))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn test_device() -> (VirtioBlkDevice, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir for the backing disk");
+        let path = dir.path().join("disk.img");
+        let mut file = File::create(&path).expect("create the backing disk");
+        file.write_all(&[0u8; 4096]).expect("size the backing disk");
+        let device = VirtioBlkDevice::new(&path).expect("open the backing disk");
+        (device, dir)
+    }
+
+    /// Ring addresses come from unvalidated MMIO writes, so a base near the top
+    /// of the address space is reachable. Every offset added to one used to go
+    /// through `unchecked_add`, which is a plain `+`.
+    #[test]
+    fn ring_addresses_near_the_top_of_memory_do_not_overflow() {
+        let (mut device, _dir) = test_device();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 64 * 1024)]).unwrap();
+
+        device.queue.num = 256;
+        device.queue.ready = true;
+        device.queue.desc_addr = u64::MAX;
+        device.queue.driver_addr = u64::MAX;
+        device.queue.device_addr = u64::MAX;
+
+        device.process_queue(&mem).expect("the queue is declined");
+        assert_eq!(device.used_idx, 0, "no request is completed");
+    }
+
+    /// `QueueNum` is an MMIO register the guest writes with no validation, and
+    /// the descriptor walk derives its index bound from it.
+    #[test]
+    fn queue_num_is_clamped_to_the_advertised_maximum() {
+        let (mut device, _dir) = test_device();
+
+        device.mmio_write(mmio::QUEUE_NUM, &u32::MAX.to_le_bytes(), None);
+
+        assert_eq!(device.queue.num, QUEUE_MAX_SIZE);
     }
 }

@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace, warn};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
+use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
+use crate::devices::virtqueue::ring_addr;
 use crate::network::slirp::GUEST_MAC;
 use crate::network::NetworkBackend;
 use crate::Result;
@@ -40,6 +41,16 @@ pub mod features {
     /// Required for virtio-mmio version 2 devices
     pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 }
+
+/// Largest guest→host frame the device assembles from one descriptor chain:
+/// the largest IP packet, its Ethernet framing, and the virtio-net header.
+///
+/// Every descriptor in a chain carries a guest-written `len` that sizes a host
+/// allocation, so without a ceiling one frame can ask for as much memory as the
+/// guest cares to name, repeated across the chain. The device negotiates no
+/// segmentation offload, so a frame a driver actually sends is MTU-sized and far
+/// below this.
+const MAX_TX_FRAME_BYTES: usize = 65535 + 14 + VirtioNetHeader::SIZE;
 
 /// Virtio network header (prepended to frames)
 #[repr(C, packed)]
@@ -379,8 +390,12 @@ impl VirtioNetDevice {
                 self.queue_sel = value;
             }
             mmio::QUEUE_NUM => {
+                // The guest may not exceed the size the device advertises in
+                // `QueueNumMax`; the virtio spec forbids it, and both descriptor
+                // walks derive their chain bound from this value, so an unclamped
+                // write would let the guest choose its own bound.
                 let queue = self.current_queue_mut();
-                queue.num = value as u16;
+                queue.num = (value as u16).min(queue.num_max);
             }
             mmio::QUEUE_READY => {
                 let queue = self.current_queue_mut();
@@ -505,14 +520,22 @@ impl VirtioNetDevice {
         if !q.ready || q.num == 0 {
             return Ok(());
         }
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
+        // Every address below is a base the guest wrote to an MMIO register plus
+        // an offset. `vm_memory`'s `unchecked_add` is a plain `+`: it panics under
+        // `overflow-checks` and wraps otherwise, so a base near `u64::MAX` either
+        // ends the VMM process or folds the access onto unrelated mapped memory.
+        // `ring_addr` rejects the address instead, leaving the guest with a queue
+        // it programmed unusably.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
         let queue_size = q.num as usize;
 
         // Read available ring: flags at 0, idx at 2, ring starts at 4
+        let Some(avail_idx_addr) = ring_addr(avail_base, 2) else {
+            warn!("virtio-net: TX available ring at {avail_base:#x} overflows the address space");
+            return Ok(());
+        };
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read(&mut idx_buf, avail_idx_addr)
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
@@ -529,21 +552,39 @@ impl VirtioNetDevice {
         while self.tx_avail_idx != avail_idx {
             // Ring entry: 2 bytes, at avail_addr + 4 + (tx_avail_idx % queue_size)*2
             let ring_offset = 4 + ((self.tx_avail_idx as usize) % queue_size) * 2;
+            let Some(ring_entry_addr) = ring_addr(avail_base, ring_offset as u64) else {
+                warn!("virtio-net: TX available ring entry overflows the address space");
+                return Ok(());
+            };
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            mem.read(&mut desc_id_buf, ring_entry_addr)
+                .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             packet.clear();
             let mut next = head_idx;
+            let mut walked = 0usize;
             loop {
                 if next >= queue_size {
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
+                // A chain cannot be longer than the table it indexes into. A
+                // descriptor whose NEXT points back into the chain — at itself,
+                // or around a cycle — would otherwise spin here forever, and
+                // `packet` would grow by that descriptor's guest-written length
+                // on every pass.
+                if walked >= queue_size {
+                    warn!("virtio-net: TX chain longer than the {queue_size}-entry table (cycle?)");
+                    break;
+                }
+                walked += 1;
+
+                let Some(desc_off) = ring_addr(desc_base, (next * 16) as u64) else {
+                    warn!(
+                        "virtio-net: descriptor table at {desc_base:#x} overflows the address space"
+                    );
+                    return Ok(());
+                };
                 let mut desc = [0u8; 16];
                 mem.read(&mut desc, desc_off)
                     .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -551,14 +592,18 @@ impl VirtioNetDevice {
                 let len = u32::from_le_bytes(desc[8..12].try_into().unwrap()) as usize;
                 let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
                 let next_desc = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
-                if len > 0 && addr != 0 {
+                // `len` is guest-written and sizes the allocation below, so the
+                // frame ceiling bounds it: bytes past a full frame are bytes the
+                // backend would not transmit.
+                let readable = len.min(MAX_TX_FRAME_BYTES.saturating_sub(packet.len()));
+                if readable > 0 && addr != 0 {
                     // Read directly into the packet's tail instead of
                     // allocating an intermediate `Vec<u8>` and then
                     // `extend_from_slice`-ing it in.  Saves one alloc
                     // and one full memcpy per descriptor segment.
                     let off = packet.len();
-                    packet.resize(off + len, 0);
-                    mem.read(&mut packet[off..off + len], GuestAddress(addr))
+                    packet.resize(off + readable, 0);
+                    mem.read(&mut packet[off..off + readable], GuestAddress(addr))
                         .map_err(|e| crate::Error::Memory(e.to_string()))?;
                 }
                 if (flags & VIRTQ_DESC_F_NEXT) == 0 {
@@ -576,10 +621,14 @@ impl VirtioNetDevice {
             // `[...].concat()`.  TX descriptors carry no return data
             // so the length field is always 0.
             let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * 8;
+            let Some(used_elem_addr) = ring_addr(used_base, used_ring_off as u64) else {
+                warn!("virtio-net: TX used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let mut used_elem = [0u8; 8];
             used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
             // bytes [4..8] stay zero (the length field).
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.tx_used_idx = self.tx_used_idx.wrapping_add(1);
@@ -592,8 +641,12 @@ impl VirtioNetDevice {
         // barrier and iterates new entries.  Per-frame writes are
         // redundant for correctness and waste one mem.write per frame.
         if self.tx_used_idx != initial_tx_used_idx {
+            let Some(used_idx_addr) = ring_addr(used_base, 2) else {
+                warn!("virtio-net: TX used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_idx_bytes = self.tx_used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write(&used_idx_bytes, used_idx_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
@@ -673,9 +726,8 @@ impl VirtioNetDevice {
             self.rx_buffer.append(frames);
             return Ok(0);
         }
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
+        // See `process_tx_queue` for why every base goes through `ring_addr`.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
         let queue_size = q.num as usize;
 
         // avail_idx is monotonically increasing; the driver bumps it
@@ -684,8 +736,12 @@ impl VirtioNetDevice {
         // the hot path.  If the device runs out of available buffers
         // mid-batch the remaining frames are buffered for the next
         // call, which is the same correctness contract as before.
+        let Some(avail_idx_addr) = ring_addr(avail_base, 2) else {
+            warn!("virtio-net: RX available ring at {avail_base:#x} overflows the address space");
+            return Ok(0);
+        };
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read(&mut idx_buf, avail_idx_addr)
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
@@ -698,15 +754,17 @@ impl VirtioNetDevice {
             }
 
             let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
+            let Some(ring_entry_addr) = ring_addr(avail_base, ring_offset as u64) else {
+                warn!("virtio-net: RX available ring entry overflows the address space");
+                return Ok(frames_injected as usize);
+            };
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            mem.read(&mut desc_id_buf, ring_entry_addr)
+                .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             let mut next = head_idx;
+            let mut walked = 0usize;
             let mut written = 0;
             let frame_len = frame.len();
             let mut frame_off = 0;
@@ -715,7 +773,22 @@ impl VirtioNetDevice {
                 if next >= queue_size || frame_off >= frame_len {
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
+                // Consuming the frame ends a well-formed chain, but a descriptor
+                // with `len == 0` or `addr == 0` advances `frame_off` by nothing,
+                // so a cycle among those never reaches that condition. The table
+                // size bounds the walk regardless of what the chain describes.
+                if walked >= queue_size {
+                    warn!("virtio-net: RX chain longer than the {queue_size}-entry table (cycle?)");
+                    break;
+                }
+                walked += 1;
+
+                let Some(desc_off) = ring_addr(desc_base, (next * 16) as u64) else {
+                    warn!(
+                        "virtio-net: descriptor table at {desc_base:#x} overflows the address space"
+                    );
+                    return Ok(frames_injected as usize);
+                };
                 let mut desc = [0u8; 16];
                 mem.read(&mut desc, desc_off)
                     .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -743,10 +816,14 @@ impl VirtioNetDevice {
             // `[...].concat()` — the previous code did a heap alloc per
             // frame in the hot path.
             let used_ring_off = 4 + ((self.rx_used_idx as usize) % queue_size) * 8;
+            let Some(used_elem_addr) = ring_addr(used_base, used_ring_off as u64) else {
+                warn!("virtio-net: RX used ring at {used_base:#x} overflows the address space");
+                return Ok(frames_injected as usize);
+            };
             let mut used_elem = [0u8; 8];
             used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
             used_elem[4..8].copy_from_slice(&(written as u32).to_le_bytes());
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.rx_used_idx = self.rx_used_idx.wrapping_add(1);
@@ -761,8 +838,12 @@ impl VirtioNetDevice {
         // entries.  Per-frame writes are redundant — saves one
         // mem.write per frame on the hot path.
         if frames_injected > 0 {
+            let Some(used_idx_addr) = ring_addr(used_base, 2) else {
+                warn!("virtio-net: RX used ring at {used_base:#x} overflows the address space");
+                return Ok(frames_injected as usize);
+            };
             let used_idx_bytes = self.rx_used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write(&used_idx_bytes, used_idx_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
@@ -971,6 +1052,151 @@ impl VirtioNetDevice {
 mod tests {
     use super::*;
     use crate::network::slirp::SlirpBackend;
+    use vm_memory::GuestMemoryMmap;
+
+    const TEST_MEM_BYTES: usize = 256 * 1024;
+    const DESC_TABLE: u64 = 0x1000;
+    const AVAIL_RING: u64 = 0x4000;
+    const USED_RING: u64 = 0x5000;
+    const DATA_BUFFER: u64 = 0x8000;
+
+    fn test_device() -> VirtioNetDevice {
+        let slirp: Arc<Mutex<dyn NetworkBackend>> =
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
+        VirtioNetDevice::new(slirp).unwrap()
+    }
+
+    fn test_memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_MEM_BYTES)]).unwrap()
+    }
+
+    /// Write one 16-byte descriptor into the table at `index`.
+    fn write_desc(mem: &GuestMemoryMmap, index: u64, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = GuestAddress(DESC_TABLE + index * 16);
+        mem.write_obj(addr, at).unwrap();
+        mem.write_obj(len, GuestAddress(at.0 + 8)).unwrap();
+        mem.write_obj(flags, GuestAddress(at.0 + 12)).unwrap();
+        mem.write_obj(next, GuestAddress(at.0 + 14)).unwrap();
+    }
+
+    /// Publish one chain head on the available ring.
+    fn publish_head(mem: &GuestMemoryMmap, head: u16) {
+        mem.write_obj(1u16, GuestAddress(AVAIL_RING + 2)).unwrap();
+        mem.write_obj(head, GuestAddress(AVAIL_RING + 4)).unwrap();
+    }
+
+    fn program_queue(queue: &mut QueueState, num: u16) {
+        queue.num = num;
+        queue.ready = true;
+        queue.desc_addr = DESC_TABLE;
+        queue.driver_addr = AVAIL_RING;
+        queue.device_addr = USED_RING;
+    }
+
+    /// A descriptor whose NEXT points back at itself used to spin forever while
+    /// the frame buffer grew by that descriptor's guest-written length on every
+    /// pass. A regression here does not fail — it hangs until the harness
+    /// timeout.
+    #[test]
+    fn tx_self_referential_chain_terminates() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, DATA_BUFFER, 0x1000, VIRTQ_DESC_F_NEXT, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert_eq!(
+            device.tx_used_idx, 1,
+            "the chain is completed rather than walked forever"
+        );
+    }
+
+    /// The RX walk ends when the frame is consumed, so a cycle only runs forever
+    /// through descriptors that consume nothing: `len == 0` here.
+    #[test]
+    fn rx_zero_length_cycle_terminates() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, DATA_BUFFER, 0, VIRTQ_DESC_F_NEXT, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.rx_queue, 4);
+
+        let injected = device
+            .write_frames_to_rx_ring(&mut vec![vec![0xAAu8; 64]], &mem)
+            .expect("RX walk returns");
+
+        assert_eq!(injected, 1, "the frame is completed rather than retried");
+    }
+
+    /// Every descriptor length is a guest-written `u32`, and the chain sizes a
+    /// host allocation, so a chain of maximum-length descriptors must not read
+    /// past one frame's worth of bytes.
+    #[test]
+    fn tx_frame_is_bounded_by_the_frame_ceiling() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        // Four descriptors, each claiming the whole 4 GiB a u32 can express.
+        for index in 0..4u64 {
+            let last = index == 3;
+            write_desc(
+                &mem,
+                index,
+                DATA_BUFFER,
+                u32::MAX,
+                if last { 0 } else { VIRTQ_DESC_F_NEXT },
+                (index + 1) as u16,
+            );
+        }
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert_eq!(device.tx_used_idx, 1);
+    }
+
+    /// Ring addresses come from unvalidated MMIO writes, so a base near the top
+    /// of the address space is reachable and the offset arithmetic must reject it
+    /// rather than overflow.
+    #[test]
+    fn ring_addresses_near_the_top_of_memory_do_not_overflow() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        for queue in [&mut device.tx_queue, &mut device.rx_queue] {
+            queue.num = 256;
+            queue.ready = true;
+            queue.desc_addr = u64::MAX;
+            queue.driver_addr = u64::MAX;
+            queue.device_addr = u64::MAX;
+        }
+
+        device
+            .process_tx_queue(&mem)
+            .expect("TX declines the queue");
+        let injected = device
+            .write_frames_to_rx_ring(&mut vec![vec![0xAAu8; 64]], &mem)
+            .expect("RX declines the queue");
+        assert_eq!(injected, 0);
+    }
+
+    /// `QueueNum` is an MMIO register the guest writes with no validation, and
+    /// both descriptor walks derive their chain bound from it.
+    #[test]
+    fn queue_num_is_clamped_to_the_advertised_maximum() {
+        let mut device = test_device();
+
+        let no_mem: Option<&GuestMemoryMmap> = None;
+        device.mmio_write(mmio::QUEUE_SEL, &0u32.to_le_bytes(), no_mem);
+        device.mmio_write(mmio::QUEUE_NUM, &u32::MAX.to_le_bytes(), no_mem);
+
+        assert_eq!(device.rx_queue.num, device.rx_queue.num_max);
+    }
 
     #[test]
     fn test_virtio_net_header() {
