@@ -7,7 +7,7 @@ use std::os::unix::io::RawFd;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 /// A single descriptor in a virtio split virtqueue.
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +70,24 @@ pub struct SplitVirtqueue {
 /// the consequence of the address it programmed.
 pub(crate) fn ring_addr(base: u64, offset: u64) -> Option<GuestAddress> {
     base.checked_add(offset).map(GuestAddress)
+}
+
+/// A guest ring base, once the whole ring is known to fit in the address space
+/// and to be backed by mapped guest memory.
+///
+/// Checking each element as it is touched leaves the rest of the ring unchecked,
+/// and it checks the same ring once per element. A queue whose rings are not
+/// fully mapped is one the guest cannot operate, so the device declines it as a
+/// whole and does so once.
+pub(crate) fn mapped_ring<M: GuestMemory + ?Sized>(
+    mem: &M,
+    base: u64,
+    len: usize,
+) -> Option<GuestAddress> {
+    // The sum has to fit before the range can mean anything.
+    ring_addr(base, len as u64)?;
+    let start = GuestAddress(base);
+    mem.check_range(start, len).then_some(start)
 }
 
 /// A chain of descriptors popped from the available ring.
