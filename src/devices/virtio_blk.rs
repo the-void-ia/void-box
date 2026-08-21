@@ -411,9 +411,16 @@ impl VirtioBlkDevice {
                 );
                 let mut chunk = vec![0u8; IO_CHUNK_BYTES];
                 let mut file_off = offset;
+                // A failure here sets the status and falls through to the write
+                // below rather than returning: the status byte lives in the
+                // guest's own descriptor, and returning early leaves the guest
+                // reading whatever that byte held before while the used ring says
+                // the request completed.
+                let mut result = VIRTIO_BLK_S_OK;
                 for d in data_descs {
                     if (d.flags & VIRTQ_DESC_F_WRITE) == 0 {
-                        return Ok((VIRTIO_BLK_S_IOERR, total_written));
+                        result = VIRTIO_BLK_S_IOERR;
+                        break;
                     }
                     let want = d.len as usize;
                     // The descriptor has to name memory the guest actually has
@@ -421,8 +428,11 @@ impl VirtioBlkDevice {
                     // can name 4 GiB it does not own and the device works through
                     // all of it before the write fails.
                     if !mem.check_range(GuestAddress(d.addr), want) {
-                        warn!("virtio-blk: data descriptor names {want} bytes the guest has not mapped");
-                        return Ok((VIRTIO_BLK_S_IOERR, total_written));
+                        warn!(
+                            "virtio-blk: data descriptor names {want} bytes the guest has not mapped"
+                        );
+                        result = VIRTIO_BLK_S_IOERR;
+                        break;
                     }
 
                     let mut done = 0usize;
@@ -437,13 +447,20 @@ impl VirtioBlkDevice {
                                 Ok(0) => break, // EOF: the rest of the step reads as zeros
                                 Ok(read_now) => filled += read_now,
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                                Err(_) => return Ok((VIRTIO_BLK_S_IOERR, total_written)),
+                                Err(_) => {
+                                    result = VIRTIO_BLK_S_IOERR;
+                                    break;
+                                }
                             }
+                        }
+                        if result != VIRTIO_BLK_S_OK {
+                            break;
                         }
                         chunk[filled..step].fill(0);
 
                         let Some(dest) = ring_addr(d.addr, done as u64) else {
-                            return Ok((VIRTIO_BLK_S_IOERR, total_written));
+                            result = VIRTIO_BLK_S_IOERR;
+                            break;
                         };
                         mem.write_slice(&chunk[..step], dest)
                             .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -451,9 +468,12 @@ impl VirtioBlkDevice {
                         done += step;
                         file_off = file_off.saturating_add(step as u64);
                     }
+                    if result != VIRTIO_BLK_S_OK {
+                        break;
+                    }
                     total_written += want;
                 }
-                VIRTIO_BLK_S_OK
+                result
             }
             VIRTIO_BLK_T_OUT => {
                 // Read-only backend
