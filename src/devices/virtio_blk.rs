@@ -23,12 +23,13 @@ const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 
 const QUEUE_MAX_SIZE: u16 = 128;
 
-/// Bytes moved between the disk and guest memory in one step.
+/// Bytes moved between the disk and guest memory in one step, and the size of
+/// the device's one I/O buffer.
 ///
 /// A data descriptor's length is a guest-written `u32`, so sizing a host buffer
-/// from it hands the guest the allocation. Streaming through a fixed buffer makes
-/// the host cost of a request constant in what the guest asked for, and the
-/// descriptor's own memory is where the bytes land either way.
+/// from it hands the guest the allocation. Moving bytes a fixed step at a time
+/// makes the host cost of a request constant in what the guest asked for, and the
+/// descriptor's own memory is where they land either way.
 const IO_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Descriptors one request may chain: a header, data, and a status byte.
@@ -79,6 +80,15 @@ pub struct VirtioBlkDevice {
     used_idx: u16,
     disk: File,
     capacity_sectors: u64,
+    /// The only buffer a request moves bytes through.
+    ///
+    /// A descriptor describes memory the guest already owns, not memory the
+    /// device has to produce, so a read has a destination before it starts and
+    /// needs no buffer sized to it. Holding one fixed buffer here rather than
+    /// allocating per request leaves the device with nowhere to put a
+    /// guest-sized allocation: the shape that reads a length and allocates it is
+    /// not expressible against a field.
+    io_buffer: Vec<u8>,
 }
 
 impl VirtioBlkDevice {
@@ -117,6 +127,7 @@ impl VirtioBlkDevice {
             used_idx: 0,
             disk,
             capacity_sectors,
+            io_buffer: vec![0u8; IO_CHUNK_BYTES],
         })
     }
 
@@ -419,7 +430,11 @@ impl VirtioBlkDevice {
                     sector,
                     data_descs.len()
                 );
-                let mut chunk = vec![0u8; IO_CHUNK_BYTES];
+                // Split the borrow: the read fills the device's buffer while
+                // reading from the device's file, and those are disjoint fields.
+                let Self {
+                    disk, io_buffer, ..
+                } = self;
                 let mut file_off = offset;
                 // A failure here sets the status and falls through to the write
                 // below rather than returning: the status byte lives in the
@@ -450,8 +465,8 @@ impl VirtioBlkDevice {
                         let step = IO_CHUNK_BYTES.min(want - done);
                         let mut filled = 0usize;
                         while filled < step {
-                            match self.disk.read_at(
-                                &mut chunk[filled..step],
+                            match disk.read_at(
+                                &mut io_buffer[filled..step],
                                 file_off.saturating_add(filled as u64),
                             ) {
                                 Ok(0) => break, // EOF: the rest of the step reads as zeros
@@ -466,13 +481,13 @@ impl VirtioBlkDevice {
                         if result != VIRTIO_BLK_S_OK {
                             break;
                         }
-                        chunk[filled..step].fill(0);
+                        io_buffer[filled..step].fill(0);
 
                         let Some(dest) = ring_addr(d.addr, done as u64) else {
                             result = VIRTIO_BLK_S_IOERR;
                             break;
                         };
-                        mem.write_slice(&chunk[..step], dest)
+                        mem.write_slice(&io_buffer[..step], dest)
                             .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
                         done += step;
@@ -806,6 +821,53 @@ mod tests {
         assert_eq!(
             device.used_idx, 1,
             "the request is completed, not looped on"
+        );
+    }
+
+    /// The device holds one buffer and moves every request through it, so a
+    /// request cannot grow the host's footprint no matter what length it names.
+    /// The structural claim is that no allocation in the read path is sized from
+    /// a descriptor; this checks the buffer that would have to grow if one were.
+    #[test]
+    fn a_request_does_not_grow_the_device_buffer() {
+        let disk_bytes = IO_CHUNK_BYTES * 3;
+        let contents: Vec<u8> = (0..disk_bytes).map(|i| (i % 251) as u8).collect();
+        let (mut device, _dir) = device_with_disk(&contents);
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), disk_bytes + 0x10_0000)]).unwrap();
+
+        let before = (device.io_buffer.len(), device.io_buffer.capacity());
+
+        // Two requests, the second far larger than the first and both spanning
+        // more steps than one buffer holds.
+        for want in [IO_CHUNK_BYTES + 4096, IO_CHUNK_BYTES * 2 + 4096] {
+            write_desc(
+                &mem,
+                0,
+                REQ_HEADER,
+                BLK_HEADER_BYTES as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            );
+            write_desc(
+                &mem,
+                1,
+                DATA_BUFFER,
+                want as u32,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                2,
+            );
+            write_desc(&mem, 2, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+            post_read_request(&mut device, &mem, 0);
+            device.avail_idx = 0;
+            device.process_queue(&mem).expect("the request completes");
+            assert_eq!(status_of(&mem), VIRTIO_BLK_S_OK);
+        }
+
+        assert_eq!(
+            (device.io_buffer.len(), device.io_buffer.capacity()),
+            before,
+            "the buffer is the same one, unchanged, after both requests"
         );
     }
 
