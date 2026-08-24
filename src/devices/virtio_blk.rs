@@ -481,6 +481,12 @@ impl VirtioBlkDevice {
                         if result != VIRTIO_BLK_S_OK {
                             break;
                         }
+                        // Everything the guest receives below is either read
+                        // just now or zeroed just now. The buffer outlives the
+                        // request, so this is what keeps a short read from
+                        // handing the guest the tail of an earlier one — not
+                        // only what makes a read past the end of the disk return
+                        // zeros.
                         io_buffer[filled..step].fill(0);
 
                         let Some(dest) = ring_addr(d.addr, done as u64) else {
@@ -868,6 +874,52 @@ mod tests {
             (device.io_buffer.len(), device.io_buffer.capacity()),
             before,
             "the buffer is the same one, unchanged, after both requests"
+        );
+    }
+
+    /// The device's buffer outlives the request, so a read that stops short must
+    /// not hand the guest whatever an earlier, larger read left behind.
+    #[test]
+    fn a_short_read_does_not_leak_an_earlier_request() {
+        // A disk shorter than one step, so every read stops short of the buffer.
+        let disk_bytes = 512usize;
+        let (mut device, _dir) = device_with_disk(&vec![0xAB; disk_bytes]);
+        let mem = test_memory();
+
+        // Prime the buffer with a full step of disk bytes from a wide request.
+        device.io_buffer.fill(0xCD);
+
+        let want = 2048u32;
+        write_desc(
+            &mem,
+            0,
+            REQ_HEADER,
+            BLK_HEADER_BYTES as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(
+            &mem,
+            1,
+            DATA_BUFFER,
+            want,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            2,
+        );
+        write_desc(&mem, 2, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+        post_read_request(&mut device, &mem, 0);
+
+        device.process_queue(&mem).expect("the request completes");
+
+        let mut got = vec![0u8; want as usize];
+        mem.read_slice(&mut got, GuestAddress(DATA_BUFFER)).unwrap();
+        assert!(
+            got[..disk_bytes].iter().all(|&b| b == 0xAB),
+            "the disk bytes"
+        );
+        assert!(
+            got[disk_bytes..].iter().all(|&b| b == 0),
+            "and zeros past them, never the buffer's previous contents"
         );
     }
 
