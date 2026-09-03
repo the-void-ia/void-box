@@ -966,7 +966,7 @@ mod tests {
 
         // Each descriptor names memory this guest really has, so the mapping
         // check passes on every one and only their total can reject the request.
-        let per_desc = (MAX_REQUEST_BYTES / 3) as u32;
+        let per_desc = (MAX_REQUEST_BYTES / 2) as u32;
         write_desc(
             &mem,
             0,
