@@ -642,16 +642,21 @@ mod tests {
             VIRTQ_DESC_F_NEXT,
             1,
         );
+        // Past the end of this guest's memory, but well under the per-request
+        // ceiling, so the ceiling cannot be what rejects it.
+        let want = 1024 * 1024u32;
+        assert!((want as usize) < MAX_REQUEST_BYTES);
         write_desc(
             &mem,
             1,
             DATA_BUFFER,
-            u32::MAX,
+            want,
             VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
             2,
         );
         write_desc(&mem, 2, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
         post_read_request(&mut device, &mem, 0);
+        mem.write_obj(0xFFu8, GuestAddress(STATUS_BYTE)).unwrap();
 
         device.process_queue(&mem).expect("the request completes");
 
@@ -953,11 +958,15 @@ mod tests {
     #[test]
     fn a_request_larger_than_the_ceiling_is_refused_before_any_work() {
         let (mut device, _dir) = test_device();
-        let mem = test_memory();
+        // Large enough to back every descriptor below, so the mapping check
+        // cannot be what rejects the request.
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MAX_REQUEST_BYTES + 8 * 1024 * 1024)])
+                .unwrap();
 
-        // Three descriptors that together describe more than one request may ask
-        // for, each naming memory well past what this guest has.
-        let per_desc = (MAX_REQUEST_BYTES / 2) as u32;
+        // Each descriptor names memory this guest really has, so the mapping
+        // check passes on every one and only their total can reject the request.
+        let per_desc = (MAX_REQUEST_BYTES / 3) as u32;
         write_desc(
             &mem,
             0,
@@ -966,7 +975,7 @@ mod tests {
             VIRTQ_DESC_F_NEXT,
             1,
         );
-        for index in 1..3u64 {
+        for index in 1..4u64 {
             write_desc(
                 &mem,
                 index,
@@ -976,7 +985,11 @@ mod tests {
                 (index + 1) as u16,
             );
         }
-        write_desc(&mem, 3, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+        write_desc(&mem, 4, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+        assert!(
+            (per_desc as usize) * 3 > MAX_REQUEST_BYTES,
+            "the chain has to describe more than the ceiling"
+        );
         post_read_request(&mut device, &mem, 0);
         mem.write_obj(0xFFu8, GuestAddress(STATUS_BYTE)).unwrap();
 
