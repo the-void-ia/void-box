@@ -34,6 +34,17 @@ const IO_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Descriptors one request may chain: a header, data, and a status byte.
 const MAX_CHAIN_DESCS: usize = 32;
+
+/// Bytes one request may ask the device to move.
+///
+/// The per-descriptor check settles that each buffer is memory the guest owns,
+/// but it carries no running total, so a chain can point every descriptor at the
+/// same large region and multiply the work by the chain length. The device
+/// advertises no `VIRTIO_BLK_F_SEG_MAX`, so Linux sends one data descriptor per
+/// request and the block layer caps a request far below this — the ceiling
+/// bounds what a guest can schedule in one kick without reaching any request a
+/// driver makes.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
 
 /// Bytes in one descriptor-table entry: address, length, flags, and next.
@@ -421,6 +432,19 @@ impl VirtioBlkDevice {
         let offset = sector.saturating_mul(SECTOR_SIZE);
 
         let data_descs = &descs[1..descs.len() - 1];
+
+        // Summed before any byte moves, so an oversized request costs the device
+        // nothing rather than being abandoned partway through.
+        let requested: usize = data_descs
+            .iter()
+            .fold(0usize, |sum, d| sum.saturating_add(d.len as usize));
+        if requested > MAX_REQUEST_BYTES {
+            warn!(
+                "virtio-blk: request of {requested} bytes exceeds the {MAX_REQUEST_BYTES} ceiling"
+            );
+            return Ok((Self::report(mem, &status_desc, VIRTIO_BLK_S_IOERR)?, 1));
+        }
+
         let mut total_written = 0usize;
 
         let status = match req_type {
@@ -921,6 +945,45 @@ mod tests {
             got[disk_bytes..].iter().all(|&b| b == 0),
             "and zeros past them, never the buffer's previous contents"
         );
+    }
+
+    /// The per-descriptor check has no running total, so a chain can point every
+    /// descriptor at the same region and multiply the work by its length. The
+    /// ceiling is summed before any byte moves, so the request costs nothing.
+    #[test]
+    fn a_request_larger_than_the_ceiling_is_refused_before_any_work() {
+        let (mut device, _dir) = test_device();
+        let mem = test_memory();
+
+        // Three descriptors that together describe more than one request may ask
+        // for, each naming memory well past what this guest has.
+        let per_desc = (MAX_REQUEST_BYTES / 2) as u32;
+        write_desc(
+            &mem,
+            0,
+            REQ_HEADER,
+            BLK_HEADER_BYTES as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        for index in 1..3u64 {
+            write_desc(
+                &mem,
+                index,
+                DATA_BUFFER,
+                per_desc,
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                (index + 1) as u16,
+            );
+        }
+        write_desc(&mem, 3, STATUS_BYTE, 1, VIRTQ_DESC_F_WRITE, 0);
+        post_read_request(&mut device, &mem, 0);
+        mem.write_obj(0xFFu8, GuestAddress(STATUS_BYTE)).unwrap();
+
+        device.process_queue(&mem).expect("the request completes");
+
+        assert_eq!(status_of(&mem), VIRTIO_BLK_S_IOERR);
+        assert_eq!(device.used_idx, 1, "the descriptor is still returned");
     }
 
     /// A request whose header the device rejects still has a status descriptor,
