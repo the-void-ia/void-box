@@ -4,13 +4,15 @@
 //! each parses bytes the guest chose: the control-channel frame decoder
 //! (`void-box-protocol` framing plus the multiplex request-id prefix), the
 //! userspace vsock connection state machine that routes guest packets, the
-//! split-virtqueue reader that walks descriptor chains out of guest memory, and
-//! the 9P server that answers file operations against a host directory —
-//! together with the transport beneath it, which parses guest data of its own. A
-//! panic in any of them takes down the VMM process for every sandbox it hosts,
-//! and an allocation sized from a guest-supplied length is a host memory
-//! exhaustion the guest triggers at will. Nothing else in the tree drives these
-//! with bytes the guest is free to choose.
+//! split-virtqueue reader that walks descriptor chains out of guest memory, the
+//! 9P server that answers file operations against a host directory — together
+//! with the transport beneath it, which parses guest data of its own — the
+//! virtio-net device, whose descriptor walks assemble outbound frames and
+//! scatter inbound ones, and the virtio-blk device, which turns guest request
+//! chains into disk reads. A panic in any of them takes down the VMM process for
+//! every sandbox it hosts, and an allocation sized from a guest-supplied length
+//! is a host memory exhaustion the guest triggers at will. Nothing else in the
+//! tree drives these with bytes the guest is free to choose.
 //!
 //! Each entry point takes a raw byte slice, so one harness serves both callers:
 //! `cargo fuzz` mutates the slice under libFuzzer, and `tests/fuzz_corpus.rs`
@@ -39,9 +41,15 @@ use void_box_protocol::{parse_ping_payload, parse_pong_payload, Message};
 use crate::backend::multiplex::{build_frame, decode_payload};
 
 #[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -49,13 +57,17 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 #[cfg(target_os = "linux")]
 use crate::devices::virtio_9p::Virtio9pDevice;
 #[cfg(target_os = "linux")]
-use crate::devices::virtio_net::mmio;
+use crate::devices::virtio_blk::VirtioBlkDevice;
+#[cfg(target_os = "linux")]
+use crate::devices::virtio_net::{mmio, VirtioNetDevice};
 #[cfg(target_os = "linux")]
 use crate::devices::virtqueue::SplitVirtqueue;
 #[cfg(target_os = "linux")]
 use crate::devices::vsock_connection::{
     ConnState, VsockConnection, VsockConnectionMap, VsockHeader, VSOCK_HEADER_SIZE,
 };
+#[cfg(target_os = "linux")]
+use crate::network::NetworkBackend;
 
 /// Guest memory the virtqueue harness maps. Large enough to hold a descriptor
 /// table, both rings, and payload buffers; small enough that every fuzz
@@ -79,10 +91,128 @@ const FUZZ_MAX_VSOCK_BODY: usize = 8 * 1024;
 #[cfg(target_os = "linux")]
 const FUZZ_MAX_9P_REQUESTS: usize = 64;
 
-/// MMIO writes driven per transport iteration. Enough to program a queue and
+/// Operations driven per transport iteration: MMIO writes, and the RX frames the
+/// virtio-net harness hands over alongside them. Enough to program a queue and
 /// kick it several times; bounded so one input cannot loop indefinitely.
 #[cfg(target_os = "linux")]
-const FUZZ_MAX_MMIO_WRITES: usize = 48;
+const FUZZ_MAX_TRANSPORT_OPS: usize = 48;
+
+/// Guest memory the virtio-net and virtio-blk harnesses map.
+///
+/// Larger than [`FUZZ_GUEST_MEM_BYTES`] because both devices have paths that
+/// open only above 64 KiB: virtio-blk moves a data descriptor through a 64 KiB
+/// buffer one step at a time, so its second step needs a descriptor longer than
+/// that which still names mapped memory, and virtio-net's frame ceiling sits
+/// just above 64 KiB, so a single descriptor can only cross it if the memory
+/// behind it is mapped. Separate from the shared constant because `virtqueue`
+/// folds its ring addresses modulo that one, and changing it would repoint
+/// every seed in that corpus.
+#[cfg(target_os = "linux")]
+const FUZZ_DEVICE_GUEST_MEM_BYTES: u64 = 256 * 1024;
+
+/// Registers a driver programs to bring a virtio-mmio queue up, plus the notify
+/// that kicks it. Offsets come from the shared virtio-mmio layout.
+///
+/// The transport harnesses pick from this table by an index read from the
+/// input, so its order is part of every committed seed's byte layout: append to
+/// it, never reorder it. Appending leaves the seeds intact because every harness
+/// decodes the index modulo the slot count and a seed's slot bytes are all below
+/// it. A crash artifact is raw fuzzer output with no such property — a slot byte
+/// above the old count decodes to a different register once the count grows —
+/// and the replay gate holds artifacts to no floor, so after an append confirm
+/// each artifact still reaches its bug.
+#[cfg(target_os = "linux")]
+const QUEUE_BRING_UP_REGISTERS: &[u64] = &[
+    mmio::STATUS,
+    mmio::QUEUE_SEL,
+    mmio::QUEUE_NUM,
+    mmio::QUEUE_DESC_LOW,
+    mmio::QUEUE_DESC_HIGH,
+    mmio::QUEUE_DRIVER_LOW,
+    mmio::QUEUE_DRIVER_HIGH,
+    mmio::QUEUE_DEVICE_LOW,
+    mmio::QUEUE_DEVICE_HIGH,
+    mmio::QUEUE_READY,
+    mmio::QUEUE_NOTIFY,
+    mmio::DRIVER_FEATURES,
+    mmio::DRIVER_FEATURES_SEL,
+];
+
+/// virtio-net operation slot that hands the device an inbound frame the way
+/// the net-poll thread does: pushed onto the lock-free queue, then flushed into
+/// the RX ring.
+///
+/// The frame slots sit below the register slots, at fixed positions, so that
+/// appending a register to the table never moves them: a seed byte that meant
+/// "frame" keeps meaning "frame".
+#[cfg(target_os = "linux")]
+const NET_OP_FLUSH_RX_FRAME: usize = 0;
+
+/// virtio-net operation slot that buffers an inbound frame on the device until
+/// the next RX kick, which is the path a frame takes when the ring had no room
+/// for it.
+#[cfg(target_os = "linux")]
+const NET_OP_QUEUE_RX_FRAME: usize = 1;
+
+/// First virtio-net operation slot that names a register; the register is the
+/// slot minus this.
+#[cfg(target_os = "linux")]
+const NET_OP_FIRST_REGISTER: usize = 2;
+
+/// Number of virtio-net operation slots: the frame slots plus one per register.
+#[cfg(target_os = "linux")]
+const NET_OP_COUNT: usize = NET_OP_FIRST_REGISTER + QUEUE_BRING_UP_REGISTERS.len();
+
+/// Values the virtio-net harness lets `QueueSel` and `QueueNotify` take.
+///
+/// The device has two queues, and only 0 and 1 select one; a notify with any
+/// other value is ignored, and any other selector aliases the RX queue. Written
+/// raw, a 32-bit value selects a queue with probability two in four billion,
+/// so the mutator could refine a kick a seed already encodes but never produce
+/// one from a byte it flips. Folding to four keeps both queues likely while
+/// leaving the ignored and aliased cases reachable. Ring addresses need their
+/// full width and are not folded. A seed's selector bytes are all 0 or 1, which
+/// the fold leaves unchanged.
+#[cfg(target_os = "linux")]
+const FUZZ_NET_QUEUE_SELECTOR_SPAN: u32 = 4;
+
+/// Cap on one RX frame the virtio-net harness hands to the device.
+///
+/// Inbound frames come from the host's network stack, not the guest, so their
+/// contents are not the surface under test; the descriptor chain the guest
+/// posted to receive them is. The cap keeps a frame from swallowing the input
+/// that the operation loop after it needs.
+#[cfg(target_os = "linux")]
+const FUZZ_MAX_RX_FRAME_BYTES: usize = 2048;
+
+/// Size of the disk the virtio-blk harness backs its device with.
+///
+/// The disk is host-side — it carries an OCI rootfs, not bytes the guest chose —
+/// so a small fixed image is enough. A few sectors leave both outcomes of a
+/// guest-chosen sector reachable: a read inside the disk and one past its end.
+#[cfg(target_os = "linux")]
+const FUZZ_BLK_DISK_BYTES: usize = 8 * 1024;
+
+/// A network backend that accepts every frame and delivers none.
+///
+/// The real backend opens sockets and keeps NAT state, so a replay through it
+/// would depend on the host it runs on. It also parses the frame it is handed —
+/// Ethernet, ARP, IPv4 — and those bytes are guest memory, so that parser is a
+/// guest-facing surface of its own. It is out of scope for this harness, which
+/// covers the descriptor walks in front of it: a TX frame reaches the backend
+/// only after the walk has assembled and accepted the chain, and RX frames enter
+/// through the device, not through the backend.
+#[cfg(target_os = "linux")]
+struct SinkBackend;
+
+#[cfg(target_os = "linux")]
+impl NetworkBackend for SinkBackend {
+    fn process_guest_frame(&mut self, _frame: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn drain_to_guest(&mut self, _out: &mut Vec<Vec<u8>>) {}
+}
 
 /// A cursor that turns a fuzzer's byte slice into harness parameters.
 ///
@@ -463,24 +593,6 @@ pub fn nine_p(root: &Path, data: &[u8]) -> usize {
 /// the layer below went untouched, however cleanly the call returned.
 #[cfg(target_os = "linux")]
 pub fn nine_p_transport(root: &Path, data: &[u8]) -> usize {
-    /// Registers a driver programs to bring a queue up, plus the notify that
-    /// kicks it. Offsets come from the shared virtio-mmio layout.
-    const REGISTERS: &[u64] = &[
-        mmio::STATUS,
-        mmio::QUEUE_SEL,
-        mmio::QUEUE_NUM,
-        mmio::QUEUE_DESC_LOW,
-        mmio::QUEUE_DESC_HIGH,
-        mmio::QUEUE_DRIVER_LOW,
-        mmio::QUEUE_DRIVER_HIGH,
-        mmio::QUEUE_DEVICE_LOW,
-        mmio::QUEUE_DEVICE_HIGH,
-        mmio::QUEUE_READY,
-        mmio::QUEUE_NOTIFY,
-        mmio::DRIVER_FEATURES,
-        mmio::DRIVER_FEATURES_SEL,
-    ];
-
     let mut input = Input::new(data);
     let read_only = input.u8() & 1 == 0;
     let mut device = Virtio9pDevice::new(root, "fuzz", read_only);
@@ -503,16 +615,155 @@ pub fn nine_p_transport(root: &Path, data: &[u8]) -> usize {
     let _ = memory.write_slice(contents, GuestAddress(write_offset));
 
     let mut writes = 0;
-    for _ in 0..FUZZ_MAX_MMIO_WRITES {
+    for _ in 0..FUZZ_MAX_TRANSPORT_OPS {
         if input.is_empty() {
             break;
         }
-        let register = REGISTERS[usize::from(input.u8()) % REGISTERS.len()];
+        let register =
+            QUEUE_BRING_UP_REGISTERS[usize::from(input.u8()) % QUEUE_BRING_UP_REGISTERS.len()];
         let value = input.u32();
         device.mmio_write(register, &value.to_le_bytes(), Some(&memory));
         writes += 1;
 
         // Reads share the register decode and the config-space path.
+        let mut scratch = [0u8; 4];
+        device.mmio_read(u64::from(input.u8()) * 4, &mut scratch);
+    }
+
+    writes
+}
+
+/// Drive the virtio-net device through its MMIO registers, guest memory, and
+/// the inbound frames a host network stack would hand it.
+///
+/// The device walks guest descriptor chains in both directions. The TX walk
+/// assembles a frame from a chain the guest posted and hands it to the backend;
+/// the RX walk scatters an inbound frame into buffers the guest posted to
+/// receive it. Each reads descriptor addresses, lengths, flags, and `next`
+/// indices out of guest memory, and each takes its ring geometry from registers
+/// the guest wrote, so the input supplies a guest memory image and a sequence of
+/// operations over it. Register writes are how a queue is programmed and
+/// kicked. Frame operations hand an inbound frame to the device the way the host
+/// does: pushed onto the lock-free queue the net-poll thread fills and flushed
+/// into the RX ring, or buffered on the device until the next RX kick.
+///
+/// Returns the number of operations executed — register writes and frames
+/// handed over. Reaching either walk takes a whole bring-up sequence, so a count
+/// near zero means no queue was programmed and neither walk ran, however cleanly
+/// the call returned.
+#[cfg(target_os = "linux")]
+pub fn virtio_net(data: &[u8]) -> usize {
+    let backend: Arc<Mutex<dyn NetworkBackend>> = Arc::new(Mutex::new(SinkBackend));
+    let mut device = VirtioNetDevice::new(backend).expect("constructing the virtio-net device");
+
+    // Annotated because the device's MMIO entry points are generic over the
+    // memory type, so nothing else pins the map's bitmap parameter.
+    let memory: GuestMemoryMmap =
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), FUZZ_DEVICE_GUEST_MEM_BYTES as usize)])
+            .expect("mapping fuzz guest memory");
+
+    // Same split as `nine_p_transport`, for the same reason: the image length is
+    // its own field so the operation loop below keeps some of the input.
+    let mut input = Input::new(data);
+    let write_offset = input.u16() as u64 % FUZZ_DEVICE_GUEST_MEM_BYTES;
+    let image_len =
+        usize::from(input.u16()).min((FUZZ_DEVICE_GUEST_MEM_BYTES - write_offset) as usize);
+    let contents = input.take(image_len);
+    let _ = memory.write_slice(contents, GuestAddress(write_offset));
+
+    let mut operations = 0;
+    for _ in 0..FUZZ_MAX_TRANSPORT_OPS {
+        if input.is_empty() {
+            break;
+        }
+        let slot = usize::from(input.u8()) % NET_OP_COUNT;
+        match slot {
+            // The length is folded rather than clamped: a clamp would send
+            // almost every mutated length to the cap, and a frame at the cap
+            // swallows the rest of a seed-sized input.
+            NET_OP_FLUSH_RX_FRAME => {
+                let frame_len = usize::from(input.u16()) % (FUZZ_MAX_RX_FRAME_BYTES + 1);
+                device.pending_rx().push(input.take(frame_len).to_vec());
+                let _ = device.flush_pending_rx(&memory);
+            }
+            NET_OP_QUEUE_RX_FRAME => {
+                let frame_len = usize::from(input.u16()) % (FUZZ_MAX_RX_FRAME_BYTES + 1);
+                device.queue_rx_frame(input.take(frame_len).to_vec());
+            }
+            register_slot => {
+                let register = QUEUE_BRING_UP_REGISTERS[register_slot - NET_OP_FIRST_REGISTER];
+                let raw = input.u32();
+                // The queue selectors are folded; every other register — the
+                // ring addresses above all — needs its full width.
+                let value = if register == mmio::QUEUE_SEL || register == mmio::QUEUE_NOTIFY {
+                    raw % FUZZ_NET_QUEUE_SELECTOR_SPAN
+                } else {
+                    raw
+                };
+                device.mmio_write(register, &value.to_le_bytes(), Some(&memory));
+            }
+        }
+        operations += 1;
+
+        // Reads share the register decode and the config-space path.
+        let mut scratch = [0u8; 4];
+        device.mmio_read(u64::from(input.u8()) * 4, &mut scratch);
+    }
+
+    operations
+}
+
+/// Drive the virtio-blk device through its MMIO registers and guest memory,
+/// against a disk the harness creates under `root`.
+///
+/// A request is a descriptor chain the guest posts: a header naming the
+/// operation and sector, data descriptors naming the memory the sectors land in,
+/// and a status byte the device writes back. Every field is guest-written, and
+/// the device turns them into file reads and guest-memory writes. The disk is
+/// host-side, so the harness backs the device with a small fixed image and
+/// spends the whole input on the chains and the registers that publish them.
+/// `root` must be a directory the caller is willing to see a file created in.
+///
+/// Returns the number of MMIO register writes executed. Reaching the request
+/// handler takes a whole bring-up sequence — size, three ring addresses, ready,
+/// notify — so a count near zero means the input never programmed a queue and
+/// no request was handled, however cleanly the call returned.
+#[cfg(target_os = "linux")]
+pub fn virtio_blk(root: &Path, data: &[u8]) -> usize {
+    let disk_path = root.join("disk.img");
+    // A repeating pattern rather than zeros, so a read that lands at the wrong
+    // offset is at least visible under a debugger; the harness itself has no
+    // oracle for the bytes.
+    let disk_contents: Vec<u8> = (0..FUZZ_BLK_DISK_BYTES).map(|i| (i % 251) as u8).collect();
+    fs::write(&disk_path, &disk_contents).expect("writing the virtio-blk fuzz disk");
+    let mut device = VirtioBlkDevice::new(&disk_path).expect("opening the virtio-blk fuzz disk");
+
+    let memory =
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), FUZZ_DEVICE_GUEST_MEM_BYTES as usize)])
+            .expect("mapping fuzz guest memory");
+
+    // Same split as `nine_p_transport`, for the same reason: the image length is
+    // its own field so the register loop below keeps some of the input.
+    let mut input = Input::new(data);
+    let write_offset = input.u16() as u64 % FUZZ_DEVICE_GUEST_MEM_BYTES;
+    let image_len =
+        usize::from(input.u16()).min((FUZZ_DEVICE_GUEST_MEM_BYTES - write_offset) as usize);
+    let contents = input.take(image_len);
+    let _ = memory.write_slice(contents, GuestAddress(write_offset));
+
+    let mut writes = 0;
+    for _ in 0..FUZZ_MAX_TRANSPORT_OPS {
+        if input.is_empty() {
+            break;
+        }
+        let register =
+            QUEUE_BRING_UP_REGISTERS[usize::from(input.u8()) % QUEUE_BRING_UP_REGISTERS.len()];
+        let value = input.u32();
+        device.mmio_write(register, &value.to_le_bytes(), Some(&memory));
+        writes += 1;
+
+        // Reads share the register decode and the config-space path, which for
+        // this device is the capacity.
         let mut scratch = [0u8; 4];
         device.mmio_read(u64::from(input.u8()) * 4, &mut scratch);
     }

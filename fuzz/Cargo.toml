@@ -62,4 +62,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "virtio_net"
+path = "fuzz_targets/virtio_net.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtio_blk"
+path = "fuzz_targets/virtio_blk.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

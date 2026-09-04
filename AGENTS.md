@@ -864,7 +864,7 @@ ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-thread
 
 ### Fuzzing the guest-facing parsers
 
-Several host-side parsers read bytes a guest chooses: the control-channel frame decoder (`void-box-protocol` framing plus the multiplex request-id prefix), the userspace vsock connection state machine, the split-virtqueue reader that walks descriptor chains out of guest memory, and the 9P server together with the transport beneath it. Their harnesses live in `src/fuzz.rs`, and two callers drive the same bodies — `cargo fuzz` and the replay gate.
+Several host-side parsers read bytes a guest chooses: the control-channel frame decoder (`void-box-protocol` framing plus the multiplex request-id prefix), the userspace vsock connection state machine, the split-virtqueue reader that walks descriptor chains out of guest memory, the 9P server together with the transport beneath it, the virtio-net device's TX and RX descriptor walks, and the virtio-blk request handler. Their harnesses live in `src/fuzz.rs`, and two callers drive the same bodies — `cargo fuzz` and the replay gate.
 
 The merge gate replays them. `tests/fuzz_corpus.rs` runs every file under `fuzz/corpus/<target>/` and `fuzz/artifacts/<target>/` through its harness on stable, as part of a plain `cargo test`. It is deterministic and costs milliseconds, so it needs no special invocation.
 
@@ -881,12 +881,15 @@ cargo install cargo-fuzz
 mkdir -p fuzz/corpus-run/vsock_frame
 cargo +nightly fuzz run vsock_frame fuzz/corpus-run/vsock_frame fuzz/corpus/vsock_frame \
   -- -max_total_time=60 -rss_limit_mb=2048
-# targets: vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport
+# targets: vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport,
+#          virtio_net, virtio_blk
 ```
 
 Do not commit what a run accumulates in `fuzz/corpus-run/`. libFuzzer keeps an input because it reached new coverage, which is not the property the replay gate checks, so those inputs would be judged against a work floor written for curated seeds. Promote one deliberately when it covers a shape worth keeping: move it into `fuzz/corpus/<target>/` and give it a name that says what it covers.
 
 `nine_p` drives the 9P message parser directly; `nine_p_transport` drives the device through its MMIO registers and guest memory, covering the queue programming and descriptor walk beneath it. The split matters: the transport parses guest data of its own — descriptor lengths size host allocations and `next` indices steer the walk — and a harness aimed at the message parser never reaches it.
+
+`virtio_net` and `virtio_blk` follow `nine_p_transport`: the input carries a guest memory image, then a bounded sequence of register writes chosen from a fixed list of queue bring-up registers, so one input lays out the rings, programs them, and kicks them. `virtio_net` adds two operations that hand the device an inbound frame, because the RX walk runs only when there is a frame to scatter. One pushes the frame onto the queue the net-poll thread fills and flushes it into the RX ring. The other buffers it on the device until the next RX kick. `virtio_blk` creates its backing disk under the scratch root the caller gives it. The disk is host-side, so a small fixed image serves, and the input goes to the request chains. `fuzz/seeds/virtio_devices.py` writes both seed corpora and documents their byte layout; regenerate from it after any change to a harness's read order.
 
 When a run crashes, `cargo fuzz` writes the input under `fuzz/artifacts/<target>/`. Commit that file **together with the parser fix** — the replay test then keeps the bug fixed for everyone. Never commit a crashing input ahead of its fix: it reds the gate for every unrelated change.
 

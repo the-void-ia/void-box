@@ -18,23 +18,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Corpus directories are per target; `nine_p` additionally needs a writable
-/// root, so the dispatch is by name rather than by a function pointer table.
+/// Corpus directories are per target; the 9P and virtio-blk harnesses
+/// additionally need a writable root, so the dispatch is by name rather than by
+/// a function pointer table.
 const TARGETS: &[&str] = &[
     "vsock_frame",
     "vsock_packet",
     "virtqueue",
     "nine_p",
     "nine_p_transport",
+    "virtio_net",
+    "virtio_blk",
 ];
 
 /// Run one corpus input through the harness that owns it, returning the units of
 /// work the harness reported — or `None` when the target compiles out on this
 /// platform.
 ///
-/// `root` is a scratch directory the 9P harness may modify. Each input gets its
-/// own, so a replay failure names one file rather than one file plus whatever
-/// the previous input left behind.
+/// `root` is a scratch directory the 9P and virtio-blk harnesses may modify.
+/// Each input gets its own, so a replay failure names one file rather than one
+/// file plus whatever the previous input left behind.
 fn replay(target: &str, data: &[u8], root: &Path) -> Option<usize> {
     match target {
         "vsock_frame" => Some(void_box::fuzz::vsock_frame(data)),
@@ -46,10 +49,15 @@ fn replay(target: &str, data: &[u8], root: &Path) -> Option<usize> {
         "nine_p" => Some(void_box::fuzz::nine_p(root, data)),
         #[cfg(target_os = "linux")]
         "nine_p_transport" => Some(void_box::fuzz::nine_p_transport(root, data)),
+        #[cfg(target_os = "linux")]
+        "virtio_net" => Some(void_box::fuzz::virtio_net(data)),
+        #[cfg(target_os = "linux")]
+        "virtio_blk" => Some(void_box::fuzz::virtio_blk(root, data)),
         // The device harnesses are Linux-only because `void_box::devices` is.
         // Their corpus still travels with the repo and still replays on Linux.
         #[cfg(not(target_os = "linux"))]
-        "vsock_packet" | "virtqueue" | "nine_p" | "nine_p_transport" => {
+        "vsock_packet" | "virtqueue" | "nine_p" | "nine_p_transport" | "virtio_net"
+        | "virtio_blk" => {
             let _ = (data, root);
             None
         }
@@ -75,12 +83,16 @@ fn replay(target: &str, data: &[u8], root: &Path) -> Option<usize> {
 /// vacuous either way.
 fn work_floor(target: &str) -> usize {
     match target {
-        // Reaching the queue walker takes a full bring-up: queue size, three
-        // ring addresses, ready, notify. The seeds carry ten register writes, so
-        // eight leaves margin for one to be trimmed while still failing an input
-        // that programs nothing. This is the target whose harness was found
-        // starved, and the floor is measured against that failure.
-        "nine_p_transport" => 8,
+        // Reaching a queue walker takes a full bring-up: queue select and size,
+        // three ring addresses, ready, notify. The seeds carry ten or more
+        // operations, so eight leaves margin for one to be trimmed. The count is
+        // of operations decoded, not of walks reached: it catches a harness
+        // that consumes its input before its loop and returns zero, which is
+        // the failure this floor exists for, and says nothing about whether
+        // the operations that survived were the ones that program a queue —
+        // eight status writes pass it. Whether a seed reaches its walk is what
+        // the coverage a discovery run prints shows.
+        "nine_p_transport" | "virtio_net" | "virtio_blk" => 8,
         // Both dispatch to their parser from a loop over `Input`, so both can be
         // starved to zero the same way.
         "nine_p" | "vsock_packet" => 1,
@@ -127,7 +139,7 @@ fn inputs_for(target: &str) -> Vec<(InputKind, PathBuf)> {
 /// hold on all of them.
 #[test]
 fn fuzz_corpus_replays_clean() {
-    let scratch = tempfile::tempdir().expect("scratch dir for the 9P corpus");
+    let scratch = tempfile::tempdir().expect("scratch dir for the corpus replay");
     let mut replayed = 0usize;
 
     let mut skipped: Vec<&str> = Vec::new();
@@ -162,10 +174,10 @@ fn fuzz_corpus_replays_clean() {
         }
     }
 
-    // Count harnesses actually executed, not files read. Four of the five
-    // targets compile out on non-Linux, and a count of files would report a
-    // healthy number there while exercising one parser — the "covering nothing"
-    // guard would never fire on the platform where it matters most.
+    // Count harnesses actually executed, not files read. Every target but
+    // `vsock_frame` compiles out on non-Linux, and a count of files would report
+    // a healthy number there while exercising one parser — the "covering
+    // nothing" guard would never fire on the platform where it matters most.
     if !skipped.is_empty() {
         eprintln!(
             "SKIP: {} not replayed on this platform (void_box::devices is Linux-only): {}",
