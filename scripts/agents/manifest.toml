@@ -22,11 +22,11 @@ url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d
 sha256 = "65445bd4dd042079cc3fa43791b561370a05c8599e8ec47580e25a81050abbdd"
 
 [codex.linux.x86_64]
-version = "0.151.0"
+version = "0.153.4"
 url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-x86_64-unknown-linux-musl.tar.gz"
-sha256 = "605b4b183f22c645f5def63a5b7191767407fb66a6feaec4eaf10b5b7e0058f6"
+sha256 = "f479424eca092484dc40d87ae28c44f4cc40234a60045d6131e493800d814a30"
 
 [codex.linux.aarch64]
-version = "0.151.0"
+version = "0.153.4"
 url = "https://github.com/openai/codex/releases/download/rust-v{version}/codex-aarch64-unknown-linux-musl.tar.gz"
-sha256 = "c1cf2baf375e261c1469381a52dc2c8fd05b6fb45cfff83fed0988fd6c5369b6"
+sha256 = "5cda6182bd94c3a30f2eb63a495489ebf7f691fddb14d70f48c6c1a5071b6cde"
