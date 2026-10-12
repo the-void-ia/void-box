@@ -12,14 +12,14 @@
 # `.github/workflows/bump-agents.yml` job opens one PR per bumped tuple.
 
 [claude-code.linux.x86_64]
-version = "2.1.251"
+version = "2.1.296"
 url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-x64/claude"
-sha256 = "fd5f10ff0eb58daec04900466b143ea98aab50abf208a422bc008eaec13f61f7"
+sha256 = "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de"
 
 [claude-code.linux.aarch64]
-version = "2.1.251"
+version = "2.1.296"
 url = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-arm64/claude"
-sha256 = "65445bd4dd042079cc3fa43791b561370a05c8599e8ec47580e25a81050abbdd"
+sha256 = "f1f6e96e0d8342b9dbf41d7e88255397a6a52ce3d8736ad6a4c6b59c9b62fefa"
 
 [codex.linux.x86_64]
 version = "0.151.0"
