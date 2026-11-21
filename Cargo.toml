@@ -75,6 +75,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+llm-budget = { version = "0.10.0", default-features = false }
 void-box-protocol = { path = "void-box-protocol" }
 voidbox-oci = { path = "voidbox-oci" }
 libc = "0.2"

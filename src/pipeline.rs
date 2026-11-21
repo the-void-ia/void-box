@@ -34,6 +34,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use llm_budget::budget::AtomicBudget;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent_box::VoidBox;
@@ -119,6 +120,7 @@ enum PipelineStage {
 pub struct Pipeline {
     name: String,
     stages: Vec<PipelineStage>,
+    budget: Option<Arc<AtomicBudget>>,
 }
 
 impl Pipeline {
@@ -127,6 +129,7 @@ impl Pipeline {
         Self {
             name: first.name.clone(),
             stages: vec![PipelineStage::Single(Box::new(first))],
+            budget: None,
         }
     }
 
@@ -135,6 +138,7 @@ impl Pipeline {
         Self {
             name: name.into(),
             stages: vec![PipelineStage::Single(Box::new(first))],
+            budget: None,
         }
     }
 
@@ -151,6 +155,14 @@ impl Pipeline {
         self
     }
 
+    /// Cap the pipeline's spend. Every stage's `total_cost_usd` is charged to
+    /// `budget`; once it is exhausted, no further stage or fan-out starts.
+    /// Share one `Arc` across pipelines to cap them together.
+    pub fn budget(mut self, budget: Arc<AtomicBudget>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
     /// Execute the pipeline: run each stage in order, piping output forward.
     ///
     /// For `PipelineStage::Single` stages, a single Box is booted and run.
@@ -159,7 +171,16 @@ impl Pipeline {
     /// array for the next stage.
     pub async fn run(self) -> crate::Result<PipelineResult> {
         let mut hook = NoopOutputHook;
-        run_pipeline_core(self.name, self.stages, &mut hook, None, None, None).await
+        run_pipeline_core(
+            self.name,
+            self.stages,
+            self.budget,
+            &mut hook,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Execute the pipeline with a streaming callback for output chunks.
@@ -174,7 +195,16 @@ impl Pipeline {
         F: FnMut(&str, &ExecOutputChunk) + Send,
     {
         let mut hook = StreamingOutputHook(on_output);
-        run_pipeline_core(self.name, self.stages, &mut hook, None, None, None).await
+        run_pipeline_core(
+            self.name,
+            self.stages,
+            self.budget,
+            &mut hook,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Number of stages in the pipeline.
@@ -201,6 +231,7 @@ impl Pipeline {
         run_pipeline_core(
             self.name,
             self.stages,
+            self.budget,
             &mut hook,
             None,
             stage_tx,
@@ -224,6 +255,7 @@ impl Pipeline {
         run_pipeline_core(
             self.name,
             self.stages,
+            self.budget,
             &mut hook,
             None,
             stage_tx,
@@ -318,6 +350,7 @@ impl<F: FnMut(&str, &ExecOutputChunk) + Send> OutputHook for StreamingOutputHook
 async fn run_pipeline_core(
     pipeline_name: String,
     pipeline_stages: Vec<PipelineStage>,
+    budget: Option<Arc<AtomicBudget>>,
     output_hook: &mut dyn OutputHook,
     observer: Option<&Observer>,
     stage_tx: Option<UnboundedSender<RunEvent>>,
@@ -342,8 +375,19 @@ async fn run_pipeline_core(
     let mut stages: Vec<StageResult> = Vec::new();
     let mut carry_data: Option<Vec<u8>> = None;
     let mut had_pipeline_error = false;
+    let mut charged = 0;
 
     for (i, stage) in pipeline_stages.into_iter().enumerate() {
+        let exhausted = charge_budget(budget.as_deref(), &stages[charged..]);
+        charged = stages.len();
+        if exhausted {
+            eprintln!(
+                "[pipeline] Budget exhausted; stopping before stage {}.",
+                i + 1
+            );
+            had_pipeline_error = true;
+            break;
+        }
         let group_id = format!("g{}", i);
         match stage {
             PipelineStage::Single(agent_box) => {
@@ -564,6 +608,8 @@ async fn run_pipeline_core(
         }
     }
 
+    charge_budget(budget.as_deref(), &stages[charged..]);
+
     let output = stages
         .last()
         .map(|s| s.agent_result.result_text.clone())
@@ -673,6 +719,7 @@ impl ObservablePipeline {
         let result = run_pipeline_core(
             self.pipeline.name,
             self.pipeline.stages,
+            self.pipeline.budget,
             &mut hook,
             Some(&observer),
             None,
@@ -697,6 +744,7 @@ impl ObservablePipeline {
         let result = run_pipeline_core(
             self.pipeline.name,
             self.pipeline.stages,
+            self.pipeline.budget,
             &mut hook,
             Some(&observer),
             None,
@@ -748,6 +796,17 @@ fn set_stage_span_attrs(span: &mut crate::observe::tracer::Span, stage_result: &
     if !r.model.is_empty() {
         span.set_attribute("gen_ai.request.model", &r.model);
     }
+}
+
+/// Charge each stage's cost to `budget` and report whether it is exhausted.
+fn charge_budget(budget: Option<&AtomicBudget>, results: &[StageResult]) -> bool {
+    let Some(budget) = budget else {
+        return false;
+    };
+    for r in results {
+        budget.charge_force(r.agent_result.total_cost_usd);
+    }
+    budget.is_exhausted()
 }
 
 /// Computes carry-forward bytes for the next stage.
@@ -820,6 +879,53 @@ fn looks_like_login_error(result: &AgentExecResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stage_costing(cost: f64) -> StageResult {
+        StageResult {
+            box_name: "s".into(),
+            agent_result: AgentExecResult {
+                total_cost_usd: cost,
+                ..Default::default()
+            },
+            file_output: None,
+        }
+    }
+
+    #[test]
+    fn test_charge_budget_books_each_stage() {
+        let budget = AtomicBudget::new(1.0).unwrap();
+        assert!(!charge_budget(Some(&budget), &[stage_costing(0.4)]));
+        assert!(charge_budget(
+            Some(&budget),
+            &[stage_costing(0.4), stage_costing(0.3)]
+        ));
+        assert!((budget.spent_usd() - 1.1).abs() < 1e-9);
+        assert!(!charge_budget(None, &[stage_costing(5.0)]));
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_budget_stops_pipeline() {
+        let mock = |name: &str| VoidBox::new(name).prompt("p").mock().build().unwrap();
+        let budget = Arc::new(AtomicBudget::new(1.0).unwrap());
+        budget.charge_force(1.0);
+
+        let result = Pipeline::from(mock("a"))
+            .pipe(mock("b"))
+            .budget(budget)
+            .run()
+            .await
+            .unwrap();
+        assert!(result.stages.is_empty());
+
+        let open = Arc::new(AtomicBudget::new(1.0).unwrap());
+        let result = Pipeline::from(mock("a"))
+            .fan_out(vec![mock("b"), mock("c")])
+            .budget(open)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(result.stages.len(), 3);
+    }
 
     #[test]
     fn test_detects_login_error_from_result_text() {
